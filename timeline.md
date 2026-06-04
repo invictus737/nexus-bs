@@ -1,5 +1,54 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 23:34:48 EEST - LLC inbound duplicate guard bounded by T.251/N.252
+
+Live problem targeted:
+
+- User reported group-call tests with visible terminal-side `PTT denied`.
+- Live BS log review did not show CMCE sending a floor denial in the sampled window; repeated group `U-TX DEMAND` events were answered with `D-TX GRANTED`.
+- The same log did show a lower-layer signalling fault:
+  - `23:28:32.289`: `LLC: suppressing duplicate inbound BL-DATA/BL-ADATA N(S)=1 for SSI 2260618 endpoint 0; ACK remains scheduled`.
+  - This occurred many seconds after prior `2260618` signalling, so the old unbounded receive duplicate memory could suppress a new CMCE PDU before it reached call control.
+
+Components, simple technical meaning:
+
+- LLC: logical link control between MAC and MLE/CMCE/SDS. It acknowledges BL-DATA/BL-ADATA and prevents duplicate service-user delivery when a peer retransmits because its ACK was lost.
+- `N(S)`: one-bit basic-link sequence number for acknowledged data.
+- `inbound_receive_seq`: per-terminal/per-endpoint memory of the last valid inbound `N(S)`.
+- Patch scope: keep duplicate suppression for short retransmission windows, but stop treating the same `N(S)` as a duplicate forever.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 22.3.2.3: acknowledged BL-DATA/BL-ADATA uses `N(S)`/`N(R)` and must ACK valid inbound data; BL-ADATA handles ACK first and DATA second.
+- EN 300 392-2 clause 22.3.2.3 note 3: numbering alone does not guarantee safe duplicate suppression.
+- EN 300 392-2 Annex A.1: T.251 is counted in downlink signalling frames; default T.251 is 4 signalling frames.
+- EN 300 392-2 Annex A.2: N.252 defines the maximum retransmissions; local configured value is 3, giving a conservative duplicate guard of `(3 + 1) * 4 = 16` downlink signalling frames.
+- This is clause-scoped robustness hardening, not formal ETSI certification evidence.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - `ReceiveSeqState` now stores `last_ns`, `received_at`, and `ack_timeslot`.
+  - Added a duplicate-suppression horizon based on `(N.252 + 1) * T.251`.
+  - Prunes expired receive-sequence entries before duplicate comparison.
+  - Does not refresh the duplicate window when suppressing a duplicate, so repeated stale frames cannot extend suppression indefinitely.
+  - Keeps duplicate BL-DATA/BL-ADATA ACK scheduling intact.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_llc_bs inbound --locked` -> 6 passed.
+- `cargo test -p tetra-entities llc::llc_bs_ms::tests::inbound_duplicate_guard_expires_after_full_retransmission_horizon --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 80 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to testing.
+2. Retest group alternating PTT with `2260616`, `2260618`, and `2260082` on GSSI `226333`.
+3. Expected live evidence: no stale `LLC: suppressing duplicate inbound ...` for new group-call control after the T.251/N.252 horizon; CMCE should receive the control PDU and either grant or explicitly log any real floor denial reason.
+
 ## 2026-06-04 23:21:39 EEST - Dashboard CPU model detection across boards
 
 Problem targeted:

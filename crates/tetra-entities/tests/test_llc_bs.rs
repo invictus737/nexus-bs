@@ -6,6 +6,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, debug};
 use tetra_entities::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
+use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
@@ -20,6 +21,9 @@ use tetra_saps::tla::{
     TlDataRespBl, TlaTlDataReqBl, TlaTlUnitdataReqBl,
 };
 use tetra_saps::tma::{TmaReport, TmaReportInd, TmaUnitdataInd};
+
+const LLC_INBOUND_DUPLICATE_SUPPRESSION_HORIZON_TICKS: usize =
+    (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as usize + 1) * T251_SENDER_RETRY_TIMER as usize;
 
 #[test]
 fn test_bl_data_with_unanswered_tl_sdu_sends_standalone_ack() {
@@ -3512,6 +3516,62 @@ fn test_duplicate_inbound_bl_data_after_ack_is_not_delivered_again_but_is_acked(
 }
 
 #[test]
+fn test_inbound_bl_data_same_ns_after_retry_horizon_is_delivered_again() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    test.submit_message(build_bl_data_ind_with_payload_and_fcs(addr, 0, &[0xA0], false));
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    assert_eq!(
+        first_msgs
+            .iter()
+            .filter_map(tl_data_ind_handle_and_payload_bits)
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>(),
+        vec!["10100000".to_owned()],
+        "first valid BL-DATA should be delivered as TL-DATA.ind"
+    );
+    assert_eq!(
+        first_msgs.iter().filter_map(bl_ack_nr_and_payload_bits).collect::<Vec<_>>(),
+        vec![(0, String::new())],
+        "first valid BL-DATA should be acknowledged"
+    );
+
+    // EN 300 392-2 clause 22.3.2.3 note 3 says N(S) alone is not a safe
+    // indefinite duplicate-suppression mechanism. After the full Annex A.1
+    // T.251/N.252 retry envelope, the same N(S) may be a new transfer.
+    test.run_stack(Some(LLC_INBOUND_DUPLICATE_SUPPRESSION_HORIZON_TICKS + 8));
+    let idle_msgs = test.dump_sinks();
+    assert!(
+        idle_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
+        "idle expiry ticks must not synthesize service-user data"
+    );
+
+    test.submit_message(build_bl_data_ind_with_payload_and_fcs(addr, 0, &[0xA2], false));
+    test.run_stack(Some(1));
+    let later_msgs = test.dump_sinks();
+    assert_eq!(
+        later_msgs
+            .iter()
+            .filter_map(tl_data_ind_handle_and_payload_bits)
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>(),
+        vec!["10100010".to_owned()],
+        "same BL-DATA N(S) after the retry horizon should be delivered as a new TL-DATA.ind"
+    );
+    assert_eq!(
+        later_msgs.iter().filter_map(bl_ack_nr_and_payload_bits).collect::<Vec<_>>(),
+        vec![(0, String::new())],
+        "same BL-DATA N(S) after the retry horizon should still be acknowledged"
+    );
+}
+
+#[test]
 fn test_duplicate_inbound_bl_adata_after_ack_is_not_delivered_again_but_is_acked() {
     debug::setup_logging_verbose();
 
@@ -3569,6 +3629,59 @@ fn test_duplicate_inbound_bl_adata_after_ack_is_not_delivered_again_but_is_acked
             .iter()
             .all(|msg| !matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
         "duplicate BL-ADATA ACK tick must not include a delayed duplicate TL-DATA.ind"
+    );
+}
+
+#[test]
+fn test_inbound_bl_adata_same_ns_after_retry_horizon_is_delivered_again() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    test.submit_message(build_bl_adata_ind_with_payload_and_fcs(addr, 0, 1, &[0xB0], false));
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    assert_eq!(
+        first_msgs
+            .iter()
+            .filter_map(tl_data_ind_handle_and_payload_bits)
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>(),
+        vec!["10110000".to_owned()],
+        "first valid BL-ADATA data half should be delivered as TL-DATA.ind"
+    );
+    assert_eq!(
+        first_msgs.iter().filter_map(bl_ack_nr_and_payload_bits).collect::<Vec<_>>(),
+        vec![(1, String::new())],
+        "first valid BL-ADATA data half should be acknowledged"
+    );
+
+    test.run_stack(Some(LLC_INBOUND_DUPLICATE_SUPPRESSION_HORIZON_TICKS + 8));
+    let idle_msgs = test.dump_sinks();
+    assert!(
+        idle_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
+        "idle expiry ticks must not synthesize service-user data"
+    );
+
+    test.submit_message(build_bl_adata_ind_with_payload_and_fcs(addr, 0, 1, &[0xB2], false));
+    test.run_stack(Some(1));
+    let later_msgs = test.dump_sinks();
+    assert_eq!(
+        later_msgs
+            .iter()
+            .filter_map(tl_data_ind_handle_and_payload_bits)
+            .map(|(_, payload)| payload)
+            .collect::<Vec<_>>(),
+        vec!["10110010".to_owned()],
+        "same BL-ADATA N(S) after the retry horizon should be delivered as a new TL-DATA.ind"
+    );
+    assert_eq!(
+        later_msgs.iter().filter_map(bl_ack_nr_and_payload_bits).collect::<Vec<_>>(),
+        vec![(1, String::new())],
+        "same BL-ADATA N(S) after the retry horizon should still be acknowledged"
     );
 }
 

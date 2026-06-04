@@ -33,6 +33,8 @@ use crate::umac::subcomp::bs_sched::SCH_F_CAP;
 
 const TDMA_TIMESLOTS_PER_FRAME: u32 = 4;
 const T251_SENDER_RETRY_SIGNALLING_FRAMES: u32 = T251_SENDER_RETRY_TIMER / TDMA_TIMESLOTS_PER_FRAME;
+const INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES: u32 =
+    (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as u32 + 1) * T251_SENDER_RETRY_SIGNALLING_FRAMES;
 const N253_MAX_REQUESTED_TLSDU_REPEATS: u8 = 5;
 const TMA_HIGHEST_PDU_PRIORITY: Todo = 7;
 
@@ -47,6 +49,8 @@ struct BasicLinkKey {
 #[derive(Debug, Clone, Copy)]
 struct ReceiveSeqState {
     last_ns: u8,
+    received_at: TdmaTime,
+    ack_timeslot: u8,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -377,6 +381,26 @@ impl Llc {
 
     fn basic_link_key(addr: TetraAddress, endpoint_id: EndpointId) -> BasicLinkKey {
         BasicLinkKey { addr, endpoint_id }
+    }
+
+    fn inbound_duplicate_state_expired(state: ReceiveSeqState, now: TdmaTime) -> bool {
+        Self::downlink_signalling_frames_elapsed(state.received_at, now, state.ack_timeslot)
+            > INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES
+    }
+
+    fn prune_expired_inbound_receive_seq(&mut self, now: TdmaTime) {
+        self.inbound_receive_seq.retain(|key, state| {
+            let expired = Self::inbound_duplicate_state_expired(*state, now);
+            if expired {
+                tracing::debug!(
+                    "LLC: expiring inbound duplicate guard for SSI {} endpoint {} N(S) {}",
+                    key.addr.ssi,
+                    key.endpoint_id,
+                    state.last_ns
+                );
+            }
+            !expired
+        });
     }
 
     fn expected_ack_key(ack: &ExpectedInAck) -> BasicLinkKey {
@@ -1456,6 +1480,7 @@ impl Llc {
         let tl_data_ind_req_handle = if let Some(ns) = ns
             && fcs_ok
         {
+            self.prune_expired_inbound_receive_seq(self.dltime);
             let key = Self::basic_link_key(prim.main_address, prim.endpoint_id);
             duplicate_inbound_ns = self
                 .inbound_receive_seq
@@ -1473,7 +1498,14 @@ impl Llc {
                     .unwrap_or_else(|| self.next_tl_data_ind_req_handle())
             } else {
                 let handle = self.next_tl_data_ind_req_handle();
-                self.inbound_receive_seq.insert(key, ReceiveSeqState { last_ns: ns });
+                self.inbound_receive_seq.insert(
+                    key,
+                    ReceiveSeqState {
+                        last_ns: ns,
+                        received_at: msg_dltime,
+                        ack_timeslot: msg_dltime.t,
+                    },
+                );
                 handle
             };
             Some(handle)
@@ -2250,7 +2282,10 @@ impl TetraEntityTrait for Llc {
 
 #[cfg(test)]
 mod tests {
-    use super::{Llc, ScheduledOutAck, T251_SENDER_RETRY_SIGNALLING_FRAMES, TDMA_TIMESLOTS_PER_FRAME};
+    use super::{
+        INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES, Llc, ReceiveSeqState, ScheduledOutAck, T251_SENDER_RETRY_SIGNALLING_FRAMES,
+        TDMA_TIMESLOTS_PER_FRAME,
+    };
     use std::collections::VecDeque;
     use tetra_core::{SsiType, TdmaTime, TetraAddress};
     use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
@@ -2299,6 +2334,26 @@ mod tests {
         );
         assert_eq!(Llc::t251_downlink_frames_elapsed(start, now, 3, Some(false)), 3);
         assert_eq!(Llc::t251_downlink_frames_elapsed(start, now, 3, None), 3);
+    }
+
+    #[test]
+    fn inbound_duplicate_guard_expires_after_full_retransmission_horizon() {
+        let received_at = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        let state = ReceiveSeqState {
+            last_ns: 1,
+            received_at,
+            ack_timeslot: 2,
+        };
+
+        let boundary = received_at.add_timeslots((INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES * TDMA_TIMESLOTS_PER_FRAME) as i32);
+        assert!(
+            !Llc::inbound_duplicate_state_expired(state, boundary),
+            "same N(S) at the full N.252/T.251 retry horizon is still treated as a possible retransmission"
+        );
+        assert!(
+            Llc::inbound_duplicate_state_expired(state, boundary.add_timeslots(TDMA_TIMESLOTS_PER_FRAME as i32)),
+            "same N(S) after the full retry horizon may be delivered as a new transfer"
+        );
     }
 
     #[test]
