@@ -222,6 +222,18 @@ impl UmacBs {
         self.current_ul_speaker[ts as usize - 1]
     }
 
+    fn floor_media_timeslots(&self, ts: u8) -> [Option<u8>; 2] {
+        if !(1..=4).contains(&ts) {
+            return [None, None];
+        }
+
+        let peer_ts = self
+            .channel_scheduler
+            .ul_circuit_peer_ts(ts)
+            .filter(|peer_ts| (1..=4).contains(peer_ts) && *peer_ts != ts);
+        [Some(ts), peer_ts]
+    }
+
     fn tlmc_energy_start_time(&self, startpoint: TlmcEnergyEconomyStartpoint) -> TdmaTime {
         let mut start_time = TdmaTime {
             t: self.dltime.t,
@@ -2110,13 +2122,15 @@ impl UmacBs {
             }
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
             CallControl::FloorReleased { ts, .. } => {
-                self.channel_scheduler
-                    .clear_dl_media_queue(ts, "floor released; U-plane enters hangtime");
-                self.channel_scheduler.set_hangtime(ts, true);
-                // Stop checking UL inactivity during hangtime
-                if (1..=4).contains(&ts) {
-                    self.last_ul_voice[ts as usize - 1] = None;
-                    self.clear_current_ul_speaker(ts);
+                for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                    self.channel_scheduler
+                        .clear_dl_media_queue(floor_ts, "floor released; U-plane enters hangtime");
+                    self.channel_scheduler.set_hangtime(floor_ts, true);
+                    // Stop checking UL inactivity during hangtime. For crossed
+                    // P2P media, the downlink target timeslot can still hold
+                    // queued old-speaker TCH/S, so clear both affected slots.
+                    self.last_ul_voice[floor_ts as usize - 1] = None;
+                    self.clear_current_ul_speaker(floor_ts);
                 }
             }
             CallControl::FloorGranted {
@@ -2125,9 +2139,11 @@ impl UmacBs {
                 dest_gssi,
                 ts,
             } => {
-                self.channel_scheduler
-                    .clear_dl_media_queue(ts, "new floor grant; discard previous speaker media");
-                self.channel_scheduler.set_hangtime(ts, false);
+                for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                    self.channel_scheduler
+                        .clear_dl_media_queue(floor_ts, "new floor grant; discard previous speaker media");
+                    self.channel_scheduler.set_hangtime(floor_ts, false);
+                }
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     let source_addr = TetraAddress::issi(source_issi);
@@ -2155,11 +2171,11 @@ impl UmacBs {
                 }
             }
             CallControl::CallEnded { ts, .. } => {
-                self.channel_scheduler.clear_dl_media_queue(ts, "call ended");
-                self.channel_scheduler.set_hangtime(ts, false);
-                if (1..=4).contains(&ts) {
-                    self.last_ul_voice[ts as usize - 1] = None;
-                    self.clear_current_ul_speaker(ts);
+                for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                    self.channel_scheduler.clear_dl_media_queue(floor_ts, "call ended");
+                    self.channel_scheduler.set_hangtime(floor_ts, false);
+                    self.last_ul_voice[floor_ts as usize - 1] = None;
+                    self.clear_current_ul_speaker(floor_ts);
                 }
             }
 

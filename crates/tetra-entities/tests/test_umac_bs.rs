@@ -865,6 +865,69 @@ fn test_private_simplex_ul_voice_loopback_preserves_tch_s_bits() {
 }
 
 #[test]
+fn test_private_simplex_cross_route_floor_release_purges_peer_dl_media() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x3201;
+    let called_issi = 0x3202;
+    let caller_ts = 2;
+    let called_ts = 3;
+    let call_id = 1;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg_with_peer(caller_issi, called_issi, caller_ts, called_ts));
+    test.submit_message(private_call_open_msg_with_peer(called_issi, caller_issi, called_ts, caller_ts));
+    test.submit_message(floor_granted_msg(call_id, caller_issi, called_issi, caller_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let stale_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 7 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, caller_ts, stale_raw_block2.clone());
+    test.submit_message(floor_released_msg(call_id, caller_ts));
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let observed = collect_dl_raw_tch_block2_bits(&msgs, called_ts);
+    assert!(
+        !observed.iter().any(|bits| bits == &stale_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 e), 23.5 and 23.8.5: private simplex floor release must purge queued old-speaker TCH/S on the crossed peer DL timeslot"
+    );
+}
+
+#[test]
+fn test_private_simplex_cross_route_floor_grant_keeps_new_peer_audio() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x3211;
+    let called_issi = 0x3212;
+    let caller_ts = 2;
+    let called_ts = 3;
+    let call_id = 1;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg_with_peer(caller_issi, called_issi, caller_ts, called_ts));
+    test.submit_message(private_call_open_msg_with_peer(called_issi, caller_issi, called_ts, caller_ts));
+    test.submit_message(floor_granted_msg(call_id, called_issi, caller_issi, called_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let fresh_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 11 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, called_ts, fresh_raw_block2.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let observed = collect_dl_raw_tch_block2_bits(&msgs, caller_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &fresh_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 b) and 23.5: private simplex P2P on separate assigned timeslots must cross-route the granted speaker's TCH/S to the peer DL timeslot"
+    );
+}
+
+#[test]
 fn test_private_duplex_ul_voice_cross_route_preserves_tch_s_bits() {
     debug::setup_logging_verbose();
 

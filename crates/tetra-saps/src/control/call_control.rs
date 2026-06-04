@@ -20,9 +20,11 @@ pub struct Circuit {
     /// Timeslot in which this circuit exists
     pub ts: u8,
 
-    /// Optional peer timeslot for duplex cross-routing (UL on ts -> DL on peer_ts).
-    /// For full-duplex P2P calls: calling MS on ts, called MS on peer_ts, audio is crossed.
-    /// None for simplex/group calls.
+    /// Optional peer timeslot for P2P cross-routing (UL on ts -> DL on peer_ts).
+    /// For local P2P calls, including simplex calls where only one MS holds the
+    /// floor at a time, calling MS and called MS may use different assigned
+    /// timeslots and audio is crossed between them. None for group calls and
+    /// same-timeslot local loopback.
     pub peer_ts: Option<u8>,
 
     /// Usage number, between 4 and 63

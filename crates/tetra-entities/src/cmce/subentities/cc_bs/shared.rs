@@ -1473,7 +1473,8 @@ impl CcBsSubentity {
     }
 
     /// Notify UMAC to open a traffic circuit (ETSI §21 circuit management).
-    /// `peer_ts` is Some only for full-duplex calls where UL of one MS feeds DL of the other.
+    /// `peer_ts` is Some for local P2P calls on separate assigned timeslots,
+    /// including simplex calls where floor control still requires crossed media.
     pub(super) fn signal_umac_circuit_open(
         queue: &mut MessageQueue,
         call: &CmceCircuit,

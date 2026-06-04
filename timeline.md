@@ -2990,3 +2990,48 @@ Next non-repeating execution:
 2. Inspect the post-deploy log for the first reverse-PTT sequence: expected `U-TX DEMAND` then `D-TX GRANTED` then TCH/S voice, with no stale `D-TX CEASED` emitted after the new grant.
 3. If P2P still fails, patch the next proven layer only: likely UMAC bearer/speaker gating or CMCE floor-holder state, not another LLC repetition change without fresh log evidence.
 4. Then retest group `226333` alternating PTT for the same stale floor-control pattern.
+
+## 2026-06-05 00:32:46 EEST - P2P simplex crossed-timeslot floor media cleanup
+
+Problem targeted:
+
+- User reported current P2P simplex is broken after the floor-control repeat guard deployment.
+- The live post-deploy log still showed no `USetup`/`UTxDemand` P2P sequence in the current process log; a bounded 90 s tail saw only broadcasts, Brew deregisters, and one isolated TCH burst.
+- Code inspection found a missing UMAC case for local P2P simplex when the two MSs are on separate assigned timeslots: floor release/grant cleanup only cleared the source UL timeslot, while downlink speech for that source is queued on the crossed peer timeslot.
+- That can leave old-speaker raw TCH/S queued on the peer DL timeslot across `D-TX CEASED`/`D-TX GRANTED`, matching the static/no-voice symptom class.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b/e: private simplex request-to-transmit/floor release must switch the single authorized speaker cleanly.
+- EN 300 392-2 clause 23.5: assigned traffic channels carry FACCH/STCH signalling during floor control.
+- EN 300 392-2 clause 23.8.5: TCH/S media timing/half-slot handling must not be carried across an obsolete floor epoch.
+- This is clause-scoped engineering hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `floor_media_timeslots(ts)` to include the peer timeslot for local P2P cross-route circuits.
+  - `FloorReleased` now clears DL media, enters hangtime, clears UL inactivity state, and clears current STCH speaker state on both the source and crossed peer timeslots.
+  - `FloorGranted` now clears stale media and exits hangtime on both affected timeslots before accepting the new floor holder.
+  - `CallEnded` now clears both affected timeslots for crossed P2P circuits.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_private_simplex_cross_route_floor_release_purges_peer_dl_media`.
+  - Added `test_private_simplex_cross_route_floor_grant_keeps_new_peer_audio`.
+- `crates/tetra-saps/src/control/call_control.rs` and `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Updated internal comments: `peer_ts` is for local P2P cross-routing, including simplex calls on separate assigned timeslots, not only duplex.
+
+Verification:
+
+- `cargo fmt --all` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 49 passed.
+- `cargo check -p tetra-saps -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC crossed-timeslot cleanup.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest private simplex `2260616 <-> 2260618`: expected reverse PTT has `U-TX DEMAND`, `D-TX GRANTED`, then TCH/S routed to the peer TS with no old raw TCH/S from the previous floor.
+4. If P2P setup still does not appear in the log, instrument/inspect the MAC/LLC decode path before changing CMCE floor semantics again.
