@@ -918,3 +918,49 @@ Conclusion:
   - full valid TCH/S is proven to pass;
   - partial/bad TCH/S is proven not to become clean speech/static.
 - Next step after commit/deploy is still a live private/group PTT test using the log filter from the previous checkpoint.
+
+## 2026-06-04 11:36:35 EEST - Deployed LMAC guard build to test BS
+
+Commit deployed:
+
+- `bfc1960 test: guard LMAC partial speech handling`
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape used: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Output binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `b830daa3e18bcb478092e453a6be6618165b7110e109701c4a188cbf0865ae7c`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Stopped the prior test BS/control-service using the existing pidfiles.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `b830daa3e18bcb478092e453a6be6618165b7110e109701c4a188cbf0865ae7c`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `16125`
+  - control-service pid `16128`
+  - nexus-bs pid `16130`
+
+Post-restart checks:
+
+- Dashboard root on `127.0.0.1:8080` returned HTML.
+- `2260616` re-registered/re-affiliated to group `226333`; soft re-attach after restart was handled and EG3 assignment was attempted.
+- `2260082` reappeared with RSSI/ACK activity and soft re-attach handling; EG assignment later timed out and fell back to `StayAlive`.
+- `2260618` re-registered/re-affiliated to group `226333`; requested EG1 and BS allocated EG3.
+- `T352 expired` appeared for BS-initiated EG assignment to `2260082` and `2260616`; current fail-safe behavior keeps `StayAlive`.
+- One post-deploy `NormalTrainSeq2 in fullslot` was seen at PHY after restart, but no complete PTT trace was present yet.
+
+Current live status:
+
+- The deployed binary contains the LMAC partial TCH/S debug guard.
+- No post-`bfc1960` private/group PTT attempt has been recorded yet.
+- The next operator test must be:
+  - private simplex `2260082 -> 2260616`;
+  - private simplex `2260616 -> 2260082`;
+  - group PTT on `226333`, alternating radios.
+- Required log focus:
+  - `U-TX DEMAND`, `D-TX GRANTED`, `FloorGranted`, `CMCE opening UMAC circuit`, `UMAC voice route`, `rx_blk_traffic`, `dropping partial TCH/S`, `CRC fail`, `NormalTrainSeq2`, `Block2`, `PTT denied`, `NotGranted`, `UL inactivity`.
