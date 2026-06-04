@@ -602,3 +602,49 @@ Anti-loop rules from this checkpoint:
 - Do not call the stack `100% certified`; only clause-scoped engineering evidence exists.
 - Keep `call_preemptive` / transmission interruption default off.
 - Encryption remains out of focus unless explicitly requested.
+
+## 2026-06-04 11:14:01 EEST - UMAC idle traffic no longer emits all-zero speech
+
+Patch scope:
+
+- File changed: `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+- Component: UMAC/MAC downlink scheduler.
+- Simple meaning: this scheduler decides what the BS transmits on an assigned traffic slot. If it has real uplink speech, it sends TCH/S speech. If it has call-control signalling, it uses FACCH/STCH stealing. If it has neither, it must keep the assigned channel alive without inventing invalid speech.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.8.5: when the BS does not receive data from the sending MS, it should still transmit on the downlink channel; examples include C-plane Null PDUs or substitution traffic.
+- EN 300 392-2 clause 23.5 / 23.5.4: traffic channel and STCH/FACCH slot handling.
+- This is clause-scoped engineering hardening, not a formal certification claim.
+
+Behavior changed:
+
+- Before: an active DL traffic circuit with no queued uplink voice produced a 274-bit all-zero TCH/S block as "silence".
+- After: an active DL traffic circuit with no queued uplink voice transmits C-plane Null PDUs on STCH half-slots.
+- FACCH/STCH with real queued voice still keeps first half = STCH and second half = TCH/S.
+- FACCH/STCH without queued voice uses first half = STCH signalling and second half = STCH Null PDU.
+- This avoids sending an all-zero ACELP frame as clean speech when that frame is not proven to be a valid TETRA silence/substitution frame.
+
+Tests added/updated:
+
+- Added `test_active_traffic_slot_without_voice_uses_stch_null_not_zero_tch`.
+- Added `test_facch_without_voice_replaces_second_half_with_stch_null`.
+- Added `test_facch_with_voice_keeps_second_half_tch_s`.
+- Updated EG/FACCH tests that previously expected TCH/S zero filler while a FACCH item was deferred or pruned.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib active_traffic_slot_without_voice --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib facch_ --locked` -> 11 passed.
+- `cargo test -p tetra-entities --lib --locked` -> 204 passed, 5 ignored.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 42 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 2 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Current conclusion:
+
+- This patch removes one plausible static-audio source: synthetic all-zero TCH/S during active call gaps or missing uplink voice.
+- It does not prove live private/group audio is fixed; live PTT validation is still required.
+- Next live test must still capture `2260082 -> 2260616`, `2260616 -> 2260082`, and group `226333`, with logs for `CMCE opening UMAC circuit`, `FloorGranted`, `UMAC voice route`, `rx_blk_traffic`, CRC failures, and STCH/FACCH events.

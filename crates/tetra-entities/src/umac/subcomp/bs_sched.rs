@@ -1772,8 +1772,8 @@ impl BsChannelScheduler {
         buf_opt
     }
 
-    /// Build traffic block for active circuit. Returns (tch_block, optional_stch_block):
-    /// - tch_block: speech/silence (274 bits)
+    /// Build traffic block for active circuit. Returns (optional_tch_block, optional_stch_block):
+    /// - tch_block: queued speech (274 bits), or None when no uplink speech was received
     /// - stch_block: STCH signaling (124 bits) for FACCH stealing (EN 300 392-2, clause 23.5)
     /// Also reports transmission, if a TxReporter was attached to the DlSchedElem::Stealing element
     fn dl_build_traffic_block(
@@ -1781,19 +1781,14 @@ impl BsChannelScheduler {
         ts: TdmaTime,
         subscribers: &SubscriberRegistry,
         energy_saving: &mut HashMap<u32, EnergySavingAssignment>,
-    ) -> (BitBuffer, Option<BitBuffer>) {
-        // Get speech data or silence
-        let tch_buf = if let Some(block) = self.circuits.take_block(ts.t) {
+    ) -> (Option<BitBuffer>, Option<BitBuffer>) {
+        let tch_buf = self.circuits.take_block(ts.t).map(|block| {
             let mut buf = BitBuffer::from_vec(block);
             // Raw ACELP speech (274 bits for TCH/S).
             // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
             buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
             buf
-        } else {
-            // No voice data queued — send silence frame (all zeros).
-            // This is normal during hangtime or between voice bursts.
-            BitBuffer::new(TCH_S_CAP)
-        };
+        });
 
         // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)
         let (stch_opt, stealing_addr_opt, tx_reporter_opt, group_state_opt) = {
@@ -1853,6 +1848,12 @@ impl BsChannelScheduler {
         }
 
         (tch_buf, stch_opt)
+    }
+
+    fn generate_stch_null_block(&self) -> BitBuffer {
+        let mut buf = BitBuffer::new(SCH_HD_CAP);
+        MacResource::null_pdu().to_bitbuf(&mut buf);
+        buf
     }
 
     /// Return first queued grant.
@@ -1983,16 +1984,19 @@ impl BsChannelScheduler {
         let ul_phy = if ul_is_traffic { PhysicalChannel::Tp } else { PhysicalChannel::Cp };
 
         let mut elem = if dl_is_traffic {
-            let (tch_buf, stch_opt) = self.dl_build_traffic_block(ts, subscribers, energy_saving);
+            let (tch_buf_opt, stch_opt) = self.dl_build_traffic_block(ts, subscribers, energy_saving);
 
             if let Some(stch_buf) = stch_opt {
-                // FACCH/Stealing: 1st half = STCH signaling, 2nd half = TCH speech.
+                // FACCH/Stealing: 1st half = STCH signaling. If uplink speech
+                // is available, keep it in the second half. If not, EN 300 392-2
+                // clause 23.8.5 permits filling the channel with C-plane Null
+                // PDUs instead of fabricating an unproven all-zero speech frame.
                 // NDB uses NormalTrainSeq2 for independent half-slot demodulation (EN 300 392-2, clause 23.5).
                 tracing::info!(
-                    "finalize_ts_for_tick: FACCH stealing on ts {} (stch={} bits, tch={} bits)",
+                    "finalize_ts_for_tick: FACCH stealing on ts {} (stch={} bits, speech_present={})",
                     ts.t,
                     stch_buf.get_len(),
-                    tch_buf.get_len()
+                    tch_buf_opt.is_some()
                 );
                 TmvUnitdataReqSlot {
                     ts,
@@ -2001,15 +2005,23 @@ impl BsChannelScheduler {
                         mac_block: stch_buf,
                         scrambling_code: self.scrambling_code,
                     }),
-                    blk2: Some(TmvUnitdataReq {
-                        logical_channel: LogicalChannel::TchS,
-                        mac_block: tch_buf,
-                        scrambling_code: self.scrambling_code,
+                    blk2: Some(if let Some(tch_buf) = tch_buf_opt {
+                        TmvUnitdataReq {
+                            logical_channel: LogicalChannel::TchS,
+                            mac_block: tch_buf,
+                            scrambling_code: self.scrambling_code,
+                        }
+                    } else {
+                        TmvUnitdataReq {
+                            logical_channel: LogicalChannel::Stch,
+                            mac_block: self.generate_stch_null_block(),
+                            scrambling_code: self.scrambling_code,
+                        }
                     }),
                     bbk: None,
                     ul_phy_chan: ul_phy,
                 }
-            } else {
+            } else if let Some(tch_buf) = tch_buf_opt {
                 // Normal traffic: full-slot TCH
                 TmvUnitdataReqSlot {
                     ts,
@@ -2019,6 +2031,26 @@ impl BsChannelScheduler {
                         scrambling_code: self.scrambling_code,
                     }),
                     blk2: None,
+                    bbk: None,
+                    ul_phy_chan: ul_phy,
+                }
+            } else {
+                // No uplink speech was received for this active circuit. Per
+                // EN 300 392-2 clause 23.8.5, keep transmitting on the assigned
+                // channel using C-plane Null PDUs rather than an all-zero ACELP
+                // frame that is not proven to be a valid silence/substitution frame.
+                TmvUnitdataReqSlot {
+                    ts,
+                    blk1: Some(TmvUnitdataReq {
+                        logical_channel: LogicalChannel::Stch,
+                        mac_block: self.generate_stch_null_block(),
+                        scrambling_code: self.scrambling_code,
+                    }),
+                    blk2: Some(TmvUnitdataReq {
+                        logical_channel: LogicalChannel::Stch,
+                        mac_block: self.generate_stch_null_block(),
+                        scrambling_code: self.scrambling_code,
+                    }),
                     bbk: None,
                     ul_phy_chan: ul_phy,
                 }
@@ -2686,6 +2718,81 @@ mod tests {
         );
     }
 
+    fn assert_stch_null_block(block: &TmvUnitdataReq) {
+        assert_eq!(block.logical_channel, LogicalChannel::Stch);
+
+        let mut mac_block = block.mac_block.clone();
+        mac_block.seek(0);
+        let resource = MacResource::from_bitbuf(&mut mac_block).expect("STCH idle block must carry a MAC-RESOURCE");
+        assert!(
+            resource.is_null_pdu(),
+            "EN 300 392-2 clause 23.8.5 permits C-plane Null PDUs when no uplink speech was received"
+        );
+    }
+
+    #[test]
+    fn test_active_traffic_slot_without_voice_uses_stch_null_not_zero_tch() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+
+        let elem = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        assert_eq!(elem.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        assert_stch_null_block(
+            elem.blk1
+                .as_ref()
+                .expect("active idle circuit should transmit first Null half-slot"),
+        );
+        assert_stch_null_block(
+            elem.blk2
+                .as_ref()
+                .expect("active idle circuit should transmit second Null half-slot"),
+        );
+    }
+
+    #[test]
+    fn test_facch_without_voice_replaces_second_half_with_stch_null() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+        sched.dl_enqueue_stealing(2, BitBuffer::new(SCH_HD_CAP), TetraAddress::new(1234, SsiType::Issi), None);
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+
+        let elem = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        assert_eq!(elem.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        assert_eq!(elem.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::Stch));
+        assert_stch_null_block(
+            elem.blk2
+                .as_ref()
+                .expect("FACCH without speech should Null-fill the second half-slot"),
+        );
+    }
+
+    #[test]
+    fn test_facch_with_voice_keeps_second_half_tch_s() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+        sched.dl_enqueue_stealing(2, BitBuffer::new(SCH_HD_CAP), TetraAddress::new(1234, SsiType::Issi), None);
+        sched.dl_schedule_tmd(2, vec![0xA5; 35]);
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+
+        let elem = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        assert_eq!(elem.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        assert_eq!(elem.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::Stch));
+        assert_eq!(elem.blk2.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::TchS));
+    }
+
     #[test]
     fn test_energy_saving_defers_issi_resource_until_monitoring_window() {
         let mut sched = get_testing_slotter();
@@ -3131,7 +3238,18 @@ mod tests {
 
         let asleep = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
         assert_eq!(asleep.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
-        assert_eq!(asleep.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::TchS));
+        assert_stch_null_block(
+            asleep
+                .blk1
+                .as_ref()
+                .expect("idle assigned channel should carry first Null half-slot"),
+        );
+        assert_stch_null_block(
+            asleep
+                .blk2
+                .as_ref()
+                .expect("idle assigned channel should carry second Null half-slot"),
+        );
         assert_eq!(reporter.get_state(), TxState::Pending);
         assert_eq!(energy_saving.get(&issi).and_then(|assignment| assignment.awake_until), None);
         assert!(
@@ -3593,7 +3711,18 @@ mod tests {
         // the stale snapshot.
         let second = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
         assert_eq!(second.ts, TdmaTime { t: 2, f: 3, m: 1, h: 0 });
-        assert_eq!(second.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::TchS));
+        assert_stch_null_block(
+            second
+                .blk1
+                .as_ref()
+                .expect("idle assigned channel should carry first Null half-slot"),
+        );
+        assert_stch_null_block(
+            second
+                .blk2
+                .as_ref()
+                .expect("idle assigned channel should carry second Null half-slot"),
+        );
         assert_eq!(reporter.get_state(), TxState::Transmitted);
         assert!(
             sched.dltx_queues[1]
