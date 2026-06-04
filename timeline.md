@@ -964,3 +964,76 @@ Current live status:
   - group PTT on `226333`, alternating radios.
 - Required log focus:
   - `U-TX DEMAND`, `D-TX GRANTED`, `FloorGranted`, `CMCE opening UMAC circuit`, `UMAC voice route`, `rx_blk_traffic`, `dropping partial TCH/S`, `CRC fail`, `NormalTrainSeq2`, `Block2`, `PTT denied`, `NotGranted`, `UL inactivity`.
+
+## 2026-06-04 11:39:20 EEST - Voice architecture feedback integrated
+
+Voice Architecture returned after the LMAC guard deploy.
+
+Key feedback:
+
+- Strongest non-repeating live suspect remains real-air LMAC TCH/S handling around `NormalTrainSeq2`, not UMAC bit-copy.
+- Existing UMAC voice tests inject after LMAC, so they cannot prove that PHY/LMAC traffic bursts reach UMAC.
+- The deployed `bfc1960` patch covers the safe fail-closed/logging side:
+  - valid full-slot TCH/S passes;
+  - partial `Block2` TCH/S is not forwarded as clean speech/static.
+- It does not implement a BFI/half-slot-condition capable traffic SAP or explicit half-slot TCH/S decode. That remains a future LMAC design task if live logs prove terminals send speech primarily as `NormalTrainSeq2 + Block2`.
+
+Additional patch candidate from Voice Architecture:
+
+- CMCE private setup should not route a configured-local ISSI over Brew only because that ISSI is currently absent from `subscriber_groups`.
+- For configured local SSI ranges, an unregistered callee should be rejected locally/recovered locally, not misclassified as external/Brew.
+- ETSI scope if patched:
+  - EN 300 392-2 clause 14.5.1.1.2 for first setup response/dummy call reference.
+  - EN 300 392-2 clause 14.5.1.3.2 for unsupported/rejected individual-call release.
+  - Local SSI range is a deployment policy guard, not an ETSI rule.
+
+Next code task selected:
+
+- Add a focused CMCE guard/test for local-range but unregistered private-call destination.
+- Keep PBX/phone `called_ssi == 0` and non-local Brew-routable ISSIs on the existing Brew path.
+
+## 2026-06-04 11:40:32 EEST - CMCE local unregistered private-call guard
+
+Patch scope:
+
+- Files changed:
+  - `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - `timeline.md`
+- Component: CMCE private-call setup.
+- Simple meaning: CMCE decides whether a private call is local, external/Brew, or rejected before setup.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.1.2: first SwMI response to individual-call setup.
+- EN 300 392-2 clause 14.5.1.3.2: rejecting unsupported/unreachable individual call with D-RELEASE before a SwMI call identity exists.
+- Configured `local_ssi_ranges` remains deployment policy, not an ETSI address rule.
+
+Behavior changed:
+
+- Before: if a called private ISSI was not in `subscriber_groups`, CMCE entered the Brew fallback path first. Later Brew routing checks could reject it, but logs/semantics misclassified a configured-local offline ISSI as an external routing candidate.
+- After: if `called_addr.ssi` is inside `config.cell.local_ssi_ranges` and is not registered/affiliated locally, CMCE rejects locally with dummy-call-id `D-RELEASE` cause `CalledPartyNotReachable`.
+- PBX/phone calls with `called_ssi == 0` still use the Brew path.
+- Non-local unregistered ISSIs still use the existing Brew path if routable/configured.
+
+Test added:
+
+- `test_p2p_setup_to_configured_local_unregistered_issi_rejects_without_brew_fallback`
+  - Configures local SSI range `2260000..2269999`.
+  - Registers only the caller.
+  - Calls local but unregistered `2260616`.
+  - Asserts one dummy-call-id `D-RELEASE` with `CalledPartyNotReachable`.
+  - Asserts no `NetworkCircuitSetupRequest` is sent to Brew and no UMAC traffic circuit opens.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_setup_to_configured_local_unregistered_issi_rejects_without_brew_fallback --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Conclusion:
+
+- This is a private-call routing hardening patch. It does not claim live audio is fixed.
+- It prevents one misleading local-vs-external call setup path for lab ISSIs such as `2260082`, `2260616`, and `2260618` when they are configured local but not currently registered.

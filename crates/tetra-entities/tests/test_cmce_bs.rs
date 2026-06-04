@@ -1,6 +1,7 @@
 mod common;
 
 use tetra_config::bluestation::{CfgBrew, StackMode, from_toml_str};
+use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
@@ -4716,6 +4717,40 @@ fn test_p2p_busy_calling_party_echo_setup_rejects_with_dummy_call_id() {
     // clause 14.5.1.1.2 idle-state gating applies before local service
     // routing, so echo must not create a parallel call for a busy caller.
     assert_p2p_setup_rejected_with_dummy_call_id_and_cause(&msgs, TEST_ISSI, DisconnectCause::NoIdleCcEntity);
+}
+
+#[test]
+fn test_p2p_setup_to_configured_local_unregistered_issi_rejects_without_brew_fallback() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    test.submit_message(build_u_setup_p2p_msg(TEST_ISSI, 2_260_616));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 14.5.1.1.2 and 14.5.1.3.2 scope this as an
+    // individual-call setup rejection before a SwMI call identity exists. The
+    // configured local SSI range is policy, not an ETSI address rule: the
+    // destination remains local and unreachable instead of falling through to
+    // the external Brew path.
+    assert_p2p_setup_rejected_with_dummy_call_id_and_cause(&msgs, TEST_ISSI, DisconnectCause::CalledPartyNotReachable);
+    assert!(
+        !msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { .. })
+        )),
+        "configured-local unregistered ISSI must not be forwarded as a Brew network setup"
+    );
 }
 
 #[test]

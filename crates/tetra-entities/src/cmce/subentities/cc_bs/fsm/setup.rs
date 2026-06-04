@@ -466,7 +466,34 @@ impl CcBsSubentity {
             return;
         }
 
+        let called_is_configured_local = {
+            let config = self.config.config();
+            config.cell.local_ssi_ranges.contains(called_addr.ssi)
+        };
+
         if !self.subscriber_groups.contains_key(&called_addr.ssi) {
+            if called_is_configured_local {
+                tracing::info!(
+                    "CMCE: rejecting U-SETUP P2P from ISSI {} to local unregistered ISSI {}",
+                    calling_party.ssi,
+                    called_addr.ssi
+                );
+                // EN 300 392-2 clause 14.5.1.1.2 scopes the first SwMI
+                // response to a private-call setup. No SwMI call identity
+                // exists yet, so clause 14.5.1.3.2 rejection uses the dummy
+                // call reference. The local SSI range is deployment policy:
+                // it prevents a configured-local ISSI from being reclassified
+                // as an external Brew destination just because it is offline.
+                Self::reject_u_setup_before_call_id(
+                    queue,
+                    calling_party,
+                    prim.handle,
+                    prim.link_id,
+                    prim.endpoint_id,
+                    DisconnectCause::CalledPartyNotReachable,
+                );
+                return;
+            }
             self.fsm_on_u_setup_p2p_over_brew(queue, message, pdu, calling_party, called_addr);
             return;
         }
