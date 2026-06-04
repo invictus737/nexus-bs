@@ -3035,3 +3035,25 @@ Next non-repeating execution:
 2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
 3. Retest private simplex `2260616 <-> 2260618`: expected reverse PTT has `U-TX DEMAND`, `D-TX GRANTED`, then TCH/S routed to the peer TS with no old raw TCH/S from the previous floor.
 4. If P2P setup still does not appear in the log, instrument/inspect the MAC/LLC decode path before changing CMCE floor semantics again.
+
+## 2026-06-05 00:34:40 EEST - Crossed P2P media cleanup deployed to RF test BS
+
+Deployment:
+
+- Committed patch: `82297b5 fix: clear crossed P2P floor media`.
+- Deployed direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote binary SHA-256: `8317e81208d92ef5e4ec7839e2ee1037bcd3a0f5117b772884e7ea8614bebb67`.
+- Remote build banner: `Build: v0.1.55-82297b54`.
+- Remote processes after restart: `nexus-bs-control-service` on `127.0.0.1:9002`, `nexus-bs` with `/home/chris/nexus-bs-v0.1.55-test/config.live.toml`.
+
+Post-start live state:
+
+- `2260618` registered and affiliated to `226333`.
+- `2260616` registered and affiliated to `226333`.
+- `2260082` registered and affiliated to `226333`.
+
+Next non-repeating execution:
+
+1. RF retest private simplex both directions between `2260616` and `2260618`.
+2. Expected on reverse PTT: `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, then `UMAC voice route` from granted UL TS to peer DL TS.
+3. If terminal still shows PTT denied or no P2P setup appears, collect a fresh bounded log around the attempt and inspect MAC/LLC decode before another CMCE/LLC semantic patch.
