@@ -1,0 +1,5490 @@
+mod common;
+
+use tetra_config::bluestation::{CfgBrew, EnergySavingAssignment, StackMode, from_toml_str};
+use tetra_core::ranges::SortedDisjointSsiRanges;
+use tetra_core::tetra_entities::TetraEntity;
+use tetra_core::typed_pdu_fields::Type3FieldGeneric;
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, debug};
+use tetra_entities::mm::mm_bs::MmBs;
+use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
+use tetra_pdus::mm::enums::location_update_accept_type::LocationUpdateAcceptType;
+use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
+use tetra_pdus::mm::enums::mm_pdu_type_dl::MmPduTypeDl;
+use tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
+use tetra_pdus::mm::enums::reject_cause::RejectCause;
+use tetra_pdus::mm::enums::status_downlink::StatusDownlink;
+use tetra_pdus::mm::enums::status_uplink::StatusUplink;
+use tetra_pdus::mm::enums::type34_elem_id_ul::MmType34ElemIdUl;
+use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
+use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
+use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
+use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
+use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
+use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
+use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
+use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
+use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
+use tetra_pdus::mm::pdus::mm_pdu_function_not_supported::MmPduFunctionNotSupported;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
+use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
+use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
+use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
+use tetra_pdus::mm::pdus::u_tei_provide::UTeiProvide;
+use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::lmm::LmmMleUnitdataInd;
+use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+
+use crate::common::ComponentTest;
+
+#[test]
+fn test_u_mm_status_energy_saving() {
+    // Motorola requesting power management (ChangeOfEnergySavingModeRequest)
+    debug::setup_logging_verbose();
+    let dltime_vec1 = TdmaTime::default().add_timeslots(2); // Downlink time: 0/1/1/3
+    let issi = 2040814;
+
+    // Setup testing stack
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime_vec1));
+    let components = vec![TetraEntity::Mm];
+    let sinks: Vec<TetraEntity> = vec![TetraEntity::Mle];
+    test.populate_entities(components, sinks);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // Submit and process message
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // Energy saving mode requests now get a D-MM-STATUS ChangeOfEnergySavingModeResponse
+    assert_eq!(sink_msgs.len(), 1);
+
+    // Parse the response and verify it's a D-MM-STATUS
+    let SapMsgInner::LmmMleUnitdataReq(ref resp_prim) = sink_msgs[0].msg else {
+        panic!("Expected LmmMleUnitdataReq");
+    };
+    let mut resp_sdu = BitBuffer::from_bitstr(&resp_prim.sdu.to_bitstr());
+    let resp_pdu = DMmStatus::from_bitbuf(&mut resp_sdu).expect("Failed parsing D-MM-STATUS response");
+    assert_eq!(
+        resp_pdu.status_downlink,
+        tetra_pdus::mm::enums::status_downlink::StatusDownlink::ChangeOfEnergySavingModeResponse
+    );
+    let esi = resp_pdu
+        .energy_saving_information
+        .expect("D-MM-STATUS response must carry energy saving information");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::StayAlive);
+    assert_eq!(esi.frame_number, None);
+    assert_eq!(esi.multiframe_number, None);
+}
+
+#[test]
+fn test_u_mm_status_energy_saving_request_activates_configured_eg_when_enabled() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    // Register the MS while explicitly staying alive so this test isolates the
+    // MS-initiated U-CHANGE OF ENERGY SAVING MODE REQUEST path.
+    submit_location_update(&mut test, issi, Some(EnergySavingMode::StayAlive));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.7.1 allows the BS to allocate a different
+    // energy economy mode than requested. Clauses 16.10.9/16.10.10 require the
+    // allocated mode plus frame/multiframe start point in the response.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::LmmMleUnitdataReq(ref resp_prim) = sink_msgs[0].msg else {
+        panic!("Expected LmmMleUnitdataReq");
+    };
+    let mut resp_sdu = BitBuffer::from_bitstr(&resp_prim.sdu.to_bitstr());
+    let resp_pdu = DMmStatus::from_bitbuf(&mut resp_sdu).expect("Failed parsing D-MM-STATUS response");
+    assert_eq!(resp_pdu.status_downlink, StatusDownlink::ChangeOfEnergySavingModeResponse);
+    let esi = resp_pdu
+        .energy_saving_information
+        .expect("D-MM-STATUS response must carry allocated energy saving information");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg3);
+    assert!(esi.frame_number.is_some());
+    assert!(esi.multiframe_number.is_some());
+    assert_ne!(esi.frame_number, Some(18));
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("MS-requested EG should activate configured assignment after D-MM-STATUS response");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg3 as u8);
+    assert_eq!(assignment.frame, esi.frame_number);
+    assert_eq!(assignment.multiframe, esi.multiframe_number);
+    assert!(assignment.awake_until.is_some());
+}
+
+#[test]
+fn test_u_mm_status_energy_saving_request_does_not_allocate_frame_18_start() {
+    debug::setup_logging_verbose();
+    let issi_that_would_spread_to_frame_18 = 17;
+
+    for mode in energy_economy_modes_for_test() {
+        let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+        config.cell.energy_saving_mode = mode as u8;
+
+        let mut test = ComponentTest::from_config(
+            config,
+            Some(dltime_for_frame_18_energy_start(issi_that_would_spread_to_frame_18, mode)),
+        );
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        submit_location_update(&mut test, issi_that_would_spread_to_frame_18, Some(EnergySavingMode::StayAlive));
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+
+        // EN 300 392-2 clauses 16.7.1, 16.10.9 and 16.10.10 carry the
+        // negotiated energy economy mode and start point in D-MM-STATUS. Clause
+        // 23.7.6 derives the continuing receive cycle from that start point, so
+        // the MS-initiated change path must use the same frame-18 guard as the
+        // registration and BS-initiated paths.
+        submit_u_mm_status_energy_saving(
+            &mut test,
+            issi_that_would_spread_to_frame_18,
+            StatusUplink::ChangeOfEnergySavingModeRequest,
+            EnergySavingMode::Eg1,
+        );
+        test.run_stack(Some(1));
+        let status_msgs = test.dump_sinks();
+
+        let status = extract_d_mm_status(&status_msgs);
+        assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeResponse);
+        let esi = status
+            .energy_saving_information
+            .expect("D-MM-STATUS response must carry allocated energy saving information");
+        assert_eq!(esi.energy_saving_mode, mode);
+        assert_energy_saving_start_avoids_frame_18(mode, esi.frame_number, esi.multiframe_number);
+
+        let state = test.config.state_read();
+        let assignment = state
+            .energy_saving
+            .get(&issi_that_would_spread_to_frame_18)
+            .expect("MS-requested EG assignment should activate");
+        assert_eq!(assignment.mode, mode as u8);
+        assert_eq!(assignment.frame, esi.frame_number);
+        assert_eq!(assignment.multiframe, esi.multiframe_number);
+    }
+}
+
+#[test]
+fn test_u_mm_status_stay_alive_request_clears_active_energy_saving_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040815;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, Some(EnergySavingMode::StayAlive));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let eg_msgs = test.dump_sinks();
+    let eg_status = extract_d_mm_status(&eg_msgs);
+    let eg_esi = eg_status
+        .energy_saving_information
+        .expect("EG response must carry energy saving information");
+    assert_eq!(eg_status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeResponse);
+    assert_eq!(eg_esi.energy_saving_mode, EnergySavingMode::Eg3);
+    assert!(
+        test.config.state_read().energy_saving.contains_key(&issi),
+        "configured EG should be active before the StayAlive request"
+    );
+
+    // EN 300 392-2 clauses 16.7.1, 16.10.9 and 16.10.10 allow an MS to
+    // request StayAlive. Per clause 23.7.6, StayAlive ends the MAC sleep cycle
+    // immediately; the registration itself remains valid.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::StayAlive,
+    );
+    test.run_stack(Some(1));
+    let stay_alive_msgs = test.dump_sinks();
+    let stay_alive_status = extract_d_mm_status(&stay_alive_msgs);
+    assert_eq!(stay_alive_status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeResponse);
+    let stay_alive_esi = stay_alive_status
+        .energy_saving_information
+        .expect("StayAlive response must carry energy saving information");
+    assert_eq!(stay_alive_esi.energy_saving_mode, EnergySavingMode::StayAlive);
+    assert_eq!(stay_alive_esi.frame_number, None);
+    assert_eq!(stay_alive_esi.multiframe_number, None);
+
+    let state = test.config.state_read();
+    assert!(
+        !state.energy_saving.contains_key(&issi),
+        "StayAlive request must clear the active EG assignment"
+    );
+    assert!(
+        state.subscribers.is_registered(issi),
+        "exiting energy economy must not deregister the MS"
+    );
+}
+
+#[test]
+fn test_u_mm_status_energy_saving_accepts_type3_absent_terminator() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 tables 16.20/16.21 carry the 3-bit energy saving mode
+    // followed by optional Type 3 Proprietary. A zero m-bit after the mode
+    // explicitly terminates the absent Type 3 list.
+    let dep_info = (EnergySavingMode::Eg1 as u64) << 1;
+    submit_u_mm_status(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        Some(dep_info),
+        Some(4),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let status = extract_d_mm_status(&sink_msgs);
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeResponse);
+}
+
+#[test]
+fn test_u_mm_status_energy_saving_rejects_malformed_trailing_dependent_data() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // Same leading EnergySavingMode::Eg1 bits as a valid request, but the
+    // trailing bit is an unterminated Type 3 m-bit with no field identifier.
+    let dep_info = ((EnergySavingMode::Eg1 as u64) << 1) | 1;
+    submit_u_mm_status(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        Some(dep_info),
+        Some(4),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        sink_msgs.is_empty(),
+        "malformed U-CHANGE OF ENERGY SAVING MODE REQUEST must not emit D-MM STATUS"
+    );
+    assert!(
+        test.config.state_read().energy_saving.get(&issi).is_none(),
+        "malformed U-MM STATUS must not activate energy saving state"
+    );
+}
+
+#[test]
+fn test_unsupported_u_mm_status_returns_function_not_supported_with_sub_pdu_type() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    // EN 300 392-2 clause 16.9.3.5.1 note 3 and table 16.27 note 2:
+    // when U-MM STATUS is recognized but its status-uplink sub-PDU is not
+    // supported, MM PDU/FUNCTION NOT SUPPORTED carries that sub-PDU selector.
+    submit_u_mm_status(&mut test, issi, StatusUplink::DualWatchModeRequest, None, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let unsupported = extract_mm_pdu_function_not_supported(&sink_msgs);
+    assert_eq!(
+        unsupported.not_supported_pdu_type,
+        tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl::UMmStatus as u8
+    );
+    assert_eq!(
+        unsupported.not_supported_sub_pdu_type,
+        Some((6, StatusUplink::DualWatchModeRequest.into()))
+    );
+    assert_eq!(
+        extract_mm_pdu_function_not_supported_layer2service(&sink_msgs),
+        Layer2Service::Acknowledged
+    );
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_unsupported_non_security_mm_pdu_types_return_function_not_supported_without_registration() {
+    debug::setup_logging_verbose();
+
+    for (idx, pdu_type) in [MmPduTypeUl::UInformationProvide, MmPduTypeUl::UDisableStatus]
+        .into_iter()
+        .enumerate()
+    {
+        let issi = 2040814 + idx as u32;
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        submit_raw_mm_pdu_type(&mut test, issi, pdu_type);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        // EN 300 392-2 clause 16.8.8 and table 16.27 allow the SwMI to
+        // answer an individually addressed unsupported MM PDU with
+        // MM PDU/FUNCTION NOT SUPPORTED. These are whole-PDU non-security
+        // cases, so no sub-PDU selector is present.
+        let unsupported = extract_mm_pdu_function_not_supported(&sink_msgs);
+        assert_eq!(unsupported.not_supported_pdu_type, pdu_type.into_raw() as u8);
+        assert_eq!(unsupported.not_supported_sub_pdu_type, None);
+        assert_eq!(
+            extract_mm_pdu_function_not_supported_layer2service(&sink_msgs),
+            Layer2Service::Acknowledged
+        );
+        assert!(
+            !test.config.state_read().subscribers.is_registered(issi),
+            "{pdu_type:?} must not synthesize registration"
+        );
+        assert!(subscriber_updates(&sink_msgs).is_empty());
+
+        let response_address = sink_msgs
+            .iter()
+            .find_map(|msg| match &msg.msg {
+                SapMsgInner::LmmMleUnitdataReq(prim) => {
+                    let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                    MmPduFunctionNotSupported::from_bitbuf(&mut sdu).ok().map(|_| prim.address)
+                }
+                _ => None,
+            })
+            .expect("expected addressed MM PDU/FUNCTION NOT SUPPORTED");
+        assert_eq!(response_address, TetraAddress::issi(issi));
+    }
+}
+
+#[test]
+fn test_non_issi_unsupported_mm_pdu_drops_without_function_not_supported() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    for received_address in invalid_mm_source_addresses(issi) {
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        // EN 300 392-2 clause 16.8.8 allows MM PDU/FUNCTION NOT SUPPORTED
+        // only for an individually addressed MM PDU. Non-ISSI RF sources are
+        // rejected at the source-address guard and must not receive an MM
+        // response or synthesize local registration state.
+        submit_raw_mm_pdu_type_with_received_address(&mut test, MmPduTypeUl::UInformationProvide, received_address);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        assert!(
+            sink_msgs.is_empty(),
+            "non-ISSI unsupported MM PDU source {received_address} should be dropped"
+        );
+        assert!(!test.config.state_read().subscribers.is_registered(issi));
+        assert!(subscriber_updates(&sink_msgs).is_empty());
+    }
+}
+
+#[test]
+fn test_stale_stay_alive_response_does_not_clear_active_energy_saving_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040816;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, Some(EnergySavingMode::StayAlive));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let state = test.config.state_read();
+        let assignment = state
+            .energy_saving
+            .get(&issi)
+            .expect("MS-requested EG should be active before stale response");
+        assert_eq!(assignment.mode, EnergySavingMode::Eg3 as u8);
+    }
+
+    // EN 300 392-2 clause 16.7.1 makes U-CHANGE OF ENERGY SAVING MODE
+    // RESPONSE the answer to a SwMI D-CHANGE request. Without a pending SwMI
+    // request, a StayAlive response is stale and must not cancel active EG.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::StayAlive,
+    );
+    test.run_stack(Some(1));
+
+    assert_eq!(
+        test.dump_sinks().len(),
+        0,
+        "stale StayAlive response should not produce a downlink status"
+    );
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("stale StayAlive response must not clear active EG assignment");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg3 as u8);
+}
+
+#[test]
+fn test_mm_energy_saving_reconfiguration_preserves_assigned_channel_suspension() {
+    debug::setup_logging_verbose();
+    let issi = 2040817;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, Some(EnergySavingMode::Eg1));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let mut state = test.config.state_write();
+        let assignment = state
+            .energy_saving
+            .get_mut(&issi)
+            .expect("registration-carried EG assignment should be active");
+        assignment.suspension_count = 2;
+    }
+
+    // EN 300 392-2 clause 23.7.6 suspends the sleep cycle while an MS obeys an
+    // assigned channel or is active in a call. MM energy-economy renegotiation
+    // must not clear that MAC-owned suspension counter.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("MM-requested EG assignment should remain active");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg1 as u8);
+    assert_eq!(assignment.suspension_count, 2);
+}
+
+#[test]
+fn test_unknown_u_mm_status_energy_saving_does_not_create_phantom_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeRequest,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+
+    assert_eq!(test.dump_sinks().len(), 0);
+    assert!(!test.config.state_read().energy_saving.contains_key(&issi));
+}
+
+#[test]
+fn test_unknown_u_tei_provide_does_not_create_phantom_mm_state() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_u_tei_provide(&mut test, issi, 0x1234_5678_9abc_de);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    assert_eq!(sink_msgs.len(), 0);
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    {
+        let state = test.config.state_read();
+        assert!(!state.subscribers.is_registered(issi));
+        assert!(!state.energy_saving.contains_key(&issi));
+    }
+    assert_eq!(debug_mm_client_tei(&mut test, issi), None);
+}
+
+#[test]
+fn test_known_u_tei_provide_updates_only_registered_client_tei() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let tei = 0x1234_5678_9abc_de;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+    assert_eq!(debug_mm_client_tei(&mut test, issi), Some(None));
+
+    submit_u_tei_provide(&mut test, issi, tei);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    assert_eq!(sink_msgs.len(), 0);
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    {
+        let state = test.config.state_read();
+        assert!(state.subscribers.is_registered(issi));
+        assert!(!state.energy_saving.contains_key(&issi));
+    }
+    assert_eq!(debug_mm_client_tei(&mut test, issi), Some(Some(tei)));
+}
+
+#[test]
+fn test_u_location_update_demand_energy_saving_gets_stay_alive() {
+    assert_location_update_response_stay_alive(Some(EnergySavingMode::Eg1));
+}
+
+#[test]
+fn test_u_location_update_demand_without_energy_saving_gets_stay_alive() {
+    assert_location_update_response_stay_alive(None);
+}
+
+#[test]
+fn test_location_update_accept_preserves_supported_request_type() {
+    debug::setup_logging_verbose();
+    let supported_types = [
+        LocationUpdateType::RoamingLocationUpdating,
+        LocationUpdateType::PeriodicLocationUpdating,
+        LocationUpdateType::ItsiAttach,
+        LocationUpdateType::ServiceRestorationRoamingLocationUpdating,
+        LocationUpdateType::DemandLocationUpdating,
+    ];
+
+    for (idx, location_update_type) in supported_types.into_iter().enumerate() {
+        let issi = 2041000 + idx as u32;
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        submit_location_update_with_type(&mut test, issi, location_update_type, None);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        let accept = sink_msgs
+            .iter()
+            .find_map(|msg| match &msg.msg {
+                SapMsgInner::LmmMleUnitdataReq(prim) => {
+                    let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                    DLocationUpdateAccept::from_bitbuf(&mut sdu).ok()
+                }
+                _ => None,
+            })
+            .expect("expected D-LOCATION UPDATE ACCEPT");
+
+        assert_eq!(
+            accept.location_update_accept_type,
+            expected_location_update_accept_type(location_update_type)
+        );
+        assert_eq!(
+            accept.location_update_accept_type.into_raw(),
+            location_update_type.into_raw(),
+            "D-LOCATION UPDATE ACCEPT must preserve the raw U-LOCATION UPDATE DEMAND type"
+        );
+    }
+}
+
+#[test]
+fn test_location_update_accept_preserves_type_with_energy_saving_request() {
+    debug::setup_logging_verbose();
+    let supported_types = [
+        LocationUpdateType::RoamingLocationUpdating,
+        LocationUpdateType::PeriodicLocationUpdating,
+        LocationUpdateType::ItsiAttach,
+        LocationUpdateType::ServiceRestorationRoamingLocationUpdating,
+        LocationUpdateType::DemandLocationUpdating,
+    ];
+
+    for (idx, location_update_type) in supported_types.into_iter().enumerate() {
+        let issi = 2042000 + idx as u32;
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        // EN 300 392-2 clauses 16.10.35a and 16.7.1 are independent fields:
+        // answering an energy-saving request with safe-default StayAlive must
+        // not rewrite the location update accept type.
+        submit_location_update_with_type(&mut test, issi, location_update_type, Some(EnergySavingMode::Eg1));
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+        let accept = extract_location_update_accept(&sink_msgs);
+
+        assert_eq!(
+            accept.location_update_accept_type,
+            expected_location_update_accept_type(location_update_type)
+        );
+        assert_eq!(
+            accept.location_update_accept_type.into_raw(),
+            location_update_type.into_raw(),
+            "D-LOCATION UPDATE ACCEPT must preserve the raw U-LOCATION UPDATE DEMAND type when ESI is present"
+        );
+        let esi = accept
+            .energy_saving_information
+            .expect("energy saving request should be answered in D-LOCATION UPDATE ACCEPT");
+        assert_eq!(esi.energy_saving_mode, EnergySavingMode::StayAlive);
+        assert_eq!(esi.frame_number, None);
+        assert_eq!(esi.multiframe_number, None);
+    }
+}
+
+#[test]
+fn test_location_update_accept_scch_frame18_distribution_uses_slot1_for_class_of_ms() {
+    debug::setup_logging_verbose();
+
+    let issi = 2043000;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.class_of_ms = Some(ClassOfMs {
+        freq_simplex_duplex: true,
+        multislot_phase_mod: false,
+        concurrent_multicarrier: false,
+        voice: true,
+        e2e_encryption_not_supported: true,
+        circuit_mode_data: false,
+        tetra_packet_data: false,
+        fast_switching: false,
+        dck_encryption: false,
+        clch_needed: true,
+        concurrent_circuit_mode: false,
+        original_advanced_link: false,
+        minimum_mode: true,
+        carrier_specific_signalling: false,
+        authentication: false,
+        sck_encryption: false,
+        air_interface_version: 0,
+        common_scch: true,
+        reserved_21: false,
+        mac_d_blck: false,
+        extended_advanced_link: false,
+        d8psk: false,
+    });
+
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+
+    // EN 300 392-2 clauses 16.10.46 and 16.10.8: table 16.90 encodes
+    // SCCH information in the upper 4 bits and distribution in the lower
+    // 2 bits; distribution 00 means frame-18 time slot 1.
+    assert_eq!(accept.scch_information_and_distribution_on_18th_frame, Some(0x00));
+}
+
+#[test]
+fn test_bs_initiated_energy_saving_stays_pending_until_ms_response() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 2);
+    let SapMsgInner::LmmMleUnitdataReq(ref accept_prim) = sink_msgs[0].msg else {
+        panic!("Expected D-LOCATION UPDATE ACCEPT");
+    };
+    let mut accept_sdu = BitBuffer::from_bitstr(&accept_prim.sdu.to_bitstr());
+    let accept = DLocationUpdateAccept::from_bitbuf(&mut accept_sdu).expect("Failed parsing D-LOCATION UPDATE ACCEPT");
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    assert!(accept.energy_saving_information.is_none());
+
+    let SapMsgInner::LmmMleUnitdataReq(ref status_prim) = sink_msgs[1].msg else {
+        panic!("Expected D-MM STATUS");
+    };
+    let mut status_sdu = BitBuffer::from_bitstr(&status_prim.sdu.to_bitstr());
+    let status = DMmStatus::from_bitbuf(&mut status_sdu).expect("Failed parsing D-MM STATUS");
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    let esi = status
+        .energy_saving_information
+        .expect("D-MM STATUS request must carry energy saving information");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg1);
+    assert!(esi.frame_number.is_some());
+    assert!(esi.multiframe_number.is_some());
+
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "BS-initiated EG must not become active before the MS response"
+    );
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("matching U-CHANGE response must activate pending EG assignment");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg1 as u8);
+    assert_eq!(assignment.frame, esi.frame_number);
+    assert_eq!(assignment.multiframe, esi.multiframe_number);
+}
+
+#[test]
+fn test_example_config_default_eg3_stays_pending_until_ms_response() {
+    debug::setup_logging_verbose();
+    let issi = 2040819;
+
+    let config_toml = include_str!("../../../example_config/config.toml");
+    let config = from_toml_str(config_toml).expect("example config should parse");
+    assert_eq!(
+        config.cell.energy_saving_mode,
+        EnergySavingMode::Eg3 as u8,
+        "example config must exercise the Nexus-BS EG3 operator default"
+    );
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    assert!(
+        accept.energy_saving_information.is_none(),
+        "BS-initiated EG3 allocation must not be marked accepted in D-LOCATION UPDATE ACCEPT before MS response"
+    );
+
+    let status = extract_d_mm_status(&sink_msgs);
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    let esi = status
+        .energy_saving_information
+        .expect("BS-initiated D-MM STATUS request must carry EG3 energy saving information");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg3);
+    assert_energy_saving_start_avoids_frame_18(esi.energy_saving_mode, esi.frame_number, esi.multiframe_number);
+
+    // EN 300 392-2 clause 16.7.1 allows BS-initiated energy economy changes,
+    // while clauses 16.10.9/16.10.10 carry the requested mode/start point. The
+    // MS response is what activates the assignment; until then lower layers
+    // must keep scheduling this MS as continuously reachable.
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "default EG3 must stay pending until the MS accepts the BS-initiated request"
+    );
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg3,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("matching U-CHANGE response must activate the example-config EG3 assignment");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg3 as u8);
+    assert_eq!(assignment.frame, esi.frame_number);
+    assert_eq!(assignment.multiframe, esi.multiframe_number);
+}
+
+#[test]
+fn test_plain_location_update_does_not_restart_same_active_energy_saving_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let initial_msgs = test.dump_sinks();
+    let status = extract_d_mm_status(&initial_msgs);
+    let initial_esi = status
+        .energy_saving_information
+        .expect("BS-initiated D-MM STATUS must carry energy saving information");
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.7.1 lets the BS allocate/change EG with
+    // D-MM STATUS and clause 16.11.1.2 starts T352 for that request. If the
+    // same valid EG assignment is already active, a plain location update must
+    // not create a duplicate BS-initiated request whose later T352 expiry could
+    // clear the working assignment.
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let reattach_msgs = test.dump_sinks();
+    assert!(
+        !reattach_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::LmmMleUnitdataReq(prim) if {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DMmStatus::from_bitbuf(&mut sdu)
+                    .map(|status| status.status_downlink == StatusDownlink::ChangeOfEnergySavingModeRequest)
+                    .unwrap_or(false)
+            })),
+        "plain LU for an already-active EG assignment must not queue another D-MM STATUS request"
+    );
+
+    test.run_stack(Some((30 * 18 * 4 + 1) as usize));
+    let _ = test.dump_sinks();
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("active EG assignment must survive the duplicate-LU window");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg1 as u8);
+    assert_eq!(assignment.frame, initial_esi.frame_number);
+    assert_eq!(assignment.multiframe, initial_esi.multiframe_number);
+}
+
+#[test]
+fn test_registration_energy_request_supersedes_pending_bs_initiated_energy_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let pending_msgs = test.dump_sinks();
+
+    let SapMsgInner::LmmMleUnitdataReq(ref status_prim) = pending_msgs[1].msg else {
+        panic!("Expected D-MM STATUS");
+    };
+    let mut status_sdu = BitBuffer::from_bitstr(&status_prim.sdu.to_bitstr());
+    let status = DMmStatus::from_bitbuf(&mut status_sdu).expect("Failed parsing D-MM STATUS");
+    let pending_esi = status
+        .energy_saving_information
+        .expect("D-MM STATUS request must carry energy saving information");
+
+    test.run_stack(Some(4));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    // EN 300 392-2 clauses 16.7.1 and 16.10.10: registration-carried energy
+    // saving allocation includes its own absolute start point. It supersedes a
+    // previous BS-initiated D-CHANGE request that has not been answered yet.
+    submit_location_update(&mut test, issi, Some(EnergySavingMode::Eg1));
+    test.run_stack(Some(1));
+    let accept_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&accept_msgs);
+    let accepted_esi = accept
+        .energy_saving_information
+        .expect("D-LOCATION UPDATE ACCEPT must answer requested energy saving mode");
+    assert_ne!(
+        (accepted_esi.frame_number, accepted_esi.multiframe_number),
+        (pending_esi.frame_number, pending_esi.multiframe_number),
+        "test setup must create a newer EG start point"
+    );
+
+    {
+        let state = test.config.state_read();
+        let assignment = state
+            .energy_saving
+            .get(&issi)
+            .expect("registration-carried energy saving must activate immediately");
+        assert_eq!(assignment.frame, accepted_esi.frame_number);
+        assert_eq!(assignment.multiframe, accepted_esi.multiframe_number);
+    }
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("stale U-CHANGE response must not clear active assignment");
+    assert_eq!(assignment.frame, accepted_esi.frame_number);
+    assert_eq!(assignment.multiframe, accepted_esi.multiframe_number);
+}
+
+#[test]
+fn test_bs_initiated_energy_saving_response_after_t352_expiry_keeps_stay_alive() {
+    debug::setup_logging_verbose();
+    let issi = 2040815;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let SapMsgInner::LmmMleUnitdataReq(ref status_prim) = sink_msgs[1].msg else {
+        panic!("Expected D-MM STATUS");
+    };
+    let mut status_sdu = BitBuffer::from_bitstr(&status_prim.sdu.to_bitstr());
+    let status = DMmStatus::from_bitbuf(&mut status_sdu).expect("Failed parsing D-MM STATUS");
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+
+    // EN 300 392-2 clauses 16.7.3 and 16.11.1.2 define T352 as the 30 s
+    // energy-mode response timer. After expiry, a late response must not
+    // activate the stale BS-initiated EG assignment.
+    test.run_stack(Some((30 * 18 * 4 + 1) as usize));
+    assert_eq!(test.dump_sinks().len(), 0);
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "T352 expiry must leave the MS in StayAlive until a fresh negotiation"
+    );
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+
+    assert_eq!(
+        test.dump_sinks().len(),
+        0,
+        "late U-CHANGE response should not produce a downlink status"
+    );
+    let state = test.config.state_read();
+    assert!(
+        state.subscribers.is_registered(issi),
+        "T352 expiry must not disturb registration state"
+    );
+    assert!(
+        !state.energy_saving.contains_key(&issi),
+        "late U-CHANGE response after T352 expiry must not activate EG"
+    );
+}
+
+#[test]
+fn test_bs_initiated_energy_saving_replacement_t352_expiry_preserves_previous_active_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040816;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg2 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    let previous_assignment = EnergySavingAssignment {
+        mode: EnergySavingMode::Eg1 as u8,
+        frame: Some(3),
+        multiframe: Some(1),
+        awake_until: Some(TdmaTime { t: 1, f: 3, m: 1, h: 0 }),
+        suspension_count: 0,
+    };
+    test.config.state_write().energy_saving.insert(issi, previous_assignment);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let status = extract_d_mm_status(&sink_msgs);
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    let requested_esi = status
+        .energy_saving_information
+        .expect("BS-initiated replacement request must carry energy saving information");
+    assert_eq!(requested_esi.energy_saving_mode, EnergySavingMode::Eg2);
+
+    // EN 300 392-2 clause 16.7.1 permits a BS-initiated EG change and
+    // clause 16.7.3 makes T352 expiry a failure of the requested service.
+    // A failed replacement negotiation must not erase the previously
+    // negotiated EG cycle, which remains valid within the RA per clause 23.7.6.
+    test.run_stack(Some((30 * 18 * 4 + 1) as usize));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("T352 expiry of an EG replacement must preserve the previous active assignment");
+    assert_eq!(assignment.mode, previous_assignment.mode);
+    assert_eq!(assignment.frame, previous_assignment.frame);
+    assert_eq!(assignment.multiframe, previous_assignment.multiframe);
+    assert_eq!(assignment.awake_until, previous_assignment.awake_until);
+    assert_eq!(assignment.suspension_count, previous_assignment.suspension_count);
+    drop(state);
+
+    assert_eq!(
+        debug_mm_client_energy(&mut test, issi),
+        Some((EnergySavingMode::Eg1, previous_assignment.frame, previous_assignment.multiframe)),
+        "MM client state must also return to the previous EG assignment"
+    );
+}
+
+#[test]
+fn test_bs_initiated_energy_saving_replacement_mismatched_response_preserves_previous_active_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040817;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg2 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    let previous_assignment = EnergySavingAssignment {
+        mode: EnergySavingMode::Eg1 as u8,
+        frame: Some(5),
+        multiframe: Some(1),
+        awake_until: Some(TdmaTime { t: 1, f: 5, m: 1, h: 0 }),
+        suspension_count: 0,
+    };
+    test.config.state_write().energy_saving.insert(issi, previous_assignment);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let status = extract_d_mm_status(&sink_msgs);
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    let requested_esi = status
+        .energy_saving_information
+        .expect("BS-initiated replacement request must carry energy saving information");
+    assert_eq!(requested_esi.energy_saving_mode, EnergySavingMode::Eg2);
+
+    // EN 300 392-2 clause 16.7.1 says the MS response to a BS-initiated
+    // change uses the same requested energy mode or StayAlive rejection. A
+    // mismatched response fails only this replacement negotiation; it must not
+    // erase the previous active EG cycle still valid in the current RA.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("mismatched EG replacement response must preserve the previous active assignment");
+    assert_eq!(assignment.mode, previous_assignment.mode);
+    assert_eq!(assignment.frame, previous_assignment.frame);
+    assert_eq!(assignment.multiframe, previous_assignment.multiframe);
+    assert_eq!(assignment.awake_until, previous_assignment.awake_until);
+    assert_eq!(assignment.suspension_count, previous_assignment.suspension_count);
+    drop(state);
+
+    assert_eq!(
+        debug_mm_client_energy(&mut test, issi),
+        Some((EnergySavingMode::Eg1, previous_assignment.frame, previous_assignment.multiframe)),
+        "MM client state must continue advertising the previous EG assignment"
+    );
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg2,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&issi)
+        .expect("stale matching response after mismatch must not replace the restored assignment");
+    assert_eq!(assignment.mode, previous_assignment.mode);
+    assert_eq!(assignment.frame, previous_assignment.frame);
+    assert_eq!(assignment.multiframe, previous_assignment.multiframe);
+}
+
+#[test]
+fn test_bs_initiated_energy_saving_stay_alive_rejection_clears_previous_active_assignment() {
+    debug::setup_logging_verbose();
+    let issi = 2040818;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg2 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    let previous_assignment = EnergySavingAssignment {
+        mode: EnergySavingMode::Eg1 as u8,
+        frame: Some(5),
+        multiframe: Some(1),
+        awake_until: Some(TdmaTime { t: 1, f: 5, m: 1, h: 0 }),
+        suspension_count: 0,
+    };
+    test.config.state_write().energy_saving.insert(issi, previous_assignment);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let status = extract_d_mm_status(&sink_msgs);
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    assert_eq!(
+        status
+            .energy_saving_information
+            .expect("BS-initiated replacement request must carry energy saving information")
+            .energy_saving_mode,
+        EnergySavingMode::Eg2
+    );
+
+    // EN 300 392-2 clause 16.7.1 allows the MS to reject a BS-initiated
+    // energy economy change by responding StayAlive. Honour that as the
+    // terminal's current mode instead of restoring an older EG assignment.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::StayAlive,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "StayAlive rejection must clear any previous active EG assignment"
+    );
+    assert_eq!(
+        debug_mm_client_energy(&mut test, issi),
+        Some((EnergySavingMode::StayAlive, None, None)),
+        "MM client state must track the terminal's StayAlive rejection"
+    );
+}
+
+#[test]
+fn test_mismatched_bs_initiated_energy_saving_response_clears_pending_and_keeps_stay_alive() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let SapMsgInner::LmmMleUnitdataReq(ref status_prim) = sink_msgs[1].msg else {
+        panic!("Expected D-MM STATUS");
+    };
+    let mut status_sdu = BitBuffer::from_bitstr(&status_prim.sdu.to_bitstr());
+    let status = DMmStatus::from_bitbuf(&mut status_sdu).expect("Failed parsing D-MM STATUS");
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    let esi = status
+        .energy_saving_information
+        .expect("D-MM STATUS request must carry energy saving information");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg1);
+
+    // EN 300 392-2 clauses 16.7.1/16.10.9/16.10.10 make the BS-initiated
+    // response mode part of a single negotiation. A mismatched response must
+    // clear the pending assignment so a later stale matching response cannot
+    // activate EG after the negotiation has failed.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg2,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "mismatched U-CHANGE response must keep the MS in StayAlive"
+    );
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    assert_eq!(test.dump_sinks().len(), 0);
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "stale matching response after mismatch must not reactivate cleared pending EG"
+    );
+}
+
+#[test]
+fn test_stale_energy_saving_response_for_known_issi_keeps_stay_alive() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+
+    // EN 300 392-2 clauses 16.7.1/16.10.9/16.10.10 negotiate EG state.
+    // A response without a matching SwMI request is stale and must not activate EG.
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+
+    assert_eq!(
+        test.dump_sinks().len(),
+        0,
+        "stale U-CHANGE response should not produce a downlink status"
+    );
+    let state = test.config.state_read();
+    assert!(
+        !state.energy_saving.contains_key(&issi),
+        "stale U-CHANGE response must not create an EG assignment"
+    );
+    assert!(
+        state.subscribers.is_registered(issi),
+        "stale U-CHANGE response must not disturb attach state"
+    );
+}
+
+#[test]
+fn test_periodic_registration_command_uses_last_l2_handle() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let handle = 0x4321;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update_with_type_and_handle(&mut test, issi, LocationUpdateType::ItsiAttach, None, handle);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let (command_prim, command_pdu) = sink_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                let pdu_type = sdu.read_field(4, "pdu_type").ok()?;
+                if pdu_type != MmPduTypeDl::DLocationUpdateCommand.into_raw() {
+                    return None;
+                }
+
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                let pdu = DLocationUpdateCommand::from_bitbuf(&mut sdu).ok()?;
+                Some((prim, pdu))
+            }
+            _ => None,
+        })
+        .expect("expected D-LOCATION UPDATE COMMAND after periodic registration expiry");
+
+    assert_eq!(
+        command_prim.handle, handle,
+        "ETSI 16.9.2.8 command must be sent on the stored L2 handle for this MS"
+    );
+    assert!(
+        command_pdu.group_identity_report,
+        "ETSI 16.9.2.8 group identity report request should stay enabled for periodic registration"
+    );
+    assert!(!command_pdu.cipher_control);
+    assert_eq!(command_pdu.ciphering_parameters, None);
+    assert_eq!(command_pdu.address_extension, None);
+    assert_eq!(command_pdu.cell_type_control, None);
+    assert_eq!(command_pdu.proprietary, None);
+}
+
+#[test]
+fn test_demand_location_update_after_periodic_command_reregisters_shared_subscriber_before_group_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3001;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "first periodic expiry removes the shared subscriber while waiting for DemandLocationUpdating"
+        );
+        assert!(state.subscribers.group_members(gssi).is_empty());
+    }
+
+    // EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4: the MS answers a
+    // D-LOCATION-UPDATE-COMMAND with U-LOCATION-UPDATE-DEMAND. If the SwMI
+    // accepts DemandLocationUpdating, shared subscriber state must exist before
+    // group identity location demand is applied.
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::DemandLocationUpdating, vec![gssi]);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+}
+
+#[test]
+fn test_demand_location_update_after_periodic_command_without_group_report_reaffiliates_cached_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040815;
+    let gssi = 3002;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+
+    // Some terminals return from coverage believing persistent group
+    // affiliations are still valid and send DemandLocationUpdating without a
+    // group report. Keep the cached groups coherent with the re-created shared
+    // registration instead of ACKing while the local registry remains empty.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+}
+
+#[test]
+fn test_standalone_group_attach_after_periodic_command_restores_shared_subscriber_before_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040816;
+    let initial_group = 3003;
+    let new_group = 3004;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![initial_group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(initial_group), vec![issi]);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "first periodic expiry keeps the MM client known but clears shared routing state"
+        );
+        assert!(state.subscribers.group_members(initial_group).is_empty());
+    }
+
+    // EN 300 392-2 clauses 16.4.3 and 16.8.2 make standalone group
+    // attach/detach an MM procedure for an attached MS. After the local
+    // periodic watchdog command from clause 16.9.2.8, a still-known client in
+    // the grace window must be restored in the shared registry before the
+    // accepted group affiliation is advertised.
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![new_group]));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    let downlink = ack
+        .group_identity_downlink
+        .expect("accepted standalone attach should acknowledge the requested group");
+    assert_eq!(downlink.len(), 1);
+    assert_eq!(downlink[0].gssi, Some(new_group));
+    assert!(downlink[0].group_identity_attachment.is_some());
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![new_group]);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(initial_group).is_empty());
+    assert_eq!(state.subscribers.group_members(new_group), vec![issi]);
+}
+
+#[test]
+fn test_bs_initiated_energy_saving_does_not_allocate_frame_18_start() {
+    debug::setup_logging_verbose();
+    let issi_that_would_spread_to_frame_18 = 17;
+
+    for mode in energy_economy_modes_for_test() {
+        let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+        config.cell.energy_saving_mode = mode as u8;
+
+        let mut test = ComponentTest::from_config(
+            config,
+            Some(dltime_for_frame_18_energy_start(issi_that_would_spread_to_frame_18, mode)),
+        );
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        submit_location_update(&mut test, issi_that_would_spread_to_frame_18, None);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        let SapMsgInner::LmmMleUnitdataReq(ref status_prim) = sink_msgs[1].msg else {
+            panic!("Expected D-MM STATUS");
+        };
+        let mut status_sdu = BitBuffer::from_bitstr(&status_prim.sdu.to_bitstr());
+        let status = DMmStatus::from_bitbuf(&mut status_sdu).expect("Failed parsing D-MM STATUS");
+        let esi = status
+            .energy_saving_information
+            .expect("D-MM STATUS request must carry energy saving information");
+
+        // EN 300 392-2 clauses 16.7.1 and 16.10.10 make the ESI frame/MF
+        // the negotiated start point, and clause 23.7.6 makes that start point
+        // the first receive frame before the sleeping cycle. Clause 23.5.2.2.7
+        // requires the BS to send downlink PDUs where the MS should listen, so
+        // a stack with no SCH/F scheduling on frame 18 must not allocate that
+        // frame as the start or recurring receive frame.
+        assert_energy_saving_start_avoids_frame_18(mode, esi.frame_number, esi.multiframe_number);
+    }
+}
+
+#[test]
+fn test_registration_energy_saving_accept_does_not_allocate_frame_18_start() {
+    debug::setup_logging_verbose();
+    let issi_that_would_spread_to_frame_18 = 17;
+
+    for mode in energy_economy_modes_for_test() {
+        let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+        config.cell.energy_saving_mode = mode as u8;
+
+        let mut test = ComponentTest::from_config(
+            config,
+            Some(dltime_for_frame_18_energy_start(issi_that_would_spread_to_frame_18, mode)),
+        );
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        submit_location_update(&mut test, issi_that_would_spread_to_frame_18, Some(mode));
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        let accept = extract_location_update_accept(&sink_msgs);
+        assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+        let esi = accept
+            .energy_saving_information
+            .expect("D-LOCATION UPDATE ACCEPT must carry requested energy saving information");
+        assert_eq!(esi.energy_saving_mode, mode);
+
+        // EN 300 392-2 clauses 16.7.1/16.10.10 allow the registration accept
+        // path to carry the same energy economy start point as D-MM STATUS.
+        // Per clause 23.7.6 and timer T.210, the MS remains awake through the
+        // negotiated start and later returns to this receive cycle after
+        // signalling activity; keep the cycle away from this stack's unscheduled
+        // frame 18 SCH/F resources.
+        assert_energy_saving_start_avoids_frame_18(mode, esi.frame_number, esi.multiframe_number);
+
+        let state = test.config.state_read();
+        let assignment = state
+            .energy_saving
+            .get(&issi_that_would_spread_to_frame_18)
+            .expect("registration-carried EG assignment should activate immediately");
+        assert_eq!(assignment.mode, mode as u8);
+        assert_eq!(assignment.frame, esi.frame_number);
+        assert_eq!(assignment.multiframe, esi.multiframe_number);
+        assert!(assignment.awake_until.is_some());
+    }
+}
+
+#[test]
+fn test_malformed_u_mm_status_energy_saving_is_not_reinterpreted_as_stay_alive() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let test_prim = LmmMleUnitdataInd {
+        sdu: BitBuffer::from_bitstr("0011000001"),
+        handle: 0,
+        received_address: TetraAddress::issi(issi),
+    };
+    let test_sapmsg = SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(test_prim),
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    test.submit_message(test_sapmsg);
+    test.run_stack(Some(1));
+
+    assert_eq!(test.dump_sinks().len(), 0);
+    assert!(!test.config.state_read().energy_saving.contains_key(&issi));
+}
+
+#[test]
+fn test_non_issi_location_update_demand_drops_without_registration() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    for received_address in invalid_mm_source_addresses(issi) {
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+        // EN 300 392-2 clauses 16.4.3 and 16.9.3.4 make location update an
+        // MS/ITSI registration procedure. A non-individual RF source must not
+        // create MM registration state or receive a D-LOCATION UPDATE response.
+        submit_location_update_demand_with_handle_and_received_address(
+            &mut test,
+            base_location_update_demand(LocationUpdateType::ItsiAttach, None),
+            0,
+            received_address,
+        );
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        assert!(sink_msgs.is_empty(), "non-ISSI LU source {received_address} should be dropped");
+        assert!(!test.config.state_read().subscribers.is_registered(issi));
+        assert!(subscriber_updates(&sink_msgs).is_empty());
+    }
+}
+
+#[test]
+fn test_non_issi_u_mm_status_energy_saving_drops_without_energy_mutation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    for received_address in invalid_mm_source_addresses(issi) {
+        let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+        config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+        let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+        submit_location_update(&mut test, issi, None);
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        assert!(test.config.state_read().subscribers.is_registered(issi));
+
+        // EN 300 392-2 clauses 16.7.1 and 16.10.35a carry energy-economy MM
+        // changes for a registered individual MS. The same numeric SSI with a
+        // non-ISSI RF address must not activate EG state.
+        submit_u_mm_status_energy_saving_with_received_address(
+            &mut test,
+            StatusUplink::ChangeOfEnergySavingModeResponse,
+            EnergySavingMode::Eg1,
+            received_address,
+        );
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        assert!(
+            sink_msgs.is_empty(),
+            "non-ISSI U-MM STATUS source {received_address} should be dropped"
+        );
+        assert!(!test.config.state_read().energy_saving.contains_key(&issi));
+    }
+}
+
+#[test]
+fn test_non_issi_standalone_group_attach_drops_without_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3000;
+
+    for received_address in invalid_mm_source_addresses(issi) {
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+        submit_location_update(&mut test, issi, None);
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        assert!(test.config.state_read().subscribers.is_registered(issi));
+
+        // EN 300 392-2 clauses 16.8.2 and 16.8.4 define group
+        // attach/detach/report as procedures for an attached individual MS.
+        // A non-ISSI RF source must not affiliate the numeric SSI to a group.
+        submit_attach_detach_group_identity_with_received_address(&mut test, false, Some(vec![gssi]), received_address);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        assert!(
+            sink_msgs.is_empty(),
+            "non-ISSI group attach source {received_address} should be dropped"
+        );
+        assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+    }
+}
+
+#[test]
+fn test_location_update_group_report_is_capped_before_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups: Vec<u32> = (1000..1013).collect();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, groups.clone());
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept_prim = sink_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => Some(prim),
+            _ => None,
+        })
+        .expect("expected D-LOCATION UPDATE ACCEPT");
+    let mut accept_sdu = BitBuffer::from_bitstr(&accept_prim.sdu.to_bitstr());
+    let accept = DLocationUpdateAccept::from_bitbuf(&mut accept_sdu).expect("Failed parsing D-LOCATION UPDATE ACCEPT");
+    let gila = accept.group_identity_location_accept.expect("expected GroupIdentityLocationAccept");
+    assert_eq!(
+        gila.group_identity_accept_reject, 1,
+        "over-cap group reports must not claim aggregate acceptance"
+    );
+    let rejected = gila
+        .group_identity_downlink
+        .expect("over-cap group reports must explicitly list rejected identities");
+    assert_eq!(rejected.len(), groups.len());
+    for (rejected_group, requested_gssi) in rejected.iter().zip(groups.iter()) {
+        assert_eq!(rejected_group.gssi, Some(*requested_gssi));
+        assert_eq!(rejected_group.group_identity_detachment_uplink, Some(0));
+        assert!(rejected_group.group_identity_attachment.is_none());
+    }
+
+    let state = test.config.state_read();
+    assert!(
+        state.subscribers.group_members(1000).is_empty(),
+        "first group in an over-cap report must not be partially affiliated"
+    );
+    assert!(
+        state.subscribers.group_members(1012).is_empty(),
+        "last group in an over-cap report must not be affiliated on the BS side"
+    );
+}
+
+#[test]
+fn test_standalone_group_attach_over_cap_marks_partial_reject_before_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups: Vec<u32> = (4000..4013).collect();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 Annex G makes the aggregate accept/reject bit cover the
+    // requested identities. If local ACK capacity cannot represent all rejected
+    // identities, the BS must not commit a partial local affiliation set.
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(groups.clone()));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(ack.group_identity_accept_reject, 1);
+    let rejected = ack
+        .group_identity_downlink
+        .expect("over-cap standalone attach must explicitly list rejected identities");
+    assert_eq!(rejected.len(), groups.len());
+    for (rejected_group, requested_gssi) in rejected.iter().zip(groups.iter()) {
+        assert_eq!(rejected_group.gssi, Some(*requested_gssi));
+        assert_eq!(rejected_group.group_identity_detachment_uplink, Some(0));
+        assert!(rejected_group.group_identity_attachment.is_none());
+    }
+
+    let state = test.config.state_read();
+    assert!(
+        state.subscribers.group_members(4000).is_empty(),
+        "first group in an over-cap standalone attach must not be partially affiliated"
+    );
+    assert!(
+        state.subscribers.group_members(4012).is_empty(),
+        "last group in an over-cap standalone attach must not be affiliated on the BS side"
+    );
+}
+
+#[test]
+fn test_location_update_rejects_unprovisioned_group_without_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let allowed_gssi = 3000;
+    let rejected_gssi = 4000;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.allowed_gssi_ranges = Some(SortedDisjointSsiRanges::from_vec_tuple(vec![(allowed_gssi, allowed_gssi)]));
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![allowed_gssi, rejected_gssi]);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    let gila = accept.group_identity_location_accept.expect("expected GroupIdentityLocationAccept");
+    assert_eq!(
+        gila.group_identity_accept_reject, 1,
+        "unprovisioned GSSI should make group-location accept partial"
+    );
+    let downlink = gila
+        .group_identity_downlink
+        .expect("partial group-location accept should list accepted/rejected groups");
+    assert!(downlink.iter().any(|group| {
+        group.gssi == Some(allowed_gssi)
+            && group
+                .group_identity_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.group_identity_attachment_lifetime == 0)
+    }));
+    assert!(downlink.iter().any(|group| {
+        group.gssi == Some(rejected_gssi) && group.group_identity_detachment_uplink == Some(0) && group.group_identity_attachment.is_none()
+    }));
+
+    let state = test.config.state_read();
+    assert_eq!(state.subscribers.group_members(allowed_gssi), vec![issi]);
+    assert!(
+        state.subscribers.group_members(rejected_gssi).is_empty(),
+        "unprovisioned GSSI must not enter the shared subscriber registry"
+    );
+}
+
+#[test]
+fn test_standalone_group_attach_rejects_unprovisioned_group_without_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let allowed_gssi = 3000;
+    let rejected_gssi = 4000;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.allowed_gssi_ranges = Some(SortedDisjointSsiRanges::from_vec_tuple(vec![(allowed_gssi, allowed_gssi)]));
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![allowed_gssi, rejected_gssi]));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(
+        ack.group_identity_accept_reject, 1,
+        "unprovisioned GSSI should make standalone group ACK partial"
+    );
+    let downlink = ack
+        .group_identity_downlink
+        .expect("partial standalone group ACK should list accepted/rejected groups");
+    assert!(downlink.iter().any(|group| {
+        group.gssi == Some(allowed_gssi)
+            && group
+                .group_identity_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.group_identity_attachment_lifetime == 0)
+    }));
+    assert!(downlink.iter().any(|group| {
+        group.gssi == Some(rejected_gssi) && group.group_identity_detachment_uplink == Some(0) && group.group_identity_attachment.is_none()
+    }));
+
+    let state = test.config.state_read();
+    assert_eq!(state.subscribers.group_members(allowed_gssi), vec![issi]);
+    assert!(
+        state.subscribers.group_members(rejected_gssi).is_empty(),
+        "unprovisioned GSSI must not enter the shared subscriber registry"
+    );
+}
+
+#[test]
+fn test_standalone_over_cap_mode_one_preserves_existing_groups_without_partial_detach() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let over_cap_groups: Vec<u32> = (6000..6013).collect();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![3000, 3001]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(3000), vec![issi]);
+    assert_eq!(test.config.state_read().subscribers.group_members(3001), vec![issi]);
+
+    // EN 300 392-2 Annex G does not allow local state to move to a partial
+    // replacement when the ACK cannot coherently represent the oversized
+    // request. Standalone mode=1 must therefore validate capacity before
+    // detaching current groups.
+    submit_attach_detach_group_identity(&mut test, issi, true, Some(over_cap_groups.clone()));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+    assert_eq!(ack.group_identity_accept_reject, 1);
+    let rejected = ack
+        .group_identity_downlink
+        .expect("over-cap mode=1 standalone attach must explicitly list rejected identities");
+    assert_eq!(rejected.len(), over_cap_groups.len());
+    for (rejected_group, requested_gssi) in rejected.iter().zip(over_cap_groups.iter()) {
+        assert_eq!(rejected_group.gssi, Some(*requested_gssi));
+        assert_eq!(rejected_group.group_identity_detachment_uplink, Some(0));
+        assert!(rejected_group.group_identity_attachment.is_none());
+    }
+
+    let state = test.config.state_read();
+    assert_eq!(state.subscribers.group_members(3000), vec![issi]);
+    assert_eq!(state.subscribers.group_members(3001), vec![issi]);
+    assert!(
+        state.subscribers.group_members(6000).is_empty(),
+        "oversized standalone replacement set must not be partially affiliated"
+    );
+}
+
+#[test]
+fn test_location_update_over_cap_mode_one_preserves_existing_groups_without_partial_detach() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let old_groups = vec![2000, 2001];
+    let over_cap_groups: Vec<u32> = (5000..5013).collect();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, old_groups.clone());
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(2000), vec![issi]);
+    assert_eq!(test.config.state_read().subscribers.group_members(2001), vec![issi]);
+
+    // EN 300 392-2 Annex G requires reject ACKs to represent rejected groups
+    // coherently. If local ACK capacity cannot represent the result, mode=1
+    // must not first detach the old groups and then reject the oversized new set.
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, over_cap_groups.clone());
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+    let gila = accept.group_identity_location_accept.expect("expected GroupIdentityLocationAccept");
+    assert_eq!(gila.group_identity_accept_reject, 1);
+    let rejected = gila
+        .group_identity_downlink
+        .expect("over-cap location update must explicitly list rejected identities");
+    assert_eq!(rejected.len(), over_cap_groups.len());
+    for (rejected_group, requested_gssi) in rejected.iter().zip(over_cap_groups.iter()) {
+        assert_eq!(rejected_group.gssi, Some(*requested_gssi));
+        assert_eq!(rejected_group.group_identity_detachment_uplink, Some(0));
+        assert!(rejected_group.group_identity_attachment.is_none());
+    }
+
+    let state = test.config.state_read();
+    assert_eq!(state.subscribers.group_members(2000), vec![issi]);
+    assert_eq!(state.subscribers.group_members(2001), vec![issi]);
+    assert!(
+        state.subscribers.group_members(5000).is_empty(),
+        "oversized replacement set must not be partially affiliated"
+    );
+}
+
+#[test]
+fn test_location_update_mode_one_detaches_old_groups_before_affiliating_ack_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![2000, 2001]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.has_group_members(2000));
+    assert!(test.config.state_read().subscribers.has_group_members(2001));
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![2001, 2002]);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+    let accepted_groups = accept
+        .group_identity_location_accept
+        .and_then(|gila| gila.group_identity_downlink)
+        .expect("expected GroupIdentityLocationAccept");
+    let accepted_gssis: Vec<u32> = accepted_groups.iter().filter_map(|group| group.gssi).collect();
+    assert_eq!(accepted_gssis, vec![2001, 2002]);
+    for group in &accepted_groups {
+        let attachment = group
+            .group_identity_attachment
+            .as_ref()
+            .expect("mode=1 attach list should acknowledge attachments");
+        assert_eq!(attachment.group_identity_attachment_lifetime, 0);
+        assert_eq!(attachment.class_of_usage, 0);
+        assert!(group.group_identity_detachment_uplink.is_none());
+    }
+
+    let state = test.config.state_read();
+    assert!(
+        state.subscribers.group_members(2000).is_empty(),
+        "mode=1 must detach groups absent from the new accepted report"
+    );
+    assert_eq!(state.subscribers.group_members(2001), vec![issi]);
+    assert_eq!(state.subscribers.group_members(2002), vec![issi]);
+}
+
+#[test]
+fn test_location_update_mode_one_ignores_explicit_detachment_entries() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![2000, 2001]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 16.10.17 mode=1 already detaches all active groups and
+    // attaches groups defined in the uplink element. Detachment entries in
+    // that element must not be processed or ACKed as separate detachments.
+    submit_location_update_with_group_identity_uplink(
+        &mut test,
+        issi,
+        LocationUpdateType::ItsiAttach,
+        vec![
+            GroupIdentityUplink {
+                class_of_usage: None,
+                group_identity_detachment_uplink: Some(0),
+                gssi: Some(2000),
+                address_extension: None,
+                vgssi: None,
+            },
+            GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: Some(2002),
+                address_extension: None,
+                vgssi: None,
+            },
+        ],
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+    let accepted_groups = accept
+        .group_identity_location_accept
+        .and_then(|gila| gila.group_identity_downlink)
+        .expect("expected GroupIdentityLocationAccept");
+
+    assert_eq!(accepted_groups.len(), 1);
+    assert_eq!(accepted_groups[0].gssi, Some(2002));
+    assert!(accepted_groups[0].group_identity_attachment.is_some());
+    assert!(accepted_groups[0].group_identity_detachment_uplink.is_none());
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.group_members(2000).is_empty());
+    assert!(state.subscribers.group_members(2001).is_empty());
+    assert_eq!(state.subscribers.group_members(2002), vec![issi]);
+}
+
+#[test]
+fn test_attach_detach_group_identity_without_uplink_groups_acks_empty_current_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity(&mut test, issi, false, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    assert!(!ack.reserved);
+    assert!(
+        ack.group_identity_downlink.is_none(),
+        "empty current group set should be acknowledged without stale downlink groups"
+    );
+}
+
+#[test]
+fn test_standalone_mode_zero_without_uplink_groups_does_not_echo_current_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    submit_attach_detach_group_identity(&mut test, issi, false, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    // EN 300 392-2 Annex G requirement 9 gives no-group PDUs a detach-all
+    // meaning only for mode=1, except for solicited group-report responses.
+    // A bare mode=0 no-op must not re-advertise local affiliations as if the
+    // MS had requested them in this transaction.
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    assert!(
+        ack.group_identity_downlink.is_none(),
+        "mode=0 no-group ACK must not echo current GSSI affiliations"
+    );
+    assert!(
+        subscriber_updates(&sink_msgs).is_empty(),
+        "mode=0 no-group ACK must not mutate affiliation state"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+}
+
+#[test]
+fn test_standalone_mode_one_without_uplink_groups_detaches_all_current_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups = vec![3000, 3001];
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, groups.clone());
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity(&mut test, issi, true, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    // EN 300 392-2 clause 16.8.2 and Annex G requirement 9 allow mode=1
+    // without a group list to mean "detach all currently active group
+    // identities". The acknowledgement should therefore accept the request
+    // without re-advertising the groups that were just removed.
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    assert!(
+        ack.group_identity_downlink.is_none(),
+        "detach-all ACK should not report stale current groups"
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    let mut update_groups = updates[0].groups.clone();
+    update_groups.sort_unstable();
+    assert_eq!(update_groups, groups);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(3000).is_empty());
+    assert!(state.subscribers.group_members(3001).is_empty());
+}
+
+#[test]
+fn test_standalone_group_detach_ack_omits_accepted_detachment_group() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    submit_attach_detach_group_identity_uplink(
+        &mut test,
+        issi,
+        false,
+        Some(vec![GroupIdentityUplink {
+            class_of_usage: None,
+            group_identity_detachment_uplink: Some(0),
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }]),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    // EN 300 392-2 Annex G requirements 6d and 8d say an accepted group
+    // detachment is acknowledged implicitly: accept/reject=0 and no detached
+    // group is echoed in the acknowledgement.
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    assert!(
+        ack.group_identity_downlink.is_none(),
+        "accepted detachment should be implicit and omit the detached GSSI"
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    assert_eq!(updates[0].groups, vec![gssi]);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(gssi).is_empty());
+}
+
+#[test]
+fn test_standalone_group_report_complete_clears_stale_groups_without_reacknowledging_them() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups = vec![3050, 3051];
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, groups.clone());
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_report_response(&mut test, issi, 1, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    // EN 300 392-2 clauses 16.4.3 and 16.10.27a define group report complete
+    // as the MS reporting no attached groups. It must not ACK stale local
+    // groups as if the MS had re-sent them in GroupIdentityUplink.
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    assert!(
+        ack.group_identity_downlink.is_none(),
+        "standalone group-report-complete ACK should not report stale current groups"
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    let mut update_groups = updates[0].groups.clone();
+    update_groups.sort_unstable();
+    assert_eq!(update_groups, groups);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(3050).is_empty());
+    assert!(state.subscribers.group_members(3051).is_empty());
+}
+
+#[test]
+fn test_group_report_response_preserves_ms_accepted_class_of_usage() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3055;
+    let class_of_usage = 5;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_group_identity_uplink(
+        &mut test,
+        issi,
+        LocationUpdateType::ItsiAttach,
+        vec![GroupIdentityUplink {
+            class_of_usage: Some(class_of_usage),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }],
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let (report, layer2service) = extract_d_attach_detach_group_identity(&sink_msgs);
+
+    // EN 300 392-2 clauses 16.8.4 and 16.10.19 require reported downlink
+    // group identities to carry the Group identity attachment sub-elements.
+    // Clause 16.10.6 defines Class of usage as the group priority, so the BS
+    // must not synthesize a generic priority during group-report refresh.
+    assert_eq!(layer2service, Layer2Service::AcknowledgedResponse);
+    assert!(report.group_identity_attach_detach_mode);
+    let reported = report.group_identity_downlink.expect("group report should include attached group");
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported[0].gssi, Some(gssi));
+    let attachment = reported[0]
+        .group_identity_attachment
+        .as_ref()
+        .expect("reported group should include attachment information");
+    assert_eq!(attachment.group_identity_attachment_lifetime, 0);
+    assert_eq!(attachment.class_of_usage, class_of_usage);
+}
+
+#[test]
+fn test_group_report_response_preserves_swmi_assigned_class_of_usage() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3056;
+    let handle = 72;
+    let class_of_usage = 6;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(
+        &mut test,
+        issi,
+        handle,
+        vec![GroupIdentityDownlink {
+            group_identity_attachment: Some(GroupIdentityAttachment {
+                group_identity_attachment_lifetime: 0,
+                class_of_usage,
+            }),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }],
+        false,
+    );
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let (report, layer2service) = extract_d_attach_detach_group_identity(&sink_msgs);
+
+    assert_eq!(layer2service, Layer2Service::AcknowledgedResponse);
+    let reported = report
+        .group_identity_downlink
+        .expect("group report should include SwMI-assigned group");
+    assert_eq!(reported.len(), 1);
+    assert_eq!(reported[0].gssi, Some(gssi));
+    let attachment = reported[0]
+        .group_identity_attachment
+        .as_ref()
+        .expect("reported SwMI group should include attachment information");
+    assert_eq!(attachment.group_identity_attachment_lifetime, 0);
+    assert_eq!(attachment.class_of_usage, class_of_usage);
+}
+
+#[test]
+fn test_standalone_group_report_response_reserved_value_rejects_without_group_mutation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 3060;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_report_response(&mut test, issi, 1, 1);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(ack.group_identity_accept_reject, 1);
+    assert!(ack.group_identity_downlink.is_none());
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    assert_eq!(test.config.state_read().subscribers.group_members(group), vec![issi]);
+}
+
+#[test]
+fn test_mixed_group_report_response_and_attach_list_rejects_without_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let requested_group = 3070;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity_with_report_response(
+        &mut test,
+        issi,
+        false,
+        vec![GroupIdentityUplink {
+            class_of_usage: Some(0),
+            group_identity_detachment_uplink: None,
+            gssi: Some(requested_group),
+            address_extension: None,
+            vgssi: None,
+        }],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    // EN 300 392-2 clause 16.8.2 says an MS-initiated attach/detach group
+    // identity request shall not include group report response. Annex G then
+    // requires the rejected requested group to be listed in the reject ACK.
+    assert_eq!(ack.group_identity_accept_reject, 1);
+    let rejected = ack
+        .group_identity_downlink
+        .expect("mixed report response plus attach list must explicitly reject requested groups");
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].gssi, Some(requested_group));
+    assert_eq!(rejected[0].group_identity_detachment_uplink, Some(0));
+    assert!(rejected[0].group_identity_attachment.is_none());
+    assert!(
+        subscriber_updates(&sink_msgs).is_empty(),
+        "mixed report response plus attach list must not emit affiliation updates"
+    );
+    assert!(test.config.state_read().subscribers.group_members(requested_group).is_empty());
+}
+
+#[test]
+fn test_mixed_group_report_response_and_mode_one_preserves_existing_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let existing_group = 3075;
+    let requested_group = 3076;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![existing_group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(existing_group), vec![issi]);
+
+    submit_attach_detach_group_identity_with_report_response(
+        &mut test,
+        issi,
+        true,
+        vec![GroupIdentityUplink {
+            class_of_usage: Some(0),
+            group_identity_detachment_uplink: None,
+            gssi: Some(requested_group),
+            address_extension: None,
+            vgssi: None,
+        }],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    // The mixed PDU is rejected before mode=1 detach-all is applied, so the
+    // old affiliation remains intact and the requested replacement group is not
+    // partially attached.
+    assert_eq!(ack.group_identity_accept_reject, 1);
+    let rejected = ack
+        .group_identity_downlink
+        .expect("mixed mode=1 request must explicitly reject requested groups");
+    assert_eq!(rejected.len(), 1);
+    assert_eq!(rejected[0].gssi, Some(requested_group));
+    assert_eq!(rejected[0].group_identity_detachment_uplink, Some(0));
+    assert!(rejected[0].group_identity_attachment.is_none());
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+
+    let state = test.config.state_read();
+    assert_eq!(state.subscribers.group_members(existing_group), vec![issi]);
+    assert!(state.subscribers.group_members(requested_group).is_empty());
+}
+
+#[test]
+fn test_location_update_group_report_complete_clears_stale_groups_without_reaffiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups = vec![3100, 3101];
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, groups.clone());
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(3100), vec![issi]);
+    assert_eq!(test.config.state_read().subscribers.group_members(3101), vec![issi]);
+
+    // EN 300 392-2 clause 16.4.3 says an MS with no attached groups answers a
+    // SwMI group-report request with group report complete. Clause 16.10.27a
+    // defines value 0 as complete.
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::DemandLocationUpdating, 1, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(
+        accept.group_identity_location_accept.is_none(),
+        "empty complete group report must not advertise stale GSSI entries"
+    );
+    assert!(
+        !contains_location_update_command(&sink_msgs),
+        "group-report-complete is already a completed report"
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    let mut update_groups = updates[0].groups.clone();
+    update_groups.sort_unstable();
+    assert_eq!(update_groups, groups);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(3100).is_empty());
+    assert!(state.subscribers.group_members(3101).is_empty());
+}
+
+#[test]
+fn test_group_report_complete_with_energy_saving_preserves_demand_accept_and_clears_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040815;
+    let groups = vec![3110, 3111];
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, groups.clone());
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(3110), vec![issi]);
+    assert_eq!(test.config.state_read().subscribers.group_members(3111), vec![issi]);
+
+    // EN 300 392-2 clauses 16.4.3 and 16.10.27a define a complete
+    // group-report response as no attached groups. Clause 16.7.1 permits the
+    // SwMI to answer an MS energy-economy request with StayAlive, and clause
+    // 16.10.35a requires the accept type to echo the LU procedure.
+    submit_location_update_with_group_report_response_and_energy(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        1,
+        0,
+        Some(EnergySavingMode::Eg1),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    let esi = accept
+        .energy_saving_information
+        .expect("energy-saving request should be answered explicitly");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::StayAlive);
+    assert_eq!(esi.frame_number, None);
+    assert_eq!(esi.multiframe_number, None);
+    assert!(
+        accept.group_identity_location_accept.is_none(),
+        "group-report-complete must not ACK stale local affiliations"
+    );
+    assert!(
+        !contains_location_update_command(&sink_msgs),
+        "group-report-complete must not trigger a follow-up group report command"
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    let mut update_groups = updates[0].groups.clone();
+    update_groups.sort_unstable();
+    assert_eq!(update_groups, groups);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(3110).is_empty());
+    assert!(state.subscribers.group_members(3111).is_empty());
+    assert!(
+        !state.energy_saving.contains_key(&issi),
+        "StayAlive LU response must not create an EG assignment"
+    );
+}
+
+#[test]
+fn test_new_roaming_group_report_complete_does_not_trigger_another_group_report_command() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::RoamingLocationUpdating, 1, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(
+        accept.location_update_accept_type,
+        LocationUpdateAcceptType::RoamingLocationUpdating
+    );
+    assert!(accept.group_identity_location_accept.is_none());
+    assert!(
+        !contains_location_update_command(&sink_msgs),
+        "a complete empty group report must not be followed by another D-LOCATION UPDATE COMMAND"
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert!(updates.iter().any(|update| update.action == BrewSubscriberAction::Register));
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_location_update_group_report_response_reserved_value_is_rejected() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::DemandLocationUpdating, 1, 1);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let reject = extract_location_update_reject(&sink_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::DemandLocationUpdating);
+    assert_eq!(reject.reject_cause, RejectCause::MessageConsistencyError as u8);
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_group_report_request_from_known_ms_returns_d_attach_detach_group_identity_report_complete() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 3000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.8.4: if SwMI accepts an MS-initiated group
+    // report request, it answers with D-ATTACH/DETACH GROUP IDENTITY, mode=1
+    // and group-report-complete when the groups fit in one PDU.
+    let (report, layer2service) = extract_d_attach_detach_group_identity(&sink_msgs);
+    assert!(!report.group_identity_report);
+    assert!(!report.group_identity_acknowledgement_request);
+    assert!(report.group_identity_attach_detach_mode);
+    assert_eq!(layer2service, Layer2Service::AcknowledgedResponse);
+    let response = report.group_report_response.expect("group report complete IE should be present");
+    assert_eq!(response.len, 1);
+    assert_eq!(response.data, 0);
+    let downlink = report
+        .group_identity_downlink
+        .expect("known MS with local group should get downlink group report");
+    assert_eq!(downlink.len(), 1);
+    assert_eq!(downlink[0].gssi, Some(group));
+    assert!(downlink[0].group_identity_attachment.is_some());
+    assert!(!contains_attach_detach_ack(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(group), vec![issi]);
+}
+
+#[test]
+fn test_group_report_request_restores_shared_state_before_reporting_cached_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 3000;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(group), vec![issi]);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "first periodic expiry should clear shared routing state while MM waits for re-registration"
+        );
+        assert!(state.subscribers.group_members(group).is_empty());
+    }
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 16.8.0 and 16.8.4 make accepted reported groups
+    // valid attached identities. Before MM advertises cached groups back to
+    // the MS, the shared local routing registry must be coherent again.
+    let (report, _) = extract_d_attach_detach_group_identity(&sink_msgs);
+    let downlink = report
+        .group_identity_downlink
+        .expect("cached group report should include locally valid groups");
+    assert_eq!(downlink.len(), 1);
+    assert_eq!(downlink[0].gssi, Some(group));
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![group]);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(group), vec![issi]);
+}
+
+#[test]
+fn test_group_report_request_with_uplink_groups_rejects_without_affiliation_mutation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let existing_group = 3000;
+    let requested_group = 3001;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![existing_group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_malformed_attach_detach_group_report_request(
+        &mut test,
+        issi,
+        false,
+        Some(vec![GroupIdentityUplink {
+            class_of_usage: Some(0),
+            group_identity_detachment_uplink: None,
+            gssi: Some(requested_group),
+            address_extension: None,
+            vgssi: None,
+        }]),
+        None,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.8.4 says a report request uses amendment mode
+    // and shall not include group identity uplink elements. Do not accept it
+    // as a report or process the attached GSSI list.
+    let unsupported = extract_mm_pdu_function_not_supported(&sink_msgs);
+    assert_eq!(
+        unsupported.not_supported_pdu_type,
+        MmPduTypeUl::UAttachDetachGroupIdentity.into_raw() as u8
+    );
+    assert!(extract_d_attach_detach_group_identities(&sink_msgs).is_empty());
+    assert!(!contains_attach_detach_ack(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+
+    let state = test.config.state_read();
+    assert_eq!(state.subscribers.group_members(existing_group), vec![issi]);
+    assert!(state.subscribers.group_members(requested_group).is_empty());
+}
+
+#[test]
+fn test_group_report_request_with_group_report_response_rejects_without_report_downlink() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 3000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_malformed_attach_detach_group_report_request(
+        &mut test,
+        issi,
+        false,
+        None,
+        Some(Type3FieldGeneric {
+            field_id: 0,
+            len: 1,
+            data: 0,
+        }),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // group_report_response is the completion indicator in the report answer,
+    // not in the MS report request. A mixed request must not be accepted as a
+    // valid report and must not trigger a D-ATTACH/DETACH GROUP IDENTITY report.
+    let unsupported = extract_mm_pdu_function_not_supported(&sink_msgs);
+    assert_eq!(
+        unsupported.not_supported_pdu_type,
+        MmPduTypeUl::UAttachDetachGroupIdentity.into_raw() as u8
+    );
+    assert!(extract_d_attach_detach_group_identities(&sink_msgs).is_empty());
+    assert!(!contains_attach_detach_ack(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    assert_eq!(test.config.state_read().subscribers.group_members(group), vec![issi]);
+}
+
+#[test]
+fn test_group_report_request_from_known_ms_without_groups_reports_complete_empty() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.8.4: when SwMI has no groups to report, it sends
+    // group-report-complete with no group identity downlink IE.
+    let (report, layer2service) = extract_d_attach_detach_group_identity(&sink_msgs);
+    assert_eq!(layer2service, Layer2Service::AcknowledgedResponse);
+    assert!(report.group_identity_attach_detach_mode);
+    let response = report.group_report_response.expect("group report complete IE should be present");
+    assert_eq!(response.len, 1);
+    assert_eq!(response.data, 0);
+    assert!(report.group_identity_downlink.is_none());
+    assert!(!contains_attach_detach_ack(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+}
+
+#[test]
+fn test_group_report_request_from_known_ms_segments_large_group_list() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups: Vec<u32> = (0..14).map(|idx| 3000 + idx).collect();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(
+        &mut test,
+        issi,
+        LocationUpdateType::ItsiAttach,
+        groups.iter().copied().take(12).collect(),
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(groups.iter().copied().skip(12).collect()));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.8.4: when reported groups do not fit one
+    // D-ATTACH/DETACH GROUP IDENTITY PDU, the first PDU omits group-report-
+    // complete and subsequent PDUs use amendment mode; only the last PDU
+    // carries group-report-complete.
+    let reports = extract_d_attach_detach_group_identities(&sink_msgs);
+    assert_eq!(reports.len(), 2);
+
+    let (first, first_l2) = &reports[0];
+    assert!(!first.group_identity_report);
+    assert!(!first.group_identity_acknowledgement_request);
+    assert!(first.group_identity_attach_detach_mode);
+    assert!(first.group_report_response.is_none());
+    assert_eq!(*first_l2, Layer2Service::AcknowledgedResponse);
+    let first_groups: Vec<u32> = first
+        .group_identity_downlink
+        .as_ref()
+        .expect("first segment should carry groups")
+        .iter()
+        .map(|gid| gid.gssi.expect("GSSI should be present"))
+        .collect();
+    assert_eq!(first_groups, groups[..12].to_vec());
+
+    let (last, last_l2) = &reports[1];
+    assert!(!last.group_identity_report);
+    assert!(!last.group_identity_acknowledgement_request);
+    assert!(!last.group_identity_attach_detach_mode);
+    assert_eq!(*last_l2, Layer2Service::Acknowledged);
+    let response = last
+        .group_report_response
+        .as_ref()
+        .expect("last segment should complete the report");
+    assert_eq!(response.len, 1);
+    assert_eq!(response.data, 0);
+    let last_groups: Vec<u32> = last
+        .group_identity_downlink
+        .as_ref()
+        .expect("last segment should carry remaining groups")
+        .iter()
+        .map(|gid| gid.gssi.expect("GSSI should be present"))
+        .collect();
+    assert_eq!(last_groups, groups[12..].to_vec());
+
+    assert!(!contains_attach_detach_ack(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+}
+
+#[test]
+fn test_group_report_request_from_unknown_ms_returns_function_not_supported_without_registration() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_attach_detach_group_report_request(&mut test, issi);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let unsupported = extract_mm_pdu_function_not_supported(&sink_msgs);
+    assert_eq!(
+        unsupported.not_supported_pdu_type,
+        tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl::UAttachDetachGroupIdentity as u8
+    );
+    assert_eq!(
+        extract_mm_pdu_function_not_supported_layer2service(&sink_msgs),
+        Layer2Service::Acknowledged
+    );
+    assert!(!contains_attach_detach_ack(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_unknown_group_attach_rejects_without_synthesizing_registration() {
+    debug::setup_logging_verbose();
+
+    for (idx, group_identity_attach_detach_mode) in [false, true].into_iter().enumerate() {
+        let issi = 2040814 + idx as u32;
+        let group = 3000 + idx as u32;
+
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+        // EN 300 392-2 clauses 16.4.3 and 16.9.3.4 keep group attachment behind
+        // the MS registration/location-update path. A standalone group attach from
+        // an unknown ISSI must be rejected, not used to synthesize registration.
+        submit_attach_detach_group_identity(&mut test, issi, group_identity_attach_detach_mode, Some(vec![group]));
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+        let ack = extract_attach_detach_ack(&sink_msgs);
+
+        assert_eq!(ack.group_identity_accept_reject, 1);
+        let rejected = ack
+            .group_identity_downlink
+            .expect("rejected group attach must list the rejected identity");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].gssi, Some(group));
+        assert_eq!(rejected[0].group_identity_detachment_uplink, Some(0));
+        assert!(rejected[0].group_identity_attachment.is_none());
+        assert!(
+            subscriber_updates(&sink_msgs).is_empty(),
+            "unknown standalone group attach must not emit Register or Affiliate updates"
+        );
+
+        let state = test.config.state_read();
+        assert!(!state.subscribers.is_registered(issi));
+        assert!(state.subscribers.group_members(group).is_empty());
+    }
+}
+
+#[test]
+fn test_standalone_mode_one_ignores_explicit_detachment_entries() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![3000, 3001]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity_uplink(
+        &mut test,
+        issi,
+        true,
+        Some(vec![
+            GroupIdentityUplink {
+                class_of_usage: None,
+                group_identity_detachment_uplink: Some(0),
+                gssi: Some(3000),
+                address_extension: None,
+                vgssi: None,
+            },
+            GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: Some(3002),
+                address_extension: None,
+                vgssi: None,
+            },
+        ]),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    let downlink = ack.group_identity_downlink.expect("expected acknowledgement for attached group");
+    assert_eq!(downlink.len(), 1);
+    assert_eq!(downlink[0].gssi, Some(3002));
+    assert!(downlink[0].group_identity_attachment.is_some());
+    assert!(downlink[0].group_identity_detachment_uplink.is_none());
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.group_members(3000).is_empty());
+    assert!(state.subscribers.group_members(3001).is_empty());
+    assert_eq!(state.subscribers.group_members(3002), vec![issi]);
+}
+
+#[test]
+fn test_u_itsi_detach_deaffiliates_deregisters_and_clears_energy_saving() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3000;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let state = test.config.state_read();
+        assert!(state.subscribers.is_registered(issi));
+        assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+        assert!(state.energy_saving.contains_key(&issi));
+    }
+
+    // EN 300 392-2 clause 16.9.3.3 U-ITSI DETACH announces MS
+    // de-activation. The BS-side lifecycle must therefore clear the registered
+    // subscriber, its group affiliations, and any negotiated energy economy
+    // assignment instead of leaving stale routing/listen-window state.
+    submit_u_itsi_detach(&mut test, issi);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let state = test.config.state_read();
+    assert!(!state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(gssi).is_empty());
+    assert!(!state.energy_saving.contains_key(&issi));
+}
+
+#[test]
+fn test_hard_roaming_reregistration_resets_shared_groups_and_energy_saving() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3000;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+        assert!(state.energy_saving.contains_key(&issi));
+    }
+
+    backdate_mm_registration(&mut test, issi, 121);
+
+    // EN 300 392-2 clauses 16.4.1.1 and 16.7.1: once the old MS is treated
+    // as a hard roaming re-registration, accepted group and energy-economy
+    // state must be rebuilt from the new procedure rather than inherited from
+    // the stale local registration.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::RoamingLocationUpdating, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(
+        accept.location_update_accept_type,
+        LocationUpdateAcceptType::RoamingLocationUpdating
+    );
+    let status = extract_d_mm_status(&sink_msgs);
+    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
+    assert_eq!(
+        status
+            .energy_saving_information
+            .expect("fresh BS-initiated EG request should carry ESI")
+            .energy_saving_mode,
+        EnergySavingMode::Eg1
+    );
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert!(
+        state.subscribers.group_members(gssi).is_empty(),
+        "hard roaming re-registration without group list must clear stale shared GSSI membership"
+    );
+    assert!(
+        !state.energy_saving.contains_key(&issi),
+        "new BS-initiated EG request must stay pending until the MS response"
+    );
+    drop(state);
+    assert_eq!(
+        debug_mm_client_energy(&mut test, issi),
+        Some((EnergySavingMode::StayAlive, None, None)),
+        "hard roaming re-registration must clear stale client-manager EG mode/window until the fresh response arrives"
+    );
+}
+
+#[test]
+fn test_soft_roaming_reattach_resets_cmce_without_brew_affiliate_replay() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let gssi = 3000;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(CfgBrew {
+        host: "127.0.0.1".to_string(),
+        port: 443,
+        tls: false,
+        username: None,
+        password: None,
+        reconnect_delay: std::time::Duration::from_secs(1),
+        jitter_initial_latency_frames: 0,
+        feature_sds_enabled: false,
+        feature_rssi_export: false,
+        whitelisted_ssis: None,
+    });
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::RoamingLocationUpdating, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 16.9.3.4 and 16.10.35a keep this as a location
+    // registration update accepted as RoamingLocationUpdating. The local CMCE
+    // reset is a bounded call-state cleanup, not a new group-affiliation
+    // procedure toward Brew.
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(
+        accept.location_update_accept_type,
+        LocationUpdateAcceptType::RoamingLocationUpdating
+    );
+
+    let cmce_updates: Vec<&MmSubscriberUpdate> = sink_msgs
+        .iter()
+        .filter(|msg| msg.dest == TetraEntity::Cmce)
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::MmSubscriberUpdate(update) => Some(update),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(cmce_updates.len(), 3);
+    assert_eq!(cmce_updates[0].action, BrewSubscriberAction::Deregister);
+    assert_eq!(cmce_updates[0].groups, Vec::<u32>::new());
+    assert_eq!(cmce_updates[1].action, BrewSubscriberAction::Register);
+    assert_eq!(cmce_updates[1].groups, Vec::<u32>::new());
+    assert_eq!(cmce_updates[2].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(cmce_updates[2].groups, vec![gssi]);
+
+    assert!(
+        sink_msgs
+            .iter()
+            .filter(|msg| msg.dest == TetraEntity::Brew)
+            .all(|msg| !matches!(msg.msg, SapMsgInner::MmSubscriberUpdate(_))),
+        "soft roaming re-attach must not replay cached affiliation toward Brew"
+    );
+}
+
+#[test]
+fn test_location_update_with_groups_emits_register_before_affiliate() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let groups = vec![3000, 3001];
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    // EN 300 392-2 clauses 16.10.35/16.10.35a keep registration and group
+    // attachment as separate MM results; CMCE must learn the ISSI before its
+    // group affiliations are made visible.
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, groups.clone());
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let updates = subscriber_updates(&sink_msgs);
+
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].issi, issi);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].groups, groups);
+}
+
+#[test]
+fn test_duplicate_group_attach_retry_acks_without_duplicate_affiliate() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 3000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![group]));
+    test.run_stack(Some(1));
+    let first_attach_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&first_attach_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group])
+    );
+
+    // EN 300 392-2 clause 16.4.3 allows the MS to retry group attachment
+    // procedures. A duplicate attach must be ACKed but must not inflate local
+    // group-listener state with another affiliate event.
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![group]));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&retry_msgs);
+    let ack_groups: Vec<u32> = ack
+        .group_identity_downlink
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|group| group.gssi)
+        .collect();
+    assert_eq!(ack_groups, vec![group]);
+    assert!(
+        subscriber_updates(&retry_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "duplicate attach retry must not emit another affiliate update"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(group), vec![issi]);
+}
+
+#[test]
+fn test_swmi_group_ack_accepts_pending_attach_without_downlink_response() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 91;
+    let handle = 77;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let updates = subscriber_updates(&msgs);
+
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group]),
+        "accepted SwMI-initiated group attachment should affiliate the MS"
+    );
+    assert!(
+        test.config.state_read().subscribers.group_members(group).contains(&issi),
+        "accepted SwMI-initiated group attachment should update subscriber registry"
+    );
+    assert!(
+        !contains_attach_detach_ack(&msgs),
+        "U-ATTACH/DETACH GROUP IDENTITY ACK expects no downlink MM response"
+    );
+}
+
+#[test]
+fn test_non_issi_swmi_group_ack_drops_without_completing_pending_transaction() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 92;
+    let handle = 78;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+
+    for received_address in invalid_mm_source_addresses(issi) {
+        // EN 300 392-2 clauses 16.8.6, 16.8.8 and Annex G bind SwMI group
+        // acknowledgement to an individual MS/ITSI procedure. A GSSI,
+        // unknown, or out-of-range RF source must not complete the pending
+        // SwMI-initiated group transaction.
+        submit_swmi_group_ack_with_received_address(&mut test, issi, handle, false, vec![], received_address);
+        test.run_stack(Some(1));
+        let msgs = test.dump_sinks();
+
+        assert!(
+            msgs.is_empty(),
+            "non-ISSI SwMI group ACK source {received_address} should be dropped"
+        );
+        assert!(!test.config.state_read().subscribers.group_members(group).contains(&issi));
+    }
+
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let valid_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&valid_ack_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group]),
+        "valid ACK after invalid RF sources should still complete the pending SwMI attachment"
+    );
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_wrong_handle_swmi_group_ack_keeps_pending_transaction_until_valid_ack() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 101;
+    let handle = 87;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    submit_swmi_group_ack(&mut test, issi, handle + 1, false, vec![]);
+    test.run_stack(Some(1));
+    let wrong_handle_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.11.1.4 binds the SwMI-initiated group
+    // attach/detach transaction to T353. A mismatched ACK handle is not the
+    // solicited response and must not consume the pending transaction.
+    assert!(
+        subscriber_updates(&wrong_handle_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "mismatched handle ACK must not affiliate the pending SwMI attachment"
+    );
+    assert!(!test.config.state_read().subscribers.group_members(group).contains(&issi));
+    assert!(!contains_attach_detach_ack(&wrong_handle_msgs));
+
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let valid_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&valid_ack_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group]),
+        "valid ACK after mismatched handle should still complete the pending SwMI attachment"
+    );
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_swmi_group_ack_rejects_explicit_attachment_without_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 92;
+    let handle = 78;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, true, vec![group]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let updates = subscriber_updates(&msgs);
+
+    assert!(
+        updates.iter().all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "explicitly rejected SwMI-requested group attachment must not affiliate the MS"
+    );
+    assert!(
+        !test.config.state_read().subscribers.group_members(group).contains(&issi),
+        "explicit rejection must leave subscriber registry unattached"
+    );
+    assert!(!contains_attach_detach_ack(&msgs));
+}
+
+#[test]
+fn test_swmi_group_ack_reject_without_group_list_does_not_affiliate() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 96;
+    let handle = 82;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, true, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    // EN 300 392-2 Annex G requirement 7 and clause 16.10.14/table 16.46:
+    // reject means at least one attachment was rejected, and all rejected
+    // groups must be present in the ACK identity list.
+    assert!(
+        subscriber_updates(&msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "malformed reject ACK without rejected groups must not accept the pending SwMI attachment"
+    );
+    assert!(
+        !test.config.state_read().subscribers.group_members(group).contains(&issi),
+        "malformed reject ACK without rejected groups must leave subscriber registry unattached"
+    );
+    assert!(
+        !contains_attach_detach_ack(&msgs),
+        "U-ATTACH/DETACH GROUP IDENTITY ACK still expects no downlink MM response"
+    );
+
+    // A malformed ACK is ignored, not treated as terminal. EN 300 392-2
+    // Annex G requirement 7 forbids implicit rejection, so the pending
+    // SwMI-initiated transaction remains open until a valid ACK or T353 expiry.
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let valid_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&valid_ack_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group]),
+        "valid ACK after malformed reject should still complete the pending SwMI attachment"
+    );
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_swmi_group_ack_reject_wrong_address_type_does_not_consume_pending() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 103;
+    let handle = 89;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    submit_swmi_group_ack_uplink(&mut test, issi, handle, true, Some(vec![swmi_ack_vgssi_detach_entry(group)]));
+    test.run_stack(Some(1));
+    let wrong_type_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 16.10.22/16.10.27 and Annex G keep the group
+    // identity address form significant. A VGSSI rejection is not a GSSI
+    // rejection merely because the numeric value matches.
+    assert!(
+        subscriber_updates(&wrong_type_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "wrong-address-type reject ACK must not affiliate or complete the pending GSSI attachment"
+    );
+    assert!(!test.config.state_read().subscribers.group_members(group).contains(&issi));
+    assert!(!contains_attach_detach_ack(&wrong_type_msgs));
+
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let valid_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&valid_ack_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group]),
+        "valid ACK after wrong-address-type reject should still complete the pending GSSI attachment"
+    );
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_swmi_group_ack_accept_vgssi_pending_does_not_affiliate_plain_gssi() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let vgssi = 104;
+    let handle = 90;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_vgssi(vgssi)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    // This stack does not yet model VGSSI/GTSI affiliation in the local
+    // subscriber registry. Annex G acknowledgement handling must therefore
+    // fail closed instead of coercing VGSSI 104 into plain GSSI 104.
+    assert!(
+        subscriber_updates(&msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "accepted VGSSI transaction must not be reported as a plain GSSI affiliation"
+    );
+    assert!(!test.config.state_read().subscribers.group_members(vgssi).contains(&issi));
+    assert!(!contains_attach_detach_ack(&msgs));
+}
+
+#[test]
+fn test_swmi_group_ack_reject_with_accepted_attachment_entry_still_affiliates_that_group() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let accepted_group = 97;
+    let rejected_group = 98;
+    let handle = 83;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(
+        &mut test,
+        issi,
+        handle,
+        vec![swmi_attach_group(accepted_group), swmi_attach_group(rejected_group)],
+        false,
+    );
+    submit_swmi_group_ack_uplink(
+        &mut test,
+        issi,
+        handle,
+        true,
+        Some(vec![swmi_ack_attach_entry(accepted_group), swmi_ack_detach_entry(rejected_group)]),
+    );
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let updates = subscriber_updates(&msgs);
+
+    // EN 300 392-2 Annex G requirements 7, 8a and 8b: a reject ACK may list
+    // accepted attachments as attachment entries, while rejected attachments
+    // are detachment entries. Do not treat every listed GSSI as rejected.
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![accepted_group]),
+        "explicitly accepted attachment in a mixed reject ACK should affiliate"
+    );
+    assert!(
+        test.config.state_read().subscribers.group_members(accepted_group).contains(&issi),
+        "accepted group should be present in subscriber registry"
+    );
+    assert!(
+        !test.config.state_read().subscribers.group_members(rejected_group).contains(&issi),
+        "detachment entry in reject ACK should leave the requested attachment rejected"
+    );
+    assert!(!contains_attach_detach_ack(&msgs));
+}
+
+#[test]
+fn test_swmi_group_ack_reject_with_only_attachment_entries_does_not_affiliate() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 99;
+    let handle = 84;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    submit_swmi_group_ack_uplink(&mut test, issi, handle, true, Some(vec![swmi_ack_attach_entry(group)]));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    // EN 300 392-2 Annex G requirement 7 forbids implicit rejection. If the
+    // reject bit is set but no detachment-form rejected attachment is present,
+    // do not reinterpret the ACK as acceptance.
+    assert!(
+        subscriber_updates(&msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "malformed reject ACK without rejection entries must not affiliate"
+    );
+    assert!(
+        !test.config.state_read().subscribers.group_members(group).contains(&issi),
+        "malformed reject ACK must leave subscriber registry unattached"
+    );
+    assert!(!contains_attach_detach_ack(&msgs));
+
+    // Attachment-form entries in a reject ACK can be explicit acceptances
+    // (Annex G requirement 8a), but they are not rejection entries. The ACK is
+    // therefore malformed for a single requested attachment and must not
+    // consume the pending transaction.
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let valid_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&valid_ack_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![group]),
+        "valid ACK after malformed reject should still complete the pending SwMI attachment"
+    );
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_swmi_group_ack_cannot_reject_requested_detach() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 93;
+    let handle = 79;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![group]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_detach_group(group)], false);
+    submit_swmi_group_ack_uplink(&mut test, issi, handle, true, Some(vec![swmi_ack_attach_entry(group)]));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let updates = subscriber_updates(&msgs);
+
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![group]),
+        "MS cannot reject a SwMI-requested group detachment"
+    );
+    assert!(
+        !test.config.state_read().subscribers.group_members(group).contains(&issi),
+        "SwMI-requested detachment must be applied despite ACK reject list"
+    );
+}
+
+#[test]
+fn test_swmi_group_ack_accepts_pending_detach_without_downlink_response() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 102;
+    let handle = 88;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![group]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_detach_group(group)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+    let updates = subscriber_updates(&msgs);
+
+    // EN 300 392-2 Annex G requirements 4, 6d and G.3: an accepted
+    // SwMI-requested detachment may omit the group list, and the uplink ACK
+    // expects no additional downlink MM response.
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![group]),
+        "accepted SwMI-requested group detachment should deaffiliate the MS"
+    );
+    assert!(
+        !test.config.state_read().subscribers.group_members(group).contains(&issi),
+        "accepted SwMI-requested detachment should update subscriber registry"
+    );
+    assert!(!contains_attach_detach_ack(&msgs));
+}
+
+#[test]
+fn test_itsi_detach_clears_pending_swmi_group_transaction_before_issi_reuse() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let stale_group = 105;
+    let handle = 91;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(stale_group)], false);
+
+    // EN 300 392-2 clauses 16.8.6 and 16.9.3.3: U-ITSI DETACH terminates
+    // the registered MM context, so a later ACK from the detached/reused ISSI
+    // must not complete an older SwMI group attach transaction.
+    submit_u_itsi_detach(&mut test, issi);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert!(msgs.is_empty(), "stale SwMI group ACK after detach/reuse should be ignored");
+    assert!(!test.config.state_read().subscribers.group_members(stale_group).contains(&issi));
+}
+
+#[test]
+fn test_periodic_registration_command_abandons_pending_swmi_group_transaction() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let stale_group = 106;
+    let handle = 92;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(stale_group)], false);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+
+    // EN 300 392-2 clauses 16.8.6 and 16.9.2.8: a SwMI registration command
+    // starts a fresh registration procedure, so any old Annex G group ACK must
+    // not attach groups while the MS is in the re-registration window.
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert!(msgs.is_empty(), "stale SwMI group ACK after registration command should be ignored");
+    assert!(!test.config.state_read().subscribers.group_members(stale_group).contains(&issi));
+}
+
+#[test]
+fn test_periodic_registration_grace_expiry_rejects_and_removes_groups_energy_and_stale_swmi_ack() {
+    debug::setup_logging_verbose();
+    let issi = 2040818;
+    let active_group = 3007;
+    let stale_group = 3008;
+    let handle = 94;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+    config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![active_group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg1,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let state = test.config.state_read();
+        assert!(state.subscribers.is_registered(issi));
+        assert_eq!(state.subscribers.group_members(active_group), vec![issi]);
+        assert!(state.energy_saving.contains_key(&issi));
+    }
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(stale_group)], false);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "first periodic expiry clears shared routing while the SwMI waits for re-registration"
+        );
+        assert!(state.subscribers.group_members(active_group).is_empty());
+        assert!(
+            state.energy_saving.contains_key(&issi),
+            "grace period keeps the cached EG assignment available for a timely DemandLocationUpdating response"
+        );
+    }
+
+    // EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4: the SwMI first prompts a
+    // fresh registration with D-LOCATION UPDATE COMMAND. If the local watchdog
+    // grace period then expires without the expected U-LOCATION UPDATE DEMAND,
+    // clause 16.11.1.1 timer-expiry semantics map to REJECT(ExpiryOfTimer).
+    // Clause 16.8.6 keeps stale group ACKs from completing after registration
+    // has overridden the old group procedure.
+    expire_mm_registration_grace(&mut test, issi);
+    test.run_stack(Some(1));
+    let reject_msgs = test.dump_sinks();
+    let reject = extract_location_update_reject(&reject_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::PeriodicLocationUpdating);
+    assert_eq!(reject.reject_cause, RejectCause::ExpiryOfTimer as u8);
+
+    let updates = subscriber_updates(&reject_msgs);
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![active_group]),
+        "final removal must publish deaffiliation for cached groups"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deregister && update.issi == issi),
+        "final removal must publish deregistration"
+    );
+
+    {
+        let state = test.config.state_read();
+        assert!(!state.subscribers.is_registered(issi));
+        assert!(state.subscribers.group_members(active_group).is_empty());
+        assert!(!state.energy_saving.contains_key(&issi));
+    }
+    assert_eq!(
+        debug_mm_client_energy(&mut test, issi),
+        None,
+        "second expiry removes the MM client and its cached EG mode"
+    );
+
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let stale_ack_msgs = test.dump_sinks();
+    assert!(
+        stale_ack_msgs.is_empty(),
+        "stale SwMI group ACK after final registration expiry must be ignored"
+    );
+    assert!(!test.config.state_read().subscribers.group_members(stale_group).contains(&issi));
+}
+
+#[test]
+fn test_brew_reconnected_marks_registration_pending_and_abandons_swmi_group_transaction() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let existing_group = 107;
+    let stale_group = 108;
+    let handle = 93;
+    let registration_handle = 0x4321;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update_with_type_and_handle(&mut test, issi, LocationUpdateType::ItsiAttach, None, registration_handle);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![existing_group]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(stale_group)], false);
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::BrewReconnected,
+    });
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+
+    // EN 300 392-2 clauses 16.4.3 and 16.8.6: Brew reconnect uses
+    // D-LOCATION UPDATE COMMAND as a SwMI-initiated registration refresh.
+    // The old SwMI group transaction is abandoned, while the subsequent
+    // DemandLocationUpdating response is still treated as a pending-command
+    // registration and replays Register/Affiliate toward CMCE/Brew.
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let stale_ack_msgs = test.dump_sinks();
+    assert!(
+        stale_ack_msgs.is_empty(),
+        "stale SwMI group ACK after Brew reconnect should be ignored"
+    );
+    assert!(!test.config.state_read().subscribers.group_members(stale_group).contains(&issi));
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::DemandLocationUpdating, vec![existing_group]);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let updates = subscriber_updates(&demand_msgs);
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Register && update.issi == issi),
+        "Brew reconnect registration refresh must replay Register after DemandLocationUpdating"
+    );
+    assert!(
+        updates
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![existing_group]),
+        "Brew reconnect registration refresh must replay group affiliation"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(existing_group), vec![issi]);
+}
+
+#[test]
+fn test_unmatched_swmi_group_ack_is_ignored() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 94;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_swmi_group_ack(&mut test, issi, 80, false, vec![group]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert!(msgs.is_empty(), "unmatched SwMI group ACK should not emit responses or updates");
+    assert!(!test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_swmi_group_pending_expiry_blocks_late_ack() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 95;
+    let handle = 81;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(group)], false);
+    test.run_stack(Some(730));
+    let _ = test.dump_sinks();
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert!(msgs.is_empty(), "late ACK after T353 expiry should be ignored");
+    assert!(!test.config.state_read().subscribers.group_members(group).contains(&issi));
+}
+
+#[test]
+fn test_standalone_group_attach_marks_reject_for_unsupported_address_form() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let accepted_gssi = 3000;
+    let rejected_vgssi = 4000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 16.10.12 says accept/reject=1 when at least one requested
+    // attachment/detachment is rejected. This implementation only supports
+    // plain GSSI attachment; a VGSSI entry must not be silently skipped while
+    // the ACK claims that all requested identities were accepted.
+    submit_attach_detach_group_identity_uplink(
+        &mut test,
+        issi,
+        false,
+        Some(vec![
+            GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: Some(accepted_gssi),
+                address_extension: None,
+                vgssi: None,
+            },
+            GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: None,
+                address_extension: None,
+                vgssi: Some(rejected_vgssi),
+            },
+        ]),
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(ack.group_identity_accept_reject, 1);
+    let downlink = ack
+        .group_identity_downlink
+        .expect("partial rejection should identify affected groups");
+    assert!(downlink.iter().any(|group| {
+        group.gssi == Some(accepted_gssi)
+            && group
+                .group_identity_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.group_identity_attachment_lifetime == 0)
+    }));
+    assert!(downlink.iter().any(|group| {
+        group.vgssi == Some(rejected_vgssi)
+            && group.group_identity_attachment.is_none()
+            && group.group_identity_detachment_uplink == Some(0)
+    }));
+    assert_eq!(test.config.state_read().subscribers.group_members(accepted_gssi), vec![issi]);
+}
+
+#[test]
+fn test_location_update_group_demand_marks_reject_for_unsupported_address_form() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let accepted_gssi = 3000;
+    let rejected_vgssi = 4000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update_with_group_identity_uplink(
+        &mut test,
+        issi,
+        LocationUpdateType::ItsiAttach,
+        vec![
+            GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: Some(accepted_gssi),
+                address_extension: None,
+                vgssi: None,
+            },
+            GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: None,
+                address_extension: None,
+                vgssi: Some(rejected_vgssi),
+            },
+        ],
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+    let gila = accept
+        .group_identity_location_accept
+        .expect("location update should include GroupIdentityLocationAccept");
+
+    assert_eq!(gila.group_identity_accept_reject, 1);
+    let downlink = gila
+        .group_identity_downlink
+        .expect("partial rejection should identify affected groups in GILA");
+    assert!(downlink.iter().any(|group| group.gssi == Some(accepted_gssi)));
+    assert!(downlink.iter().any(|group| {
+        group.vgssi == Some(rejected_vgssi)
+            && group.group_identity_attachment.is_none()
+            && group.group_identity_detachment_uplink == Some(0)
+    }));
+    assert_eq!(test.config.state_read().subscribers.group_members(accepted_gssi), vec![issi]);
+}
+
+#[test]
+fn test_unsupported_location_update_types_do_not_emit_accept() {
+    debug::setup_logging_verbose();
+    let unsupported_types = [
+        LocationUpdateType::MigratingLocationUpdating,
+        LocationUpdateType::ServiceRestorationMigratingLocationUpdating,
+        LocationUpdateType::DisabledMsUpdating,
+    ];
+
+    for (idx, location_update_type) in unsupported_types.into_iter().enumerate() {
+        let issi = 2043000 + idx as u32;
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+        // EN 300 392-2 table 16.67 defines raw LU types 1, 5, and 7, but this
+        // SwMI implementation does not support accepting those procedures. They
+        // must not fall through to D-LOCATION UPDATE ACCEPT table 16.68 values.
+        submit_location_update_with_type(&mut test, issi, location_update_type, None);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        assert!(
+            !contains_location_update_accept(&sink_msgs),
+            "{location_update_type} must not produce D-LOCATION UPDATE ACCEPT"
+        );
+        assert!(
+            subscriber_updates(&sink_msgs).is_empty(),
+            "{location_update_type} must not register or affiliate the subscriber"
+        );
+        let reject = extract_location_update_reject(&sink_msgs);
+        assert_eq!(
+            reject.location_update_type, location_update_type,
+            "D-LOCATION UPDATE REJECT must preserve the unsupported LU demand type"
+        );
+        let expected_cause = match location_update_type {
+            LocationUpdateType::MigratingLocationUpdating | LocationUpdateType::ServiceRestorationMigratingLocationUpdating => {
+                RejectCause::MigrationNotSupported
+            }
+            LocationUpdateType::DisabledMsUpdating => RejectCause::ServiceNotSubscribed,
+            _ => unreachable!("test only covers unsupported LU types"),
+        };
+        assert_eq!(reject.reject_cause, expected_cause as u8);
+    }
+}
+
+#[test]
+fn test_unsupported_location_update_features_emit_reject() {
+    debug::setup_logging_verbose();
+
+    let unsupported_requests = vec![
+        {
+            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+            pdu.request_to_append_la = true;
+            (pdu, RejectCause::LaNotAllowed)
+        },
+        {
+            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+            pdu.la_information = Some(0x1234);
+            (pdu, RejectCause::LaNotAllowed)
+        },
+        {
+            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+            pdu.cipher_control = true;
+            pdu.ciphering_parameters = Some(0);
+            (pdu, RejectCause::NoCipherKsg)
+        },
+        {
+            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+            pdu.authentication_uplink = Some(type3_field(MmType34ElemIdUl::AuthenticationUplink, 8, 0));
+            (pdu, RejectCause::MessageConsistencyError)
+        },
+        {
+            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+            pdu.extended_capabilities = Some(type3_field(MmType34ElemIdUl::ExtendedCapabilities, 8, 0));
+            (pdu, RejectCause::MessageConsistencyError)
+        },
+        {
+            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+            pdu.proprietary = Some(type3_field(MmType34ElemIdUl::Proprietary, 8, 0));
+            (pdu, RejectCause::MessageConsistencyError)
+        },
+    ];
+
+    for (idx, (pdu, expected_cause)) in unsupported_requests.into_iter().enumerate() {
+        let issi = 2044000 + idx as u32;
+        let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+        test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+        // EN 300 392-2 clause 16.9.3.4 expects D-LOCATION UPDATE ACCEPT or
+        // REJECT. Unsupported critical LU features must not be silently dropped.
+        submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+        test.run_stack(Some(1));
+        let sink_msgs = test.dump_sinks();
+
+        assert!(!contains_location_update_accept(&sink_msgs));
+        assert!(subscriber_updates(&sink_msgs).is_empty());
+        let reject = extract_location_update_reject(&sink_msgs);
+        assert_eq!(reject.location_update_type, LocationUpdateType::ItsiAttach);
+        assert_eq!(reject.reject_cause, expected_cause as u8);
+        assert!(!test.config.state_read().subscribers.is_registered(issi));
+    }
+}
+
+#[test]
+fn test_location_update_accepts_matching_optional_ssi_identity() {
+    debug::setup_logging_verbose();
+
+    let issi = 2040814;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    // EN 300 392-2 clause 16.9.3.4 table 16.18 defines optional SSI as the
+    // ISSI of the MS. A matching value is valid and remains compatible with
+    // radios that include the identity explicitly.
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.ssi = Some(issi as u64);
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(contains_location_update_accept(&sink_msgs));
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_location_update_accepts_matching_optional_mni_identity() {
+    debug::setup_logging_verbose();
+
+    let issi = 2040814;
+    let matching_mni = (204u64 << 14) | 1337u64;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    // EN 300 392-2 clause 16.9.3.4 table 16.18 defines address extension as
+    // the MS MNI. A matching MCC/MNC extension is valid, while absence remains
+    // accepted for radios that omit the optional field.
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.address_extension = Some(matching_mni);
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(contains_location_update_accept(&sink_msgs));
+    assert!(test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_location_update_rejects_mismatched_optional_mni_identity() {
+    debug::setup_logging_verbose();
+
+    let issi = 2040814;
+    let mismatched_mni = (204u64 << 14) | 1338u64;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    // EN 300 392-2 clauses 16.4.1.1 and 16.9.3.4 require a present address
+    // extension to identify the MS MNI. A different MNC is inconsistent with
+    // this cell and must not create subscriber or energy-economy state.
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.address_extension = Some(mismatched_mni);
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(!contains_location_update_accept(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    let reject = extract_location_update_reject(&sink_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::ItsiAttach);
+    assert_eq!(reject.reject_cause, RejectCause::MessageConsistencyError as u8);
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_location_update_rejects_mismatched_optional_ssi_identity() {
+    debug::setup_logging_verbose();
+
+    let issi = 2040814;
+    let claimed_issi = issi + 1;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    // EN 300 392-2 clause 16.4.1.1 and table 16.18 require the optional SSI
+    // in U-LOCATION UPDATE DEMAND to identify the registering MS. It must not
+    // contradict the lower-layer address that delivered the MM procedure.
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.ssi = Some(claimed_issi as u64);
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(!contains_location_update_accept(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    let reject = extract_location_update_reject(&sink_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::ItsiAttach);
+    assert_eq!(reject.reject_cause, RejectCause::MessageConsistencyError as u8);
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+    assert!(!test.config.state_read().subscribers.is_registered(claimed_issi));
+}
+
+#[test]
+fn test_whitelist_rejection_uses_policy_cause_not_migration() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.security.issi_whitelist = vec![999_999];
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(!contains_location_update_accept(&sink_msgs));
+    assert!(subscriber_updates(&sink_msgs).is_empty());
+    let reject = extract_location_update_reject(&sink_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::ItsiAttach);
+    assert_eq!(reject.reject_cause, RejectCause::ServiceNotSubscribed as u8);
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_known_migrating_location_update_deaffiliates_and_deregisters_without_accept() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 3000;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(group), vec![issi]);
+
+    // EN 300 392-2 table 16.67 defines migrating LU types, while table 16.68
+    // defines accept encodings. This SwMI does not implement migration identity
+    // exchange, so a known migrating MS must be released from local affiliation
+    // state and must not be accepted as still registered here.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::MigratingLocationUpdating, None);
+    test.run_stack(Some(1));
+    let migration_msgs = test.dump_sinks();
+    let updates = subscriber_updates(&migration_msgs);
+
+    assert!(
+        !contains_location_update_accept(&migration_msgs),
+        "unsupported migration must not produce D-LOCATION UPDATE ACCEPT"
+    );
+    let reject = extract_location_update_reject(&migration_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::MigratingLocationUpdating);
+    assert_eq!(reject.reject_cause, RejectCause::MigrationNotSupported as u8);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    assert_eq!(updates[0].groups, vec![group]);
+    assert_eq!(updates[1].action, BrewSubscriberAction::Deregister);
+    assert!(updates[1].groups.is_empty());
+
+    let state = test.config.state_read();
+    assert!(!state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(group).is_empty());
+}
+
+#[test]
+fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
+    debug::setup_logging_verbose();
+    let cached_issi = 2260082;
+    let seeded_issi = 2260616;
+    let path = unique_restart_recovery_path("startup");
+    std::fs::write(&path, format!("{cached_issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![seeded_issi];
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    // EN 300 392-2 clause 16.4.4 permits the SwMI to initiate registration at
+    // any time with D-LOCATION UPDATE COMMAND. Nexus-BS uses that procedure
+    // after process restart for locally known ISSIs that may still be camped.
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let commands = location_update_commands(&sink_msgs);
+
+    assert_eq!(commands.len(), 2);
+    assert!(
+        commands
+            .iter()
+            .any(|(issi, handle, pdu)| *issi == cached_issi && *handle == 0 && pdu.group_identity_report),
+        "expected restart recovery command for cached ISSI {cached_issi}, got {commands:?}"
+    );
+    assert!(
+        commands
+            .iter()
+            .any(|(issi, handle, pdu)| *issi == seeded_issi && *handle == 0 && pdu.group_identity_report),
+        "expected restart recovery command for configured seed ISSI {seeded_issi}, got {commands:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_successful_location_update_persists_restart_recovery_cache() {
+    debug::setup_logging_verbose();
+    let issi = 2260082;
+    let path = unique_restart_recovery_path("persist");
+    let _ = std::fs::remove_file(&path);
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(contains_location_update_accept(&sink_msgs));
+    let cache = std::fs::read_to_string(&path).expect("registration should persist restart recovery cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "cache should contain ISSI {issi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+fn assert_location_update_response_stay_alive(energy_saving_mode: Option<EnergySavingMode>) {
+    debug::setup_logging_verbose();
+
+    let pdu = ULocationUpdateDemand {
+        location_update_type: LocationUpdateType::ItsiAttach,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: None,
+        energy_saving_mode,
+        la_information: None,
+        ssi: None,
+        address_extension: None,
+        group_identity_location_demand: None,
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    let test_prim = LmmMleUnitdataInd {
+        sdu,
+        handle: 0,
+        received_address: TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 2040814,
+        },
+    };
+    let test_sapmsg = SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(test_prim),
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    let components = vec![TetraEntity::Mm];
+    let sinks: Vec<TetraEntity> = vec![TetraEntity::Mle];
+    test.populate_entities(components, sinks);
+
+    test.submit_message(test_sapmsg);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::LmmMleUnitdataReq(ref resp_prim) = sink_msgs[0].msg else {
+        panic!("Expected LmmMleUnitdataReq");
+    };
+    let mut resp_sdu = BitBuffer::from_bitstr(&resp_prim.sdu.to_bitstr());
+    let resp_pdu = DLocationUpdateAccept::from_bitbuf(&mut resp_sdu).expect("Failed parsing D-LOCATION UPDATE ACCEPT response");
+    assert_eq!(resp_pdu.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    let esi = resp_pdu
+        .energy_saving_information
+        .expect("D-LOCATION UPDATE ACCEPT must answer requested energy saving mode");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::StayAlive);
+    assert_eq!(esi.frame_number, None);
+    assert_eq!(esi.multiframe_number, None);
+}
+
+fn energy_economy_modes_for_test() -> [EnergySavingMode; 7] {
+    [
+        EnergySavingMode::Eg1,
+        EnergySavingMode::Eg2,
+        EnergySavingMode::Eg3,
+        EnergySavingMode::Eg4,
+        EnergySavingMode::Eg5,
+        EnergySavingMode::Eg6,
+        EnergySavingMode::Eg7,
+    ]
+}
+
+fn dltime_for_frame_18_energy_start(issi: u32, mode: EnergySavingMode) -> TdmaTime {
+    let cycle_frames = EnergySavingAssignment::sleep_frames(mode as u8).expect("EG mode should have table 23.9 sleep frames") + 1;
+    let spread_frames = (issi % cycle_frames as u32) as u8;
+    assert!(
+        spread_frames < 18,
+        "test ISSI must spread each EG start within the current multiframe"
+    );
+    let dltime = TdmaTime {
+        t: 1,
+        f: 18 - spread_frames,
+        m: 1,
+        h: 0,
+    };
+    let raw_start = dltime.add_timeslots((2 * 18 + spread_frames as i32) * 4);
+    assert_eq!(raw_start.f, 18, "test setup must force an unguarded EG start onto frame 18");
+    dltime
+}
+
+fn assert_energy_saving_start_avoids_frame_18(mode: EnergySavingMode, frame: Option<u8>, multiframe: Option<u8>) {
+    assert_ne!(frame, Some(18), "mode {mode:?} must not start EG on frame 18");
+    let start = TdmaTime {
+        t: 1,
+        f: frame.expect("EG start should carry frame number"),
+        m: multiframe.expect("EG start should carry multiframe number"),
+        h: 0,
+    };
+    let cycle_frames = EnergySavingAssignment::sleep_frames(mode as u8).expect("EG mode should have table 23.9 sleep frames") + 1;
+    let receive_opportunities_in_full_multiframe_cycle = (18 * 60) / cycle_frames as i32;
+    for n in 1..=receive_opportunities_in_full_multiframe_cycle {
+        let receive = start.add_timeslots((cycle_frames as i32) * n * 4);
+        assert_ne!(receive.f, 18, "mode {mode:?} receive opportunity {n} must not recur on frame 18");
+    }
+}
+
+fn extract_location_update_accept(msgs: &[SapMsg]) -> DLocationUpdateAccept {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DLocationUpdateAccept::from_bitbuf(&mut sdu).ok()
+            }
+            _ => None,
+        })
+        .expect("expected D-LOCATION UPDATE ACCEPT")
+}
+
+fn contains_location_update_accept(msgs: &[SapMsg]) -> bool {
+    msgs.iter().any(|msg| match &msg.msg {
+        SapMsgInner::LmmMleUnitdataReq(prim) => {
+            let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+            DLocationUpdateAccept::from_bitbuf(&mut sdu).is_ok()
+        }
+        _ => false,
+    })
+}
+
+fn contains_location_update_command(msgs: &[SapMsg]) -> bool {
+    msgs.iter().any(|msg| match &msg.msg {
+        SapMsgInner::LmmMleUnitdataReq(prim) => {
+            let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+            DLocationUpdateCommand::from_bitbuf(&mut sdu).is_ok()
+        }
+        _ => false,
+    })
+}
+
+fn location_update_commands(msgs: &[SapMsg]) -> Vec<(u32, u32, DLocationUpdateCommand)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                let pdu = DLocationUpdateCommand::from_bitbuf(&mut sdu).ok()?;
+                Some((prim.address.ssi, prim.handle, pdu))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn extract_location_update_reject(msgs: &[SapMsg]) -> DLocationUpdateReject {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DLocationUpdateReject::from_bitbuf(&mut sdu).ok()
+            }
+            _ => None,
+        })
+        .expect("expected D-LOCATION UPDATE REJECT")
+}
+
+fn extract_attach_detach_ack(msgs: &[SapMsg]) -> DAttachDetachGroupIdentityAcknowledgement {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DAttachDetachGroupIdentityAcknowledgement::from_bitbuf(&mut sdu).ok()
+            }
+            _ => None,
+        })
+        .expect("expected D-ATTACH-DETACH GROUP IDENTITY ACKNOWLEDGEMENT")
+}
+
+fn extract_d_attach_detach_group_identity(msgs: &[SapMsg]) -> (DAttachDetachGroupIdentity, Layer2Service) {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DAttachDetachGroupIdentity::from_bitbuf(&mut sdu)
+                    .ok()
+                    .map(|pdu| (pdu, prim.layer2service))
+            }
+            _ => None,
+        })
+        .expect("expected D-ATTACH-DETACH GROUP IDENTITY")
+}
+
+fn extract_d_attach_detach_group_identities(msgs: &[SapMsg]) -> Vec<(DAttachDetachGroupIdentity, Layer2Service)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DAttachDetachGroupIdentity::from_bitbuf(&mut sdu)
+                    .ok()
+                    .map(|pdu| (pdu, prim.layer2service))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn extract_d_mm_status(msgs: &[SapMsg]) -> DMmStatus {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DMmStatus::from_bitbuf(&mut sdu).ok()
+            }
+            _ => None,
+        })
+        .expect("expected D-MM-STATUS")
+}
+
+fn extract_mm_pdu_function_not_supported(msgs: &[SapMsg]) -> MmPduFunctionNotSupported {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                MmPduFunctionNotSupported::from_bitbuf(&mut sdu).ok()
+            }
+            _ => None,
+        })
+        .expect("expected MM PDU/FUNCTION NOT SUPPORTED")
+}
+
+fn extract_mm_pdu_function_not_supported_layer2service(msgs: &[SapMsg]) -> Layer2Service {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                MmPduFunctionNotSupported::from_bitbuf(&mut sdu).ok().map(|_| prim.layer2service)
+            }
+            _ => None,
+        })
+        .expect("expected MM PDU/FUNCTION NOT SUPPORTED")
+}
+
+fn contains_attach_detach_ack(msgs: &[SapMsg]) -> bool {
+    msgs.iter().any(|msg| match &msg.msg {
+        SapMsgInner::LmmMleUnitdataReq(prim) => {
+            let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+            DAttachDetachGroupIdentityAcknowledgement::from_bitbuf(&mut sdu).is_ok()
+        }
+        _ => false,
+    })
+}
+
+fn subscriber_updates(msgs: &[SapMsg]) -> Vec<&MmSubscriberUpdate> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::MmSubscriberUpdate(update) => Some(update),
+            _ => None,
+        })
+        .collect()
+}
+
+fn backdate_mm_registration(test: &mut ComponentTest, issi: u32, elapsed_secs: u64) {
+    let mm = test
+        .router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs");
+    assert!(
+        mm.debug_backdate_registration_for_test(issi, std::time::Duration::from_secs(elapsed_secs)),
+        "expected registered ISSI to backdate"
+    );
+}
+
+fn expire_mm_registration_grace(test: &mut ComponentTest, issi: u32) {
+    let mm = test
+        .router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs");
+    assert!(
+        mm.debug_expire_registration_grace_for_test(issi),
+        "expected registered ISSI to have an expirable periodic-registration grace window"
+    );
+}
+
+fn debug_mm_client_energy(test: &mut ComponentTest, issi: u32) -> Option<(EnergySavingMode, Option<u8>, Option<u8>)> {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_client_energy_for_test(issi)
+}
+
+fn debug_mm_client_tei(test: &mut ComponentTest, issi: u32) -> Option<Option<u64>> {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_client_tei_for_test(issi)
+}
+
+fn begin_swmi_group_transaction_for_test(
+    test: &mut ComponentTest,
+    issi: u32,
+    handle: u32,
+    group_identity_downlink: Vec<GroupIdentityDownlink>,
+    detach_all_then_attach: bool,
+) {
+    let mm = test
+        .router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs");
+    assert!(
+        mm.debug_begin_swmi_group_transaction_for_test(issi, handle, group_identity_downlink, detach_all_then_attach),
+        "expected registered ISSI to accept pending SwMI group transaction"
+    );
+}
+
+fn swmi_attach_group(gssi: u32) -> GroupIdentityDownlink {
+    GroupIdentityDownlink {
+        group_identity_attachment: Some(GroupIdentityAttachment {
+            group_identity_attachment_lifetime: 0,
+            class_of_usage: 4,
+        }),
+        group_identity_detachment_uplink: None,
+        gssi: Some(gssi),
+        address_extension: None,
+        vgssi: None,
+    }
+}
+
+fn swmi_attach_vgssi(vgssi: u32) -> GroupIdentityDownlink {
+    GroupIdentityDownlink {
+        group_identity_attachment: Some(GroupIdentityAttachment {
+            group_identity_attachment_lifetime: 0,
+            class_of_usage: 4,
+        }),
+        group_identity_detachment_uplink: None,
+        gssi: None,
+        address_extension: None,
+        vgssi: Some(vgssi),
+    }
+}
+
+fn swmi_detach_group(gssi: u32) -> GroupIdentityDownlink {
+    GroupIdentityDownlink {
+        group_identity_attachment: None,
+        group_identity_detachment_uplink: Some(0),
+        gssi: Some(gssi),
+        address_extension: None,
+        vgssi: None,
+    }
+}
+
+fn swmi_ack_attach_entry(gssi: u32) -> GroupIdentityUplink {
+    GroupIdentityUplink {
+        class_of_usage: Some(0),
+        group_identity_detachment_uplink: None,
+        gssi: Some(gssi),
+        address_extension: None,
+        vgssi: None,
+    }
+}
+
+fn swmi_ack_detach_entry(gssi: u32) -> GroupIdentityUplink {
+    GroupIdentityUplink {
+        class_of_usage: None,
+        group_identity_detachment_uplink: Some(0),
+        gssi: Some(gssi),
+        address_extension: None,
+        vgssi: None,
+    }
+}
+
+fn swmi_ack_vgssi_detach_entry(vgssi: u32) -> GroupIdentityUplink {
+    GroupIdentityUplink {
+        class_of_usage: None,
+        group_identity_detachment_uplink: Some(0),
+        gssi: None,
+        address_extension: None,
+        vgssi: Some(vgssi),
+    }
+}
+
+fn expected_location_update_accept_type(location_update_type: LocationUpdateType) -> LocationUpdateAcceptType {
+    match location_update_type {
+        LocationUpdateType::RoamingLocationUpdating => LocationUpdateAcceptType::RoamingLocationUpdating,
+        LocationUpdateType::PeriodicLocationUpdating => LocationUpdateAcceptType::PeriodicLocationUpdating,
+        LocationUpdateType::ItsiAttach => LocationUpdateAcceptType::ItsiAttach,
+        LocationUpdateType::ServiceRestorationRoamingLocationUpdating => {
+            LocationUpdateAcceptType::ServiceRestorationRoamingLocationUpdating
+        }
+        LocationUpdateType::DemandLocationUpdating => LocationUpdateAcceptType::DemandLocationUpdating,
+        LocationUpdateType::MigratingLocationUpdating
+        | LocationUpdateType::ServiceRestorationMigratingLocationUpdating
+        | LocationUpdateType::DisabledMsUpdating => {
+            panic!("unsupported location update type should not produce D-LOCATION UPDATE ACCEPT")
+        }
+    }
+}
+
+fn unique_restart_recovery_path(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after UNIX_EPOCH")
+        .as_nanos();
+    let mut path = std::env::temp_dir();
+    path.push(format!("nexus-bs-mm-restart-recovery-{label}-{}-{nanos}.txt", std::process::id()));
+    path.to_string_lossy().into_owned()
+}
+
+fn submit_location_update(test: &mut ComponentTest, issi: u32, energy_saving_mode: Option<EnergySavingMode>) {
+    submit_location_update_with_type(test, issi, LocationUpdateType::ItsiAttach, energy_saving_mode);
+}
+
+fn submit_location_update_with_type(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    energy_saving_mode: Option<EnergySavingMode>,
+) {
+    submit_location_update_with_type_and_handle(test, issi, location_update_type, energy_saving_mode, 0);
+}
+
+fn submit_location_update_with_type_and_handle(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    energy_saving_mode: Option<EnergySavingMode>,
+    handle: u32,
+) {
+    let pdu = base_location_update_demand(location_update_type, energy_saving_mode);
+    submit_location_update_demand_with_handle(test, issi, pdu, handle);
+}
+
+fn base_location_update_demand(
+    location_update_type: LocationUpdateType,
+    energy_saving_mode: Option<EnergySavingMode>,
+) -> ULocationUpdateDemand {
+    ULocationUpdateDemand {
+        location_update_type,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: None,
+        energy_saving_mode,
+        la_information: None,
+        ssi: None,
+        address_extension: None,
+        group_identity_location_demand: None,
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    }
+}
+
+fn type3_field(field_id: MmType34ElemIdUl, len: usize, data: u128) -> Type3FieldGeneric {
+    Type3FieldGeneric {
+        field_id: field_id.into_raw(),
+        len,
+        data,
+    }
+}
+
+fn submit_location_update_demand_with_handle(test: &mut ComponentTest, issi: u32, pdu: ULocationUpdateDemand, handle: u32) {
+    submit_location_update_demand_with_handle_and_received_address(test, pdu, handle, TetraAddress::issi(issi));
+}
+
+fn submit_location_update_demand_with_handle_and_received_address(
+    test: &mut ComponentTest,
+    pdu: ULocationUpdateDemand,
+    handle: u32,
+    received_address: TetraAddress,
+) {
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle,
+            received_address,
+        }),
+    });
+}
+
+fn submit_u_itsi_detach(test: &mut ComponentTest, issi: u32) {
+    let pdu = UItsiDetach {
+        address_extension: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(8);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_u_tei_provide(test: &mut ComponentTest, issi: u32, tei: u64) {
+    let pdu = UTeiProvide { tei, proprietary: None };
+    let mut sdu = BitBuffer::new_autoexpand(16);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_location_update_with_groups(test: &mut ComponentTest, issi: u32, location_update_type: LocationUpdateType, groups: Vec<u32>) {
+    let group_identity_uplink = groups
+        .into_iter()
+        .map(|gssi| GroupIdentityUplink {
+            class_of_usage: Some(0),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        })
+        .collect();
+    submit_location_update_with_group_identity_uplink(test, issi, location_update_type, group_identity_uplink);
+}
+
+fn submit_location_update_with_group_identity_uplink(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    group_identity_uplink: Vec<GroupIdentityUplink>,
+) {
+    let pdu = ULocationUpdateDemand {
+        location_update_type,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: None,
+        energy_saving_mode: None,
+        la_information: None,
+        ssi: None,
+        address_extension: None,
+        group_identity_location_demand: Some(GroupIdentityLocationDemand {
+            group_identity_attach_detach_mode: 1,
+            group_identity_uplink: Some(group_identity_uplink),
+        }),
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(256);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_location_update_with_group_report_response(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    len: usize,
+    data: u128,
+) {
+    submit_location_update_with_group_report_response_and_energy(test, issi, location_update_type, len, data, None);
+}
+
+fn submit_location_update_with_group_report_response_and_energy(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    len: usize,
+    data: u128,
+    energy_saving_mode: Option<EnergySavingMode>,
+) {
+    let mut pdu = base_location_update_demand(location_update_type, energy_saving_mode);
+    pdu.group_report_response = Some(Type3FieldGeneric { field_id: 0, len, data });
+    submit_location_update_demand_with_handle(test, issi, pdu, 0);
+}
+
+fn submit_u_mm_status_energy_saving(test: &mut ComponentTest, issi: u32, status: StatusUplink, mode: EnergySavingMode) {
+    submit_u_mm_status(test, issi, status, Some(mode as u64), Some(3));
+}
+
+fn submit_u_mm_status_energy_saving_with_received_address(
+    test: &mut ComponentTest,
+    status: StatusUplink,
+    mode: EnergySavingMode,
+    received_address: TetraAddress,
+) {
+    submit_u_mm_status_with_received_address(test, status, Some(mode as u64), Some(3), received_address);
+}
+
+fn submit_u_mm_status(
+    test: &mut ComponentTest,
+    issi: u32,
+    status: StatusUplink,
+    dependent_information: Option<u64>,
+    dependent_information_len: Option<usize>,
+) {
+    submit_u_mm_status_with_received_address(
+        test,
+        status,
+        dependent_information,
+        dependent_information_len,
+        TetraAddress::issi(issi),
+    );
+}
+
+fn submit_u_mm_status_with_received_address(
+    test: &mut ComponentTest,
+    status: StatusUplink,
+    dependent_information: Option<u64>,
+    dependent_information_len: Option<usize>,
+    received_address: TetraAddress,
+) {
+    let pdu = UMmStatus {
+        status_uplink: status,
+        status_uplink_dependent_information: dependent_information,
+        status_uplink_dependent_information_len: dependent_information_len,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(16);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address,
+        }),
+    });
+}
+
+fn submit_raw_mm_pdu_type(test: &mut ComponentTest, issi: u32, pdu_type: MmPduTypeUl) {
+    submit_raw_mm_pdu_type_with_received_address(test, pdu_type, TetraAddress::issi(issi));
+}
+
+fn submit_raw_mm_pdu_type_with_received_address(test: &mut ComponentTest, pdu_type: MmPduTypeUl, received_address: TetraAddress) {
+    let mut sdu = BitBuffer::new_autoexpand(4);
+    sdu.write_bits(pdu_type.into_raw(), 4);
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address,
+        }),
+    });
+}
+
+fn submit_attach_detach_group_identity(
+    test: &mut ComponentTest,
+    issi: u32,
+    group_identity_attach_detach_mode: bool,
+    groups: Option<Vec<u32>>,
+) {
+    submit_attach_detach_group_identity_with_received_address(test, group_identity_attach_detach_mode, groups, TetraAddress::issi(issi));
+}
+
+fn submit_attach_detach_group_identity_with_received_address(
+    test: &mut ComponentTest,
+    group_identity_attach_detach_mode: bool,
+    groups: Option<Vec<u32>>,
+    received_address: TetraAddress,
+) {
+    let group_identity_uplink = groups.map(|groups| {
+        groups
+            .into_iter()
+            .map(|gssi| GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
+            })
+            .collect()
+    });
+    submit_attach_detach_group_identity_uplink_with_received_address(
+        test,
+        group_identity_attach_detach_mode,
+        group_identity_uplink,
+        received_address,
+    );
+}
+
+fn submit_attach_detach_group_identity_uplink(
+    test: &mut ComponentTest,
+    issi: u32,
+    group_identity_attach_detach_mode: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+) {
+    submit_attach_detach_group_identity_uplink_with_response(test, issi, group_identity_attach_detach_mode, group_identity_uplink, None);
+}
+
+fn submit_attach_detach_group_identity_with_report_response(
+    test: &mut ComponentTest,
+    issi: u32,
+    group_identity_attach_detach_mode: bool,
+    group_identity_uplink: Vec<GroupIdentityUplink>,
+    len: usize,
+    data: u128,
+) {
+    submit_attach_detach_group_identity_uplink_with_response(
+        test,
+        issi,
+        group_identity_attach_detach_mode,
+        Some(group_identity_uplink),
+        Some(Type3FieldGeneric { field_id: 0, len, data }),
+    );
+}
+
+fn submit_attach_detach_group_identity_uplink_with_response(
+    test: &mut ComponentTest,
+    issi: u32,
+    group_identity_attach_detach_mode: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+    group_report_response: Option<Type3FieldGeneric>,
+) {
+    submit_attach_detach_group_identity_uplink_with_response_and_received_address(
+        test,
+        group_identity_attach_detach_mode,
+        group_identity_uplink,
+        group_report_response,
+        TetraAddress::issi(issi),
+    );
+}
+
+fn submit_attach_detach_group_identity_uplink_with_received_address(
+    test: &mut ComponentTest,
+    group_identity_attach_detach_mode: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+    received_address: TetraAddress,
+) {
+    submit_attach_detach_group_identity_uplink_with_response_and_received_address(
+        test,
+        group_identity_attach_detach_mode,
+        group_identity_uplink,
+        None,
+        received_address,
+    );
+}
+
+fn submit_attach_detach_group_identity_uplink_with_response_and_received_address(
+    test: &mut ComponentTest,
+    group_identity_attach_detach_mode: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+    group_report_response: Option<Type3FieldGeneric>,
+    received_address: TetraAddress,
+) {
+    let pdu = UAttachDetachGroupIdentity {
+        group_identity_report: false,
+        group_identity_attach_detach_mode,
+        group_report_response,
+        group_identity_uplink,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(128);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address,
+        }),
+    });
+}
+
+fn invalid_mm_source_addresses(issi: u32) -> [TetraAddress; 3] {
+    [
+        TetraAddress::new(issi, SsiType::Gssi),
+        TetraAddress::new(issi, SsiType::Unknown),
+        TetraAddress::new(0x0100_0000, SsiType::Issi),
+    ]
+}
+
+fn submit_swmi_group_ack(test: &mut ComponentTest, issi: u32, handle: u32, rejected: bool, rejected_groups: Vec<u32>) {
+    let group_identity_uplink = (!rejected_groups.is_empty()).then(|| rejected_groups.into_iter().map(swmi_ack_detach_entry).collect());
+    submit_swmi_group_ack_uplink(test, issi, handle, rejected, group_identity_uplink);
+}
+
+fn submit_swmi_group_ack_with_received_address(
+    test: &mut ComponentTest,
+    issi: u32,
+    handle: u32,
+    rejected: bool,
+    rejected_groups: Vec<u32>,
+    received_address: TetraAddress,
+) {
+    let group_identity_uplink = (!rejected_groups.is_empty()).then(|| rejected_groups.into_iter().map(swmi_ack_detach_entry).collect());
+    submit_swmi_group_ack_uplink_with_received_address(test, issi, handle, rejected, group_identity_uplink, received_address);
+}
+
+fn submit_swmi_group_ack_uplink(
+    test: &mut ComponentTest,
+    issi: u32,
+    handle: u32,
+    rejected: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+) {
+    submit_swmi_group_ack_uplink_with_received_address(test, issi, handle, rejected, group_identity_uplink, TetraAddress::issi(issi));
+}
+
+fn submit_swmi_group_ack_uplink_with_received_address(
+    test: &mut ComponentTest,
+    _issi: u32,
+    handle: u32,
+    rejected: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+    received_address: TetraAddress,
+) {
+    let pdu = UAttachDetachGroupIdentityAcknowledgement {
+        group_identity_acknowledgement_type: rejected,
+        group_identity_uplink,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(128);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle,
+            received_address,
+        }),
+    });
+}
+
+fn submit_attach_detach_group_report_request(test: &mut ComponentTest, issi: u32) {
+    let pdu = UAttachDetachGroupIdentity {
+        group_identity_report: true,
+        group_identity_attach_detach_mode: false,
+        group_report_response: None,
+        group_identity_uplink: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_malformed_attach_detach_group_report_request(
+    test: &mut ComponentTest,
+    issi: u32,
+    group_identity_attach_detach_mode: bool,
+    group_identity_uplink: Option<Vec<GroupIdentityUplink>>,
+    group_report_response: Option<Type3FieldGeneric>,
+) {
+    let pdu = UAttachDetachGroupIdentity {
+        group_identity_report: true,
+        group_identity_attach_detach_mode,
+        group_report_response,
+        group_identity_uplink,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(128);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_attach_detach_group_report_response(test: &mut ComponentTest, issi: u32, len: usize, data: u128) {
+    let pdu = UAttachDetachGroupIdentity {
+        group_identity_report: false,
+        group_identity_attach_detach_mode: false,
+        group_report_response: Some(Type3FieldGeneric { field_id: 0, len, data }),
+        group_identity_uplink: None,
+        proprietary: None,
+    };
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    pdu.to_bitbuf(&mut sdu).unwrap();
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}

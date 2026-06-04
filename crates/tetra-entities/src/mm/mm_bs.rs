@@ -1,0 +1,3163 @@
+use crate::net_control::ControlEndpoint;
+use crate::net_telemetry::channel::TelemetrySink;
+use crate::{MessageQueue, TetraEntityTrait, net_brew};
+use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
+use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
+use tetra_core::tetra_entities::TetraEntity;
+use tetra_core::typed_pdu_fields::{Type3FieldGeneric, delimiters, typed};
+use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
+use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+use tetra_saps::lmm::LmmMleUnitdataReq;
+use tetra_saps::{SapMsg, SapMsgInner};
+
+use crate::mm::components::client_state::{ClientMgrErr, GroupAttachmentInfo, MmClientMgr, MmClientState};
+use crate::mm::components::not_supported::make_ul_mm_pdu_function_not_supported;
+use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
+use tetra_pdus::mm::enums::location_update_accept_type::LocationUpdateAcceptType;
+use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
+use tetra_pdus::mm::enums::mm_pdu_type_ul::MmPduTypeUl;
+use tetra_pdus::mm::enums::reject_cause::RejectCause;
+use tetra_pdus::mm::enums::status_downlink::StatusDownlink;
+use tetra_pdus::mm::enums::status_uplink::StatusUplink;
+use tetra_pdus::mm::enums::type34_elem_id_dl::MmType34ElemIdDl;
+use tetra_pdus::mm::enums::type34_elem_id_ul::MmType34ElemIdUl;
+use tetra_pdus::mm::fields::energy_saving_information::EnergySavingInformation;
+use tetra_pdus::mm::fields::group_identity_attachment::GroupIdentityAttachment;
+use tetra_pdus::mm::fields::group_identity_downlink::GroupIdentityDownlink;
+use tetra_pdus::mm::fields::group_identity_location_accept::GroupIdentityLocationAccept;
+use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
+use tetra_pdus::mm::pdus::d_attach_detach_group_identity::DAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::d_attach_detach_group_identity_acknowledgement::DAttachDetachGroupIdentityAcknowledgement;
+use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+use tetra_pdus::mm::pdus::d_location_update_command::DLocationUpdateCommand;
+use tetra_pdus::mm::pdus::d_location_update_reject::DLocationUpdateReject;
+use tetra_pdus::mm::pdus::d_mm_status::DMmStatus;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity::UAttachDetachGroupIdentity;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
+use tetra_pdus::mm::pdus::u_itsi_detach::UItsiDetach;
+use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
+use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
+use tetra_pdus::mm::pdus::u_tei_provide::UTeiProvide;
+
+pub struct MmBs {
+    config: SharedConfig,
+    telemetry: Option<TelemetrySink>,
+    control: Option<ControlEndpoint>,
+    client_mgr: MmClientMgr,
+    dltime: TdmaTime,
+    pending_energy_saving: HashMap<u32, PendingEnergySavingAssignment>,
+    pending_swmi_group_transactions: HashMap<u32, PendingSwmiGroupTransaction>,
+    restart_recovery: HashMap<u32, RestartRecoveryProbe>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestartRecoveryProbe {
+    attempts: u8,
+    next_due: TdmaTime,
+}
+
+struct PendingEnergySavingAssignment {
+    esi: EnergySavingInformation,
+    start_time: Option<TdmaTime>,
+    expires_at: TdmaTime,
+    previous_active: Option<EnergySavingAssignment>,
+}
+
+struct PendingSwmiGroupTransaction {
+    handle: u32,
+    expires_at: TdmaTime,
+    group_identity_downlink: Vec<GroupIdentityDownlink>,
+    detach_all_then_attach: bool,
+}
+
+struct GroupIdentityProcessResult {
+    group_identity_downlink: Vec<GroupIdentityDownlink>,
+    all_accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupIdentityAddress {
+    gssi: Option<u32>,
+    address_extension: Option<u32>,
+    vgssi: Option<u32>,
+}
+
+impl GroupIdentityAddress {
+    fn from_downlink(gid: &GroupIdentityDownlink) -> Self {
+        Self {
+            gssi: gid.gssi,
+            address_extension: gid.address_extension,
+            vgssi: gid.vgssi,
+        }
+    }
+
+    fn from_uplink(gid: &GroupIdentityUplink) -> Self {
+        Self {
+            gssi: gid.gssi,
+            address_extension: gid.address_extension,
+            vgssi: gid.vgssi,
+        }
+    }
+
+    fn plain_gssi(self) -> Option<u32> {
+        match (self.gssi, self.address_extension, self.vgssi) {
+            (Some(gssi), None, None) => Some(gssi),
+            _ => None,
+        }
+    }
+}
+
+impl MmBs {
+    const MAX_AIR_INTERFACE_SSI: u32 = 0x00FF_FFFF;
+    const MAX_GROUPS_PER_ATTACH: usize = 12;
+    // EN 300 392-2 clause 23.7.6 / timer T.210: after signalling activity,
+    // the MS remains awake for 18 TDMA frames before returning to energy economy.
+    const T210_AWAKE_FRAMES: i32 = 18;
+    const ENERGY_ECONOMY_UNSCHEDULED_SCH_F_FRAME: u8 = 18;
+    // EN 300 392-2 clauses 16.7.3 and 16.11.1.2: T352 energy mode response
+    // time is 30 s. One TETRA multiframe is 18 TDMA frames (72 slots), so this
+    // deterministic TDMA approximation is just over 30 s.
+    const T352_ENERGY_RESPONSE_TIMESLOTS: i32 = 30 * 18 * 4;
+    // EN 300 392-2 clause 16.11.1.4: T353 is 10 s for attach/detach group
+    // identity response. One TETRA second is 18 frames * 4 timeslots.
+    const T353_GROUP_RESPONSE_TIMESLOTS: i32 = 10 * 18 * 4;
+    // Local restart recovery retry cadence. This is an operator-side SwMI
+    // policy around the ETSI clause 16.4.4 infrastructure-initiated
+    // registration procedure, not an ETSI timer value.
+    const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 18 * 4;
+    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 5;
+
+    pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
+        let client_mgr = MmClientMgr::new(telemetry.clone());
+        let restart_recovery = Self::load_restart_recovery_candidates(&config)
+            .into_iter()
+            .map(|issi| {
+                (
+                    issi,
+                    RestartRecoveryProbe {
+                        attempts: 0,
+                        next_due: TdmaTime::default(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            config,
+            telemetry,
+            control,
+            client_mgr,
+            dltime: TdmaTime::default(),
+            pending_energy_saving: HashMap::new(),
+            pending_swmi_group_transactions: HashMap::new(),
+            restart_recovery,
+        }
+    }
+
+    fn expected_ms_mni(&self) -> u64 {
+        let net = &self.config.config().net;
+        ((net.mcc as u64) << 14) | net.mnc as u64
+    }
+
+    fn subscriber_recovery_path(config: &SharedConfig) -> Option<String> {
+        config.state_read().subscriber_recovery_path.clone()
+    }
+
+    fn restart_recovery_eligible(config: &SharedConfig, issi: u32) -> bool {
+        if issi > Self::MAX_AIR_INTERFACE_SSI {
+            return false;
+        }
+
+        let cfg = config.config();
+        let local_ranges = &cfg.cell.local_ssi_ranges;
+        if !local_ranges.as_slice().is_empty() && !local_ranges.contains(issi) {
+            return false;
+        }
+
+        cfg.security.is_issi_allowed(issi)
+    }
+
+    fn read_restart_recovery_cache(path: &str) -> BTreeSet<u32> {
+        let mut issis = BTreeSet::new();
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return issis,
+            Err(err) => {
+                tracing::warn!("MM: failed reading restart recovery cache '{}': {}", path, err);
+                return issis;
+            }
+        };
+
+        for (line_no, line) in contents.lines().enumerate() {
+            let token = line.split('#').next().unwrap_or("").trim().trim_end_matches(',');
+            if token.is_empty() {
+                continue;
+            }
+            match token.parse::<u32>() {
+                Ok(issi) => {
+                    issis.insert(issi);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "MM: ignored invalid ISSI '{}' in restart recovery cache '{}' line {}: {}",
+                        token,
+                        path,
+                        line_no + 1,
+                        err
+                    );
+                }
+            }
+        }
+
+        issis
+    }
+
+    fn write_restart_recovery_cache(path: &str, issis: &BTreeSet<u32>) -> std::io::Result<()> {
+        if let Some(parent) = Path::new(path).parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        let mut body = String::from("# Nexus-BS local subscriber restart recovery cache\n# Auto-managed by MM. One ISSI per line.\n");
+        for issi in issis {
+            body.push_str(&format!("{issi}\n"));
+        }
+
+        let tmp = format!("{path}.tmp");
+        std::fs::write(&tmp, body)?;
+        std::fs::rename(&tmp, path)
+    }
+
+    fn load_restart_recovery_candidates(config: &SharedConfig) -> BTreeSet<u32> {
+        if !config.config().cell.registration {
+            return BTreeSet::new();
+        }
+
+        let mut issis = BTreeSet::new();
+        for issi in &config.config().cell.restart_recovery_issis {
+            if Self::restart_recovery_eligible(config, *issi) {
+                issis.insert(*issi);
+            }
+        }
+
+        if let Some(path) = Self::subscriber_recovery_path(config) {
+            for issi in Self::read_restart_recovery_cache(&path) {
+                if Self::restart_recovery_eligible(config, issi) {
+                    issis.insert(issi);
+                } else {
+                    tracing::warn!(
+                        "MM: restart recovery cache ISSI {} ignored because it is outside local policy/whitelist",
+                        issi
+                    );
+                }
+            }
+        }
+
+        if !issis.is_empty() {
+            tracing::info!("MM: restart recovery armed for {} local ISSI(s): {:?}", issis.len(), issis);
+        }
+
+        issis
+    }
+
+    fn remember_restart_recovery_issi(&mut self, issi: u32) {
+        self.restart_recovery.remove(&issi);
+        if !Self::restart_recovery_eligible(&self.config, issi) {
+            return;
+        }
+        let Some(path) = Self::subscriber_recovery_path(&self.config) else {
+            return;
+        };
+
+        let mut issis = Self::read_restart_recovery_cache(&path);
+        if issis.insert(issi) {
+            if let Err(err) = Self::write_restart_recovery_cache(&path, &issis) {
+                tracing::warn!("MM: failed persisting ISSI {} to restart recovery cache '{}': {}", issi, path, err);
+            }
+        }
+    }
+
+    fn forget_restart_recovery_issi(&mut self, issi: u32) {
+        self.restart_recovery.remove(&issi);
+        let Some(path) = Self::subscriber_recovery_path(&self.config) else {
+            return;
+        };
+
+        let mut issis = Self::read_restart_recovery_cache(&path);
+        if issis.remove(&issi) {
+            if let Err(err) = Self::write_restart_recovery_cache(&path, &issis) {
+                tracing::warn!("MM: failed removing ISSI {} from restart recovery cache '{}': {}", issi, path, err);
+            }
+        }
+    }
+
+    fn tick_restart_recovery(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        if self.restart_recovery.is_empty() || !self.config.config().cell.registration {
+            return;
+        }
+
+        let mut done = Vec::new();
+        for (&issi, probe) in self.restart_recovery.iter_mut() {
+            if self.client_mgr.client_is_known(issi) {
+                done.push(issi);
+                continue;
+            }
+            if !Self::restart_recovery_eligible(&self.config, issi) {
+                done.push(issi);
+                continue;
+            }
+            if probe.attempts >= Self::RESTART_RECOVERY_MAX_ATTEMPTS {
+                tracing::warn!(
+                    "MM: restart recovery for ISSI {} stopped after {} D-LOCATION-UPDATE-COMMAND attempt(s)",
+                    issi,
+                    probe.attempts
+                );
+                done.push(issi);
+                continue;
+            }
+            if ts.diff(probe.next_due) < 0 {
+                continue;
+            }
+
+            tracing::info!(
+                "MM: restart recovery attempt {}/{} for ISSI {} — sending D-LOCATION-UPDATE-COMMAND",
+                probe.attempts + 1,
+                Self::RESTART_RECOVERY_MAX_ATTEMPTS,
+                issi
+            );
+            Self::send_d_location_update_command(queue, issi, 0);
+            probe.attempts = probe.attempts.saturating_add(1);
+            probe.next_due = ts.add_timeslots(Self::RESTART_RECOVERY_RETRY_TIMESLOTS);
+        }
+
+        for issi in done {
+            self.restart_recovery.remove(&issi);
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_backdate_registration_for_test(&mut self, issi: u32, elapsed: std::time::Duration) -> bool {
+        self.client_mgr.debug_backdate_registration_for_test(issi, elapsed)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_expire_registration_grace_for_test(&mut self, issi: u32) -> bool {
+        self.client_mgr.debug_expire_registration_grace_for_test(issi)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_client_energy_for_test(&mut self, issi: u32) -> Option<(EnergySavingMode, Option<u8>, Option<u8>)> {
+        self.client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| (client.energy_saving_mode, client.monitoring_frame, client.monitoring_multiframe))
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_client_tei_for_test(&mut self, issi: u32) -> Option<Option<u64>> {
+        self.client_mgr.get_client_by_issi(issi).map(|client| client.tei)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_begin_swmi_group_transaction_for_test(
+        &mut self,
+        issi: u32,
+        handle: u32,
+        group_identity_downlink: Vec<GroupIdentityDownlink>,
+        detach_all_then_attach: bool,
+    ) -> bool {
+        if !self.client_mgr.client_is_known(issi) {
+            return false;
+        }
+        self.pending_swmi_group_transactions.insert(
+            issi,
+            PendingSwmiGroupTransaction {
+                handle,
+                expires_at: self.dltime.add_timeslots(Self::T353_GROUP_RESPONSE_TIMESLOTS),
+                group_identity_downlink,
+                detach_all_then_attach,
+            },
+        );
+        true
+    }
+
+    fn stay_alive_energy_saving_information() -> EnergySavingInformation {
+        EnergySavingInformation {
+            energy_saving_mode: EnergySavingMode::StayAlive,
+            frame_number: None,
+            multiframe_number: None,
+        }
+    }
+
+    fn set_client_stay_alive(&mut self, issi: u32) {
+        self.pending_energy_saving.remove(&issi);
+        let _ = self.client_mgr.set_client_energy_saving_mode(issi, EnergySavingMode::StayAlive);
+        let _ = self.client_mgr.set_client_monitoring_window(issi, None, None);
+        self.config.state_write().energy_saving.remove(&issi);
+        self.emit_energy_saving_telemetry(issi, EnergySavingMode::StayAlive, None, None);
+    }
+
+    fn emit_energy_saving_telemetry(&self, issi: u32, mode: EnergySavingMode, frame: Option<u8>, multiframe: Option<u8>) {
+        if let Some(sink) = &self.telemetry {
+            sink.send(crate::net_telemetry::TelemetryEvent::MsEnergySaving {
+                issi,
+                mode: mode as u8,
+                frame,
+                multiframe,
+            });
+        }
+    }
+
+    fn configured_energy_saving_mode(&self) -> EnergySavingMode {
+        Self::energy_saving_mode_from_u8(self.config.config().cell.energy_saving_mode)
+    }
+
+    fn select_energy_saving_mode(&self, requested: Option<EnergySavingMode>) -> EnergySavingMode {
+        let configured = self.configured_energy_saving_mode();
+        if requested == Some(EnergySavingMode::StayAlive) {
+            return EnergySavingMode::StayAlive;
+        }
+        configured
+    }
+
+    fn energy_saving_mode_from_u8(mode: u8) -> EnergySavingMode {
+        match mode {
+            1 => EnergySavingMode::Eg1,
+            2 => EnergySavingMode::Eg2,
+            3 => EnergySavingMode::Eg3,
+            4 => EnergySavingMode::Eg4,
+            5 => EnergySavingMode::Eg5,
+            6 => EnergySavingMode::Eg6,
+            7 => EnergySavingMode::Eg7,
+            _ => EnergySavingMode::StayAlive,
+        }
+    }
+
+    fn energy_saving_cycle_uses_frame(mode: EnergySavingMode, start_time: TdmaTime, frame: u8) -> bool {
+        let Some(sleep_frames) = EnergySavingAssignment::sleep_frames(mode as u8) else {
+            return false;
+        };
+        let cycle_frames = sleep_frames as i32 + 1;
+        let start_index = (start_time.m as i32 - 1) * 18 + (start_time.f as i32 - 1);
+        let multiframe_cycle_frames = 18 * 60;
+        let mut offset = 0;
+        while offset < multiframe_cycle_frames {
+            let current_index = (start_index + offset).rem_euclid(multiframe_cycle_frames);
+            if (current_index % 18) + 1 == frame as i32 {
+                return true;
+            }
+            offset += cycle_frames;
+        }
+        false
+    }
+
+    fn allocate_energy_saving_information(&self, issi: u32, mode: EnergySavingMode) -> (EnergySavingInformation, Option<TdmaTime>) {
+        let mode_u8 = mode as u8;
+        let Some(sleep_frames) = EnergySavingAssignment::sleep_frames(mode_u8) else {
+            return (Self::stay_alive_energy_saving_information(), None);
+        };
+
+        let cycle_frames = sleep_frames + 1;
+        let guard_frames = 2 * 18;
+        let spread_frames = (issi % cycle_frames as u32) as i32;
+        let mut start_time = self.dltime.add_timeslots((guard_frames + spread_frames) * 4);
+        let mut attempts = 0;
+        while Self::energy_saving_cycle_uses_frame(mode, start_time, Self::ENERGY_ECONOMY_UNSCHEDULED_SCH_F_FRAME) {
+            // EN 300 392-2 clauses 16.7.1 and 16.10.10 make the ESI frame/MF the
+            // absolute energy economy start point. Clause 23.7.6 derives future
+            // receive frames from it, while clause 23.5.2.2.7 requires the BS to
+            // send where the MS listens. Nexus-BS does not yet advertise full
+            // frame-18 receive support for EG sleep cycles, so choose a valid
+            // start point whose repeating EG cycle does not include frame 18.
+            start_time = start_time.add_timeslots(4);
+            attempts += 1;
+            if attempts >= 18 {
+                tracing::warn!(
+                    "MM: could not allocate frame-18-safe energy economy start for ISSI {} mode {:?}; using StayAlive",
+                    issi,
+                    mode
+                );
+                return (Self::stay_alive_energy_saving_information(), None);
+            }
+        }
+
+        (
+            EnergySavingInformation {
+                energy_saving_mode: mode,
+                frame_number: Some(start_time.f),
+                multiframe_number: Some(start_time.m),
+            },
+            Some(start_time),
+        )
+    }
+
+    fn apply_energy_saving_information(&mut self, issi: u32, esi: &EnergySavingInformation, start_time: Option<TdmaTime>) {
+        // EN 300 392-2 clause 16.7.1 allows energy economy to be allocated in
+        // D-LOCATION UPDATE ACCEPT or negotiated by D/U-CHANGE OF ENERGY
+        // SAVING MODE. A fresh accepted allocation supersedes any older
+        // BS-initiated pending negotiation for the same MS.
+        self.pending_energy_saving.remove(&issi);
+
+        if esi.energy_saving_mode == EnergySavingMode::StayAlive {
+            self.set_client_stay_alive(issi);
+            return;
+        }
+
+        let _ = self.client_mgr.set_client_energy_saving_mode(issi, esi.energy_saving_mode);
+        let _ = self
+            .client_mgr
+            .set_client_monitoring_window(issi, esi.frame_number, esi.multiframe_number);
+
+        let awake_until = start_time.map(|start_time| {
+            let t210_until = self.dltime.add_timeslots(Self::T210_AWAKE_FRAMES * 4);
+            if start_time.diff(t210_until) >= 0 { start_time } else { t210_until }
+        });
+        let existing_suspension_count = self
+            .config
+            .state_read()
+            .energy_saving
+            .get(&issi)
+            .map(|assignment| assignment.suspension_count)
+            .unwrap_or(0);
+
+        self.config.state_write().energy_saving.insert(
+            issi,
+            EnergySavingAssignment {
+                mode: esi.energy_saving_mode as u8,
+                frame: esi.frame_number,
+                multiframe: esi.multiframe_number,
+                awake_until,
+                suspension_count: existing_suspension_count,
+            },
+        );
+        self.emit_energy_saving_telemetry(issi, esi.energy_saving_mode, esi.frame_number, esi.multiframe_number);
+    }
+
+    fn has_active_energy_saving_assignment(&self, issi: u32, mode: EnergySavingMode) -> bool {
+        self.config
+            .state_read()
+            .energy_saving
+            .get(&issi)
+            .copied()
+            .is_some_and(|assignment| assignment.mode == mode as u8 && assignment.is_energy_economy())
+    }
+
+    fn active_energy_saving_assignment(&self, issi: u32) -> Option<EnergySavingAssignment> {
+        self.config
+            .state_read()
+            .energy_saving
+            .get(&issi)
+            .copied()
+            .filter(|assignment| assignment.is_energy_economy())
+    }
+
+    fn restore_energy_saving_assignment(&mut self, issi: u32, assignment: EnergySavingAssignment) {
+        let mode = Self::energy_saving_mode_from_u8(assignment.mode);
+        let _ = self.client_mgr.set_client_energy_saving_mode(issi, mode);
+        let _ = self
+            .client_mgr
+            .set_client_monitoring_window(issi, assignment.frame, assignment.multiframe);
+        self.config.state_write().energy_saving.insert(issi, assignment);
+        self.emit_energy_saving_telemetry(issi, mode, assignment.frame, assignment.multiframe);
+    }
+
+    fn fail_pending_energy_saving_assignment(&mut self, issi: u32, pending: PendingEnergySavingAssignment, reason: &str) {
+        if let Some(previous_active) = pending.previous_active {
+            tracing::warn!(
+                "MM: {} for BS-initiated energy saving assignment to ISSI {}; preserving previous active mode {:?}",
+                reason,
+                issi,
+                Self::energy_saving_mode_from_u8(previous_active.mode)
+            );
+            self.restore_energy_saving_assignment(issi, previous_active);
+        } else {
+            tracing::warn!(
+                "MM: {} for BS-initiated energy saving assignment to ISSI {}; keeping StayAlive",
+                reason,
+                issi
+            );
+            self.set_client_stay_alive(issi);
+        }
+    }
+
+    fn forget_energy_saving(&mut self, issi: u32) {
+        self.pending_energy_saving.remove(&issi);
+        self.config.state_write().energy_saving.remove(&issi);
+    }
+
+    fn expire_pending_energy_saving(&mut self, now: TdmaTime) {
+        let expired: Vec<u32> = self
+            .pending_energy_saving
+            .iter()
+            .filter_map(|(&issi, pending)| if now.diff(pending.expires_at) >= 0 { Some(issi) } else { None })
+            .collect();
+
+        for issi in expired {
+            if let Some(pending) = self.pending_energy_saving.remove(&issi) {
+                self.fail_pending_energy_saving_assignment(issi, pending, "T352 expired");
+            }
+        }
+    }
+
+    fn expire_pending_swmi_group_transactions(&mut self, now: TdmaTime) {
+        let expired: Vec<u32> = self
+            .pending_swmi_group_transactions
+            .iter()
+            .filter_map(|(&issi, pending)| if now.diff(pending.expires_at) >= 0 { Some(issi) } else { None })
+            .collect();
+
+        for issi in expired {
+            if self.pending_swmi_group_transactions.remove(&issi).is_some() {
+                tracing::warn!(
+                    "MM: T353 expired for SwMI-initiated group attach/detach transaction to ISSI {}; discarding pending transaction",
+                    issi
+                );
+            }
+        }
+    }
+
+    fn abandon_pending_swmi_group_transaction(&mut self, issi: u32, reason: &str) {
+        if self.pending_swmi_group_transactions.remove(&issi).is_some() {
+            tracing::debug!(
+                "MM: abandoning pending SwMI-initiated group attach/detach transaction for ISSI {}: {}",
+                issi,
+                reason
+            );
+        }
+    }
+
+    fn push_unique_group(groups: &mut Vec<u32>, gssi: u32) {
+        if !groups.contains(&gssi) {
+            groups.push(gssi);
+        }
+    }
+
+    fn ack_rejects_group_identity(pdu: &UAttachDetachGroupIdentityAcknowledgement, identity: GroupIdentityAddress) -> bool {
+        if !pdu.group_identity_acknowledgement_type {
+            return false;
+        }
+        pdu.group_identity_uplink
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|entry| entry.group_identity_detachment_uplink.is_some() && GroupIdentityAddress::from_uplink(entry) == identity)
+    }
+
+    fn reject_ack_has_rejected_pending_attachment(
+        pending: &PendingSwmiGroupTransaction,
+        pdu: &UAttachDetachGroupIdentityAcknowledgement,
+    ) -> bool {
+        pending.group_identity_downlink.iter().any(|gid| {
+            gid.group_identity_attachment.is_some() && Self::ack_rejects_group_identity(pdu, GroupIdentityAddress::from_downlink(gid))
+        })
+    }
+
+    fn detach_all_groups_for_swmi_transaction(&mut self, issi: u32, deaff_groups: &mut Vec<u32>) -> bool {
+        let prior_groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| client.groups.iter().copied().collect())
+            .unwrap_or_default();
+        match self.client_mgr.client_detach_all_groups(issi) {
+            Ok(_) => {
+                if !prior_groups.is_empty() {
+                    let mut state = self.config.state_write();
+                    for gssi in prior_groups {
+                        state.subscribers.deaffiliate(issi, gssi);
+                        Self::push_unique_group(deaff_groups, gssi);
+                    }
+                }
+                true
+            }
+            Err(e) => {
+                tracing::warn!("MM: failed detach-all for SwMI-initiated group transaction ISSI {}: {:?}", issi, e);
+                false
+            }
+        }
+    }
+
+    fn apply_swmi_group_ack(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        pending: PendingSwmiGroupTransaction,
+        pdu: &UAttachDetachGroupIdentityAcknowledgement,
+    ) {
+        let mut aff_groups = Vec::new();
+        let mut deaff_groups = Vec::new();
+
+        if pending.detach_all_then_attach && !self.detach_all_groups_for_swmi_transaction(issi, &mut deaff_groups) {
+            return;
+        }
+
+        for gid in &pending.group_identity_downlink {
+            let identity = GroupIdentityAddress::from_downlink(gid);
+            let Some(gssi) = identity.plain_gssi() else {
+                tracing::warn!(
+                    "MM: SwMI group ACK transaction for ISSI {} contains unsupported non-GSSI group identity {:?}; local affiliation unchanged",
+                    issi,
+                    gid
+                );
+                continue;
+            };
+
+            if gid.group_identity_detachment_uplink.is_some() {
+                // EN 300 392-2 Annex G: an MS cannot reject a SwMI requested
+                // detachment. Apply detachment regardless of ACK type/list.
+                match self.client_mgr.client_group_attach(issi, gssi, false) {
+                    Ok(changed) => {
+                        if changed {
+                            self.config.state_write().subscribers.deaffiliate(issi, gssi);
+                            Self::push_unique_group(&mut deaff_groups, gssi);
+                        }
+                    }
+                    Err(e) => tracing::warn!("MM: failed SwMI-requested group detach ISSI {} GSSI {}: {:?}", issi, gssi, e),
+                }
+                continue;
+            }
+
+            if let Some(attachment) = &gid.group_identity_attachment {
+                if Self::ack_rejects_group_identity(pdu, identity) {
+                    tracing::debug!(
+                        "MM: MS {} explicitly rejected SwMI-requested group attachment to GSSI {}",
+                        issi,
+                        gssi
+                    );
+                    continue;
+                }
+                let attachment_info = GroupAttachmentInfo {
+                    group_identity_attachment_lifetime: attachment.group_identity_attachment_lifetime,
+                    class_of_usage: attachment.class_of_usage,
+                };
+                match self.client_mgr.client_group_attach_with_info(issi, gssi, true, attachment_info) {
+                    Ok(changed) => {
+                        if changed {
+                            self.config.state_write().subscribers.affiliate(issi, gssi);
+                            Self::push_unique_group(&mut aff_groups, gssi);
+                        }
+                    }
+                    Err(e) => tracing::warn!("MM: failed SwMI-requested group attach ISSI {} GSSI {}: {:?}", issi, gssi, e),
+                }
+            }
+        }
+
+        if !deaff_groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
+        }
+        if !aff_groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
+        }
+    }
+
+    fn restore_shared_subscriber_state_for_reported_groups(&mut self, queue: &mut MessageQueue, issi: u32, groups: &[u32]) {
+        let (needs_register, missing_groups) = {
+            let state = self.config.state_read();
+            let needs_register = !state.subscribers.is_registered(issi);
+            let missing_groups = groups
+                .iter()
+                .copied()
+                .filter(|gssi| !state.subscribers.group_members(*gssi).contains(&issi))
+                .collect::<Vec<u32>>();
+            (needs_register, missing_groups)
+        };
+
+        if !needs_register && missing_groups.is_empty() {
+            return;
+        }
+
+        {
+            let mut state = self.config.state_write();
+            if needs_register {
+                state.subscribers.register(issi);
+            }
+            for gssi in &missing_groups {
+                state.subscribers.affiliate(issi, *gssi);
+            }
+        }
+
+        // EN 300 392-2 clauses 16.8.0 and 16.8.4 make reported downlink
+        // group identities valid attached identities. Keep the local routing
+        // registry coherent with any groups MM advertises back to the MS.
+        if needs_register {
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
+        }
+        if !missing_groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, missing_groups, BrewSubscriberAction::Affiliate);
+        }
+    }
+
+    fn restore_shared_subscriber_registration_for_known_client(&mut self, queue: &mut MessageQueue, issi: u32) -> bool {
+        if self.config.state_read().subscribers.is_registered(issi) {
+            return false;
+        }
+        if !self.client_mgr.client_is_known(issi) {
+            return false;
+        }
+
+        self.config.state_write().subscribers.register(issi);
+
+        // EN 300 392-2 clauses 16.4.3 and 16.8.2 define standalone group
+        // attach/detach as an MM procedure for an attached MS. Clause 16.9.2.8
+        // lets this local watchdog ask for re-registration with
+        // D-LOCATION-UPDATE-COMMAND, but while the known client is still in the
+        // grace window the shared routing registry must be restored before any
+        // accepted group affiliation is advertised.
+        self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
+        true
+    }
+
+    fn parse_u_mm_status_energy_saving_mode(pdu: &UMmStatus, issi: u32) -> Option<EnergySavingMode> {
+        let Some(dep_info) = pdu.status_uplink_dependent_information else {
+            tracing::warn!(
+                "MM: malformed {:?} from ISSI {}: missing energy saving mode",
+                pdu.status_uplink,
+                issi
+            );
+            return None;
+        };
+        let dep_len = pdu.status_uplink_dependent_information_len.unwrap_or(0);
+        if dep_len < 3 {
+            tracing::warn!(
+                "MM: malformed {:?} from ISSI {}: energy saving mode is {} bits, expected at least 3",
+                pdu.status_uplink,
+                issi,
+                dep_len
+            );
+            return None;
+        }
+
+        let mode_val = dep_info >> (dep_len - 3);
+        let mode = match EnergySavingMode::try_from(mode_val) {
+            Ok(mode) => mode,
+            Err(_) => {
+                tracing::warn!(
+                    "MM: malformed {:?} from ISSI {}: invalid energy saving mode {}",
+                    pdu.status_uplink,
+                    issi,
+                    mode_val
+                );
+                return None;
+            }
+        };
+
+        let trailing_len = dep_len - 3;
+        if trailing_len == 0 {
+            return Some(mode);
+        }
+
+        let trailing_mask = if trailing_len == 64 { u64::MAX } else { (1u64 << trailing_len) - 1 };
+        let trailing = dep_info & trailing_mask;
+        let mut trailing_buf = BitBuffer::new_autoexpand(trailing_len);
+        trailing_buf.write_bits(trailing, trailing_len);
+        trailing_buf.seek(0);
+
+        // EN 300 392-2 tables 16.20/16.21 define the dependent data as the
+        // mandatory 3-bit energy saving mode followed only by optional uplink
+        // Type 3 Proprietary. A lone zero m-bit is accepted as "no Type 3 IE".
+        let proprietary = match typed::parse_type3_generic(true, &mut trailing_buf, MmType34ElemIdUl::Proprietary) {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(
+                    "MM: malformed {:?} from ISSI {}: invalid trailing Type 3 proprietary data after energy saving mode: {:?}",
+                    pdu.status_uplink,
+                    issi,
+                    err
+                );
+                return None;
+            }
+        };
+        match delimiters::read_mbit(&mut trailing_buf) {
+            Ok(false) if trailing_buf.get_len_remaining() == 0 => Some(mode),
+            Ok(false) => {
+                tracing::warn!(
+                    "MM: malformed {:?} from ISSI {}: {} extra bit(s) after Type 3 proprietary terminator",
+                    pdu.status_uplink,
+                    issi,
+                    trailing_buf.get_len_remaining()
+                );
+                None
+            }
+            Ok(true) => {
+                tracing::warn!(
+                    "MM: malformed {:?} from ISSI {}: unsupported trailing Type 3 IE after energy saving mode (only proprietary is supported); parsed proprietary={}",
+                    pdu.status_uplink,
+                    issi,
+                    proprietary.is_some()
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "MM: malformed {:?} from ISSI {}: missing Type 3 terminator after energy saving mode: {:?}",
+                    pdu.status_uplink,
+                    issi,
+                    err
+                );
+                None
+            }
+        }
+    }
+
+    /// Force CMCE to release any individual P2P calls involving the given ISSI,
+    /// without touching Brew affiliations. Used on soft re-attach (e.g. MTP3550
+    /// 2s RF dropout) to prevent "PTT denied" caused by stale call state in CMCE.
+    ///
+    /// Implementation: sends Deregister to CMCE only (not Brew), then re-sends
+    /// Register + Affiliate so subscriber_groups and group_listener counts are
+    /// restored. Brew is not informed because the MS is still considered registered.
+    fn emit_individual_call_release_for_issi(&mut self, queue: &mut MessageQueue, issi: u32) {
+        let groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|c| c.groups.iter().copied().collect())
+            .unwrap_or_default();
+
+        // CMCE Deregister: releases individual_calls + drops group_listener counts
+        let dereg = MmSubscriberUpdate {
+            issi,
+            groups: Vec::new(),
+            action: BrewSubscriberAction::Deregister,
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(dereg),
+        });
+
+        // CMCE Register: re-introduces the ISSI as known
+        let reg = MmSubscriberUpdate {
+            issi,
+            groups: Vec::new(),
+            action: BrewSubscriberAction::Register,
+        };
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(reg),
+        });
+
+        // CMCE Affiliate: restores group_listener counts so group calls still route
+        if !groups.is_empty() {
+            let aff = MmSubscriberUpdate {
+                issi,
+                groups,
+                action: BrewSubscriberAction::Affiliate,
+            };
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::MmSubscriberUpdate(aff),
+            });
+        }
+
+        tracing::info!("MM: forced individual call release for ISSI {} (soft re-attach)", issi);
+    }
+
+    fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
+        // If brew is active, forward subscriber updates to the Brew entity.
+        // Register/Deregister must always be sent for brew-routable ISSIs,
+        // even when there are no group affiliations yet. The Brew worker
+        // decides whether to send REGISTER or REREGISTER based on its own state.
+        // Affiliate/Deaffiliate only sent when there are brew-routable groups.
+        if net_brew::is_active(&self.config) {
+            let brew_groups = groups
+                .iter()
+                .filter(|gssi| net_brew::is_brew_gssi_routable(&self.config, **gssi))
+                .copied()
+                .collect::<Vec<u32>>();
+            let should_send = match action {
+                BrewSubscriberAction::Register | BrewSubscriberAction::Deregister => net_brew::is_brew_issi_routable(&self.config, issi),
+                BrewSubscriberAction::Affiliate | BrewSubscriberAction::Deaffiliate => !brew_groups.is_empty(),
+            };
+            if should_send {
+                let brew_update = MmSubscriberUpdate {
+                    issi,
+                    groups: brew_groups,
+                    action,
+                };
+                let msg = SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Mm,
+                    dest: TetraEntity::Brew,
+                    msg: SapMsgInner::MmSubscriberUpdate(brew_update),
+                };
+                queue.push_back(msg);
+            }
+        }
+
+        // Always emit an update to the Cmce entity
+        let mm_update = MmSubscriberUpdate { issi, groups, action };
+        let msg = SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(mm_update),
+        };
+        queue.push_back(msg);
+    }
+
+    fn rx_u_itsi_detach(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_u_itsi_detach");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let pdu = match UItsiDetach::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing UItsiDetach: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        // Check if we can satisfy this request, print unsupported stuff
+        if !Self::feature_check_u_itsi_detach(&pdu) {
+            tracing::error!("Unsupported critical features in UItsiDetach");
+            return;
+        }
+
+        let ssi = prim.received_address.ssi;
+        self.abandon_pending_swmi_group_transaction(
+            ssi,
+            "U-ITSI DETACH terminates the registered MM context before any pending SwMI group ACK",
+        );
+        self.forget_restart_recovery_issi(ssi);
+        let detached_client = self.client_mgr.remove_client(ssi);
+        if let Some(client) = detached_client {
+            self.forget_energy_saving(ssi);
+            self.config.state_write().subscribers.deregister(ssi);
+            if !client.groups.is_empty() {
+                let groups: Vec<u32> = client.groups.iter().copied().collect();
+                self.emit_subscriber_update(_queue, ssi, groups, BrewSubscriberAction::Deaffiliate);
+            }
+            self.emit_subscriber_update(_queue, ssi, Vec::new(), BrewSubscriberAction::Deregister);
+        } else {
+            tracing::warn!("Received UItsiDetach for unknown client with SSI: {}", ssi);
+            // return;
+        };
+    }
+
+    fn rx_u_location_update_demand(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_location_update_demand");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let pdu = match ULocationUpdateDemand::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing ULocationUpdateDemand: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        if let Some(pdu_ssi) = pdu.ssi
+            && pdu_ssi != prim.received_address.ssi as u64
+        {
+            tracing::warn!(
+                "MM: U-LOCATION UPDATE DEMAND SSI {} does not match received L2 address {}; rejecting",
+                pdu_ssi,
+                prim.received_address.ssi
+            );
+            Self::send_d_location_update_reject_cause(
+                queue,
+                prim.received_address.ssi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                RejectCause::MessageConsistencyError,
+            );
+            return;
+        }
+
+        if let Some(pdu_mni) = pdu.address_extension {
+            let expected_mni = self.expected_ms_mni();
+            if pdu_mni != expected_mni {
+                tracing::warn!(
+                    "MM: U-LOCATION UPDATE DEMAND MNI {} does not match configured network MNI {}; rejecting",
+                    pdu_mni,
+                    expected_mni
+                );
+                Self::send_d_location_update_reject_cause(
+                    queue,
+                    prim.received_address.ssi,
+                    prim.handle,
+                    pdu.location_update_type,
+                    pdu.address_extension,
+                    RejectCause::MessageConsistencyError,
+                );
+                return;
+            }
+        }
+
+        self.abandon_pending_swmi_group_transaction(
+            prim.received_address.ssi,
+            "U-LOCATION UPDATE DEMAND overrides pending group attach/detach procedure",
+        );
+
+        // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
+        // D-LOCATION-UPDATE-PROCEEDING which we don't implement. Reject with cause
+        // "Migration not supported" (12, Table 16.81) so the MS can act on it.
+        if pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
+            || pdu.location_update_type == LocationUpdateType::ServiceRestorationMigratingLocationUpdating
+        {
+            // Terminal wants to migrate to another network (e.g. SmartConnect).
+            // We don't implement D-LOCATION-UPDATE-PROCEEDING identity exchange (ETSI §16.4.1.1 case b),
+            // so we can't accept migration formally. But we MUST release the terminal from Brew
+            // so the destination network can register it without identity conflict.
+            // Send REJECT so terminal knows to try the other network, but first deregister from Brew.
+            let issi = prim.received_address.ssi;
+            tracing::info!("MM: ISSI {} migrating to another network — releasing from Brew", issi);
+            self.forget_restart_recovery_issi(issi);
+            let detached = self.client_mgr.remove_client(issi);
+            if let Some(client) = detached {
+                self.set_client_stay_alive(issi);
+                self.config.state_write().subscribers.deregister(issi);
+                if !client.groups.is_empty() {
+                    let groups: Vec<u32> = client.groups.iter().copied().collect();
+                    self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+                }
+                self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+            }
+            Self::send_d_location_update_reject_cause(
+                queue,
+                issi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                RejectCause::MigrationNotSupported,
+            );
+            return;
+        }
+
+        if pdu.location_update_type == LocationUpdateType::DisabledMsUpdating {
+            // EN 300 392-2 clause 16.9.3.4 defines U-LOCATION UPDATE DEMAND as
+            // answered by D-LOCATION UPDATE ACCEPT/REJECT. This SwMI does not
+            // support disabled MS updating, so preserve the requested LU type in
+            // the reject instead of silently dropping the procedure.
+            Self::send_d_location_update_reject_cause(
+                queue,
+                prim.received_address.ssi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                RejectCause::ServiceNotSubscribed,
+            );
+            return;
+        }
+
+        // Check if we can satisfy this request, print unsupported stuff
+        if let Some(reject_cause) = Self::reject_cause_for_unsupported_u_location_update_demand(&pdu) {
+            tracing::error!(
+                "Unsupported critical features in ULocationUpdateDemand; rejecting with {}",
+                reject_cause
+            );
+            Self::send_d_location_update_reject_cause(
+                queue,
+                prim.received_address.ssi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                reject_cause,
+            );
+            return;
+        }
+
+        let configured_esm = self.configured_energy_saving_mode();
+        let energy_saving_assignment = if pdu.energy_saving_mode.is_some() || configured_esm == EnergySavingMode::StayAlive {
+            let allocated_esm = self.select_energy_saving_mode(pdu.energy_saving_mode);
+            let (esi, start_time) = self.allocate_energy_saving_information(prim.received_address.ssi, allocated_esm);
+            if pdu.energy_saving_mode != Some(allocated_esm) {
+                tracing::info!(
+                    "MS {} requested energy saving mode {:?}; allocating {:?}",
+                    prim.received_address.ssi,
+                    pdu.energy_saving_mode,
+                    allocated_esm
+                );
+            }
+            Some((esi, start_time))
+        } else {
+            None
+        };
+
+        // Try to register the client
+        let issi = prim.received_address.ssi;
+        let handle = prim.handle;
+
+        // ISSI whitelist check — reject if whitelist is non-empty and ISSI not in it.
+        // The dashboard can override the config whitelist at runtime (state override takes
+        // precedence so edits apply without a restart); fall back to the config value when
+        // no override is set. An empty list (in either place) means "open network".
+        let issi_allowed = {
+            let state = self.config.state_read();
+            match &state.issi_whitelist_override {
+                Some(list) => list.is_empty() || list.contains(&issi),
+                None => self.config.config().security.is_issi_allowed(issi),
+            }
+        };
+        if !issi_allowed {
+            tracing::warn!("MM: ISSI {} not in whitelist, rejecting registration", issi);
+            Self::send_d_location_update_reject_cause(
+                queue,
+                issi,
+                handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                RejectCause::ServiceNotSubscribed,
+            );
+            return;
+        }
+
+        let was_pending = self.client_mgr.is_pending_command(issi);
+        let is_new = !self.client_mgr.client_is_known(issi);
+        let mut soft_reattach_cmce_reset = false;
+        if !is_new {
+            // MS is re-registering while already known. Three cases:
+            //
+            // A) RoamingLocationUpdating — MS re-registered from scratch (RF loss / reboot /
+            //    power-cycle, no prior U-ITSI-DETACH). Clean up stale state so CMCE releases
+            //    any ghost calls and group_listeners stays accurate.
+            //
+            // B) PeriodicLocationUpdating — healthy MS renewing the local watchdog. No cleanup.
+            //
+            // C) DemandLocationUpdating — MS responding to our D-LOCATION-UPDATE-COMMAND.
+            //    This is the second message in the normal registration flow; the first message
+            //    already registered+affiliated the MS. Do NOT clean up here.
+            let needs_cleanup = if pdu.location_update_type == LocationUpdateType::RoamingLocationUpdating
+                || pdu.location_update_type == LocationUpdateType::ServiceRestorationRoamingLocationUpdating
+            {
+                // Some terminals (e.g. Sepura) send RoamingLocationUpdating after every PTT
+                // release, not just on power-cycle or RF loss. If we treat this as a full reboot
+                // and do deregister→register, CMCE has a brief window where it doesn't know the
+                // terminal — a PTT press in that window gets "no listeners" and the terminal
+                // interprets it as a network error and fully disconnects.
+                //
+                // Heuristic: treat RoamingLocationUpdating as a soft re-attach (no cleanup) if
+                // the terminal registered less than 120 seconds ago.
+                let recently_registered = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|c| c.last_registration_time.elapsed().as_secs() < 120)
+                    .unwrap_or(false);
+                if recently_registered {
+                    tracing::debug!(
+                        "MM: ISSI {} RoamingLocationUpdating within 120s of last register — treating as soft re-attach (Sepura post-PTT)",
+                        issi
+                    );
+                    // Even on soft re-attach, force CMCE to release any individual P2P calls
+                    // involving this ISSI. Terminals (e.g. Motorola MTP3550) that drop RF for
+                    // 2s and re-attach lose call state but BS keeps the call alive — next PTT
+                    // is rejected ("PTT denied") because the terminal doesn't recognize the call_id
+                    // in our D-TX-GRANTED. Releasing the individual call here forces a clean U-SETUP
+                    // on the next PTT.
+                    self.emit_individual_call_release_for_issi(queue, issi);
+                    soft_reattach_cmce_reset = true;
+                    false
+                } else {
+                    true
+                }
+            } else {
+                false
+            };
+
+            // needs_cleanup: Roaming = MS rebooted, need CMCE reset
+            // was_pending: local watchdog expired, we already sent Deregister to Brew — just re-register
+            if needs_cleanup {
+                let old_groups: Vec<u32> = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|c| c.groups.iter().copied().collect())
+                    .unwrap_or_default();
+                if !old_groups.is_empty() {
+                    self.emit_subscriber_update(queue, issi, old_groups, BrewSubscriberAction::Deaffiliate);
+                }
+                if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
+                    tracing::warn!("Failed clearing stale groups for re-registering MS {}: {:?}", issi, e);
+                }
+                // EN 300 392-2 clauses 16.4.1.1/16.7.1: a hard
+                // RoamingLocationUpdating re-registration establishes fresh
+                // accepted MM state. Reset shared routing/EG state alongside
+                // client_mgr so stale GSSI listeners or active EG assignment
+                // cannot survive into the new registration.
+                self.set_client_stay_alive(issi);
+                self.config.state_write().subscribers.register(issi);
+                self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+                self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
+            } else if was_pending {
+                // Local-watchdog re-registration: Brew already got Deregister — just re-register
+                // CMCE gets a fresh affiliate when groups are processed below.
+                // EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4 make the
+                // DemandLocationUpdating response a location-registration
+                // update; if we accept it, the shared subscriber registry
+                // must exist before group identity processing can affiliate it.
+                tracing::info!("MM: ISSI {} re-registered after local periodic-registration command", issi);
+                self.config.state_write().subscribers.register(issi);
+            }
+            // Always reset the registration timer on any re-registration
+            self.client_mgr.reset_registration_timer(issi);
+        }
+        // Determine if we need to emit Register toward Brew.
+        // We do this when:
+        //   A) Terminal is genuinely new (never seen before).
+        //   B) Terminal is known but re-attaching via ItsiAttach — migrated from another network.
+        //   C) Terminal is known but had pending_command_sent=true — local watchdog expired, we sent COMMAND
+        //      and deregistered from Brew. Now terminal is back, re-register.
+        let is_itsi_attach = pdu.location_update_type == LocationUpdateType::ItsiAttach;
+        let needs_brew_register = is_new || (!is_new && is_itsi_attach) || (!is_new && was_pending);
+
+        if is_new {
+            match self.client_mgr.try_register_client(issi, true) {
+                Ok(_) => {
+                    self.config.state_write().subscribers.register(issi);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed registering roaming MS {}: {:?}", issi, e);
+                    return;
+                }
+            }
+        } else if let Err(e) = self.client_mgr.set_client_state(issi, MmClientState::Attached) {
+            tracing::warn!("Failed updating roaming MS {}: {:?}", issi, e);
+            return;
+        }
+        if needs_brew_register {
+            if !is_new {
+                tracing::info!(
+                    "MM: ISSI {} re-attaching via ItsiAttach (returned from another network) — re-registering in Brew",
+                    issi
+                );
+            }
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
+        }
+
+        // Always update the last known L2 handle so we can send downlink PDUs later
+        // (e.g. D-LOCATION-UPDATE-COMMAND after Brew reconnection).
+        self.client_mgr.set_client_handle(issi, handle);
+
+        let mut post_attach_energy_saving_request = None;
+        let mut esi_for_accept = None;
+        if let Some((ref esi, start_time)) = energy_saving_assignment {
+            self.apply_energy_saving_information(issi, esi, start_time);
+            esi_for_accept = Some(esi.clone());
+        } else if configured_esm != EnergySavingMode::StayAlive {
+            if self.has_active_energy_saving_assignment(issi, configured_esm) {
+                // EN 300 392-2 clause 16.7.1 permits the BS to change or
+                // allocate an MS energy economy mode with D-MM STATUS. If the
+                // same valid mode is already active, avoid a redundant
+                // allocation request and a fresh T352 window that could later
+                // clear a working assignment.
+                tracing::debug!(
+                    "MM: ISSI {} already has active {:?} assignment; not sending duplicate D-CHANGE OF ENERGY SAVING MODE REQUEST",
+                    issi,
+                    configured_esm
+                );
+            } else {
+                let previous_active = self.active_energy_saving_assignment(issi);
+                let (esi, start_time) = self.allocate_energy_saving_information(issi, configured_esm);
+                self.pending_energy_saving.insert(
+                    issi,
+                    PendingEnergySavingAssignment {
+                        esi: esi.clone(),
+                        start_time,
+                        expires_at: self.dltime.add_timeslots(Self::T352_ENERGY_RESPONSE_TIMESLOTS),
+                        previous_active,
+                    },
+                );
+                post_attach_energy_saving_request = Some(esi);
+            }
+        } else {
+            self.set_client_stay_alive(issi);
+        }
+
+        let group_report_complete = Self::group_report_response_is_complete(&pdu);
+
+        // Process optional GroupIdentityLocationDemand field
+        let _has_groups = pdu.group_identity_location_demand.is_some();
+        let gila = if let Some(gild) = pdu.group_identity_location_demand {
+            let giu_for_mode = gild
+                .group_identity_uplink
+                .as_ref()
+                .map(|giu| Self::group_identity_uplink_for_mode(gild.group_identity_attach_detach_mode == 1, giu));
+            let over_ack_cap = giu_for_mode
+                .as_ref()
+                .is_some_and(|giu| self.group_identity_uplink_exceeds_ack_capacity(issi, giu.len()));
+
+            let group_result = if over_ack_cap {
+                Some(GroupIdentityProcessResult {
+                    group_identity_downlink: giu_for_mode
+                        .as_ref()
+                        .map(|giu| Self::rejected_group_identity_downlinks(giu))
+                        .unwrap_or_default(),
+                    all_accepted: false,
+                })
+            } else {
+                // ETSI Table 16.49 (clause 16.10.17): mode=1 means "detach all currently
+                // attached group identities and attach group identities defined in the
+                // group identity uplink element." Apply that mutation only after the
+                // request has passed local ACK-capacity validation, otherwise Annex G
+                // cannot be represented coherently and the procedure remains unchanged.
+                if gild.group_identity_attach_detach_mode == 1 {
+                    let prior_groups: Vec<u32> = self
+                        .client_mgr
+                        .get_client_by_issi(issi)
+                        .map(|client| client.groups.iter().copied().collect())
+                        .unwrap_or_default();
+                    if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
+                        tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
+                    } else if !prior_groups.is_empty() {
+                        {
+                            let mut state = self.config.state_write();
+                            for &gssi in &prior_groups {
+                                state.subscribers.deaffiliate(issi, gssi);
+                            }
+                        }
+                        self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                    }
+                }
+
+                giu_for_mode.as_ref().map(|giu| self.try_attach_detach_groups(queue, issi, giu))
+            };
+
+            let group_identity_accept_reject = group_result
+                .as_ref()
+                .map(|result| if result.all_accepted { 0 } else { 1 })
+                .unwrap_or(0);
+            let group_identity_downlink = group_result.and_then(|result| {
+                if result.group_identity_downlink.is_empty() {
+                    None
+                } else {
+                    Some(result.group_identity_downlink)
+                }
+            });
+            let gila = GroupIdentityLocationAccept {
+                group_identity_accept_reject,
+                group_identity_downlink,
+            };
+
+            Some(gila)
+        } else if group_report_complete {
+            // EN 300 392-2 clauses 16.4.3 and 16.10.27a: when the SwMI
+            // requested a group report and the MS has no attached groups, it
+            // answers with "group report complete". Treat that as a real empty
+            // group report: clear stale affiliations and do not re-affiliate
+            // from the local coverage-return cache.
+            let prior_groups: Vec<u32> = self
+                .client_mgr
+                .get_client_by_issi(issi)
+                .map(|client| client.groups.iter().copied().collect())
+                .unwrap_or_default();
+            if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
+                tracing::warn!("Failed clearing groups for group-report-complete MS {}: {:?}", issi, e);
+            } else if !prior_groups.is_empty() {
+                {
+                    let mut state = self.config.state_write();
+                    for &gssi in &prior_groups {
+                        state.subscribers.deaffiliate(issi, gssi);
+                    }
+                }
+                self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+            }
+            None
+        } else {
+            None
+        };
+
+        // Coverage-return re-affiliation (fixes "PTT no longer works after leaving and
+        // returning to coverage", workaround = DMO→TMO).
+        //
+        // Sequence that breaks PTT:
+        //   1. MS affiliates to a GSSI → CMCE group_listeners[gssi] += 1. PTT works.
+        //   2. MS leaves coverage; local BS watchdog expires and emits Deregister to CMCE, which
+        //      does dec_group_listener() → the GSSI now has 0 listeners.
+        //   3. MS returns. Because we hand out attachment_lifetime=0 (persistent), the MS
+        //      believes it is still affiliated and sends a plain location update WITHOUT a
+        //      group identity report.
+        //   4. MM re-registers the MS but never re-affiliates the groups → CMCE still has
+        //      0 listeners for the GSSI → the next PTT is rejected with "no listeners"
+        //      ("please wait" on the radio). DMO→TMO forces an ItsiAttach with a full group
+        //      report, which is why that clears it.
+        //
+        // Fix: when a *known* MS re-registers without supplying a group report, but we
+        // still hold groups for it in client_mgr, re-emit Affiliate for those groups so
+        // CMCE's group_listeners (and Brew) are resynced with what the MS believes.
+        if !soft_reattach_cmce_reset && !is_new && !_has_groups && !group_report_complete {
+            let stored_groups: Vec<u32> = self
+                .client_mgr
+                .get_client_by_issi(issi)
+                .map(|c| c.groups.iter().copied().collect())
+                .unwrap_or_default();
+            if !stored_groups.is_empty() {
+                tracing::info!(
+                    "MM: ISSI {} re-registered without group report but has {} stored group(s) {:?} — re-affiliating to resync CMCE/Brew (coverage-return fix)",
+                    issi,
+                    stored_groups.len(),
+                    stored_groups
+                );
+                {
+                    let mut state = self.config.state_write();
+                    for &gssi in &stored_groups {
+                        state.subscribers.affiliate(issi, gssi);
+                    }
+                }
+                self.emit_subscriber_update(queue, issi, stored_groups, BrewSubscriberAction::Affiliate);
+            }
+        }
+
+        // Store and log class_of_ms
+        if let Some(ref class) = pdu.class_of_ms {
+            tracing::info!("MS {} class_of_ms: {}", issi, class);
+        }
+        // Per ETSI EN 300 392-2 clauses 16.10.46 and 16.10.8: if the MS
+        // signals clch_needed=true or common_scch=true, include the 6-bit
+        // SCCH information + distribution-on-18th-frame IE. This stack uses
+        // MS SCCH allocation 0 and frame-18 distribution 00 = time slot 1,
+        // matching the MCCH/control slot used here.
+        let scch_info = pdu
+            .class_of_ms
+            .as_ref()
+            .and_then(|c| if c.clch_needed || c.common_scch { Some(0x00u64) } else { None });
+
+        let _ = self.client_mgr.set_client_class_of_ms(issi, pdu.class_of_ms);
+
+        // Reset periodic registration timer on every successful registration.
+        self.client_mgr.reset_registration_timer(issi);
+
+        // EN 300 392-2 clause 16.10.35a: Location update accept type is a DL
+        // IE with different names for raw values 1 and 5. Preserve the raw
+        // registration type for the supported accepted requests.
+        let Some(accept_type) = Self::location_update_accept_type_for(pdu.location_update_type) else {
+            tracing::error!(
+                "BUG: unsupported location update type reached ACCEPT path: {}",
+                pdu.location_update_type
+            );
+            return;
+        };
+
+        // Build D-LOCATION UPDATE ACCEPT pdu
+        let pdu_response = DLocationUpdateAccept {
+            location_update_accept_type: accept_type,
+            ssi: Some(issi as u64),
+            address_extension: None,
+            subscriber_class: None,
+            energy_saving_information: esi_for_accept,
+            scch_information_and_distribution_on_18th_frame: scch_info,
+            new_registered_area: None,
+            security_downlink: None,
+            group_identity_location_accept: gila,
+            default_group_attachment_lifetime: None,
+            authentication_downlink: None,
+            group_identity_security_related_information: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+
+        // Convert pdu to bits
+        let pdu_len = 4 + 3 + 24 + 1 + 1 + 1; // Minimal lenght; may expand beyond this.
+        let mut sdu = BitBuffer::new_autoexpand(pdu_len);
+        pdu_response.to_bitbuf(&mut sdu).unwrap(); // we want to know when this happens
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu_response, sdu.dump_bin());
+
+        // Build and submit response prim
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: prim.handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+        self.remember_restart_recovery_issi(issi);
+
+        if let Some(esi) = post_attach_energy_saving_request {
+            tracing::info!(
+                "MM: allocating energy saving mode {:?} to ISSI {} after registration",
+                esi.energy_saving_mode,
+                issi
+            );
+            Self::send_d_mm_status_energy_saving_request(queue, issi, prim.handle, esi);
+        }
+
+        // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI + group
+        // identity report) ONLY for a genuinely new (unknown) radio that didn't ITSI-attach
+        // and didn't already include a group report.
+        //
+        // This mirrors the legacy upstream behaviour and is deliberately narrow:
+        //  - A new radio doing RoamingLocationUpdating without groups gets exactly one
+        //    COMMAND so it re-registers with its group list.
+        //  - A radio we ALREADY know never gets a COMMAND here. This is critical for
+        //    receive-only devices like the Motorola TPG2200 pager, which never report any
+        //    talkgroups: keying COMMAND at them on every update made them answer with yet
+        //    another group-less RoamingLocationUpdating, producing an endless COMMAND loop
+        //    and a permanent "Unit Not Attached" that even a kick couldn't clear (regression
+        //    fixed here).
+        //  - Motorola handsets (MTM800/MXP600) that answer a COMMAND with another
+        //    RoamingLocationUpdating are now known on that second update, so they get no
+        //    further COMMAND and can't loop.
+        let has_groups = _has_groups || group_report_complete;
+        if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach && !has_groups {
+            tracing::info!("Sending D-LOCATION UPDATE COMMAND to returning MS {} to request group report", issi);
+            Self::send_d_location_update_command(queue, issi, handle);
+        }
+    }
+
+    fn rx_u_mm_status(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_u_mm_status");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let pdu = match UMmStatus::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing UMmStatus: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        let issi = prim.received_address.ssi;
+        let handle = prim.handle;
+        if matches!(
+            pdu.status_uplink,
+            StatusUplink::ChangeOfEnergySavingModeRequest | StatusUplink::ChangeOfEnergySavingModeResponse
+        ) && !self.client_mgr.client_is_known(issi)
+        {
+            tracing::warn!(
+                "MM: ignoring {:?} from unknown ISSI {}; energy economy requires registered MM state",
+                pdu.status_uplink,
+                issi
+            );
+            return;
+        }
+
+        let mut handled = false;
+        match pdu.status_uplink {
+            StatusUplink::ChangeOfEnergySavingModeRequest => {
+                let Some(requested_esm) = Self::parse_u_mm_status_energy_saving_mode(&pdu, issi) else {
+                    return;
+                };
+
+                let allocated_esm = self.select_energy_saving_mode(Some(requested_esm));
+                if requested_esm != allocated_esm {
+                    tracing::info!(
+                        "MS {} requested energy saving mode change to {:?}; allocating {:?}",
+                        issi,
+                        requested_esm,
+                        allocated_esm
+                    );
+                } else {
+                    tracing::info!("MS {} energy saving mode change request: {:?}", issi, requested_esm);
+                }
+
+                let (esi, start_time) = self.allocate_energy_saving_information(issi, allocated_esm);
+                self.apply_energy_saving_information(issi, &esi, start_time);
+                Self::send_d_mm_status_energy_saving(queue, issi, handle, esi);
+                handled = true;
+            }
+            StatusUplink::ChangeOfEnergySavingModeResponse => {
+                // MS confirming a BS-initiated change
+                let Some(esm) = Self::parse_u_mm_status_energy_saving_mode(&pdu, issi) else {
+                    return;
+                };
+
+                let pending = self.pending_energy_saving.remove(&issi);
+                match pending {
+                    Some(_pending) if esm == EnergySavingMode::StayAlive => {
+                        // EN 300 392-2 clause 16.7.1 permits the MS response
+                        // to a BS-initiated energy economy change to reject the
+                        // requested EG by returning StayAlive. Honour that as a
+                        // valid rejection instead of treating it as a generic
+                        // mismatch that could restore an older EG assignment.
+                        tracing::info!("MS {} rejected BS-initiated energy saving change with StayAlive", issi);
+                        self.set_client_stay_alive(issi);
+                    }
+                    Some(pending) if pending.esi.energy_saving_mode == esm => {
+                        tracing::info!("MS {} accepted energy saving mode {:?}", issi, esm);
+                        if esm == EnergySavingMode::StayAlive {
+                            self.set_client_stay_alive(issi);
+                        } else {
+                            self.apply_energy_saving_information(issi, &pending.esi, pending.start_time);
+                        }
+                    }
+                    Some(pending) => {
+                        tracing::warn!(
+                            "MS {} responded with energy saving mode {:?} that does not match the BS-initiated pending assignment",
+                            issi,
+                            esm
+                        );
+                        self.fail_pending_energy_saving_assignment(issi, pending, "mismatched U-CHANGE response");
+                    }
+                    None => {
+                        tracing::warn!(
+                            "MS {} responded with energy saving mode {:?} without a matching BS-initiated pending assignment; ignoring stale response",
+                            issi,
+                            esm
+                        );
+                    }
+                }
+                handled = true;
+            }
+            StatusUplink::DualWatchModeRequest
+            | StatusUplink::TerminatingDualWatchModeRequest
+            | StatusUplink::ChangeOfDualWatchModeResponse
+            | StatusUplink::StartOfDirectModeOperation
+            | StatusUplink::MsFrequencyBandsInformation
+            | StatusUplink::RequestToStartDmGatewayOperation
+            | StatusUplink::RequestToContinuedmGatewayOperation
+            | StatusUplink::RequestToStopDmGatewayOperation
+            | StatusUplink::RequestToAddDmMsAddresses
+            | StatusUplink::RequestToRemoveDmMsAddresses
+            | StatusUplink::RequestToReplaceDmMsAddresses
+            | StatusUplink::AcceptanceToRemovalOfDmMsAddresses
+            | StatusUplink::AcceptanceToChangeRegistrationLabel
+            | StatusUplink::AcceptanceToStopDmGatewayOperation => {
+                unimplemented_log!("{:?}", pdu.status_uplink)
+            }
+            _ => {
+                // Status types we don't handle (e.g. NetworkOrUserSpecific*, reserved
+                // values). This is a valid-but-unsupported PDU, not a code bug, so log it
+                // as unimplemented rather than asserting — assert_warn made it look like
+                // an internal fault in the operator's logs. handled stays false, so we
+                // still reply with "function not supported" below.
+                unimplemented_log!("Unhandled UMmStatus type {:?}", pdu.status_uplink);
+            }
+        }
+
+        if !handled {
+            // A fairly untested, best-effort way of sending a PDU not supported error back
+            // Note that an MS is not required to really do anything with this message.
+            let (sapmsg, debug_str) = make_ul_mm_pdu_function_not_supported(
+                handle,
+                MmPduTypeUl::UMmStatus,
+                Some((6, pdu.status_uplink.into())),
+                prim.received_address,
+            );
+            tracing::debug!("-> {}", debug_str);
+            queue.push_back(sapmsg);
+        }
+    }
+
+    fn rx_u_attach_detach_group_identity(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_u_attach_detach_group_identity");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let issi = prim.received_address.ssi;
+
+        let pdu = match UAttachDetachGroupIdentity::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing UAttachDetachGroupIdentity: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        self.abandon_pending_swmi_group_transaction(
+            issi,
+            "U-ATTACH/DETACH GROUP IDENTITY overrides pending SwMI group attach/detach procedure",
+        );
+
+        if pdu.group_identity_report {
+            // EN 300 392-2 clause 16.8.4: for an MS-initiated group report
+            // request accepted by the SwMI, the response is D-ATTACH/DETACH
+            // GROUP IDENTITY. Keep unknown MSs on the explicit unsupported
+            // path below so a report request cannot synthesize registration.
+            if pdu.group_identity_attach_detach_mode || pdu.group_identity_uplink.is_some() || pdu.group_report_response.is_some() {
+                // Clause 16.8.4 requires a report request to use amendment
+                // mode and to omit group identity uplink elements. A report
+                // response belongs to the answering side of a report procedure,
+                // so accepting a mixed PDU here would wrongly advertise valid
+                // groups for an inconsistent request.
+                tracing::warn!(
+                    "Rejecting malformed group report request from ISSI {}: mode={} uplink_present={} report_response_present={}",
+                    issi,
+                    pdu.group_identity_attach_detach_mode,
+                    pdu.group_identity_uplink.is_some(),
+                    pdu.group_report_response.is_some()
+                );
+                let (sapmsg, debug_str) = make_ul_mm_pdu_function_not_supported(
+                    prim.handle,
+                    MmPduTypeUl::UAttachDetachGroupIdentity,
+                    None,
+                    prim.received_address,
+                );
+                tracing::debug!("-> {}", debug_str);
+                queue.push_back(sapmsg);
+                return;
+            }
+            if let Some(client) = self.client_mgr.get_client_by_issi(issi) {
+                let mut groups: Vec<u32> = client.groups.iter().copied().collect();
+                groups.sort_unstable();
+                self.restore_shared_subscriber_state_for_reported_groups(queue, issi, &groups);
+                self.send_d_attach_detach_group_report_response(queue, issi, prim.handle, &groups);
+            } else {
+                let (sapmsg, debug_str) = make_ul_mm_pdu_function_not_supported(
+                    prim.handle,
+                    MmPduTypeUl::UAttachDetachGroupIdentity,
+                    None,
+                    prim.received_address,
+                );
+                tracing::debug!("-> {}", debug_str);
+                queue.push_back(sapmsg);
+            }
+            return;
+        }
+
+        if !self.client_mgr.client_is_known(issi) {
+            // EN 300 392-2 clause 16.4.3 treats group attachment as an MM
+            // procedure for an attached MS; initial registration belongs to the
+            // location update path in clauses 16.9.3.4 and 16.9.2.7/9. Do not
+            // synthesize or imply subscriber registration from standalone group
+            // attach because that bypasses LU accept/reject semantics.
+            tracing::warn!("Rejecting standalone group attach from unknown MS {}", issi);
+            let rejected_groups = pdu
+                .group_identity_uplink
+                .as_ref()
+                .map(|giu| {
+                    let giu_for_mode = Self::group_identity_uplink_for_mode(pdu.group_identity_attach_detach_mode, giu);
+                    Self::rejected_group_identity_downlinks(&giu_for_mode)
+                })
+                .unwrap_or_default();
+            self.send_d_attach_detach_ack_reject_with_downlink(queue, issi, prim.handle, rejected_groups);
+            return;
+        }
+
+        if pdu.group_identity_uplink.is_none() {
+            if let Some(response) = &pdu.group_report_response {
+                if response.len == 1 && response.data == 0 {
+                    // EN 300 392-2 clauses 16.4.3 and 16.10.27a define group
+                    // report complete as the MS reporting no attached groups.
+                    // Treat it as an empty report, not as a no-op ACK of stale
+                    // local affiliations.
+                    let prior_groups: Vec<u32> = self
+                        .client_mgr
+                        .get_client_by_issi(issi)
+                        .map(|client| client.groups.iter().copied().collect())
+                        .unwrap_or_default();
+                    match self.client_mgr.client_detach_all_groups(issi) {
+                        Ok(_) => {
+                            if !prior_groups.is_empty() {
+                                {
+                                    let mut state = self.config.state_write();
+                                    for &gssi in &prior_groups {
+                                        state.subscribers.deaffiliate(issi, gssi);
+                                    }
+                                }
+                                self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                            }
+                            self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed clearing groups for standalone group-report-complete MS {}: {:?}", issi, e);
+                            self.send_d_attach_detach_ack_reject(queue, issi, prim.handle);
+                        }
+                    }
+                } else {
+                    tracing::warn!(
+                        "UAttachDetachGroupIdentity from {} has unsupported group_report_response len={} data={}",
+                        issi,
+                        response.len,
+                        response.data
+                    );
+                    self.send_d_attach_detach_ack_reject(queue, issi, prim.handle);
+                }
+                return;
+            }
+        }
+
+        if pdu.group_identity_attach_detach_mode && pdu.group_identity_uplink.is_none() {
+            // EN 300 392-2 clause 16.8.2 and Annex G requirement 9 permit a
+            // mode=1 attach/detach request with no groups to detach all active
+            // group identities. ACK with no downlink group list once local state
+            // and subscriber affiliation state have both been cleared.
+            let prior_groups: Vec<u32> = self
+                .client_mgr
+                .get_client_by_issi(issi)
+                .map(|client| client.groups.iter().copied().collect())
+                .unwrap_or_default();
+            match self.client_mgr.client_detach_all_groups(issi) {
+                Ok(_) => {
+                    if !prior_groups.is_empty() {
+                        {
+                            let mut state = self.config.state_write();
+                            for &gssi in &prior_groups {
+                                state.subscribers.deaffiliate(issi, gssi);
+                            }
+                        }
+                        self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                    }
+                    self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
+                }
+                Err(e) => {
+                    tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
+                    self.send_d_attach_detach_ack_reject(queue, issi, prim.handle);
+                }
+            }
+            return;
+        }
+
+        if !pdu.group_identity_attach_detach_mode && pdu.group_identity_uplink.is_none() {
+            // Annex G requirement 9 reserves "no group identities" as detach-all
+            // only when mode=1, except for solicited group-report responses
+            // handled above. A bare mode=0 PDU carries no requested identities,
+            // so acknowledge the no-op without echoing the current local group
+            // set as if those groups had appeared in this transaction.
+            tracing::info!(
+                "UAttachDetachGroupIdentity from {} has mode=0 and no uplink groups; ACKing no-op without current group echo",
+                issi
+            );
+            self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
+            return;
+        }
+
+        if let Some(response) = &pdu.group_report_response {
+            // EN 300 392-2 clause 16.8.2: an MS-initiated attach/detach group
+            // identity request shall set "not report request" and shall not
+            // include group report response. Treat a mixed report response plus
+            // explicit requested identities as a consistency failure before any
+            // detach-all or affiliation mutation.
+            tracing::warn!(
+                "Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY from {}: group_report_response len={} data={} present with group identities",
+                issi,
+                response.len,
+                response.data
+            );
+            let rejected_groups = pdu
+                .group_identity_uplink
+                .as_ref()
+                .map(|giu| Self::rejected_group_identity_downlinks(giu))
+                .unwrap_or_default();
+            self.send_d_attach_detach_ack_reject_with_downlink(queue, issi, prim.handle, rejected_groups);
+            return;
+        }
+
+        // Check if we can satisfy this request, print unsupported stuff
+        if !Self::feature_check_u_attach_detach_group_identity(&pdu) {
+            // group_identity_uplink missing — terminal is sending a group report response
+            // without requesting any group changes. Send ACK with current groups so
+            // terminal knows it's affiliated and can use PTT.
+            tracing::info!(
+                "UAttachDetachGroupIdentity from {} has no uplink groups — sending ACK with current groups",
+                issi
+            );
+            let current_groups: Vec<u32> = self
+                .client_mgr
+                .get_client_by_issi(issi)
+                .map(|c| c.groups.iter().copied().collect())
+                .unwrap_or_default();
+            self.send_d_attach_detach_ack(queue, issi, prim.handle, &current_groups);
+            return;
+        }
+
+        // ETSI EN 300 392-2 Annex G requires reject ACKs to represent rejected
+        // identities coherently. This local BS keeps group ACKs within one
+        // unsegmented MM TM-SDU; when a request exceeds that capacity, reject it
+        // before any mode=1 detach-all or affiliation mutation.
+        // feature_check_u_attach_detach_group_identity above guarantees this is Some,
+        // but use let-else instead of .unwrap() so a future refactor that loosens that
+        // check doesn't crash the MM worker on a malformed PDU.
+        let Some(giu) = pdu.group_identity_uplink else {
+            tracing::warn!("rx_u_attach_detach_group_identity: group_identity_uplink missing after feature_check; ignoring");
+            return;
+        };
+        let giu_for_mode = Self::group_identity_uplink_for_mode(pdu.group_identity_attach_detach_mode, &giu);
+        let group_result = if self.group_identity_uplink_exceeds_ack_capacity(issi, giu_for_mode.len()) {
+            GroupIdentityProcessResult {
+                group_identity_downlink: Self::rejected_group_identity_downlinks(&giu_for_mode),
+                all_accepted: false,
+            }
+        } else {
+            if pdu.group_identity_attach_detach_mode {
+                let prior_groups: Vec<u32> = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|client| client.groups.iter().copied().collect())
+                    .unwrap_or_default();
+                match self.client_mgr.client_detach_all_groups(issi) {
+                    Ok(_) => {
+                        if !prior_groups.is_empty() {
+                            {
+                                let mut state = self.config.state_write();
+                                for &gssi in &prior_groups {
+                                    state.subscribers.deaffiliate(issi, gssi);
+                                }
+                            }
+                            self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
+                        return;
+                    }
+                }
+            }
+
+            // Try to attach to requested groups, and retrieve list of accepted GroupIdentityDownlink elements.
+            self.try_attach_detach_groups(queue, issi, &giu_for_mode)
+        };
+        let group_identity_accept_reject = if group_result.all_accepted { 0 } else { 1 };
+        let group_identity_downlink = if group_result.group_identity_downlink.is_empty() {
+            None
+        } else {
+            Some(group_result.group_identity_downlink)
+        };
+
+        // Build reply PDU
+        let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
+            group_identity_accept_reject,
+            // EN 300 392-2 clause 16.9.2.2 table 16.2 defines this as a
+            // mandatory one-bit Reserved field. Keep the reserved bit clear.
+            reserved: false,
+            proprietary: None,
+            group_identity_downlink,
+            group_identity_security_related_information: None,
+        };
+
+        // Write to PDU
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu_response.to_bitbuf(&mut sdu).unwrap(); // We want to know when this happens
+        sdu.seek(0);
+        tracing::debug!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle: prim.handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    fn rx_u_attach_detach_group_identity_acknowledgement(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_u_attach_detach_group_identity_acknowledgement");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let issi = prim.received_address.ssi;
+        let pdu = match UAttachDetachGroupIdentityAcknowledgement::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed parsing UAttachDetachGroupIdentityAcknowledgement: {:?} {}",
+                    e,
+                    prim.sdu.dump_bin()
+                );
+                return;
+            }
+        };
+
+        if pdu.proprietary.is_some() {
+            unimplemented_log!("UAttachDetachGroupIdentityAcknowledgement proprietary IE ignored");
+        }
+
+        let Some(pending) = self.pending_swmi_group_transactions.get(&issi) else {
+            tracing::debug!(
+                "MM: ignoring unmatched U-ATTACH/DETACH GROUP IDENTITY ACKNOWLEDGEMENT from ISSI {} handle={}",
+                issi,
+                prim.handle
+            );
+            return;
+        };
+
+        if pending.handle != prim.handle {
+            tracing::debug!(
+                "MM: U-ATTACH/DETACH GROUP IDENTITY ACK handle mismatch for ISSI {}: pending={} received={}; ignoring",
+                issi,
+                pending.handle,
+                prim.handle
+            );
+            return;
+        }
+
+        // EN 300 392-2 Annex G requirement 7 and 16.10.14: reject means at
+        // least one attachment was rejected, and the rejected identities shall
+        // be present in the ACK. Annex G requirement 8b marks a rejected
+        // attachment as a detachment entry; attachment entries may merely
+        // identify accepted groups with changed CoU/lifetime.
+        if pdu.group_identity_acknowledgement_type && !pdu.group_identity_uplink.as_ref().is_some_and(|groups| !groups.is_empty()) {
+            tracing::warn!(
+                "MM: malformed U-ATTACH/DETACH GROUP IDENTITY ACK from ISSI {} rejected at handle={}: reject bit set without rejected group identities",
+                issi,
+                prim.handle
+            );
+            return;
+        }
+        if pdu.group_identity_acknowledgement_type
+            && pending
+                .group_identity_downlink
+                .iter()
+                .any(|gid| gid.group_identity_attachment.is_some())
+            && !Self::reject_ack_has_rejected_pending_attachment(pending, &pdu)
+        {
+            tracing::warn!(
+                "MM: malformed U-ATTACH/DETACH GROUP IDENTITY ACK from ISSI {} rejected at handle={}: reject bit set without any rejected attachment entries",
+                issi,
+                prim.handle
+            );
+            return;
+        }
+
+        // EN 300 392-2 clauses 16.8.4 and 16.10.16: this uplink ACK is the
+        // response to a SwMI D-ATTACH/DETACH GROUP IDENTITY and expects no
+        // downlink response. Omitted ACK identities are accepted; explicit
+        // rejected attachments are listed in GroupIdentityUplink.
+        let pending = self
+            .pending_swmi_group_transactions
+            .remove(&issi)
+            .expect("pending SwMI group transaction was validated above");
+        self.apply_swmi_group_ack(queue, issi, pending, &pdu);
+    }
+
+    fn rx_lmm_mle_unitdata_ind(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        // unimplemented_log!("rx_lmm_mle_unitdata_ind for MM component");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let Some(bits) = prim.sdu.peek_bits(4) else {
+            tracing::warn!("insufficient bits: {}", prim.sdu.dump_bin());
+            return;
+        };
+
+        let Ok(pdu_type) = MmPduTypeUl::try_from(bits) else {
+            tracing::warn!("invalid pdu type: {} in {}", bits, prim.sdu.dump_bin());
+            return;
+        };
+
+        if prim.received_address.ssi_type != SsiType::Issi || prim.received_address.ssi > Self::MAX_AIR_INTERFACE_SSI {
+            // EN 300 392-2 clauses 16.4.3, 16.8.2, 16.8.4 and 16.9.3.4 are
+            // MS/ITSI mobility procedures. Clause 16.8.8 only permits an
+            // unsupported-function response for an individually addressed MM
+            // PDU, so non-ISSI RF sources are dropped before any registration,
+            // group or energy-economy state mutation.
+            tracing::warn!(
+                "MM: dropping {:?} from non-individual RF source {}",
+                pdu_type,
+                prim.received_address
+            );
+            return;
+        }
+
+        match pdu_type {
+            MmPduTypeUl::UAuthentication => unimplemented_log!("UAuthentication"),
+            MmPduTypeUl::UItsiDetach => self.rx_u_itsi_detach(queue, message),
+            MmPduTypeUl::ULocationUpdateDemand => self.rx_u_location_update_demand(queue, message),
+            MmPduTypeUl::UMmStatus => self.rx_u_mm_status(queue, message),
+            MmPduTypeUl::UCkChangeResult => unimplemented_log!("UCkChangeResult"),
+            MmPduTypeUl::UOtar => unimplemented_log!("UOtar"),
+            MmPduTypeUl::UInformationProvide => {
+                // EN 300 392-2 clause 16.8.8 permits an explicit
+                // MM PDU/FUNCTION NOT SUPPORTED response for an individually
+                // addressed MM PDU that this SwMI recognizes but does not
+                // support.
+                let (sapmsg, debug_str) = make_ul_mm_pdu_function_not_supported(prim.handle, pdu_type, None, prim.received_address);
+                tracing::debug!("-> {}", debug_str);
+                queue.push_back(sapmsg);
+            }
+            MmPduTypeUl::UAttachDetachGroupIdentity => self.rx_u_attach_detach_group_identity(queue, message),
+            MmPduTypeUl::UAttachDetachGroupIdentityAcknowledgement => {
+                self.rx_u_attach_detach_group_identity_acknowledgement(queue, message)
+            }
+            MmPduTypeUl::UTeiProvide => self.rx_u_tei_provide(queue, message),
+            MmPduTypeUl::UDisableStatus => {
+                // Keep security-specific MM PDUs out of scope here; this is a
+                // non-security unsupported whole-PDU response.
+                let (sapmsg, debug_str) = make_ul_mm_pdu_function_not_supported(prim.handle, pdu_type, None, prim.received_address);
+                tracing::debug!("-> {}", debug_str);
+                queue.push_back(sapmsg);
+            }
+            MmPduTypeUl::MmPduFunctionNotSupported => unimplemented_log!("MmPduFunctionNotSupported"),
+        };
+    }
+
+    fn try_attach_detach_groups(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        giu_vec: &[GroupIdentityUplink],
+    ) -> GroupIdentityProcessResult {
+        let mut group_identity_downlink = Vec::new();
+        let mut all_accepted = true;
+        let mut aff_groups = Vec::new();
+        let mut deaff_groups = Vec::new();
+
+        for giu in giu_vec.iter() {
+            // Currently only address_type=0 (plain GSSI) is implemented. Anything else
+            // (vgssi, address extension, missing gssi) is unsupported — reject.
+            let Some(gssi) = giu.gssi else {
+                unimplemented_log!("GroupIdentityUplink without gssi field");
+                all_accepted = false;
+                if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                    group_identity_downlink.push(rejected);
+                }
+                continue;
+            };
+            if giu.vgssi.is_some() || giu.address_extension.is_some() {
+                unimplemented_log!("Only support GroupIdentityUplink with address_type 0");
+                all_accepted = false;
+                if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                    group_identity_downlink.push(rejected);
+                }
+                continue;
+            }
+
+            let is_detach = giu.group_identity_detachment_uplink.is_some();
+            if !is_detach
+                && self
+                    .config
+                    .config()
+                    .cell
+                    .allowed_gssi_ranges
+                    .as_ref()
+                    .is_some_and(|ranges| !ranges.contains(gssi))
+            {
+                // EN 300 392-2 clause 16.10.20/table 16.52 defines reject
+                // reason 0 as unknown group identity. Keep the default policy
+                // open for dynamic scan lists, but honour an explicit local
+                // provisioning range when configured.
+                tracing::warn!("Rejecting group attach from ISSI {} to unprovisioned GSSI {}", issi, gssi);
+                all_accepted = false;
+                if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                    group_identity_downlink.push(rejected);
+                }
+                continue;
+            }
+
+            if is_detach {
+                let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+                match self.client_mgr.client_group_attach(issi, gssi, false) {
+                    Ok(changed) => {
+                        if changed {
+                            self.restore_shared_subscriber_registration_for_known_client(queue, issi);
+                            if shared_affiliated_before && self.config.state_write().subscribers.deaffiliate(issi, gssi) {
+                                deaff_groups.push(gssi);
+                            }
+                        }
+                        // EN 300 392-2 Annex G requirement 6d/8d: accepted
+                        // detachment is implicit when accept/reject=0. Do not
+                        // echo the detached group, because explicit detachment
+                        // in the ACK gives no useful information and may be
+                        // interpreted ambiguously by the requester.
+                    }
+                    Err(ClientMgrErr::ClientNotFound { .. }) => {
+                        tracing::debug!("Group detach for ISSI {} gssi={} skipped: client no longer registered", issi, gssi);
+                        all_accepted = false;
+                        if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                            group_identity_downlink.push(rejected);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed detaching MS {} from group {}: {:?}", issi, gssi, e);
+                        all_accepted = false;
+                        if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                            group_identity_downlink.push(rejected);
+                        }
+                    }
+                }
+            } else {
+                let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+                let attachment_info = GroupAttachmentInfo {
+                    group_identity_attachment_lifetime: 0,
+                    class_of_usage: giu.class_of_usage.unwrap_or(0),
+                };
+                match self.client_mgr.client_group_attach_with_info(issi, gssi, true, attachment_info) {
+                    Ok(changed) => {
+                        if changed || !shared_affiliated_before {
+                            self.restore_shared_subscriber_registration_for_known_client(queue, issi);
+                        }
+                        if !shared_affiliated_before && self.config.state_write().subscribers.affiliate(issi, gssi) {
+                            aff_groups.push(gssi);
+                        }
+                        // We have added the client to this group. Add an entry to the downlink response.
+                        //
+                        // group_identity_attachment_lifetime values (ETSI EN 300 392-2 §16.10.19):
+                        //   0 = Attachment not needed → MS keeps the group attached indefinitely
+                        //                                until an explicit detach. This is what we want
+                        //                                for scan lists / persistent group attachments.
+                        //   1 = Attachment required for the next ITSI attach → MS re-affiliates on next
+                        //                                ITSI attach (rare event: reboot, cell reselect).
+                        //   2 = Attachment not allowed for next ITSI attach → SwMI denies.
+                        //   3 = Attachment required for next location update → MS re-affiliates at every
+                        //                                LU (every few minutes), generating churn.
+                        //
+                        // We previously used 1 with a "good default" comment, but that interacted badly
+                        // with Motorola MTP-series radios in scan-list mode: those radios send the scan
+                        // list incrementally (2 GSSIs at a time, with one anchor + one new GSSI), and
+                        // expect the BS-side affiliation to persist between batches. With lifetime=1 the
+                        // MS internally drops the affiliation a few minutes later ("5-minute timer" per
+                        // dk5ras), then PTT fails with "Unit not attached" until the user changes GSSI.
+                        // Lifetime=0 makes the attachment persistent on the MS side — matching the BS
+                        // side which already keeps affiliations across attach cycles — and resolves
+                        // FH-BUG-022.
+                        let gid = GroupIdentityDownlink {
+                            group_identity_attachment: Some(GroupIdentityAttachment {
+                                group_identity_attachment_lifetime: attachment_info.group_identity_attachment_lifetime,
+                                class_of_usage: attachment_info.class_of_usage,
+                            }),
+                            group_identity_detachment_uplink: None,
+                            gssi: Some(gssi),
+                            address_extension: None,
+                            vgssi: None,
+                        };
+                        group_identity_downlink.push(gid);
+                    }
+                    Err(ClientMgrErr::ClientNotFound { .. }) => {
+                        // Terminal was removed after local watchdog grace expiry while PDU was in flight — ignore.
+                        tracing::debug!("Group attach for ISSI {} gssi={} skipped: client no longer registered", issi, gssi);
+                        all_accepted = false;
+                        if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                            group_identity_downlink.push(rejected);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed attaching MS {} to group {}: {:?}", issi, gssi, e);
+                        all_accepted = false;
+                        if let Some(rejected) = Self::rejected_group_identity_downlink(giu) {
+                            group_identity_downlink.push(rejected);
+                        }
+                    }
+                }
+            }
+        }
+
+        if !aff_groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
+        }
+        if !deaff_groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
+        }
+
+        // Emit a single snapshot of all current groups so the dashboard always has
+        // the full list (not just incremental add/remove events).
+        let _sink = self.client_mgr.telemetry_sink().cloned();
+        let all_groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|c| c.groups.iter().copied().collect())
+            .unwrap_or_default();
+        if let Some(sink) = _sink {
+            sink.send(crate::net_telemetry::TelemetryEvent::MsGroupsSnapshot { issi, gssis: all_groups });
+        }
+
+        GroupIdentityProcessResult {
+            group_identity_downlink,
+            all_accepted,
+        }
+    }
+
+    fn rejected_group_identity_downlink(giu: &GroupIdentityUplink) -> Option<GroupIdentityDownlink> {
+        if giu.gssi.is_none() && giu.vgssi.is_none() {
+            return None;
+        }
+
+        // EN 300 392-2 16.10.12 and Annex G requirements 7/8 require an
+        // explicit per-identity rejection. Attachment rejection is encoded with
+        // GIADTI=1 and a group identity detachment downlink reason; rejected
+        // detachment is encoded with GIADTI=0 as an attachment entry.
+        let (group_identity_attachment, group_identity_detachment_uplink) = if giu.group_identity_detachment_uplink.is_some() {
+            (
+                Some(GroupIdentityAttachment {
+                    group_identity_attachment_lifetime: 0,
+                    class_of_usage: giu.class_of_usage.unwrap_or(0),
+                }),
+                None,
+            )
+        } else {
+            // EN 300 392-2 16.10.20 table 16.52: 0 = unknown group identity.
+            (None, Some(0))
+        };
+
+        Some(GroupIdentityDownlink {
+            group_identity_attachment,
+            group_identity_detachment_uplink,
+            gssi: giu.gssi,
+            address_extension: giu.address_extension,
+            vgssi: giu.vgssi,
+        })
+    }
+
+    fn rejected_group_identity_downlinks(giu: &[GroupIdentityUplink]) -> Vec<GroupIdentityDownlink> {
+        giu.iter().filter_map(Self::rejected_group_identity_downlink).collect()
+    }
+
+    fn group_identity_uplink_exceeds_ack_capacity(&self, issi: u32, requested_count: usize) -> bool {
+        if requested_count > Self::MAX_GROUPS_PER_ATTACH {
+            tracing::warn!(
+                "ISSI {} requested attach/detach for {} groups; local accept capacity is {}. Explicitly rejecting without partial affiliation so Annex G accept/reject state stays transactional.",
+                issi,
+                requested_count,
+                Self::MAX_GROUPS_PER_ATTACH
+            );
+            return true;
+        }
+        false
+    }
+
+    fn group_identity_uplink_for_mode(detach_all_then_attach: bool, giu: &[GroupIdentityUplink]) -> Vec<GroupIdentityUplink> {
+        if !detach_all_then_attach {
+            return giu.to_vec();
+        }
+
+        let filtered: Vec<GroupIdentityUplink> = giu
+            .iter()
+            .filter(|entry| entry.group_identity_detachment_uplink.is_none())
+            .cloned()
+            .collect();
+        let ignored = giu.len().saturating_sub(filtered.len());
+        if ignored > 0 {
+            tracing::debug!(
+                "MM: ignoring {} explicit group detachment entries because group_identity_attach_detach_mode=1 already detaches all groups",
+                ignored
+            );
+        }
+        filtered
+    }
+
+    fn send_d_attach_detach_ack_reject(&self, queue: &mut MessageQueue, issi: u32, handle: u32) {
+        self.send_d_attach_detach_ack_reject_with_downlink(queue, issi, handle, Vec::new());
+    }
+
+    /// Send D-ATTACH-DETACH-GROUP-IDENTITY-ACKNOWLEDGEMENT with aggregate
+    /// reject. EN 300 392-2 clause 16.10.12 marks at least one rejected
+    /// attachment/detachment; Annex G requirement 7 requires rejected identities
+    /// to be listed when the request contained explicit groups.
+    fn send_d_attach_detach_ack_reject_with_downlink(
+        &self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        group_identity_downlink: Vec<GroupIdentityDownlink>,
+    ) {
+        let pdu = DAttachDetachGroupIdentityAcknowledgement {
+            group_identity_accept_reject: 1, // 1 = reject per ETSI §14.8.7
+            reserved: false,
+            proprietary: None,
+            group_identity_downlink: if group_identity_downlink.is_empty() {
+                None
+            } else {
+                Some(group_identity_downlink)
+            },
+            group_identity_security_related_information: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(16);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> DAttachDetachGroupIdentityAcknowledgement (reject) to ISSI {}", issi);
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    fn group_attachment_info_for_report(&self, issi: u32, gssi: u32) -> GroupAttachmentInfo {
+        self.client_mgr.client_group_attachment_info(issi, gssi).unwrap_or_default()
+    }
+
+    fn group_identity_downlink_for_reported_groups(&self, issi: u32, groups: &[u32]) -> Vec<GroupIdentityDownlink> {
+        groups
+            .iter()
+            .map(|&gssi| {
+                let attachment_info = self.group_attachment_info_for_report(issi, gssi);
+                GroupIdentityDownlink {
+                    group_identity_attachment: Some(GroupIdentityAttachment {
+                        // EN 300 392-2 clauses 16.8.4 and 16.10.19: group
+                        // report responses re-advertise valid downlink group
+                        // identities, so preserve the lifetime and class of
+                        // usage recorded when the group was attached.
+                        group_identity_attachment_lifetime: attachment_info.group_identity_attachment_lifetime,
+                        class_of_usage: attachment_info.class_of_usage,
+                    }),
+                    group_identity_detachment_uplink: None,
+                    gssi: Some(gssi),
+                    address_extension: None,
+                    vgssi: None,
+                }
+            })
+            .collect()
+    }
+
+    fn send_d_attach_detach_ack(&self, queue: &mut MessageQueue, issi: u32, handle: u32, groups: &[u32]) {
+        let gid = self.group_identity_downlink_for_reported_groups(issi, groups);
+        let ack = DAttachDetachGroupIdentityAcknowledgement {
+            group_identity_accept_reject: 0,
+            reserved: false,
+            proprietary: None,
+            group_identity_downlink: if gid.is_empty() { None } else { Some(gid) },
+            group_identity_security_related_information: None,
+        };
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        if ack.to_bitbuf(&mut sdu).is_ok() {
+            sdu.seek(0);
+            tracing::debug!("-> DAttachDetachGroupIdentityAcknowledgement (ack-only) sdu {}", sdu.dump_bin());
+            queue.push_back(SapMsg {
+                sap: Sap::LmmSap,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                    sdu,
+                    handle,
+                    address: TetraAddress::issi(issi),
+                    layer2service: Layer2Service::Acknowledged,
+                    stealing_permission: false,
+                    stealing_repeats_flag: false,
+                    encryption_flag: false,
+                    is_null_pdu: false,
+                    tx_reporter: None,
+                }),
+            });
+        }
+    }
+
+    fn send_d_attach_detach_group_report_response(&self, queue: &mut MessageQueue, issi: u32, handle: u32, groups: &[u32]) {
+        if groups.is_empty() {
+            self.send_d_attach_detach_group_report_response_segment(
+                queue,
+                issi,
+                handle,
+                &[],
+                true,
+                true,
+                Layer2Service::AcknowledgedResponse,
+            );
+            return;
+        }
+
+        let chunk_count = groups.chunks(Self::MAX_GROUPS_PER_ATTACH).count();
+        for (idx, chunk) in groups.chunks(Self::MAX_GROUPS_PER_ATTACH).enumerate() {
+            // EN 300 392-2 clause 16.8.4: if reported groups do not fit into
+            // one D-ATTACH/DETACH GROUP IDENTITY PDU, omit group-report-complete
+            // until the last PDU. The first PDU uses mode=1 (detach all and
+            // attach listed groups); subsequent PDUs use amendment mode.
+            let first_segment = idx == 0;
+            let last_segment = idx + 1 == chunk_count;
+            let layer2service = if first_segment {
+                Layer2Service::AcknowledgedResponse
+            } else {
+                Layer2Service::Acknowledged
+            };
+            self.send_d_attach_detach_group_report_response_segment(queue, issi, handle, chunk, first_segment, last_segment, layer2service);
+        }
+    }
+
+    fn send_d_attach_detach_group_report_response_segment(
+        &self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        groups: &[u32],
+        detach_all_then_attach: bool,
+        group_report_complete: bool,
+        layer2service: Layer2Service,
+    ) {
+        let group_identity_downlink = self.group_identity_downlink_for_reported_groups(issi, groups);
+        let pdu = DAttachDetachGroupIdentity {
+            group_identity_report: false,
+            // EN 300 392-2 clause 16.8.4 permits either value here. Use no
+            // ACK request for these report PDUs to avoid creating another
+            // pending SwMI transaction while still answering the MS request.
+            group_identity_acknowledgement_request: false,
+            group_identity_attach_detach_mode: detach_all_then_attach,
+            proprietary: None,
+            group_report_response: group_report_complete.then_some(Type3FieldGeneric {
+                field_id: MmType34ElemIdDl::GroupReportResponse.into_raw(),
+                len: 1,
+                data: 0,
+            }),
+            group_identity_downlink: if group_identity_downlink.is_empty() {
+                None
+            } else {
+                Some(group_identity_downlink)
+            },
+            group_identity_security_related_information: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        match pdu.to_bitbuf(&mut sdu) {
+            Ok(()) => {
+                sdu.seek(0);
+                tracing::debug!("-> DAttachDetachGroupIdentity (group report response) sdu {}", sdu.dump_bin());
+                queue.push_back(SapMsg {
+                    sap: Sap::LmmSap,
+                    src: TetraEntity::Mm,
+                    dest: TetraEntity::Mle,
+                    msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                        sdu,
+                        handle,
+                        address: TetraAddress::issi(issi),
+                        layer2service,
+                        stealing_permission: false,
+                        stealing_repeats_flag: false,
+                        encryption_flag: false,
+                        is_null_pdu: false,
+                        tx_reporter: None,
+                    }),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "Failed serializing DAttachDetachGroupIdentity group report response for ISSI {} groups={:?}: {:?}",
+                    issi,
+                    groups,
+                    e
+                );
+            }
+        }
+    }
+
+    fn send_d_location_update_command(queue: &mut MessageQueue, issi: u32, handle: u32) {
+        let pdu = DLocationUpdateCommand {
+            group_identity_report: true,
+            cipher_control: false,
+            ciphering_parameters: None,
+            address_extension: None,
+            cell_type_control: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(16);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> DLocationUpdateCommand sdu {}", sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    /// Sends a D-LOCATION UPDATE REJECT PDU (ETSI clause 16.9.2.9)
+    fn send_d_location_update_reject_cause(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        location_update_type: LocationUpdateType,
+        address_extension: Option<u64>,
+        reject_cause: RejectCause,
+    ) {
+        let pdu = DLocationUpdateReject {
+            location_update_type,
+            reject_cause: reject_cause as u8,
+            cipher_control: false,
+            ciphering_parameters: None,
+            address_extension,
+            cell_type_control: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(16);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    fn location_update_accept_type_for(location_update_type: LocationUpdateType) -> Option<LocationUpdateAcceptType> {
+        match location_update_type {
+            LocationUpdateType::RoamingLocationUpdating => Some(LocationUpdateAcceptType::RoamingLocationUpdating),
+            LocationUpdateType::PeriodicLocationUpdating => Some(LocationUpdateAcceptType::PeriodicLocationUpdating),
+            LocationUpdateType::ItsiAttach => Some(LocationUpdateAcceptType::ItsiAttach),
+            LocationUpdateType::ServiceRestorationRoamingLocationUpdating => {
+                Some(LocationUpdateAcceptType::ServiceRestorationRoamingLocationUpdating)
+            }
+            LocationUpdateType::DemandLocationUpdating => Some(LocationUpdateAcceptType::DemandLocationUpdating),
+            LocationUpdateType::MigratingLocationUpdating
+            | LocationUpdateType::ServiceRestorationMigratingLocationUpdating
+            | LocationUpdateType::DisabledMsUpdating => None,
+        }
+    }
+
+    fn send_d_mm_status_energy_saving_with_status(
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        status_downlink: StatusDownlink,
+        esi: EnergySavingInformation,
+    ) {
+        let pdu = DMmStatus {
+            status_downlink,
+            energy_saving_information: Some(esi),
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {} sdu {}", pdu, sdu.dump_bin());
+
+        let msg = SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        };
+        queue.push_back(msg);
+    }
+
+    /// Sends a D-MM-STATUS with ChangeOfEnergySavingModeResponse.
+    fn send_d_mm_status_energy_saving(queue: &mut MessageQueue, issi: u32, handle: u32, esi: EnergySavingInformation) {
+        Self::send_d_mm_status_energy_saving_with_status(queue, issi, handle, StatusDownlink::ChangeOfEnergySavingModeResponse, esi);
+    }
+
+    /// Sends a D-MM-STATUS with ChangeOfEnergySavingModeRequest.
+    fn send_d_mm_status_energy_saving_request(queue: &mut MessageQueue, issi: u32, handle: u32, esi: EnergySavingInformation) {
+        Self::send_d_mm_status_energy_saving_with_status(queue, issi, handle, StatusDownlink::ChangeOfEnergySavingModeRequest, esi);
+    }
+
+    fn feature_check_u_itsi_detach(pdu: &UItsiDetach) -> bool {
+        let supported = true;
+        if pdu.address_extension.is_some() {
+            unimplemented_log!("Unsupported address_extension present");
+        };
+        if pdu.proprietary.is_some() {
+            unimplemented_log!("Unsupported proprietary present");
+        };
+        supported
+    }
+
+    fn rx_u_tei_provide(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_u_tei_provide");
+        let SapMsgInner::LmmMleUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+
+        let pdu = match UTeiProvide::from_bitbuf(&mut prim.sdu) {
+            Ok(pdu) => {
+                tracing::debug!("<- {:?}", pdu);
+                pdu
+            }
+            Err(e) => {
+                tracing::warn!("Failed parsing UTeiProvide: {:?} {}", e, prim.sdu.dump_bin());
+                return;
+            }
+        };
+
+        let issi = prim.received_address.ssi;
+        tracing::info!("MM: TEI received from ISSI {} → TEI={} ({:060b})", issi, pdu.tei_hex(), pdu.tei,);
+
+        // Store TEI in client state for future use (e.g. whitelist checking)
+        if let Err(e) = self.client_mgr.set_client_tei(issi, pdu.tei) {
+            tracing::warn!("MM: failed to store TEI for ISSI {}: {:?}", issi, e);
+        }
+    }
+
+    fn reject_cause_for_unsupported_u_location_update_demand(pdu: &ULocationUpdateDemand) -> Option<RejectCause> {
+        if pdu.location_update_type == LocationUpdateType::MigratingLocationUpdating
+            || pdu.location_update_type == LocationUpdateType::DisabledMsUpdating
+        {
+            unimplemented_log!("Unsupported {}", pdu.location_update_type);
+            return Some(RejectCause::MessageConsistencyError);
+        }
+        if pdu.request_to_append_la == true {
+            unimplemented_log!("Unsupported request_to_append_la == true");
+            return Some(RejectCause::LaNotAllowed);
+        }
+        if pdu.cipher_control == true {
+            unimplemented_log!("Unsupported cipher_control == true");
+            return Some(RejectCause::NoCipherKsg);
+        }
+        if pdu.ciphering_parameters.is_some() {
+            unimplemented_log!("Unsupported ciphering_parameters present");
+            return Some(RejectCause::NoCipherKsg);
+        }
+        if pdu.la_information.is_some() {
+            unimplemented_log!("Unsupported la_information present");
+            return Some(RejectCause::LaNotAllowed);
+        }
+        if pdu.ssi.is_some() {
+            tracing::debug!("DemandLocationUpdating: ssi present (expected from radio, ignored)");
+        }
+        if pdu.address_extension.is_some() {
+            tracing::debug!("DemandLocationUpdating: address_extension present (expected from radio, ignored)");
+        }
+        if let Some(response) = &pdu.group_report_response {
+            if pdu.group_identity_location_demand.is_some() {
+                tracing::warn!("DemandLocationUpdating: group_report_response present together with group_identity_location_demand");
+                return Some(RejectCause::MessageConsistencyError);
+            }
+            if response.len != 1 || response.data != 0 {
+                tracing::warn!(
+                    "DemandLocationUpdating: unsupported group_report_response len={} data={}",
+                    response.len,
+                    response.data
+                );
+                return Some(RejectCause::MessageConsistencyError);
+            }
+        }
+        if pdu.authentication_uplink.is_some() {
+            unimplemented_log!("Unsupported authentication_uplink present");
+            return Some(RejectCause::MessageConsistencyError);
+        }
+        if pdu.extended_capabilities.is_some() {
+            unimplemented_log!("Unsupported extended_capabilities present");
+            return Some(RejectCause::MessageConsistencyError);
+        }
+        if pdu.proprietary.is_some() {
+            unimplemented_log!("Unsupported proprietary present");
+            return Some(RejectCause::MessageConsistencyError);
+        }
+
+        None
+    }
+
+    fn group_report_response_is_complete(pdu: &ULocationUpdateDemand) -> bool {
+        pdu.group_report_response
+            .as_ref()
+            .is_some_and(|response| response.len == 1 && response.data == 0)
+    }
+
+    /// Check for unsupported features in U-ATTACH/DETACH GROUP IDENTITY
+    /// Returns false if a critical feature is missing
+    fn feature_check_u_attach_detach_group_identity(pdu: &UAttachDetachGroupIdentity) -> bool {
+        let mut supported = true;
+        if pdu.group_identity_report == true {
+            unimplemented_log!("Unsupported group_identity_report == true");
+        }
+        if pdu.group_identity_uplink.is_none() {
+            unimplemented_log!("Missing group_identity_uplink");
+            supported = false;
+        }
+        if pdu.group_report_response.is_some() {
+            tracing::debug!("UAttachDetachGroupIdentity: group_report_response present (expected from radio, ignored)");
+        }
+        if pdu.proprietary.is_some() {
+            unimplemented_log!("Unsupported proprietary present");
+        }
+
+        supported
+    }
+}
+
+impl TetraEntityTrait for MmBs {
+    fn entity(&self) -> TetraEntity {
+        TetraEntity::Mm
+    }
+
+    fn set_config(&mut self, config: SharedConfig) {
+        self.config = config;
+    }
+
+    fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+        self.dltime = ts;
+
+        if let Some(cep) = &self.control {
+            while let Some(cmd) = cep.try_recv() {
+                match cmd {
+                    _ => {
+                        tracing::warn!("MM: ignoring unsupported control command {:?}", cmd);
+                    }
+                }
+            }
+        }
+
+        self.expire_pending_energy_saving(ts);
+        self.expire_pending_swmi_group_transactions(ts);
+        self.tick_restart_recovery(queue, ts);
+
+        // Local periodic-registration watchdog. Do not call this T351:
+        // EN 300 392-2 §16.11.1.1 defines T351 as the 10 s MS-side
+        // registration response timer.
+        // Uses wall-clock time — no TDMA precision needed.
+        let interval_secs = self.config.config().cell.periodic_registration_secs;
+        let expired = self.client_mgr.collect_expired_registrations(interval_secs);
+        for issi in expired {
+            tracing::info!(
+                "MM: ISSI {} periodic registration expired ({}s) — sending D-LOCATION-UPDATE-COMMAND",
+                issi,
+                interval_secs
+            );
+            // Send D-LOCATION-UPDATE-COMMAND to prompt re-registration.
+            //
+            // Analysis of real traffic (MTM800/MXP600/MTM5400) shows these terminals
+            // may not perform periodic registration at the interval configured for
+            // this local SwMI watchdog.
+            // They rely entirely on BS initiative to re-register.
+            //
+            // - REJECT(ExpiryOfTimer): terminals enter waiting state, never re-attach. BAD.
+            // - Silent removal: terminals never notice, never re-register. BAD.
+            // - D-LOCATION-UPDATE-COMMAND: terminals respond with U-LOCATION-UPDATING-DEMAND
+            //   (DemandLocationUpdating), BS re-registers them immediately. GOOD.
+            //
+            // The Roaming loop bug from before is NOT triggered here because:
+            // 1. This command is sent once per expiry, not on every registration.
+            // 2. The fix in rx_u_location_updating_demand already skips sending
+            //    COMMAND after RoamingLocationUpdating.
+            let already_sent = self.client_mgr.is_pending_command(issi);
+            if already_sent {
+                // Second expiry — terminal didn't respond to COMMAND within grace period.
+                // Send D-LOCATION-UPDATE-REJECT(ExpiryOfTimer) so the terminal knows it must
+                // re-attach. Without this, terminals like Sepura stay "connected" locally
+                // while the BS has already removed them, causing a silent desync.
+                let last_handle = self.client_mgr.get_client_by_issi(issi).map(|c| c.last_handle).unwrap_or(0);
+                tracing::info!(
+                    "MM: ISSI {} did not respond to D-LOCATION-UPDATE-COMMAND — sending REJECT and removing",
+                    issi
+                );
+                Self::send_d_location_update_reject_cause(
+                    queue,
+                    issi,
+                    last_handle,
+                    LocationUpdateType::PeriodicLocationUpdating,
+                    None,
+                    RejectCause::ExpiryOfTimer,
+                );
+                let detached = self.client_mgr.remove_client(issi);
+                if let Some(client) = detached {
+                    self.forget_energy_saving(issi);
+                    self.abandon_pending_swmi_group_transaction(
+                        issi,
+                        "periodic registration reject/removal terminates pending SwMI group procedure",
+                    );
+                    self.config.state_write().subscribers.deregister(issi);
+                    if !client.groups.is_empty() {
+                        let groups: Vec<u32> = client.groups.iter().copied().collect();
+                        self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+                    }
+                    self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+                }
+                continue;
+            }
+            // First expiry — send COMMAND and wait grace period (60s) for response.
+            // Do NOT remove_client here: keeping the client in registry preserves ESM
+            // and group state so the terminal re-registers cleanly without losing EE mode.
+            // Only notify Brew so it stops routing calls to this terminal until it re-registers.
+            let last_handle = self.client_mgr.get_client_by_issi(issi).map(|c| c.last_handle).unwrap_or(0);
+            Self::send_d_location_update_command(queue, issi, last_handle);
+            // EN 300 392-2 clause 16.8.6: registration overrides group
+            // attach/detach/report procedures. Once the BS asks the MS to
+            // re-register, a later U-ATTACH/DETACH GROUP IDENTITY ACK must not
+            // complete an older SwMI group transaction in Annex G.
+            self.abandon_pending_swmi_group_transaction(issi, "periodic D-LOCATION UPDATE COMMAND starts a fresh registration procedure");
+            self.client_mgr.set_pending_command(issi, 60);
+            let groups: Vec<u32> = self
+                .client_mgr
+                .get_client_by_issi(issi)
+                .map(|c| c.groups.iter().copied().collect())
+                .unwrap_or_default();
+            if !groups.is_empty() {
+                self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+            }
+            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+            // Mark as detached in state but keep in client_mgr (preserves ESM + groups)
+            self.config.state_write().subscribers.deregister(issi);
+        }
+    }
+
+    fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        tracing::debug!("rx_prim: {:?}", message);
+        // tracing::debug!(ts=%message.dltime, "rx_prim: {:?}", message);
+
+        match message.sap {
+            Sap::LmmSap => match message.msg {
+                SapMsgInner::LmmMleUnitdataInd(_) => {
+                    self.rx_lmm_mle_unitdata_ind(queue, message);
+                }
+                SapMsgInner::LmmMleReportInd(prim) => {
+                    tracing::trace!(
+                        "MM: MLE-REPORT indication handle={} transfer_result={}",
+                        prim.handle,
+                        prim.transfer_result
+                    );
+                }
+                _ => {
+                    tracing::error!("BUG: unexpected message or state -- routing error");
+                    return;
+                }
+            },
+            Sap::Control => {
+                match message.msg {
+                    SapMsgInner::BrewReconnected => {
+                        self.rx_brew_reconnected(queue);
+                    }
+                    SapMsgInner::MsRssiUpdate { issi, rssi_dbfs } => {
+                        self.client_mgr.update_client_rssi(issi, rssi_dbfs);
+                        // Emit RSSI telemetry for dashboard
+                        if let Some(sink) = &self.telemetry {
+                            sink.send(crate::net_telemetry::TelemetryEvent::MsRssi { issi, rssi_dbfs });
+                        }
+                        // Forward to Brew entity for optional export to Brew server.
+                        // BrewEntity applies its own rate limiting and checks feature_rssi_export.
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Mm,
+                            dest: TetraEntity::Brew,
+                            msg: SapMsgInner::MsRssiUpdate { issi, rssi_dbfs },
+                        });
+                    }
+                    SapMsgInner::MmSubscriberUpdate(update) => {
+                        // CMCE can ask MM to deregister an MS (e.g. kick from dashboard)
+                        if update.action == BrewSubscriberAction::Deregister {
+                            let issi = update.issi;
+                            tracing::info!(
+                                "MM: kicking ISSI {} — sending D-LOCATION-UPDATE-COMMAND to force re-registration",
+                                issi
+                            );
+                            // D-LOCATION-UPDATE-COMMAND forces the terminal to immediately
+                            // send a new U-LOCATION-UPDATING-DEMAND, effectively re-registering.
+                            // This is cleaner than a reject: the terminal stays on the network
+                            // but goes through a full re-registration cycle.
+                            Self::send_d_location_update_command(queue, issi, 0);
+                            // EN 300 392-2 clause 16.8.6 gives registration
+                            // precedence over group attach/detach/report
+                            // procedures, so dashboard kick/re-registration
+                            // invalidates any pending SwMI group ACK.
+                            self.abandon_pending_swmi_group_transaction(issi, "control kick starts a fresh registration procedure");
+                            let groups: Vec<u32> = self
+                                .client_mgr
+                                .get_client_by_issi(issi)
+                                .map(|c| c.groups.iter().copied().collect())
+                                .unwrap_or_default();
+                            if !groups.is_empty() {
+                                self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+                            }
+                            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+                            self.client_mgr.remove_client(issi);
+                            self.forget_energy_saving(issi);
+                            self.config.state_write().subscribers.deregister(issi);
+                        }
+                    }
+                    _ => {
+                        tracing::warn!("mm_bs: unexpected Control message from {:?}", message.src);
+                    }
+                }
+            }
+            _ => {
+                tracing::warn!("MM: unexpected SAP {:?}, ignoring", message.sap);
+            }
+        }
+    }
+}
+
+impl MmBs {
+    /// Called when Brew backhaul reconnects. Sends D-LOCATION-UPDATE-COMMAND to all
+    /// locally registered MS to force them to re-affiliate. This fixes the PTT-denied
+    /// symptom where MS units registered before a Brew disconnect never re-register.
+    fn rx_brew_reconnected(&mut self, queue: &mut MessageQueue) {
+        let clients: Vec<(u32, u32)> = self.client_mgr.all_clients_with_handle().collect();
+        if clients.is_empty() {
+            tracing::info!("mm_bs: BrewReconnected — no registered MS to re-register");
+            return;
+        }
+        tracing::info!(
+            "mm_bs: BrewReconnected — sending D-LOCATION-UPDATE-COMMAND to {} MS unit(s)",
+            clients.len()
+        );
+        for (issi, handle) in clients {
+            tracing::debug!("mm_bs: re-registering ISSI {} (handle={})", issi, handle);
+            Self::send_d_location_update_command(queue, issi, handle);
+            // EN 300 392-2 clause 16.4.3 permits SwMI-initiated
+            // registration by D-LOCATION UPDATE COMMAND, and clause 16.8.6
+            // makes that registration procedure override pending group
+            // attach/detach/report procedures. Keep the existing client state
+            // while marking the command pending so the later
+            // DemandLocationUpdating response replays Register/Affiliate
+            // coherently after Brew reconnect.
+            self.abandon_pending_swmi_group_transaction(
+                issi,
+                "Brew reconnect D-LOCATION UPDATE COMMAND starts a fresh registration procedure",
+            );
+            self.client_mgr.set_pending_command(issi, 60);
+        }
+    }
+}

@@ -1,0 +1,22 @@
+[package]
+name = "nexus-bs"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "nexus-bs"
+path = "src/main.rs"
+
+[dependencies]
+tetra-core = { workspace = true }
+tetra-config = { workspace = true }
+tetra-saps = { workspace = true }
+tetra-entities = { workspace = true }
+
+clap = { workspace = true }
+crossbeam-channel = { workspace = true }
+ctrlc = { workspace = true }
+rustls = { version = "0.23", default-features = false }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
