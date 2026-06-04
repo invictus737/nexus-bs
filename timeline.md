@@ -46,10 +46,27 @@ Verification:
 - `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
 - `git diff --check` -> pass.
 
+Build/deploy:
+
+- Commit: `33ef3ca fix: treat repeated group setup as floor control`.
+- Deployed with the one-shot local script:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Remote deployed binary SHA-256:
+  - `06b913c5f3254330596034b5a821cb874b3bc20a694932f7376a75df5e831a09`
+- Restarted test BS with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live evidence after deploy:
+
+- Startup banner reports `Build: v0.1.55-33ef3ca8`.
+- `2260082`, `2260616`, and `2260618` registered and affiliated to `226333`.
+- No complete post-deploy group PTT attempt was present in the checked log sample yet, so terminal-side RF validation remains required.
+
 Next live validation:
 
-- Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`.
-- Restart test BS.
+- Test BS is already running `v0.1.55-33ef3ca8`.
 - Validate alternating group PTT on GSSI `226333` with `2260082`, `2260616`, and `2260618`.
 - Required field evidence: no terminal `PTT denied`, no BS `NotGranted` unless another MS is truly still transmitting, `UMAC floor granted` follows the active speaker, and audio is intelligible rather than static.
 
