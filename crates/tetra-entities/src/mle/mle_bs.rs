@@ -636,7 +636,7 @@ impl MleBs {
         let msg = match prim.layer2service {
             Layer2Service::Unacknowledged => {
                 // Unacknowledged service, send a TlUnitdataReqBl.
-                let tla_handle = Self::mle_handle_to_todo(prim.handle);
+                let tla_handle = self.track_tla_data_request(MleSapUser::Cmce, prim.handle);
                 SapMsgInner::TlaTlUnitdataReqBl(TlaTlUnitdataReqBl {
                     main_address: prim.main_address,
                     link_id: prim.link_id,
@@ -651,8 +651,12 @@ impl MleBs {
                     packet_data_flag: false,
                     n_tlsdu_repeats: None,
                     data_class_info: None,
-                    // EN 300 392-2 clause 22.3.1.1 requires request handles
-                    // to identify subsequent related LLC/MAC primitives.
+                    // EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.4.1 use
+                    // request handles to relate subsequent LLC/MAC reports
+                    // to the original TL-UNITDATA request. CMCE frequently
+                    // supplies upper-layer handle 0 for D-TX/D-RELEASE FACCH
+                    // messages, so BS MLE must allocate a unique lower-layer
+                    // handle before passing the primitive to LLC.
                     req_handle: tla_handle,
 
                     chan_alloc: prim.chan_alloc.take(),

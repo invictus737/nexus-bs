@@ -432,11 +432,77 @@ fn test_lcmc_unacknowledged_request_stays_tl_unitdata_request() {
     assert_eq!(prim.link_id, 3);
     assert_eq!(prim.endpoint_id, 2);
     assert_eq!(prim.pdu_prio, 5);
-    assert_eq!(prim.req_handle, 11);
+    // EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.4.1 rely on request
+    // handles to correlate MAC/LLC progress reports. BS MLE allocates a
+    // unique lower-layer handle for CMCE TL-UNITDATA because CMCE FACCH
+    // signalling often uses upper-layer handle 0.
+    assert_ne!(prim.req_handle, 11);
     assert!(prim.stealing_permission);
     assert_eq!(prim.stealing_repeats_flag, Some(true));
     assert_ne!(prim.req_handle, 0);
     assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Cmce);
+}
+
+#[test]
+fn test_lcmc_unacknowledged_requests_get_unique_lower_handles() {
+    let mut first = build_lcmc_req(Layer2Service::Unacknowledged);
+    let mut second = build_lcmc_req(Layer2Service::Unacknowledged);
+    if let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut first.msg {
+        prim.handle = 0;
+    }
+    if let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut second.msg {
+        prim.handle = 0;
+    }
+
+    let mut test = ComponentTest::new(StackMode::Bs, None);
+    test.populate_entities(vec![TetraEntity::Mle], vec![TetraEntity::Llc]);
+    test.submit_message(first);
+    test.submit_message(second);
+    test.deliver_all_messages();
+    let sink_msgs = test.dump_sinks();
+
+    assert_eq!(sink_msgs.len(), 2);
+    let handles: Vec<i32> = sink_msgs
+        .iter()
+        .map(|msg| match &msg.msg {
+            SapMsgInner::TlaTlUnitdataReqBl(prim) => prim.req_handle,
+            _ => panic!("expected CMCE TL-UNITDATA request"),
+        })
+        .collect();
+
+    assert_ne!(handles[0], 0);
+    assert_ne!(handles[1], 0);
+    assert_ne!(
+        handles[0], handles[1],
+        "CMCE TL-UNITDATA requests with the same upper handle must not collide at LLC/TMA"
+    );
+}
+
+#[test]
+fn test_lcmc_unacknowledged_terminal_report_routes_back_to_cmce() {
+    let mut test = ComponentTest::new(StackMode::Bs, None);
+    test.populate_entities(vec![TetraEntity::Mle], vec![TetraEntity::Llc, TetraEntity::Cmce]);
+
+    test.submit_message(build_lcmc_req(Layer2Service::Unacknowledged));
+    test.deliver_all_messages();
+    let outbound = test.dump_sinks();
+    let SapMsgInner::TlaTlUnitdataReqBl(prim) = &outbound[0].msg else {
+        panic!("expected CMCE TL-UNITDATA request");
+    };
+    let lower_req_handle = prim.req_handle;
+
+    test.submit_message(build_tl_report(lower_req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER));
+    test.deliver_all_messages();
+    let reports = test.dump_sinks();
+
+    assert_eq!(reports.len(), 1);
+    assert_eq!(reports[0].sap, Sap::LcmcSap);
+    assert_eq!(reports[0].dest, TetraEntity::Cmce);
+    let SapMsgInner::LcmcMleReportInd(report) = &reports[0].msg else {
+        panic!("expected CMCE MLE-REPORT indication");
+    };
+    assert_eq!(report.handle, 11);
+    assert_eq!(report.transfer_result, TLA_REPORT_SUCCESSFUL_TRANSFER);
 }
 
 #[test]
