@@ -1778,7 +1778,7 @@ impl UmacBs {
                         if (1..=4).contains(&peer_ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, peer_ts) {
                             self.last_ul_voice[peer_ts as usize - 1] = Some(self.dltime);
                         }
-                        tracing::trace!("rx_tmd_prim: duplex P2P cross-route UL ts={} -> DL ts={}", ts, peer_ts);
+                        tracing::debug!("rx_tmd_prim: duplex P2P cross-route UL ts={} -> DL ts={}", ts, peer_ts);
                         peer_ts
                     }
                     None => {
@@ -1786,7 +1786,7 @@ impl UmacBs {
                         if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::SwMI {
                             // Circuit call via Brew: DL comes from TetraPack, not local loopback.
                             // Suppress UL->DL reflection so the caller doesn't hear their own voice.
-                            tracing::trace!("rx_tmd_prim: circuit call ts={}, suppressing local UL loopback (SwMI)", ts);
+                            tracing::debug!("rx_tmd_prim: circuit call ts={}, suppressing local UL loopback (SwMI)", ts);
                             return;
                         }
                         ts
@@ -1795,6 +1795,15 @@ impl UmacBs {
 
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
                     if let Some(packed) = pack_ul_acelp_bits(&data) {
+                        tracing::debug!(
+                            "UMAC voice route: UL ts={} bits={} -> DL ts={} packed_bytes={} peer_ts={:?} media_source={:?}",
+                            ts,
+                            data.len(),
+                            dl_target_ts,
+                            packed.len(),
+                            self.channel_scheduler.ul_circuit_peer_ts(ts),
+                            self.channel_scheduler.ul_circuit_dl_media_source(ts)
+                        );
                         self.channel_scheduler.dl_schedule_tmd(dl_target_ts, packed);
                     } else {
                         tracing::warn!(
@@ -1805,7 +1814,7 @@ impl UmacBs {
                         );
                     }
                 } else {
-                    tracing::trace!(
+                    tracing::debug!(
                         "rx_tmd_prim: no active DL circuit on ts={} (UL src ts={}), skipping",
                         dl_target_ts,
                         ts
@@ -1906,6 +1915,7 @@ impl UmacBs {
         };
 
         let mut replaced_suspensions = HashSet::new();
+        let requested_active_addrs: Vec<_> = circuit.active_addresses().collect();
         for d in dirs {
             // See if pre-existing circuit somehow needs to be closed
             if self.channel_scheduler.circuit_is_active(d, ts) {
@@ -1939,7 +1949,17 @@ impl UmacBs {
                 }
             }
 
-            tracing::debug!("  rx_control_circuit_open: Setup {:?} circuit for ts {}", d, ts);
+            tracing::info!(
+                "rx_control_circuit_open: opened {:?} ts={} usage={} mode={:?} speech={:?} peer_ts={:?} media_source={:?} active_addrs={:?}",
+                d,
+                ts,
+                circuit.usage,
+                circuit.circuit_mode,
+                circuit.speech_service,
+                circuit.peer_ts,
+                circuit.dl_media_source,
+                requested_active_addrs
+            );
         }
         for key in replaced_suspensions {
             self.resume_energy_saving_for_suspension_key_if_unowned(key);
@@ -2051,14 +2071,18 @@ impl UmacBs {
                     self.clear_current_ul_speaker(ts);
                 }
             }
-            CallControl::FloorGranted { source_issi, ts, .. } => {
+            CallControl::FloorGranted {
+                call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            } => {
                 self.channel_scheduler.set_hangtime(ts, false);
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     let source_addr = TetraAddress::issi(source_issi);
-                    if self.channel_scheduler.ul_circuit_has_issi_participants(ts)
-                        && !self.channel_scheduler.circuit_is_active_for_addr(Direction::Ul, ts, source_addr)
-                    {
+                    let has_issi_participants = self.channel_scheduler.ul_circuit_has_issi_participants(ts);
+                    if has_issi_participants && !self.channel_scheduler.circuit_is_active_for_addr(Direction::Ul, ts, source_addr) {
                         tracing::warn!(
                             "UMAC: ignoring FloorGranted for non-participant ISSI {} on private UL ts {}",
                             source_issi,
@@ -2068,6 +2092,16 @@ impl UmacBs {
                     }
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                     self.set_current_ul_speaker(ts, source_addr);
+                    tracing::info!(
+                        "UMAC floor granted: call_id={} source_issi={} dest_gssi={} ul_ts={} peer_ts={:?} media_source={:?} has_issi_participants={}",
+                        call_id,
+                        source_issi,
+                        dest_gssi,
+                        ts,
+                        self.channel_scheduler.ul_circuit_peer_ts(ts),
+                        self.channel_scheduler.ul_circuit_dl_media_source(ts),
+                        has_issi_participants
+                    );
                 }
             }
             CallControl::CallEnded { ts, .. } => {

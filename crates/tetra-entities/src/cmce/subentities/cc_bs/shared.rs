@@ -950,6 +950,18 @@ impl CcBsSubentity {
             active_addr,
             active_secondary_addrs,
         };
+        let active_addrs: Vec<_> = circuit.active_addresses().collect();
+        tracing::info!(
+            "CMCE opening UMAC circuit: direction={:?} ts={} usage={} mode={:?} speech={:?} peer_ts={:?} media_source={:?} active_addrs={:?}",
+            circuit.direction,
+            circuit.ts,
+            circuit.usage,
+            circuit.circuit_mode,
+            circuit.speech_service,
+            circuit.peer_ts,
+            circuit.dl_media_source,
+            active_addrs
+        );
         let cmd = SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,

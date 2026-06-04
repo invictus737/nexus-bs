@@ -210,7 +210,7 @@ impl LmacBs {
             // bad. The current TMD SAP has no bad-frame/half-slot-condition
             // field, so fail closed instead of forwarding corrupt bits as
             // clean speech.
-            tracing::trace!("rx_blk_traffic: CRC fail (BFI), dropping TCH/S frame");
+            tracing::debug!("rx_blk_traffic: CRC fail (BFI), dropping TCH/S frame on UL ts={}", ul_time.t);
             return;
         }
 
@@ -219,6 +219,11 @@ impl LmacBs {
         let mut bb = acelp_bits;
         bb.seek(0);
         bb.to_bitarr(&mut data);
+        tracing::debug!(
+            "rx_blk_traffic: decoded valid TCH/S frame on UL ts={} bits={}",
+            ul_time.t,
+            data.len()
+        );
 
         let msg = SapMsg {
             sap: Sap::TmdSap,
