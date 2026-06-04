@@ -2686,6 +2686,187 @@ fn test_local_origin_brew_private_connect_preserves_method_and_timeout_fields() 
     )));
 }
 
+#[test]
+fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let remote_issi = 7_000_101;
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(remote_issi as u64);
+    u_setup.simplex_duplex_selection = false;
+
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let (brew_uuid, mut network_call) = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid, call }) => Some((*brew_uuid, call.clone())),
+            _ => None,
+        })
+        .expect("local private U-SETUP should be forwarded to Brew");
+    network_call.grant = TransmissionGrant::Granted.into_raw() as u8;
+    network_call.permission = 0;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+            brew_uuid,
+            call: network_call,
+        }),
+    });
+    test.run_stack(Some(1));
+    let connect_msgs = test.dump_sinks();
+
+    let connect = connect_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("Brew connect request should emit D-CONNECT to the local caller");
+    assert_eq!(connect.0.main_address.ssi, TEST_ISSI);
+    assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
+    let call_id = connect.1.call_identifier;
+
+    assert_eq!(count_umac_floor_granted(&connect_msgs), 1);
+    assert!(
+        connect_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *got_call_id == call_id && *source_issi == TEST_ISSI && *dest_gssi == remote_issi
+        )),
+        "EN 300 392-2 clause 14.5.1.2.1: Brew-routed simplex D-CONNECT grant must seed the local floor holder"
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let tail_msgs = test.dump_sinks();
+    assert!(
+        count_umac_floor_released(&tail_msgs) >= 1,
+        "U-TX CEASED from the granted local Brew-private speaker must not be ignored as floor_holder=None"
+    );
+}
+
+#[test]
+fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    let mut call = default_network_circuit_call(TEST_ISSI, TEST_CALLED_ISSI);
+    call.priority = 11;
+    call.duplex = 0;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
+            brew_uuid,
+            call: call.clone(),
+        }),
+    });
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let call_id = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .expect("network-origin private setup should emit D-SETUP");
+
+    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+            brew_uuid,
+            grant: TransmissionGrant::Granted.into_raw() as u8,
+            permission: 0,
+        }),
+    });
+    test.run_stack(Some(1));
+    let confirm_msgs = test.dump_sinks();
+
+    let connect_ack = confirm_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("network connect confirm should emit D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(connect_ack.0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
+
+    assert_eq!(count_umac_floor_granted(&confirm_msgs), 1);
+    assert!(
+        confirm_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *got_call_id == call_id && *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_ISSI
+        )),
+        "EN 300 392-2 clause 14.5.1.2.1: Brew-routed simplex D-CONNECT-ACK grant must seed the local floor holder"
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let tail_msgs = test.dump_sinks();
+    assert!(
+        count_umac_floor_released(&tail_msgs) >= 1,
+        "U-TX CEASED from the granted network-origin local speaker must not be ignored as floor_holder=None"
+    );
+}
+
 /// Test that late-entry D-SETUP re-sends are throttled when the previous
 /// D-SETUP's TxReceipt is still in Pending state (UMAC hasn't transmitted it yet),
 /// and that they resume once the receipt reaches a final state.

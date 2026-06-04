@@ -3097,3 +3097,51 @@ Next non-repeating execution:
 1. Commit this UMAC invalid-media timer guard.
 2. Decide deploy after commit: deploy if we want the RF BS to include this guard before the next private/group PTT retest.
 3. Continue next hardening candidate if no RF retest evidence arrives: CMCE Brew-routed private simplex initial `floor_holder`, or UMAC media admission requiring explicit floor epochs for local-loopback traffic.
+
+## 2026-06-05 01:05:00 EEST - CMCE Brew-routed private simplex initial floor hardening
+
+Live diagnostic:
+
+- Remote test BS is running `Build: v0.1.55-2cef71d3`.
+- The current log after restart shows `2260082`, `2260616`, and `2260618` re-registering/affiliating to `226333`, plus one `UFacility` from `2260618`; no fresh `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, `UMAC voice route`, or P2P media sequence was present in the bounded log search.
+- Live config has `call_preemptive = false`; no private/group pre-emption was enabled.
+
+Problem targeted:
+
+- Code audit found a real CMCE gap on Brew-routed private simplex paths: the call became active and UMAC opened a SwMI-backed bearer, but CMCE did not seed `floor_holder` from the `D-CONNECT` / `D-CONNECT-ACKNOWLEDGE` transmission grant.
+- With `floor_holder=None`, a granted local MS could later send `U-TX CEASED` and have it ignored, preventing clean floor release/tail-drain behavior. This can affect P2P simplex when a local destination is temporarily not recognized as local and the setup falls through to Brew routing.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: simplex private-call transmission permission is controlled by the SwMI, and `U-TX CEASED` must be handled for the MS that owns the floor.
+- EN 300 392-2 tables 14.80 and 14.81: `D-CONNECT` / `D-CONNECT-ACKNOWLEDGE` transmission grant and request permission must drive the initial transmit permission state.
+- This is clause-scoped engineering hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/network.rs`
+  - Added `network_circuit_grant()` to decode Brew/TetraPack grant values through the CMCE `TransmissionGrant` enum.
+  - Added `apply_brew_simplex_initial_floor()` to seed `floor_holder` for Brew-routed private simplex calls from the actual connect grant.
+  - Local-origin Brew private connect now preserves `call_info.grant` and `call_info.permission` in `D-CONNECT` and the Brew connect confirm instead of hardcoding granted/no-permission.
+  - Network-origin Brew private connect confirm now seeds local floor state after opening the SwMI bearer.
+  - `FloorGranted` is emitted to UMAC only when the local MS is the granted initial speaker.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_local_origin_brew_private_simplex_connect_sets_initial_floor`.
+  - Added `test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor`.
+
+Verification:
+
+- `cargo fmt --all` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs brew_private_simplex --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 127 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit the CMCE Brew private simplex floor patch.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Confirm remote build banner and SHA.
+4. Retest private simplex `2260616 <-> 2260618`. If no `U-SETUP` appears, diagnose MAC/LLC decode before changing floor semantics again.

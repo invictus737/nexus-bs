@@ -21,6 +21,62 @@ impl CcBsSubentity {
         raw != 0
     }
 
+    fn network_circuit_grant(raw: u8) -> TransmissionGrant {
+        TransmissionGrant::try_from((raw & 0x03) as u64).unwrap_or(TransmissionGrant::Granted)
+    }
+
+    fn apply_brew_simplex_initial_floor(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        local_addr: TetraAddress,
+        peer_addr: TetraAddress,
+        ts: u8,
+        simplex_duplex: bool,
+        grant: TransmissionGrant,
+    ) {
+        if simplex_duplex {
+            return;
+        }
+
+        let floor_holder = match grant {
+            TransmissionGrant::Granted => Some(local_addr.ssi),
+            TransmissionGrant::GrantedToOtherUser => Some(peer_addr.ssi),
+            TransmissionGrant::NotGranted | TransmissionGrant::RequestQueued => None,
+        };
+
+        if let Some(call) = self.individual_calls.get_mut(&call_id) {
+            if let Some(holder_issi) = floor_holder {
+                call.set_floor_holder(holder_issi);
+            } else {
+                call.clear_floor_holder();
+            }
+        }
+
+        tracing::info!(
+            "CMCE: Brew simplex private call_id={} initial floor_holder={:?} local_issi={} peer_issi={} grant={:?}",
+            call_id,
+            floor_holder,
+            local_addr.ssi,
+            peer_addr.ssi,
+            grant
+        );
+
+        if floor_holder == Some(local_addr.ssi) {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: local_addr.ssi,
+                    dest_gssi: peer_addr.ssi,
+                    ts,
+                }),
+            });
+        }
+    }
+
     /// Handle network-initiated circuit setup request (Brew -> local called MS).
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_setup_request(
         &mut self,
@@ -340,13 +396,14 @@ impl CcBsSubentity {
             ul_dl_assigned: UlDlAssignment::Both,
         };
 
+        let grant_enum = Self::network_circuit_grant(call_info.grant);
         let d_connect = DConnect {
             call_identifier: call_id,
             call_time_out: connect_timeout,
             hook_method_selection,
             simplex_duplex_selection: call.simplex_duplex,
-            transmission_grant: TransmissionGrant::Granted,
-            transmission_request_permission: false,
+            transmission_grant: grant_enum,
+            transmission_request_permission: call_info.permission != 0,
             call_ownership: true,
             call_priority: None,
             basic_service_information: None,
@@ -416,14 +473,24 @@ impl CcBsSubentity {
             }
         }
 
+        self.apply_brew_simplex_initial_floor(
+            queue,
+            call_id,
+            call.calling_addr,
+            call.called_addr,
+            call.calling_ts,
+            call.simplex_duplex,
+            grant_enum,
+        );
+
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
             msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                 brew_uuid,
-                grant: 0,
-                permission: 0,
+                grant: grant_enum.into_raw() as u8,
+                permission: call_info.permission,
             }),
         });
 
@@ -500,7 +567,7 @@ impl CcBsSubentity {
             ul_dl_assigned: UlDlAssignment::Both,
         };
 
-        let grant_enum = TransmissionGrant::try_from((grant & 0x03) as u64).unwrap_or(TransmissionGrant::Granted);
+        let grant_enum = Self::network_circuit_grant(grant);
         let d_connect_ack = DConnectAcknowledge {
             call_identifier: call_id,
             call_time_out: call.call_timeout,
@@ -583,6 +650,16 @@ impl CcBsSubentity {
                 | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
             }
         }
+
+        self.apply_brew_simplex_initial_floor(
+            queue,
+            call_id,
+            call.called_addr,
+            call.calling_addr,
+            call.called_ts,
+            call.simplex_duplex,
+            grant_enum,
+        );
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
