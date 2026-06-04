@@ -42,12 +42,19 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Deployment:
+
+- Commit: `c01572f fix: tail-drain private peer-floor disconnect`.
+- Deployed direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote build banner: `Build: v0.1.55-c01572fb`.
+- Remote binary SHA-256: `92ca23ac132c508a12776c3759bbbf1603899c782600b4326419b922f0e67f31`.
+- Post-start log: `2260082`, `2260618`, and `2260616` registered and affiliated to group `226333`.
+
 Next non-repeating execution:
 
-1. Commit this patch.
-2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
-3. Retest exact Motorola case: `2260616 -> 2260618`, make 2260618 talk last if possible, then hang up on `2260616`.
-4. Expected live log: prompt `D-RELEASE` to 2260616, no immediate `D-DISCONNECT` to 2260618, delayed `D-DISCONNECT` after tail-drain, peer `U-RELEASE`, no fallback timeout, no MXP600 reboot.
+1. Retest exact Motorola case: `2260616 -> 2260618`, make 2260618 talk last if possible, then hang up on `2260616`.
+2. Expected live log: prompt `D-RELEASE` to 2260616, no immediate `D-DISCONNECT` to 2260618, delayed `D-DISCONNECT` after tail-drain, peer `U-RELEASE`, no fallback timeout, no MXP600 reboot.
+3. If a reboot still happens, inspect whether `2260618` was the `D-DISCONNECT` recipient or whether it sent/failed to send `U-RELEASE` before changing sequencing again.
 
 ## 2026-06-04 21:54:29 EEST - Patched private simplex hangup No Answer release acknowledgement
 
