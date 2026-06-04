@@ -80,21 +80,185 @@ impl CcBsSubentity {
             return;
         }
 
-        if let Some((&active_call_id, _)) = self.active_calls.iter().find(|(_, call)| call.dest_gssi == dest_gssi) {
+        if let Some((&active_call_id, active_call)) = self.active_calls.iter().find(|(_, call)| call.dest_gssi == dest_gssi) {
+            if self.pending_group_releases.contains_key(&active_call_id) {
+                tracing::info!(
+                    "CMCE: rejecting U-SETUP from issi={} to gssi={} while call_id={} is releasing",
+                    calling_party.ssi,
+                    dest_gssi,
+                    active_call_id
+                );
+                Self::reject_u_setup_before_call_id(
+                    queue,
+                    calling_party,
+                    ul_handle,
+                    ul_link_id,
+                    ul_endpoint_id,
+                    DisconnectCause::RequestedServiceNotAvailable,
+                );
+                return;
+            }
+
+            if !self.subscriber_affiliated_to_group(calling_party.ssi, dest_gssi) {
+                tracing::info!(
+                    "CMCE: rejecting U-SETUP from unaffiliated issi={} to active gssi={} call_id={}",
+                    calling_party.ssi,
+                    dest_gssi,
+                    active_call_id
+                );
+                Self::reject_u_setup_before_call_id(
+                    queue,
+                    calling_party,
+                    ul_handle,
+                    ul_link_id,
+                    ul_endpoint_id,
+                    DisconnectCause::RequestedServiceNotAvailable,
+                );
+                return;
+            }
+
+            let Some(cached_setup) = self.cached_setups.get(&active_call_id) else {
+                tracing::warn!(
+                    "CMCE: rejecting U-SETUP from issi={} to active gssi={} call_id={} because cached D-SETUP is missing",
+                    calling_party.ssi,
+                    dest_gssi,
+                    active_call_id
+                );
+                Self::reject_u_setup_before_call_id(
+                    queue,
+                    calling_party,
+                    ul_handle,
+                    ul_link_id,
+                    ul_endpoint_id,
+                    DisconnectCause::RequestedServiceNotAvailable,
+                );
+                return;
+            };
+
+            let existing_setup = &cached_setup.pdu;
+            let compatible_existing_call = existing_setup.hook_method_selection == pdu.hook_method_selection
+                && existing_setup.simplex_duplex_selection == pdu.simplex_duplex_selection
+                && existing_setup.basic_service_information.circuit_mode_type == pdu.basic_service_information.circuit_mode_type
+                && existing_setup.basic_service_information.encryption_flag == pdu.basic_service_information.encryption_flag
+                && existing_setup.basic_service_information.communication_type == pdu.basic_service_information.communication_type
+                && existing_setup.basic_service_information.slots_per_frame == pdu.basic_service_information.slots_per_frame
+                && existing_setup.basic_service_information.speech_service == pdu.basic_service_information.speech_service;
+            if !compatible_existing_call {
+                tracing::info!(
+                    "CMCE: rejecting incompatible same-GSSI U-SETUP from issi={} to active gssi={} call_id={}",
+                    calling_party.ssi,
+                    dest_gssi,
+                    active_call_id
+                );
+                Self::reject_u_setup_before_call_id(
+                    queue,
+                    calling_party,
+                    ul_handle,
+                    ul_link_id,
+                    ul_endpoint_id,
+                    DisconnectCause::RequestedServiceNotAvailable,
+                );
+                return;
+            }
+
+            let active_state = active_call.state();
+            let current_speaker = active_call.source_issi;
+            let active_ts = active_call.ts;
+            let active_usage = active_call.usage;
+            let active_timeout = active_call.call_timeout;
+            let call_ownership = matches!(
+                &active_call.origin,
+                CallOrigin::Local { caller_addr } if caller_addr.ssi == calling_party.ssi
+            );
+            let connect_grant = match active_state {
+                GroupCallState::Transmitting if current_speaker == calling_party.ssi => TransmissionGrant::Granted,
+                GroupCallState::Transmitting => TransmissionGrant::GrantedToOtherUser,
+                GroupCallState::NoActiveSpeaker { .. } => TransmissionGrant::Granted,
+            };
+            let hook_method_selection = existing_setup.hook_method_selection;
+            let simplex_duplex_selection = existing_setup.simplex_duplex_selection;
+
             tracing::info!(
-                "CMCE: rejecting colliding U-SETUP from issi={} to active gssi={} call_id={}",
+                "CMCE: mapping repeated U-SETUP from issi={} to active gssi={} call_id={} state={:?}",
                 calling_party.ssi,
                 dest_gssi,
-                active_call_id
+                active_call_id,
+                active_state
             );
-            Self::reject_u_setup_before_call_id(
+
+            // EN 300 392-2 clauses 14.5.2.1.2/14.5.2.1.3 say a same-group
+            // setup collision that has already reached the SwMI is completed
+            // with the SwMI call identifier. Clauses 14.5.2.2.1 b/e keep
+            // subsequent PTT as floor control (`D-TX GRANTED`) while the MS
+            // remains in CALL-ACTIVE; do not release a compatible active
+            // same-GSSI call as an unavailable service.
+            self.send_d_call_proceeding(
                 queue,
-                calling_party,
-                ul_handle,
-                ul_link_id,
-                ul_endpoint_id,
-                DisconnectCause::RequestedServiceNotAvailable,
+                message,
+                pdu,
+                active_call_id,
+                CallTimeoutSetupPhase::T10s,
+                hook_method_selection,
             );
+
+            let d_connect = DConnect {
+                call_identifier: active_call_id,
+                call_time_out: active_timeout,
+                hook_method_selection,
+                simplex_duplex_selection,
+                transmission_grant: connect_grant,
+                transmission_request_permission: false,
+                call_ownership,
+                call_priority: None,
+                basic_service_information: None,
+                temporary_address: None,
+                notification_indicator: None,
+                facility: None,
+                proprietary: None,
+            };
+
+            tracing::info!("-> {:?} (existing group call)", d_connect);
+            let mut connect_sdu = BitBuffer::new_autoexpand(30);
+            d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+            connect_sdu.seek(0);
+
+            let mut timeslots = [false; 4];
+            timeslots[active_ts as usize - 1] = true;
+            queue.push_back(SapMsg {
+                sap: Sap::LcmcSap,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Mle,
+                msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                    sdu: connect_sdu,
+                    handle: ul_handle,
+                    endpoint_id: ul_endpoint_id,
+                    link_id: ul_link_id,
+                    layer2service: Layer2Service::Unacknowledged,
+                    pdu_prio: 0,
+                    layer2_qos: 0,
+                    stealing_permission: false,
+                    stealing_repeats_flag: false,
+                    chan_alloc: Some(CmceChanAllocReq {
+                        usage: Some(active_usage),
+                        alloc_type: ChanAllocType::Replace,
+                        carrier: None,
+                        timeslots,
+                        ul_dl_assigned: UlDlAssignment::Both,
+                    }),
+                    main_address: calling_party,
+                    tx_reporter: None,
+                }),
+            });
+
+            if let Err(err) = self.fsm_group_on_tx_demand(queue, active_call_id, calling_party, 0) {
+                tracing::warn!(
+                    "CMCE: repeated U-SETUP floor handling failed call_id={} issi={} gssi={} err={:?}",
+                    active_call_id,
+                    calling_party.ssi,
+                    dest_gssi,
+                    err
+                );
+            }
             return;
         }
 

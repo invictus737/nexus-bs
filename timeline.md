@@ -1,5 +1,58 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 19:37:30 EEST - Patched repeated group PTT U-SETUP service-unavailable path
+
+User symptom:
+
+- Repeated PTT in group call reports `Service unavailable`.
+- Live logs showed `CMCE: rejecting colliding U-SETUP ... active gssi=226333` followed by `DRelease { call_identifier: 0, disconnect_cause: RequestedServiceNotAvailable }`.
+
+Components in simple technical terms:
+
+- CMCE is call control. It owns `U-SETUP`, `D-CONNECT`, `D-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, and group-call release decisions.
+- UMAC is the lower MAC scheduler. It does not decide call policy; it receives CMCE `FloorGranted`/`FloorReleased` commands and maps the current speaker onto the traffic channel.
+- Hangtime is Nexus-BS local call retention after a speaker releases PTT. The call is still maintained so the next PTT can reuse the same `call_id` and traffic circuit.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1.2 defines group call setup, `D-CALL PROCEEDING`, `D-CONNECT`, and the SwMI call identifier used for subsequent PDUs.
+- EN 300 392-2 clause 14.5.2.1.3 covers same-group setup collision handling and does not require creating a parallel group call.
+- EN 300 392-2 clause 14.5.2.2.1 says the SwMI controls group transmit permission with `U-TX DEMAND` / `D-TX GRANTED`; queued/not-granted floor responses keep the MS in `CALL-ACTIVE`.
+- EN 300 392-2 clause 14.5.2.3.2 uses `D-RELEASE` when the SwMI cannot support a call/request. A compatible repeated setup for the same active GSSI is now not treated as that failure case.
+- This is clause-scoped engineering alignment, not formal ETSI/TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Same-GSSI `U-SETUP` while a group call is active or in hangtime no longer receives dummy-call `D-RELEASE RequestedServiceNotAvailable`.
+  - If the call is already pending release, the old rejection remains; a releasing traffic circuit must not be reused or duplicated.
+  - The repeated requester must be affiliated to the GSSI and request a compatible service before rejoining the existing call.
+  - Nexus-BS responds with existing-call `D-CALL PROCEEDING` and `D-CONNECT`, including the active traffic allocation and existing `call_id`.
+  - The repeated setup is then routed through the existing group floor FSM:
+    - while another MS is transmitting, the requester receives `D-TX GRANTED RequestQueued`;
+    - during hangtime, the requester receives floor grant on the existing call and UMAC gets one `FloorGranted`;
+    - no second group circuit is allocated.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Replaced the old regression that expected service-unavailable rejection.
+  - Added active-speaker coverage: no `D-RELEASE`, no second `D-SETUP`, no second UMAC open, queued floor response on the active call id.
+  - Added hangtime coverage: no `D-RELEASE`, no second circuit, requester gets floor on the active call id.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs repeated_group_u_setup --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 117 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 9 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating actions:
+
+- Commit this CMCE patch.
+- Build locally for AArch64 with the remembered Nexus-BS SoapySDR sysroot command.
+- Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs` on `chris@192.168.1.179`; do not compile on the Pi and do not create a binary backup.
+- Restart test BS and validate group PTT on `226333`, especially repeated PTT from `2260616` and `2260082` during active speaker and hangtime.
+
 ## 2026-06-04 19:28:03 EEST - Deployed MM attach-confirmation hardening to test BS
 
 User symptom:
