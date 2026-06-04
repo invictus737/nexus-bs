@@ -1,5 +1,72 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 19:28:03 EEST - Deployed MM attach-confirmation hardening to test BS
+
+User symptom:
+
+- After BS restart, terminals can show `Unit Not Attached` even while Nexus-BS is rebuilding its local MM/CMCE state.
+
+Components in simple technical terms:
+
+- MM (Mobility Management) owns terminal registration, location update, group affiliation state, and restart recovery.
+- MLE/LLC carry MM downlink PDUs over the air and report whether acknowledged transfers succeeded or failed.
+- CMCE consumes MM register/affiliate updates so group/private call control knows which ISSIs are usable listeners.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4 permits SwMI-initiated registration at any time using `D-LOCATION UPDATE COMMAND`, including a group identity report request.
+- EN 300 392-2 clause 16.4.4 also permits/defines the `U-LOCATION UPDATE DEMAND` response to that command.
+- EN 300 392-2 clause 16.4.4 says an MS that supports listed extended capabilities includes the extended capabilities IE in `U-LOCATION UPDATE DEMAND`; Nexus-BS now accepts that IE as non-fatal but does not yet act on the capability bits.
+- LLC/MLE transfer reports are local SAP evidence, not over-air certification. No formal ETSI/TETRA certification is claimed.
+
+Patch implemented:
+
+- Commit: `c38b13b fix: harden MM restart attach confirmation`
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Restart recovery now sends the first probe after 1 s, spaces cached ISSIs by 1 s, retries every 2 s, and keeps the same long total window with 150 attempts.
+  - `U-LOCATION UPDATE DEMAND.extended_capabilities` is accepted/logged instead of rejecting registration.
+  - `D-LOCATION UPDATE ACCEPT` now uses a tracked local MLE handle.
+  - If MLE/LLC reports `FAILED_TRANSFER` for that accept, MM treats the registration as unconfirmed, fails open to `StayAlive`, withdraws shared CMCE registration/affiliation, and sends a fresh `D-LOCATION UPDATE COMMAND(group identity report=1)`.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added coverage for standards-permitted `extended_capabilities`.
+  - Added coverage for failed `D-LOCATION UPDATE ACCEPT` transfer causing MM to re-probe instead of leaving BS/MS state split.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs failed_location_update_accept --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 9 passed.
+- `cargo test -p tetra-entities --test test_mm_bs extended_capabilities --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 112 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Build/deploy:
+
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Local and remote test binary SHA-256:
+  - `80f72b4d226c5da7e83e42d525188848a80adb02d8bf094a2f1758cfe690e01c`
+- Deployed direct over `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`.
+- No binary backup was created.
+- Restarted test BS with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live evidence after deploy:
+
+- Startup banner reports `Build: v0.1.55-c38b13ba`.
+- MM armed restart recovery for cached/configured ISSIs `{2260082, 2260616, 2260618}`.
+- `2260616` registered/affiliated to `226333` at about 4 s after restart.
+- `2260082` registered/affiliated to `226333` at about 5 s after restart.
+- `2260618` needed repeated 2 s recovery probes and then registered/affiliated to `226333` at about 22 s after restart.
+- No `D-LOCATION UPDATE ACCEPT failed transfer` reprobe occurred in this sampled live run; the new failed-accept path remains unit-tested.
+- No literal `Unit Not Attached` appeared in `nexus-bs.log` or `control.log`.
+
+Residual observations:
+
+- `2260618` is still slower to answer restart recovery than the other terminals; this now retries more frequently and remains long-lived, but operator screen verdict is still required.
+- `2260616` later hit BS-initiated EG3 T352 timeout and stayed `StayAlive`, which is safe for PTT validation.
+- Next non-repeating action is live group/private PTT validation, not another MM hypothesis unless a terminal remains unattached after the recovery window.
+
 ## 2026-06-04 13:17:51 EEST - Deployed long-lived MM restart recovery to test BS
 
 Deployed commit:
