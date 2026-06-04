@@ -1,5 +1,63 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 21:01:37 EEST - Fixed private simplex first-PTT floor inversion for hook setup
+
+User symptom:
+
+- Private simplex call first PTT did not pass voice while PTT was held; a second PTT worked.
+- Live private-call log showed the concrete bad sequence:
+  - `2260616 -> 2260618` `U-SETUP` with `hook_method_selection=true`, `simplex_duplex_selection=false`, and `request_to_transmit_send_data=true`.
+  - Nexus-BS then sent `D-CONNECT` to the caller with `transmission_grant=GrantedToOtherUser`.
+  - Nexus-BS sent `D-CONNECT-ACKNOWLEDGE` to the called MS with `transmission_grant=Granted`.
+  - CMCE recorded `initial floor_holder = ISSI 2260618`.
+  - Later `2260616` sent `U-TX DEMAND`, Nexus-BS granted floor to `2260616`, and voice route became active.
+
+Component in simple technical terms:
+
+- CMCE/CC-BS is the call-control brain. In a private simplex call it decides which terminal gets the first transmit floor in `D-CONNECT` / `D-CONNECT-ACKNOWLEDGE`.
+- UMAC is the traffic-channel router. It uses the CMCE `CallControl::Open.active_addr` speaker to decide whose uplink TCH/S speech is valid and should be looped to the listeners on the shared simplex bearer.
+- The bug was in CMCE's interpretation of one setup bit, not in encryption, WAP, or RF.
+
+ETSI clause scope checked:
+
+- EN 300 392-2 clause 14.5.1.2.1 says the SwMI fully controls private-call transmit permission.
+- For on/off-hook signalling, normal operation gives the called MS permission to transmit, but if the calling MS sets the `request to transmit` bit in `U-SETUP`, the calling MS is asking for transmit permission.
+- For direct setup signalling, normal operation gives the calling MS permission to transmit; the same bit allows the called user application to request permission first, but it is not an automatic grant to the called MS.
+- EN 300 392-2 table 14.80 defines `transmission_grant`: granted, not granted, queued, or granted to another user.
+- This is clause-scoped engineering alignment only, not formal ETSI/TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Initial private simplex floor selection now interprets `request_to_transmit_send_data` by setup method:
+    - hook/on-off signalling with bit set -> caller receives initial floor;
+    - hook/on-off signalling with bit clear -> called MS receives normal initial floor;
+    - direct setup -> caller remains initial floor; the bit only permits called-first request flow, not automatic called grant.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - Updated the field comment so future patches do not reintroduce the inverted interpretation.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added/updated focused tests for hook setup with and without request-to-transmit:
+    - `hook=true, request=true` keeps the calling MS as initial UMAC speaker and sends caller `D-CONNECT Granted`;
+    - `hook=true, request=false` keeps the called MS as normal initial speaker and sends caller `D-CONNECT GrantedToOtherUser`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 121 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next live validation:
+
+- Deploy this patch to the test BS.
+- Retest private simplex while holding PTT on the calling terminal.
+- Expected evidence for the first call attempt:
+  - `D-CONNECT` to caller has `transmission_grant=Granted`;
+  - `D-CONNECT-ACKNOWLEDGE` to called MS has `transmission_grant=GrantedToOtherUser`;
+  - `Simplex P2P initial floor_holder` matches the caller;
+  - `UMAC voice route` appears during the first held PTT, without waiting for a second `U-TX DEMAND`.
+
 ## 2026-06-04 20:08:31 EEST - Extended assigned-channel usage marker to group floor cease/interrupt
 
 Live evidence after `33ef3ca`:

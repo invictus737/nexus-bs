@@ -253,9 +253,11 @@ pub(super) struct IndividualCall {
     pub(super) called_usage: u8,
     /// true = full duplex (ETSI 14.8.17), false = simplex
     pub(super) simplex_duplex: bool,
-    /// Original U-SETUP request-to-transmit/send-data bit.
-    /// EN 300 392-2 table 14.74: false means the calling MS requests initial
-    /// permission to transmit; true allows the other MS to transmit first.
+    /// Original U-SETUP request-to-transmit/send-data bit. EN 300 392-2
+    /// clause 14.5.1.2.1 gives it setup-method-specific meaning: with
+    /// on/off-hook signalling it is the calling MS asking for initial transmit
+    /// permission; with direct setup it allows the called user application to
+    /// request permission first.
     pub(super) request_to_transmit_send_data: bool,
     pub(super) state: IndividualCallState,
     /// Start instant for setup timeout (T301/T302 equivalent on BS side).

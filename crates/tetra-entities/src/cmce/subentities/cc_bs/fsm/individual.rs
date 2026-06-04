@@ -471,12 +471,20 @@ impl CcBsSubentity {
         let calling_usage = call_snapshot.calling_usage;
         let called_usage = call_snapshot.called_usage;
         let simplex_duplex = call_snapshot.simplex_duplex;
-        let called_ms_transmits_first = !simplex_duplex && call_snapshot.request_to_transmit_send_data;
 
         let Some(cached) = self.cached_setups.get(&call_id) else {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
         };
+        // EN 300 392-2 clause 14.5.1.2.1 assigns different meaning to the
+        // U-SETUP request-to-transmit/send-data bit depending on setup method.
+        // With on/off-hook signalling the normal first speaker is the called
+        // MS, unless the calling MS sets the bit to ask for initial transmit
+        // permission. With direct setup the normal first speaker is the
+        // calling MS; a set bit only allows the called user application to
+        // request permission first, it is not an automatic grant to the called
+        // MS.
+        let called_ms_transmits_first = !simplex_duplex && cached.pdu.hook_method_selection && !call_snapshot.request_to_transmit_send_data;
 
         let mut calling_timeslots = [false; 4];
         calling_timeslots[calling_ts as usize - 1] = true;
@@ -576,9 +584,8 @@ impl CcBsSubentity {
             );
         }
 
-        // D-CONNECT to calling MS. EN 300 392-2 clause 14.5.1.2.1 and
-        // table 14.74 make direct simplex setup caller-first unless U-SETUP
-        // request_to_transmit_send_data asks that the other MS may transmit.
+        // D-CONNECT to calling MS. The initial floor mirrors the clause
+        // 14.5.1.2.1 setup-method rule above.
         let calling_grant = if simplex_duplex || !called_ms_transmits_first {
             TransmissionGrant::Granted
         } else {

@@ -6491,15 +6491,15 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
         .collect();
     assert_eq!(open_circuits.len(), 1, "simplex private call should open one shared traffic bearer");
     let open = open_circuits[0];
-    // EN 300 392-2 clause 14.5.1.2.1: during call set-up, the MS given
-    // permission to transmit starts the transmission-control timer. Keep the
-    // CMCE grant state and UMAC current UL speaker aligned.
+    // EN 300 392-2 clause 14.5.1.2.1: with on/off-hook signalling and no
+    // calling-MS request-to-transmit bit, the normal first permission to
+    // transmit is given to the called MS. Keep the CMCE grant state and UMAC
+    // current UL speaker aligned.
     assert_eq!(open.peer_ts, None);
-    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)));
+    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
     assert!(
-        open.active_secondary_addrs
-            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
-        "shared simplex private bearer must still keep the called MS active for assigned-channel listening"
+        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
+        "shared simplex private bearer must still keep the calling MS active for assigned-channel listening"
     );
 
     let d_connects: Vec<_> = connect_msgs
@@ -6517,6 +6517,7 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
         assert!(pdu.hook_method_selection);
         assert!(!pdu.simplex_duplex_selection);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     }
 
     let d_connect_acks: Vec<_> = connect_msgs
@@ -6530,7 +6531,7 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
     for (_, pdu) in &d_connect_acks {
         assert_eq!(pdu.call_identifier, call_id);
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
     }
 }
 
@@ -6719,7 +6720,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
 }
 
 #[test]
-fn test_p2p_u_connect_honors_request_to_transmit_other_ms_first() {
+fn test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -6734,6 +6735,7 @@ fn test_p2p_u_connect_honors_request_to_transmit_other_ms_first() {
 
     let mut u_setup = default_p2p_u_setup();
     u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    u_setup.hook_method_selection = true;
     u_setup.request_to_transmit_send_data = true;
     test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
     test.run_stack(Some(1));
@@ -6754,17 +6756,19 @@ fn test_p2p_u_connect_honors_request_to_transmit_other_ms_first() {
     assert_eq!(
         open_circuits.len(),
         1,
-        "called-MS-first simplex private call should open one shared traffic bearer"
+        "hook private simplex call should open one shared traffic bearer"
     );
     let open = open_circuits[0];
-    // EN 300 392-2 clause 14.5.1.2.1: during call set-up, the MS given
-    // permission to transmit starts the transmission-control timer. Keep the
-    // CMCE grant state and UMAC current UL speaker aligned.
+    // EN 300 392-2 clause 14.5.1.2.1: with on/off-hook signalling, setting
+    // request-to-transmit in U-SETUP is the calling MS asking for initial
+    // transmit permission. Keep the CMCE grant state and UMAC current speaker
+    // aligned so a held PTT sends speech on the first grant.
     assert_eq!(open.peer_ts, None);
-    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
+    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)));
     assert!(
-        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
-        "shared simplex private bearer must still keep the calling MS active for assigned-channel listening"
+        open.active_secondary_addrs
+            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
+        "shared simplex private bearer must still keep the called MS active for assigned-channel listening"
     );
 
     let d_connects: Vec<_> = connect_msgs
@@ -6779,7 +6783,7 @@ fn test_p2p_u_connect_honors_request_to_transmit_other_ms_first() {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
         assert_eq!(pdu.simplex_duplex_selection, false);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
     }
 
     let d_connect_acks: Vec<_> = connect_msgs
@@ -6793,7 +6797,7 @@ fn test_p2p_u_connect_honors_request_to_transmit_other_ms_first() {
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     }
 }
 
