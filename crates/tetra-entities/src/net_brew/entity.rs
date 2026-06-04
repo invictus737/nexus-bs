@@ -943,6 +943,7 @@ impl BrewEntity {
                 msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq {
                     ts,
                     data: frame.acelp_data,
+                    raw_tch_s_block: None,
                 }),
             });
         }
@@ -1103,7 +1104,14 @@ impl TetraEntityTrait for BrewEntity {
         match message.msg {
             // UL voice from UMAC — forward to TetraPack if this timeslot is being forwarded
             SapMsgInner::TmdCircuitDataInd(prim) => {
-                self.handle_ul_voice(prim.ts, prim.data);
+                if prim.raw_tch_s_block.is_some() {
+                    tracing::trace!(
+                        "BrewEntity: ignoring raw TCH/S half-slot on ts={} because Brew expects ACELP frames",
+                        prim.ts
+                    );
+                } else {
+                    self.handle_ul_voice(prim.ts, prim.data);
+                }
             }
             // Floor-control and call lifecycle notifications from CMCE
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {

@@ -196,6 +196,34 @@ impl LmacBs {
             );
             return;
         }
+        if blk.block_num == PhyBlockNum::Block2 {
+            let data = blk.block.into_bitvec();
+            if data.len() != 216 {
+                tracing::warn!("rx_blk_traffic: dropping raw TCH/S Block2 with {} bits; expected 216", data.len());
+                return;
+            }
+            // EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 require the BS to
+            // interpret a non-stolen second half-slot as TCH and preserve its
+            // timing/position. This is not a complete ACELP frame, so keep it
+            // tagged as raw type-5 TCH/S instead of decoding it as clean speech.
+            tracing::debug!(
+                "rx_blk_traffic: forwarding raw TCH/S Block2 on UL ts={} bits={}",
+                ul_time.t,
+                data.len()
+            );
+            let msg = SapMsg {
+                sap: Sap::TmdSap,
+                src: TetraEntity::Lmac,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                    ts: ul_time.t,
+                    data,
+                    raw_tch_s_block: Some(PhyBlockNum::Block2),
+                }),
+            };
+            queue.push_back(msg);
+            return;
+        }
         if blk.block_num != PhyBlockNum::Both {
             // EN 300 392-2 clauses 23.8.3 and 23.8.3.2 permit bad or
             // partially unavailable speech only when the bad-frame/half-slot
@@ -241,7 +269,11 @@ impl LmacBs {
             sap: Sap::TmdSap,
             src: TetraEntity::Lmac,
             dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts: ul_time.t, data }),
+            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                ts: ul_time.t,
+                data,
+                raw_tch_s_block: None,
+            }),
         };
         queue.push_back(msg);
     }
@@ -447,7 +479,15 @@ impl LmacBs {
         }
         if let Some(blk2) = blk2 {
             if blk2.logical_channel.is_traffic() {
-                prim_phy.blk2 = Some(errorcontrol::encode_tp(blk2, 2));
+                if blk2.logical_channel == LogicalChannel::TchS && blk2.mac_block.get_len() == 216 {
+                    // The upper MAC can ask us to preserve a received raw TCH/S
+                    // second half-slot. It is already type-5 encoded, so passing
+                    // it directly preserves the half-slot pairing required by
+                    // EN 300 392-2 clause 23.8.5.
+                    prim_phy.blk2 = Some(blk2.mac_block);
+                } else {
+                    prim_phy.blk2 = Some(errorcontrol::encode_tp(blk2, 2));
+                }
             } else {
                 prim_phy.blk2 = Some(errorcontrol::encode_cp(blk2));
             }

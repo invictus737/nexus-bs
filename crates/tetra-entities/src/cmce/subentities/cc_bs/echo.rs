@@ -45,7 +45,11 @@ impl EchoSession {
             sap: Sap::TmdSap,
             src: TetraEntity::Brew, // UMAC listens for Brew→Umac on TmdSap
             dest: TetraEntity::Umac,
-            msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq { ts, data }),
+            msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq {
+                ts,
+                data,
+                raw_tch_s_block: None,
+            }),
         }
     }
 }

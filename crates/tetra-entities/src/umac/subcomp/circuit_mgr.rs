@@ -1,14 +1,19 @@
 use std::collections::VecDeque;
 
-use tetra_core::Direction;
+use tetra_core::{Direction, PhyBlockNum};
 use tetra_saps::control::call_control::Circuit;
+
+pub enum CircuitTxBlock {
+    AcElp(Vec<u8>),
+    RawTchSHalfSlot { block_num: PhyBlockNum, type5_bits: Vec<u8> },
+}
 
 pub struct CircuitMgr {
     pub dl: [Option<Circuit>; 4],
     pub ul: [Option<Circuit>; 4],
 
     /// Data blocks queued to be transmitted, per timeslot
-    pub tx_data: [VecDeque<Vec<u8>>; 4],
+    pub tx_data: [VecDeque<CircuitTxBlock>; 4],
 }
 
 impl CircuitMgr {
@@ -102,11 +107,19 @@ impl CircuitMgr {
             tracing::warn!("CircuitMgr::put_block on inactive circuit {:?} {}", Direction::Dl, ts);
             return;
         }
-        self.tx_data[ts as usize - 1].push_back(block);
+        self.tx_data[ts as usize - 1].push_back(CircuitTxBlock::AcElp(block));
+    }
+
+    pub fn put_raw_tch_s_half_slot(&mut self, ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
+        if !self.is_active(Direction::Dl, ts) {
+            tracing::warn!("CircuitMgr::put_raw_tch_s_half_slot on inactive circuit {:?} {}", Direction::Dl, ts);
+            return;
+        }
+        self.tx_data[ts as usize - 1].push_back(CircuitTxBlock::RawTchSHalfSlot { block_num, type5_bits });
     }
 
     /// Take a to-be-transmitted block from the queue
-    pub fn take_block(&mut self, ts: u8) -> Option<Vec<u8>> {
+    pub fn take_block(&mut self, ts: u8) -> Option<CircuitTxBlock> {
         if !self.is_active(Direction::Dl, ts) {
             tracing::warn!("CircuitMgr::take_block on inactive circuit {:?} {}", Direction::Dl, ts);
             return None;

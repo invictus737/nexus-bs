@@ -30,7 +30,10 @@ use tetra_pdus::{
 
 use crate::{
     lmac::components::scrambler,
-    umac::subcomp::{bs_frag::BsFragger, circuit_mgr::CircuitMgr},
+    umac::subcomp::{
+        bs_frag::BsFragger,
+        circuit_mgr::{CircuitMgr, CircuitTxBlock},
+    },
 };
 
 /// We submit this many TX timeslots ahead of the current time
@@ -49,6 +52,11 @@ pub const TCH_S_CAP: usize = 274;
 pub const NUM_TIMESLOTS: usize = 4;
 
 const PREDEFINED_BROADCAST_GSSI: u32 = 0xFF_FFFF;
+
+enum DlTchBlock {
+    AcElp(BitBuffer),
+    RawTchSHalfSlot { block_num: PhyBlockNum, type5_bits: BitBuffer },
+}
 
 #[derive(Debug)]
 pub struct PrecomputedUmacPdus {
@@ -1272,6 +1280,10 @@ impl BsChannelScheduler {
         self.circuits.put_block(ts, block);
     }
 
+    pub fn dl_schedule_raw_tch_s_half_slot(&mut self, ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
+        self.circuits.put_raw_tch_s_half_slot(ts, block_num, type5_bits);
+    }
+
     pub fn circuit_is_active(&self, dir: Direction, ts: u8) -> bool {
         self.circuits.is_active(dir, ts)
     }
@@ -1773,7 +1785,7 @@ impl BsChannelScheduler {
     }
 
     /// Build traffic block for active circuit. Returns (optional_tch_block, optional_stch_block):
-    /// - tch_block: queued speech (274 bits), or None when no uplink speech was received
+    /// - tch_block: queued ACELP speech or raw half-slot TCH/S, or None when no uplink speech was received
     /// - stch_block: STCH signaling (124 bits) for FACCH stealing (EN 300 392-2, clause 23.5)
     /// Also reports transmission, if a TxReporter was attached to the DlSchedElem::Stealing element
     fn dl_build_traffic_block(
@@ -1781,13 +1793,37 @@ impl BsChannelScheduler {
         ts: TdmaTime,
         subscribers: &SubscriberRegistry,
         energy_saving: &mut HashMap<u32, EnergySavingAssignment>,
-    ) -> (Option<BitBuffer>, Option<BitBuffer>) {
-        let tch_buf = self.circuits.take_block(ts.t).map(|block| {
-            let mut buf = BitBuffer::from_vec(block);
-            // Raw ACELP speech (274 bits for TCH/S).
-            // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
-            buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
-            buf
+    ) -> (Option<DlTchBlock>, Option<BitBuffer>) {
+        let tch_buf = self.circuits.take_block(ts.t).and_then(|block| match block {
+            CircuitTxBlock::AcElp(block) => {
+                let mut buf = BitBuffer::from_vec(block);
+                // Raw ACELP speech (274 bits for TCH/S).
+                // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
+                buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
+                Some(DlTchBlock::AcElp(buf))
+            }
+            CircuitTxBlock::RawTchSHalfSlot { block_num, type5_bits } => {
+                if block_num != PhyBlockNum::Block2 {
+                    tracing::warn!(
+                        "dl_build_traffic_block: dropping unsupported raw TCH/S half-slot {:?} on ts {}",
+                        block_num,
+                        ts.t
+                    );
+                    return None;
+                }
+                if type5_bits.len() != 216 {
+                    tracing::warn!(
+                        "dl_build_traffic_block: dropping raw TCH/S Block2 with {} bits on ts {}",
+                        type5_bits.len(),
+                        ts.t
+                    );
+                    return None;
+                }
+                Some(DlTchBlock::RawTchSHalfSlot {
+                    block_num,
+                    type5_bits: BitBuffer::from_bitarr(&type5_bits),
+                })
+            }
         });
 
         // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)
@@ -2005,34 +2041,75 @@ impl BsChannelScheduler {
                         mac_block: stch_buf,
                         scrambling_code: self.scrambling_code,
                     }),
-                    blk2: Some(if let Some(tch_buf) = tch_buf_opt {
-                        TmvUnitdataReq {
+                    blk2: Some(match tch_buf_opt {
+                        Some(DlTchBlock::AcElp(tch_buf)) => TmvUnitdataReq {
                             logical_channel: LogicalChannel::TchS,
                             mac_block: tch_buf,
                             scrambling_code: self.scrambling_code,
+                        },
+                        Some(DlTchBlock::RawTchSHalfSlot { block_num, type5_bits }) => {
+                            tracing::info!(
+                                "finalize_ts_for_tick: preserving raw TCH/S {:?} after FACCH on ts {}",
+                                block_num,
+                                ts.t
+                            );
+                            TmvUnitdataReq {
+                                logical_channel: LogicalChannel::TchS,
+                                mac_block: type5_bits,
+                                scrambling_code: self.scrambling_code,
+                            }
                         }
-                    } else {
-                        TmvUnitdataReq {
+                        None => TmvUnitdataReq {
                             logical_channel: LogicalChannel::Stch,
                             mac_block: self.generate_stch_null_block(),
                             scrambling_code: self.scrambling_code,
-                        }
+                        },
                     }),
                     bbk: None,
                     ul_phy_chan: ul_phy,
                 }
             } else if let Some(tch_buf) = tch_buf_opt {
-                // Normal traffic: full-slot TCH
-                TmvUnitdataReqSlot {
-                    ts,
-                    blk1: Some(TmvUnitdataReq {
-                        logical_channel: LogicalChannel::TchS,
-                        mac_block: tch_buf,
-                        scrambling_code: self.scrambling_code,
-                    }),
-                    blk2: None,
-                    bbk: None,
-                    ul_phy_chan: ul_phy,
+                match tch_buf {
+                    DlTchBlock::AcElp(tch_buf) => {
+                        // Normal traffic: full-slot TCH
+                        TmvUnitdataReqSlot {
+                            ts,
+                            blk1: Some(TmvUnitdataReq {
+                                logical_channel: LogicalChannel::TchS,
+                                mac_block: tch_buf,
+                                scrambling_code: self.scrambling_code,
+                            }),
+                            blk2: None,
+                            bbk: None,
+                            ul_phy_chan: ul_phy,
+                        }
+                    }
+                    DlTchBlock::RawTchSHalfSlot { block_num, type5_bits } => {
+                        // EN 300 392-2 clause 23.8.5 requires the BS to preserve
+                        // the timing and half-slot position of U-plane TCH. With no
+                        // local FACCH pending, fill the stolen first half with a
+                        // C-plane Null PDU and keep the received TCH/S in Block2.
+                        tracing::info!(
+                            "finalize_ts_for_tick: preserving raw TCH/S {:?} with STCH Null first half on ts {}",
+                            block_num,
+                            ts.t
+                        );
+                        TmvUnitdataReqSlot {
+                            ts,
+                            blk1: Some(TmvUnitdataReq {
+                                logical_channel: LogicalChannel::Stch,
+                                mac_block: self.generate_stch_null_block(),
+                                scrambling_code: self.scrambling_code,
+                            }),
+                            blk2: Some(TmvUnitdataReq {
+                                logical_channel: LogicalChannel::TchS,
+                                mac_block: type5_bits,
+                                scrambling_code: self.scrambling_code,
+                            }),
+                            bbk: None,
+                            ul_phy_chan: ul_phy,
+                        }
+                    }
                 }
             } else {
                 // No uplink speech was received for this active circuit. Per

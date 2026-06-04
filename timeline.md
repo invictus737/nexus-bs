@@ -1234,3 +1234,80 @@ Pass criteria for this patch:
 - `UMAC voice route` appears after each grant.
 - No `UL inactivity timeout` during an active over.
 - Operator audio verdict: both directions are voice, not static.
+
+## 2026-06-04 12:15:00 EEST - Preserved raw TCH/S Block2 for group call alternation
+
+User-reported failure:
+
+- Group call still produced bad audio/static when multiple local subscribers tried to speak in turn.
+- Existing CMCE compact `D-TX GRANTED` patch fixed an STCH/FACCH size cause, but did not prove received voice after floor handoff.
+
+Component meaning:
+
+- CMCE: call-control and floor/PTT authority. It decides who is allowed to speak.
+- UMAC/MAC scheduler: maps voice/signalling onto assigned traffic slots and routes uplink voice back to downlink listeners.
+- LMAC: burst framing. It interprets PHY bursts as STCH signalling or TCH/S speech and encodes the downlink burst sent to PHY.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.8.4.1.4: on uplink `NormalTrainSeq2`, first half is STCH; if the second half is not stolen, the BS shall interpret the second half as TCH.
+- EN 300 392-2 clause 23.8.5: BS should pass U-plane TCH onward while preserving timing, ordering and half-slot pairing; if replacing a stolen half-slot, it may use C-plane Null PDU or substitution traffic.
+- EN 300 392-2 clause 23.5: STCH/FACCH permits signalling capacity to be stolen from a traffic channel during an over.
+- Engineering decision: do not decode a raw `Block2` half-slot as a clean 274-bit ACELP frame, because the first half was STCH and the current SAP has no BFI field. Instead, tag the 216-bit type-5 `TCH/S Block2` as raw, route it locally through UMAC, and re-emit it in the same second-half position on downlink.
+
+Patch:
+
+- `crates/tetra-saps/src/tmd/mod.rs`
+  - `TmdCircuitDataReq` and `TmdCircuitDataInd` now carry `raw_tch_s_block: Option<PhyBlockNum>`.
+- `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - Uplink `NormalTrainSeq2/Block2` `TchS` is forwarded as raw 216-bit type-5 TCH/S with `raw_tch_s_block=Some(Block2)`.
+  - Downlink `TchS` `blk2` with 216 bits is treated as already type-5 encoded and sent unchanged to PHY.
+  - Full-slot `TchS` still decodes normally and bad CRC full-slot speech is still dropped.
+- `crates/tetra-entities/src/umac/subcomp/circuit_mgr.rs`
+  - Circuit TX queue now distinguishes normal ACELP from raw `TCH/S Block2`.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Raw `TCH/S Block2` is emitted as `STCH + TCH/S`, using an existing FACCH/STCH first half if present or a C-plane Null first half otherwise.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Raw `TCH/S Block2` is routed locally to the group/simplex/peer downlink and is not forwarded to Brew as ACELP.
+- `crates/tetra-entities/src/net_brew/entity.rs`
+  - Brew ignores raw half-slot payloads if one reaches it defensively.
+
+Focused tests:
+
+- `test_lmac_bs::bs_lmac_forwards_normal_seq2_block2_tch_s_as_raw_halfslot`
+- `test_lmac_bs::bs_lmac_preserves_preencoded_raw_tch_s_block2_on_downlink`
+- `test_umac_bs::test_group_ul_raw_block2_loopback_preserves_tch_s_halfslot`
+
+Verification:
+
+- `rustfmt --edition 2024` on touched files -> pass.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 43 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Current conclusion:
+
+- The local component path now preserves valid `NormalTrainSeq2/Block2` TCH/S across LMAC -> UMAC -> LMAC instead of dropping it before `UMAC voice route`.
+- This is clause-scoped ETSI hardening for traffic-mode half-slot TCH preservation. It is not formal certification.
+- Live RF/audio is still required before claiming the group conversation issue is fixed in the test BS.
+
+Next non-repeating execution:
+
+1. Commit the raw TCH/S Block2 patch.
+2. Build locally only with the Nexus-BS AArch64 command from build memory.
+3. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; no binary backup.
+4. Restart the test BS.
+5. Live group test on GSSI `226333`:
+   - `2260616` PTT, speak, release.
+   - `2260082` PTT, speak, release.
+   - `2260618` PTT if available, speak, release.
+   - Repeat at least three alternating turns.
+6. Required pass evidence:
+   - `U-TX DEMAND` and compact `D-TX GRANTED` for each speaker.
+   - `UMAC floor granted` source changes to the active speaker.
+   - `rx_blk_traffic: forwarding raw TCH/S Block2` or `rx_blk_traffic: decoded valid TCH/S frame` appears after each grant.
+   - `UMAC voice route` appears after each grant.
+   - No `PTT denied`, `NotGranted`, `does not fit STCH`, or `UL inactivity timeout` during active overs.
+   - Operator audio verdict confirms each subscriber can be heard by the others, not static.

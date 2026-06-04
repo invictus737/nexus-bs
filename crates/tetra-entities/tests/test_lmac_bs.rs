@@ -177,7 +177,7 @@ fn bs_lmac_forwards_valid_fullslot_tch_s_to_umac() {
 }
 
 #[test]
-fn bs_lmac_drops_normal_seq2_block2_tch_s_without_forwarding_clean_speech() {
+fn bs_lmac_forwards_normal_seq2_block2_tch_s_as_raw_halfslot() {
     debug::setup_logging_verbose();
 
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
@@ -186,18 +186,87 @@ fn bs_lmac_drops_normal_seq2_block2_tch_s_without_forwarding_clean_speech() {
     mark_all_ul_timeslots_as_traffic(&mut test);
 
     let codec_bits = acelp_test_bits();
+    let encoded = encoded_tch_s(&codec_bits, 2);
+    let mut expected_raw = vec![0u8; encoded.get_len()];
+    let mut encoded_for_read = encoded.clone();
+    encoded_for_read.to_bitarr(&mut expected_raw);
+
     test.submit_message(build_uplink_tch_s_ind(
         TrainingSequence::NormalTrainSeq2,
         PhyBlockNum::Block2,
-        encoded_tch_s(&codec_bits, 2),
+        encoded,
     ));
     test.deliver_all_messages();
 
-    assert!(
-        test.dump_sinks()
-            .iter()
-            .all(|msg| !matches!(msg.msg, SapMsgInner::TmdCircuitDataInd(_))),
-        "EN 300 392-2 clauses 23.8.3 and 23.8.3.2 require bad/partial speech frame state to be preserved; this SAP cannot carry BFI/half-slot condition, so LMAC-BS must not forward Block2-only TCH/S as clean speech"
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(traffic.len(), 1, "valid raw TCH/S Block2 should be forwarded once");
+    assert_eq!(traffic[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
+    assert_eq!(traffic[0].data, expected_raw);
+    assert_eq!(
+        traffic[0].ts,
+        TdmaTime::default().add_timeslots(-2).t,
+        "EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 require BS to preserve the TCH half-slot timing/position"
+    );
+}
+
+#[test]
+fn bs_lmac_preserves_preencoded_raw_tch_s_block2_on_downlink() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Phy]);
+
+    let raw_bits: Vec<u8> = (0..216).map(|idx| ((idx * 5 + 1) % 2) as u8).collect();
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TmvUnitdataReq(TmvUnitdataReqSlot {
+            ts: TdmaTime { h: 0, m: 1, f: 1, t: 2 },
+            ul_phy_chan: PhysicalChannel::Tp,
+            blk1: Some(TmvUnitdataReq {
+                mac_block: BitBuffer::new(124),
+                logical_channel: LogicalChannel::Stch,
+                scrambling_code: test_scrambling_code(),
+            }),
+            blk2: Some(TmvUnitdataReq {
+                mac_block: BitBuffer::from_bitarr(&raw_bits),
+                logical_channel: LogicalChannel::TchS,
+                scrambling_code: test_scrambling_code(),
+            }),
+            bbk: Some(TmvUnitdataReq {
+                mac_block: BitBuffer::new(14),
+                logical_channel: LogicalChannel::Aach,
+                scrambling_code: test_scrambling_code(),
+            }),
+        }),
+    });
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let phy: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TpUnitdataReq(req) => Some(req),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(phy.len(), 1, "LMAC should emit one PHY traffic burst");
+    assert_eq!(phy[0].train_type, TrainingSequence::NormalTrainSeq2);
+
+    let mut observed = vec![0u8; 216];
+    let mut blk2 = phy[0].blk2.clone().expect("raw TCH/S Block2 must reach PHY");
+    blk2.to_bitarr(&mut observed);
+    assert_eq!(
+        observed, raw_bits,
+        "EN 300 392-2 clause 23.8.5 requires raw TCH/S half-slot position/content to be preserved"
     );
 }
 

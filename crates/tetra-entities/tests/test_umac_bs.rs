@@ -417,7 +417,24 @@ fn submit_ul_voice_frame(test: &mut ComponentTest, ts: u8, data: Vec<u8>) {
         sap: Sap::TmdSap,
         src: TetraEntity::Lmac,
         dest: TetraEntity::Umac,
-        msg: SapMsgInner::TmdCircuitDataInd(TmdCircuitDataInd { ts, data }),
+        msg: SapMsgInner::TmdCircuitDataInd(TmdCircuitDataInd {
+            ts,
+            data,
+            raw_tch_s_block: None,
+        }),
+    });
+}
+
+fn submit_ul_raw_tch_s_block2(test: &mut ComponentTest, ts: u8, data: Vec<u8>) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataInd(TmdCircuitDataInd {
+            ts,
+            data,
+            raw_tch_s_block: Some(PhyBlockNum::Block2),
+        }),
     });
 }
 
@@ -455,6 +472,30 @@ fn assert_dl_tch_contains_bits(msgs: &[SapMsg], ts: u8, expected_bits: &[u8], co
         "{context}: expected ACELP bit pattern on DL TCH/S ts {ts}, observed {} TCH/S blocks",
         observed.len()
     );
+}
+
+fn collect_dl_raw_tch_block2_bits(msgs: &[SapMsg], ts: u8) -> Vec<Vec<u8>> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(prim) if prim.ts.t == ts => Some(prim),
+            _ => None,
+        })
+        .filter(|prim| {
+            prim.blk1.as_ref().is_some_and(|blk| blk.logical_channel == LogicalChannel::Stch)
+                && prim
+                    .blk2
+                    .as_ref()
+                    .is_some_and(|blk| blk.logical_channel == LogicalChannel::TchS && blk.mac_block.get_len() == 216)
+        })
+        .filter_map(|prim| prim.blk2.as_ref())
+        .map(|blk| {
+            let mut bits = vec![0u8; 216];
+            let mut block = blk.mac_block.clone();
+            block.seek(0);
+            block.to_bitarr(&mut bits);
+            bits
+        })
+        .collect()
 }
 
 fn mac_u_signal_pdu_for_test(second_half_stolen: bool) -> BitBuffer {
@@ -549,6 +590,32 @@ fn test_group_ul_voice_loopback_preserves_tch_s_bits() {
         traffic_ts,
         &ul_bits,
         "EN 300 392-2 clauses 14.5.2.1.3, 14.5.2.2.1 and 23.5: group-call UL speech must be reflected to the assigned DL TCH/S without bit corruption",
+    );
+}
+
+#[test]
+fn test_group_ul_raw_block2_loopback_preserves_tch_s_halfslot() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x1201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    test.run_stack(Some(1));
+
+    let raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 5 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, raw_block2.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let observed = collect_dl_raw_tch_block2_bits(&msgs, traffic_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &raw_block2),
+        "EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 require group-call raw TCH/S Block2 to be preserved on downlink after STCH first half; observed {} candidates",
+        observed.len()
     );
 }
 

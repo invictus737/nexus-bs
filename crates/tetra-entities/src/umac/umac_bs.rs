@@ -1744,6 +1744,7 @@ impl UmacBs {
             SapMsgInner::TmdCircuitDataInd(prim) => {
                 let ts = prim.ts;
                 let data = prim.data;
+                let raw_tch_s_block = prim.raw_tch_s_block;
 
                 // Track last UL voice frame time for inactivity detection
                 if (1..=4).contains(&ts) {
@@ -1751,13 +1752,17 @@ impl UmacBs {
                 }
 
                 // Forward UL voice to Brew (User plane) if loaded
-                if self.config.config().brew.is_some() {
+                if raw_tch_s_block.is_none() && self.config.config().brew.is_some() {
                     if self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
                         let msg = SapMsg {
                             sap: Sap::TmdSap,
                             src: TetraEntity::Umac,
                             dest: TetraEntity::Brew,
-                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data: data.clone() }),
+                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                                ts,
+                                data: data.clone(),
+                                raw_tch_s_block: None,
+                            }),
                         };
                         queue.push_back(msg);
                     } else {
@@ -1794,7 +1799,29 @@ impl UmacBs {
                 };
 
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
-                    if let Some(packed) = pack_ul_acelp_bits(&data) {
+                    if let Some(block_num) = raw_tch_s_block {
+                        if block_num == PhyBlockNum::Block2 && data.len() == 216 {
+                            tracing::debug!(
+                                "UMAC voice route: UL ts={} raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} media_source={:?}",
+                                ts,
+                                block_num,
+                                data.len(),
+                                dl_target_ts,
+                                self.channel_scheduler.ul_circuit_peer_ts(ts),
+                                self.channel_scheduler.ul_circuit_dl_media_source(ts)
+                            );
+                            self.channel_scheduler
+                                .dl_schedule_raw_tch_s_half_slot(dl_target_ts, block_num, data);
+                        } else {
+                            tracing::warn!(
+                                "rx_tmd_prim: unsupported raw TCH/S block {:?} length {} on ts={} (target ts={}), skipping",
+                                block_num,
+                                data.len(),
+                                ts,
+                                dl_target_ts
+                            );
+                        }
+                    } else if let Some(packed) = pack_ul_acelp_bits(&data) {
                         tracing::debug!(
                             "UMAC voice route: UL ts={} bits={} -> DL ts={} packed_bytes={} peer_ts={:?} media_source={:?}",
                             ts,

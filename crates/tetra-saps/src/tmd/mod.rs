@@ -1,9 +1,12 @@
+use tetra_core::PhyBlockNum;
+
 /// Pass TMD circuit data to UMAC for TX scheduling
 #[derive(Debug, Clone)]
 pub struct TmdCircuitDataReq {
     // call_id: CallId,
     pub ts: u8,
     pub data: Vec<u8>,
+    pub raw_tch_s_block: Option<PhyBlockNum>,
 }
 
 /// Rx'ed traffic
@@ -12,4 +15,5 @@ pub struct TmdCircuitDataInd {
     // call_id: CallId,
     pub ts: u8,
     pub data: Vec<u8>,
+    pub raw_tch_s_block: Option<PhyBlockNum>,
 }
