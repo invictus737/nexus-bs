@@ -1,5 +1,58 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 20:01:36 EEST - Patched group return-PTT alias to pure floor control
+
+User symptom:
+
+- Live group-call validation still reported terminal-side `PTT denied` on return PTT.
+- Previous logs showed CMCE/UMAC sending `D-TX GRANTED` and `FloorGranted`, so the remaining risk was not a BS-side `NotGranted` decision, but inconsistent active-call signalling around the grant.
+
+Components in simple technical terms:
+
+- CMCE/CC is call control. It decides whether a group call is being set up or whether an already active group call is only changing the speaker/floor.
+- `D-TX GRANTED` is the CMCE floor response that tells a terminal whether it may transmit now, is queued, or is not granted.
+- MLE/UMAC wraps that CMCE message into MAC-RESOURCE/STCH on the assigned traffic channel.
+- The traffic usage marker is the MAC label for the active assigned channel. Without it, a terminal can receive signalling but still not treat it as valid permission for that traffic circuit.
+
+ETSI clause scope checked:
+
+- EN 300 392-2 clause 14.5.2.1 covers group-call setup with `D-CALL PROCEEDING`, `D-CONNECT`, and `D-SETUP`.
+- EN 300 392-2 clause 14.5.2.2.1 covers active group-call floor control with `U-TX DEMAND` / `D-TX GRANTED`; queued/not-granted/granted floor responses keep the MS in `CALL-ACTIVE`.
+- EN 300 392-2 clause 23.8.1 says the BS allocates a traffic usage marker for the assigned channel and that TCH/STCH traffic uses the corresponding usage marker.
+- EN 300 392-2 clause 23.8.2.3.1 says an MS shall not transmit traffic unless authorized by CC and unless it has an applicable uplink traffic usage marker.
+- EN 300 392-2 clause 23.8.4.2 allows downlink C-plane signalling on STCH using MAC-RESOURCE.
+- This is clause-scoped engineering alignment only. It is not formal ETSI/TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - A compatible repeated `U-SETUP` to an already maintained same-GSSI call is now treated as a floor-request alias.
+  - It no longer emits setup-phase `D-CALL PROCEEDING` or `D-CONNECT` before the floor response.
+  - It still rejects releasing, unaffiliated, or incompatible same-GSSI attempts with the existing release path.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Individual `D-TX GRANTED` FACCH/STCH wrappers now preserve the active traffic `usage` marker.
+  - `Granted` uses `UlDlAssignment::Both`; `RequestQueued` and `NotGranted` use `UlDlAssignment::Dl`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Group-addressed `D-TX GRANTED GrantedToOtherUser` FACCH/STCH now also preserves the active traffic `usage` marker and remains DL-only.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Repeated same-GSSI active-call, current-speaker, and hangtime tests now assert no setup-phase `D-CALL PROCEEDING`/`D-CONNECT`.
+  - Tests now assert compact `D-TX GRANTED` plus channel allocation with the actual circuit timeslot, usage marker, and UL/DL direction.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs repeated_group_u_setup --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 118 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
+- `git diff --check` -> pass.
+
+Next live validation:
+
+- Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`.
+- Restart test BS.
+- Validate alternating group PTT on GSSI `226333` with `2260082`, `2260616`, and `2260618`.
+- Required field evidence: no terminal `PTT denied`, no BS `NotGranted` unless another MS is truly still transmitting, `UMAC floor granted` follows the active speaker, and audio is intelligible rather than static.
+
 ## 2026-06-04 19:47:00 EEST - Patched first-PTT retry caused by missing floor reassert
 
 User symptom:

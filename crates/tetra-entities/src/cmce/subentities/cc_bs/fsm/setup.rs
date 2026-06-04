@@ -163,93 +163,21 @@ impl CcBsSubentity {
 
             let active_state = active_call.state();
             let current_speaker = active_call.source_issi;
-            let active_ts = active_call.ts;
-            let active_usage = active_call.usage;
-            let active_timeout = active_call.call_timeout;
-            let call_ownership = matches!(
-                &active_call.origin,
-                CallOrigin::Local { caller_addr } if caller_addr.ssi == calling_party.ssi
-            );
-            let connect_grant = match active_state {
-                GroupCallState::Transmitting if current_speaker == calling_party.ssi => TransmissionGrant::Granted,
-                GroupCallState::Transmitting => TransmissionGrant::GrantedToOtherUser,
-                GroupCallState::NoActiveSpeaker { .. } => TransmissionGrant::Granted,
-            };
-            let hook_method_selection = existing_setup.hook_method_selection;
-            let simplex_duplex_selection = existing_setup.simplex_duplex_selection;
 
             tracing::info!(
-                "CMCE: mapping repeated U-SETUP from issi={} to active gssi={} call_id={} state={:?}",
+                "CMCE: mapping repeated U-SETUP from issi={} to active gssi={} call_id={} state={:?} as floor request",
                 calling_party.ssi,
                 dest_gssi,
                 active_call_id,
                 active_state
             );
 
-            // EN 300 392-2 clauses 14.5.2.1.2/14.5.2.1.3 say a same-group
-            // setup collision that has already reached the SwMI is completed
-            // with the SwMI call identifier. Clauses 14.5.2.2.1 b/e keep
-            // subsequent PTT as floor control (`D-TX GRANTED`) while the MS
-            // remains in CALL-ACTIVE; do not release a compatible active
-            // same-GSSI call as an unavailable service.
-            self.send_d_call_proceeding(
-                queue,
-                message,
-                pdu,
-                active_call_id,
-                CallTimeoutSetupPhase::T10s,
-                hook_method_selection,
-            );
-
-            let d_connect = DConnect {
-                call_identifier: active_call_id,
-                call_time_out: active_timeout,
-                hook_method_selection,
-                simplex_duplex_selection,
-                transmission_grant: connect_grant,
-                transmission_request_permission: false,
-                call_ownership,
-                call_priority: None,
-                basic_service_information: None,
-                temporary_address: None,
-                notification_indicator: None,
-                facility: None,
-                proprietary: None,
-            };
-
-            tracing::info!("-> {:?} (existing group call)", d_connect);
-            let mut connect_sdu = BitBuffer::new_autoexpand(30);
-            d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
-            connect_sdu.seek(0);
-
-            let mut timeslots = [false; 4];
-            timeslots[active_ts as usize - 1] = true;
-            queue.push_back(SapMsg {
-                sap: Sap::LcmcSap,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Mle,
-                msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
-                    sdu: connect_sdu,
-                    handle: ul_handle,
-                    endpoint_id: ul_endpoint_id,
-                    link_id: ul_link_id,
-                    layer2service: Layer2Service::Unacknowledged,
-                    pdu_prio: 0,
-                    layer2_qos: 0,
-                    stealing_permission: false,
-                    stealing_repeats_flag: false,
-                    chan_alloc: Some(CmceChanAllocReq {
-                        usage: Some(active_usage),
-                        alloc_type: ChanAllocType::Replace,
-                        carrier: None,
-                        timeslots,
-                        ul_dl_assigned: UlDlAssignment::Both,
-                    }),
-                    main_address: calling_party,
-                    tx_reporter: None,
-                }),
-            });
-
+            // EN 300 392-2 clause 14.5.2.1 covers group-call setup. Once the
+            // same GSSI call is already maintained, clause 14.5.2.2.1 makes
+            // transmit permission a floor-control procedure using
+            // D-TX GRANTED. Treat a compatible repeated U-SETUP from field
+            // radios as that floor request instead of mixing setup-phase
+            // D-CALL PROCEEDING/D-CONNECT with active-call floor signalling.
             let floor_result = if matches!(active_state, GroupCallState::Transmitting) && current_speaker == calling_party.ssi {
                 self.fsm_group_reassert_current_speaker_floor(queue, active_call_id, calling_party)
             } else {

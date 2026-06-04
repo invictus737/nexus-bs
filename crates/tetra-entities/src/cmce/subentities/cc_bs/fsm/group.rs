@@ -53,6 +53,7 @@ impl CcBsSubentity {
         call_id: u16,
         target_addr: TetraAddress,
         ts: u8,
+        usage: u8,
         transmission_grant: TransmissionGrant,
         _transmitting_party_issi: Option<u32>,
     ) {
@@ -87,7 +88,16 @@ impl CcBsSubentity {
         d_tx_granted.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
         sdu.seek(0);
 
-        let msg = Self::build_sapmsg_stealing(sdu, target_addr, ts, None);
+        // EN 300 392-2 clause 23.8.2.3.1 requires both CC authorization and
+        // an applicable uplink traffic usage marker before an MS may transmit.
+        // Only a positive floor grant therefore carries Both; queued/denied
+        // responses are downlink-only assigned-channel signalling.
+        let ul_dl_assigned = if transmission_grant == TransmissionGrant::Granted {
+            UlDlAssignment::Both
+        } else {
+            UlDlAssignment::Dl
+        };
+        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, target_addr, ts, Some(usage), ul_dl_assigned);
         queue.push_back(msg);
     }
 
@@ -117,6 +127,7 @@ impl CcBsSubentity {
         }
 
         let ts = call_snapshot.ts;
+        let usage = call_snapshot.usage;
         let dest_ssi = call_snapshot.dest_gssi;
         let current_speaker = call_snapshot.source_issi;
 
@@ -127,7 +138,15 @@ impl CcBsSubentity {
                 speaker.ssi,
                 dest_ssi
             );
-            self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, TransmissionGrant::NotGranted, Some(current_speaker));
+            self.fsm_send_d_tx_granted_individual(
+                queue,
+                call_id,
+                speaker,
+                ts,
+                usage,
+                TransmissionGrant::NotGranted,
+                Some(current_speaker),
+            );
             return Ok(());
         }
 
@@ -145,8 +164,8 @@ impl CcBsSubentity {
         // as an existing-call re-entry is not treated as unsolicited floor
         // signalling; this confirms that the already-current speaker still has
         // transmit permission and refreshes the local traffic scheduler.
-        self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, TransmissionGrant::Granted, Some(speaker.ssi));
-        self.send_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts);
+        self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, usage, TransmissionGrant::Granted, Some(speaker.ssi));
+        self.send_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -197,6 +216,7 @@ impl CcBsSubentity {
         Self::validate_group_transition(call_id, state, GroupEvent::TxDemand)?;
 
         let ts = call_snapshot.ts;
+        let usage = call_snapshot.usage;
         let dest_ssi = call_snapshot.dest_gssi;
         let current_speaker = call_snapshot.source_issi;
 
@@ -213,6 +233,7 @@ impl CcBsSubentity {
                 call_id,
                 requesting_party,
                 ts,
+                usage,
                 TransmissionGrant::NotGranted,
                 Some(current_speaker),
             );
@@ -264,10 +285,11 @@ impl CcBsSubentity {
                 call_id,
                 requesting_party,
                 ts,
+                usage,
                 TransmissionGrant::Granted,
                 Some(requesting_party.ssi),
             );
-            self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts);
+            self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
                 call_id,
@@ -336,6 +358,7 @@ impl CcBsSubentity {
                         call_id,
                         requesting_party,
                         ts,
+                        usage,
                         TransmissionGrant::RequestQueued,
                         Some(current_speaker),
                     );
@@ -346,6 +369,7 @@ impl CcBsSubentity {
                         call_id,
                         requesting_party,
                         ts,
+                        usage,
                         TransmissionGrant::NotGranted,
                         Some(current_speaker),
                     );
@@ -360,10 +384,11 @@ impl CcBsSubentity {
             call_id,
             requesting_party,
             ts,
+            usage,
             TransmissionGrant::Granted,
             Some(requesting_party.ssi),
         );
-        self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts);
+        self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
         // Notify dashboard that the speaker changed (hangtime -> new speaker).
         self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
@@ -428,6 +453,7 @@ impl CcBsSubentity {
         }
 
         let ts = call.ts;
+        let usage = call.usage;
         let dest_ssi = call.dest_gssi;
         let queued_request = call.queued_tx_demand;
         let queued_request = queued_request.filter(|requester| {
@@ -461,8 +487,16 @@ impl CcBsSubentity {
         let dest_addr = cached.dest_addr;
 
         if let Some(requester) = queued_request {
-            self.fsm_send_d_tx_granted_individual(queue, call_id, requester, ts, TransmissionGrant::Granted, Some(requester.ssi));
-            self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts);
+            self.fsm_send_d_tx_granted_individual(
+                queue,
+                call_id,
+                requester,
+                ts,
+                usage,
+                TransmissionGrant::Granted,
+                Some(requester.ssi),
+            );
+            self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
 
             // Notify dashboard that the queued speaker got the floor.
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
@@ -643,7 +677,7 @@ impl CcBsSubentity {
             );
         }
 
-        self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts);
+        self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,

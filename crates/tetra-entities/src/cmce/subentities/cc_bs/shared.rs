@@ -1172,12 +1172,23 @@ impl CcBsSubentity {
     }
 
     /// Send D-TX GRANTED via FACCH stealing on the group traffic channel.
-    pub(super) fn send_d_tx_granted_facch(&mut self, queue: &mut MessageQueue, call_id: u16, _source_issi: u32, dest_gssi: u32, ts: u8) {
+    pub(super) fn send_d_tx_granted_facch(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        _source_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+    ) {
         // EN 300 392-2 table 14.18 makes the transmitting-party address
         // optional. For assigned-channel FACCH/STCH the compact form is
         // required to fit the 124-bit STCH block; clause 14.5.2.2.1 is still
         // satisfied because the granted MS receives an individual D-TX GRANTED
         // first, and the group-addressed grant carries "granted to other user".
+        // Clauses 23.8.1 and 23.8.2.3.1 require the active traffic usage
+        // marker to remain applicable for TCH/STCH on the assigned channel, so
+        // the surrounding MAC-RESOURCE keeps the circuit usage marker.
         let pdu = DTxGranted {
             call_identifier: call_id,
             transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
@@ -1201,7 +1212,7 @@ impl CcBsSubentity {
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         // DL-only on group FACCH: only the current speaker holds UL.
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, dest_addr, ts, None, UlDlAssignment::Dl);
+        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl);
         queue.push_back(msg);
     }
 

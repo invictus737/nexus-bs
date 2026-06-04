@@ -870,6 +870,30 @@ fn assert_compact_d_tx_granted_facch(prim: &LcmcMleUnitdataReq, grant: &DTxGrant
     );
 }
 
+fn assert_d_tx_granted_facch_allocation(
+    prim: &LcmcMleUnitdataReq,
+    grant: &DTxGranted,
+    ts: u8,
+    usage: u8,
+    ul_dl_assigned: UlDlAssignment,
+    context: &str,
+) {
+    assert_compact_d_tx_granted_facch(prim, grant);
+    assert!(
+        prim.stealing_permission,
+        "{context}: D-TX GRANTED must use assigned-channel FACCH/STCH"
+    );
+    let chan_alloc = prim
+        .chan_alloc
+        .as_ref()
+        .unwrap_or_else(|| panic!("{context}: FACCH/STCH D-TX GRANTED must carry channel allocation"));
+    assert_chan_alloc_matches_circuit(chan_alloc, ts, usage, context);
+    assert_eq!(
+        chan_alloc.ul_dl_assigned, ul_dl_assigned,
+        "{context}: channel allocation direction must match floor state"
+    );
+}
+
 fn parse_d_tx_interrupt(prim: &LcmcMleUnitdataReq) -> Option<DTxInterrupt> {
     if !is_dl_pdu(prim, CmcePduTypeDl::DTxInterrupt) {
         return None;
@@ -959,6 +983,18 @@ fn count_d_setups(msgs: &[SapMsg]) -> usize {
                 && matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim)
                     if is_dl_pdu(prim, CmcePduTypeDl::DSetup))
         })
+        .count()
+}
+
+fn count_d_call_proceedings(msgs: &[SapMsg]) -> usize {
+    msgs.iter()
+        .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_call_proceeding(prim).is_some()))
+        .count()
+}
+
+fn count_d_connects(msgs: &[SapMsg]) -> usize {
+    msgs.iter()
+        .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
         .count()
 }
 
@@ -1264,6 +1300,29 @@ fn start_group_call(test: &mut ComponentTest) -> u16 {
     let initial_setups = count_d_setups(&initial_msgs);
     assert!(initial_setups > 0, "Expected initial D-SETUP after U-SETUP");
     first_d_setup_call_id(&initial_msgs)
+}
+
+fn start_group_call_with_circuit(test: &mut ComponentTest) -> (u16, u8, u8) {
+    let u_setup_msg = build_u_setup_msg(TEST_ISSI, TEST_GSSI);
+    test.submit_message(u_setup_msg);
+    test.run_stack(Some(1));
+    let initial_msgs = test.dump_sinks();
+    let initial_setups = count_d_setups(&initial_msgs);
+    assert!(initial_setups > 0, "Expected initial D-SETUP after U-SETUP");
+    let call_id = first_d_setup_call_id(&initial_msgs);
+    let circuit = initial_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .expect("group U-SETUP should open a traffic circuit");
+    assert_eq!(
+        circuit.active_addr,
+        Some(TetraAddress::new(TEST_GSSI, SsiType::Gssi)),
+        "group traffic circuit should be scoped to the destination GSSI"
+    );
+    (call_id, circuit.ts, circuit.usage)
 }
 
 fn start_group_call_with_u_setup(test: &mut ComponentTest, u_setup: USetup) -> u16 {
@@ -2840,12 +2899,12 @@ fn test_repeated_group_u_setup_same_active_gssi_uses_existing_call_without_servi
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
-    let active_call_id = start_group_call(&mut test);
+    let (active_call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
-    // EN 300 392-2 clause 14.5.2.1.3 same-group setup collisions are tied
-    // back to the SwMI call identifier, while clause 14.5.2.2.1 keeps later
-    // PTT attempts as floor control. A compatible U-SETUP for an already
-    // active GSSI must not be reported to the MS as an unavailable service.
+    // EN 300 392-2 clause 14.5.2.1 covers setup. Once the same GSSI call is
+    // already maintained, clause 14.5.2.2.1 floor control applies: a field
+    // radio's repeated same-GSSI U-SETUP is treated as a floor request alias,
+    // not as a second setup transaction.
     test.submit_message(build_u_setup_msg(TEST_CALLED_ISSI, TEST_GSSI));
     test.run_stack(Some(1));
     let duplicate_msgs = test.dump_sinks();
@@ -2855,48 +2914,15 @@ fn test_repeated_group_u_setup_same_active_gssi_uses_existing_call_without_servi
         0,
         "same-GSSI active-call rejoin must not emit D-RELEASE RequestedServiceNotAvailable"
     );
-
-    let proceedings: Vec<_> = duplicate_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        proceedings.len(),
-        1,
-        "repeated U-SETUP should receive D-CALL PROCEEDING for the existing call"
+        count_d_call_proceedings(&duplicate_msgs),
+        0,
+        "active same-GSSI U-SETUP alias must not restart setup with D-CALL PROCEEDING"
     );
-    let (proceeding_prim, proceeding) = &proceedings[0];
     assert_eq!(
-        proceeding.call_identifier, active_call_id,
-        "repeated setup must be bound to the active SwMI call id"
-    );
-    assert_eq!(proceeding_prim.main_address.ssi, TEST_CALLED_ISSI);
-    assert_eq!(proceeding_prim.main_address.ssi_type, SsiType::Issi);
-
-    let connects: Vec<_> = duplicate_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(connects.len(), 1, "repeated U-SETUP should receive D-CONNECT for the existing call");
-    let (connect_prim, connect) = &connects[0];
-    assert_eq!(connect.call_identifier, active_call_id);
-    assert_eq!(
-        connect.transmission_grant,
-        TransmissionGrant::GrantedToOtherUser,
-        "a non-speaker rejoining while another MS transmits should enter receive state"
-    );
-    assert!(!connect.call_ownership);
-    assert_eq!(connect_prim.main_address.ssi, TEST_CALLED_ISSI);
-    assert_eq!(connect_prim.main_address.ssi_type, SsiType::Issi);
-    assert!(
-        connect_prim.chan_alloc.is_some(),
-        "D-CONNECT for active-call rejoin must carry the existing traffic allocation"
+        count_d_connects(&duplicate_msgs),
+        0,
+        "active same-GSSI U-SETUP alias must not resend D-CONNECT"
     );
 
     let floor_answers: Vec<_> = duplicate_msgs
@@ -2916,7 +2942,14 @@ fn test_repeated_group_u_setup_same_active_gssi_uses_existing_call_without_servi
     assert_eq!(grant_prim.main_address.ssi, TEST_CALLED_ISSI);
     assert_eq!(grant_prim.main_address.ssi_type, SsiType::Issi);
     assert_eq!(grant.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
-    assert_compact_d_tx_granted_facch(grant_prim, grant);
+    assert_d_tx_granted_facch_allocation(
+        grant_prim,
+        grant,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "queued repeated U-SETUP floor response",
+    );
 
     assert_eq!(count_d_setups(&duplicate_msgs), 0, "duplicate setup must not send a second D-SETUP");
     assert_eq!(
@@ -2950,33 +2983,21 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
-    let active_call_id = start_group_call(&mut test);
+    let (active_call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
     // Some terminals repeat U-SETUP when the user presses PTT again even
-    // though the SwMI still has that MS as current speaker. Treating that as
-    // a duplicate with only D-CONNECT is too weak in the field: clause
-    // 14.5.2.2.1 floor control needs an explicit D-TX GRANTED response for
-    // transmit permission, and UMAC must keep the current speaker mapped.
+    // though the SwMI still has that MS as current speaker. Clause 14.5.2.2.1
+    // floor control needs an explicit D-TX GRANTED response for transmit
+    // permission, and UMAC must keep the current speaker mapped.
     test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
     test.run_stack(Some(1));
     let repeated_msgs = test.dump_sinks();
 
     assert_eq!(count_d_releases(&repeated_msgs), 0);
     assert_eq!(count_d_setups(&repeated_msgs), 0);
+    assert_eq!(count_d_call_proceedings(&repeated_msgs), 0);
+    assert_eq!(count_d_connects(&repeated_msgs), 0);
     assert_eq!(count_umac_open(&repeated_msgs), 0);
-
-    let connect = repeated_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .expect("current-speaker repeated U-SETUP should receive D-CONNECT for the existing call");
-    assert_eq!(connect.1.call_identifier, active_call_id);
-    assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
-    assert!(connect.1.call_ownership);
-    assert_eq!(connect.0.main_address.ssi, TEST_ISSI);
-    assert!(connect.0.chan_alloc.is_some());
 
     let grants: Vec<_> = repeated_msgs
         .iter()
@@ -3003,7 +3024,19 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
     for (prim, grant) in &grants {
-        assert_compact_d_tx_granted_facch(prim, grant);
+        let expected_dir = if prim.main_address.ssi_type == SsiType::Issi {
+            UlDlAssignment::Both
+        } else {
+            UlDlAssignment::Dl
+        };
+        assert_d_tx_granted_facch_allocation(
+            prim,
+            grant,
+            active_ts,
+            active_usage,
+            expected_dir,
+            "current-speaker repeated U-SETUP floor reassert",
+        );
     }
 
     assert_eq!(
@@ -3028,7 +3061,7 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
-    let active_call_id = start_group_call(&mut test);
+    let (active_call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, active_call_id));
     test.run_stack(Some(1));
@@ -3047,18 +3080,12 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
         0,
         "same-GSSI hangtime rejoin must not emit D-RELEASE RequestedServiceNotAvailable"
     );
-
-    let connect = repeated_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .expect("hangtime repeated U-SETUP should receive D-CONNECT for the existing call");
-    assert_eq!(connect.1.call_identifier, active_call_id);
-    assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
-    assert_eq!(connect.0.main_address.ssi, TEST_CALLED_ISSI);
-    assert!(connect.0.chan_alloc.is_some());
+    assert_eq!(
+        count_d_call_proceedings(&repeated_msgs),
+        0,
+        "hangtime retake must not restart setup with D-CALL PROCEEDING"
+    );
+    assert_eq!(count_d_connects(&repeated_msgs), 0, "hangtime retake must not resend D-CONNECT");
 
     let grants: Vec<_> = repeated_msgs
         .iter()
@@ -3085,7 +3112,19 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
     for (prim, grant) in &grants {
-        assert_compact_d_tx_granted_facch(prim, grant);
+        let expected_dir = if prim.main_address.ssi_type == SsiType::Issi {
+            UlDlAssignment::Both
+        } else {
+            UlDlAssignment::Dl
+        };
+        assert_d_tx_granted_facch_allocation(
+            prim,
+            grant,
+            active_ts,
+            active_usage,
+            expected_dir,
+            "hangtime repeated U-SETUP floor retake",
+        );
     }
 
     assert_eq!(count_d_setups(&repeated_msgs), 0, "hangtime retake must not send a second D-SETUP");
