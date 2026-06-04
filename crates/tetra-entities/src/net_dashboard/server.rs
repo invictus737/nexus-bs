@@ -2215,6 +2215,244 @@ fn serve_wx_post(stream: TcpStream, shared_config: &Option<tetra_config::bluesta
     http_response(stream, 200, "OK");
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CpuDescriptor {
+    model: String,
+    cores: usize,
+}
+
+fn cpuinfo_values<'a>(cpuinfo: &'a str, key: &str) -> Vec<&'a str> {
+    cpuinfo
+        .lines()
+        .filter_map(|line| {
+            let (line_key, value) = line.split_once(':')?;
+            if line_key.trim().eq_ignore_ascii_case(key) {
+                Some(value.trim())
+            } else {
+                None
+            }
+        })
+        .filter(|value| !value.is_empty())
+        .collect()
+}
+
+fn first_cpuinfo_value<'a>(cpuinfo: &'a str, key: &str) -> Option<&'a str> {
+    cpuinfo_values(cpuinfo, key).into_iter().next()
+}
+
+fn parse_hex_or_decimal(value: &str) -> Option<u32> {
+    let trimmed = value.trim();
+    let without_prefix = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+    if trimmed.starts_with("0x") || trimmed.starts_with("0X") || without_prefix.chars().any(|c| c.is_ascii_alphabetic()) {
+        u32::from_str_radix(without_prefix, 16).ok()
+    } else {
+        without_prefix.parse::<u32>().ok()
+    }
+}
+
+fn arm_implementer_name(implementer: u32) -> Option<&'static str> {
+    match implementer {
+        0x41 => Some("ARM"),
+        0x42 => Some("Broadcom"),
+        0x43 => Some("Cavium"),
+        0x46 => Some("Fujitsu"),
+        0x48 => Some("HiSilicon"),
+        0x4d => Some("Motorola/Freescale"),
+        0x4e => Some("NVIDIA"),
+        0x51 => Some("Qualcomm"),
+        0x53 => Some("Samsung"),
+        0x56 => Some("Marvell"),
+        0x61 => Some("Apple"),
+        0x69 => Some("Intel"),
+        _ => None,
+    }
+}
+
+fn arm_core_name(implementer: u32, part: u32) -> Option<&'static str> {
+    match (implementer, part) {
+        (0x41, 0xd01) => Some("Cortex-A32"),
+        (0x41, 0xd02) => Some("Cortex-A34"),
+        (0x41, 0xd03) => Some("Cortex-A53"),
+        (0x41, 0xd04) => Some("Cortex-A35"),
+        (0x41, 0xd05) => Some("Cortex-A55"),
+        (0x41, 0xd07) => Some("Cortex-A57"),
+        (0x41, 0xd08) => Some("Cortex-A72"),
+        (0x41, 0xd09) => Some("Cortex-A73"),
+        (0x41, 0xd0a) => Some("Cortex-A75"),
+        (0x41, 0xd0b) => Some("Cortex-A76"),
+        (0x41, 0xd0c) => Some("Neoverse-N1"),
+        (0x41, 0xd0d) => Some("Cortex-A77"),
+        (0x41, 0xd0e) => Some("Cortex-A76AE"),
+        (0x41, 0xd40) => Some("Neoverse-V1"),
+        (0x41, 0xd41) => Some("Cortex-A78"),
+        (0x41, 0xd42) => Some("Cortex-A78AE"),
+        (0x41, 0xd44) => Some("Cortex-X1"),
+        (0x41, 0xd46) => Some("Cortex-A510"),
+        (0x41, 0xd47) => Some("Cortex-A710"),
+        (0x41, 0xd48) => Some("Cortex-X2"),
+        (0x41, 0xd49) => Some("Neoverse-N2"),
+        (0x41, 0xd4a) => Some("Neoverse-E1"),
+        (0x42, 0x00f) => Some("Brahma-B15"),
+        (0x42, 0x100) => Some("Brahma-B53"),
+        (0x51, 0x06f) => Some("Krait"),
+        (0x51, 0x201) | (0x51, 0x205) | (0x51, 0x211) | (0x51, 0x801) => Some("Kryo"),
+        (0x51, 0x800) => Some("Falkor-V1"),
+        (0x4e, 0x000) => Some("Denver"),
+        (0x4e, 0x003) => Some("Denver 2"),
+        (0x4e, 0x004) => Some("Carmel"),
+        _ => None,
+    }
+}
+
+fn vendor_from_board_context(compatible: Option<&str>, board_model: Option<&str>, hardware: Option<&str>) -> Option<&'static str> {
+    let text = [compatible.unwrap_or(""), board_model.unwrap_or(""), hardware.unwrap_or("")]
+        .join("\n")
+        .to_lowercase();
+    if text.contains("brcm,") || text.contains("bcm27") || text.contains("bcm28") || text.contains("raspberry pi") {
+        Some("Broadcom")
+    } else if text.contains("rockchip,") {
+        Some("Rockchip")
+    } else if text.contains("allwinner,") || text.contains("sunxi") {
+        Some("Allwinner")
+    } else if text.contains("amlogic,") {
+        Some("Amlogic")
+    } else if text.contains("qcom,") || text.contains("qualcomm") {
+        Some("Qualcomm")
+    } else if text.contains("mediatek,") {
+        Some("MediaTek")
+    } else if text.contains("nvidia,") {
+        Some("NVIDIA")
+    } else if text.contains("samsung,") {
+        Some("Samsung")
+    } else if text.contains("ti,") {
+        Some("Texas Instruments")
+    } else if text.contains("fsl,") || text.contains("nxp,") {
+        Some("NXP")
+    } else {
+        None
+    }
+}
+
+fn format_cpu_freq_khz(khz: u64) -> Option<String> {
+    if khz == 0 {
+        return None;
+    }
+    if khz >= 1_000_000 {
+        let ghz = khz as f64 / 1_000_000.0;
+        if (ghz - ghz.round()).abs() < 0.05 {
+            Some(format!("{:.0}GHz", ghz))
+        } else {
+            Some(format!("{:.1}GHz", ghz))
+        }
+    } else {
+        Some(format!("{}MHz", (khz + 500) / 1000))
+    }
+}
+
+fn cpu_bits_label(cpuinfo: &str, arch: Option<&str>) -> Option<&'static str> {
+    let arch_lc = arch.unwrap_or("").to_lowercase();
+    if arch_lc.contains("64") || matches!(arch_lc.as_str(), "aarch64" | "arm64" | "riscv64" | "ppc64le" | "ppc64") {
+        return Some("64-bit");
+    }
+    if arch_lc.contains("86") || arch_lc.starts_with("armv7") || arch_lc.starts_with("armv6") || arch_lc == "arm" {
+        return Some("32-bit");
+    }
+    if first_cpuinfo_value(cpuinfo, "CPU architecture").is_some_and(|value| value == "8") {
+        return Some("64-bit");
+    }
+    None
+}
+
+fn count_cpu_cores(cpuinfo: &str) -> usize {
+    let processor_count = cpuinfo.lines().filter(|line| line.trim_start().starts_with("processor")).count();
+    if processor_count > 0 {
+        processor_count
+    } else {
+        std::thread::available_parallelism().map(usize::from).unwrap_or(0)
+    }
+}
+
+fn build_cpu_descriptor(
+    cpuinfo: &str,
+    board_model: Option<&str>,
+    compatible: Option<&str>,
+    max_freq_khz: Option<u64>,
+    arch: Option<&str>,
+) -> CpuDescriptor {
+    let cores = count_cpu_cores(cpuinfo);
+    let model_name = first_cpuinfo_value(cpuinfo, "model name").map(str::to_string);
+    let hardware = first_cpuinfo_value(cpuinfo, "Hardware");
+    let cpu_model_field = first_cpuinfo_value(cpuinfo, "Model");
+    let implementer = first_cpuinfo_value(cpuinfo, "CPU implementer").and_then(parse_hex_or_decimal);
+    let part = first_cpuinfo_value(cpuinfo, "CPU part").and_then(parse_hex_or_decimal);
+
+    let mut model = if let Some(model_name) = model_name.filter(|value| !value.eq_ignore_ascii_case("unknown")) {
+        model_name
+    } else if let (Some(implementer), Some(part)) = (implementer, part) {
+        let core = arm_core_name(implementer, part).unwrap_or("ARM-compatible CPU");
+        let vendor = vendor_from_board_context(compatible, board_model, hardware).or_else(|| arm_implementer_name(implementer));
+        match vendor {
+            Some(vendor) if !core.starts_with(vendor) => format!("{vendor} {core}"),
+            _ => core.to_string(),
+        }
+    } else if let Some(hardware) = hardware {
+        hardware.to_string()
+    } else if let Some(model) = board_model.or(cpu_model_field) {
+        model.to_string()
+    } else {
+        "unknown".to_string()
+    };
+
+    let model_lc = model.to_lowercase();
+    if let Some(freq) = max_freq_khz.and_then(format_cpu_freq_khz)
+        && !model_lc.contains("ghz")
+        && !model_lc.contains("mhz")
+    {
+        model.push(' ');
+        model.push_str(&freq);
+    }
+
+    if let Some(bits) = cpu_bits_label(cpuinfo, arch)
+        && !model.contains("64-bit")
+        && !model.contains("32-bit")
+    {
+        model.push(' ');
+        model.push_str(bits);
+    }
+
+    CpuDescriptor { model, cores }
+}
+
+fn read_trimmed_string(path: &str) -> Option<String> {
+    std::fs::read(path).ok().and_then(|bytes| {
+        let text = String::from_utf8_lossy(&bytes).replace('\0', "\n");
+        let trimmed = text.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    })
+}
+
+fn detect_cpu_descriptor() -> CpuDescriptor {
+    let cpuinfo = std::fs::read_to_string("/proc/cpuinfo").unwrap_or_default();
+    let board_model = read_trimmed_string("/proc/device-tree/model");
+    let compatible = read_trimmed_string("/proc/device-tree/compatible");
+    let max_freq_khz = read_trimmed_string("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq").and_then(|s| s.parse::<u64>().ok());
+    let arch = std::process::Command::new("uname")
+        .arg("-m")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty());
+
+    build_cpu_descriptor(
+        &cpuinfo,
+        board_model.as_deref(),
+        compatible.as_deref(),
+        max_freq_khz,
+        arch.as_deref(),
+    )
+}
+
 fn serve_system_info(mut stream: TcpStream, config_path: &str) {
     let product = dashboard_product_identity();
     let hostname = std::process::Command::new("hostname")
@@ -2244,21 +2482,7 @@ fn serve_system_info(mut stream: TcpStream, config_path: &str) {
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
 
-    // CPU model — /proc/cpuinfo "model name" (x86) or "Model" (ARM/Pi)
-    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.to_lowercase().starts_with("model name") || l.to_lowercase().starts_with("hardware"))
-                .and_then(|l| l.splitn(2, ':').nth(1).map(|v| v.trim().to_string()))
-        })
-        .unwrap_or_else(|| "unknown".to_string());
-
-    // CPU core count
-    let cpu_cores = std::fs::read_to_string("/proc/cpuinfo")
-        .ok()
-        .map(|s| s.lines().filter(|l| l.starts_with("processor")).count())
-        .unwrap_or(0);
+    let cpu = detect_cpu_descriptor();
 
     // CPU load — /proc/stat first line: user nice system idle iowait irq softirq
     // Take a 100ms sample for a meaningful reading
@@ -2409,8 +2633,8 @@ fn serve_system_info(mut stream: TcpStream, config_path: &str) {
         "product_version_tag": product.version_tag,
         "product_user_agent": product.user_agent,
         "stack_version": tetra_core::STACK_VERSION,
-        "cpu_model": cpu_model,
-        "cpu_cores": cpu_cores,
+        "cpu_model": cpu.model,
+        "cpu_cores": cpu.cores,
         "cpu_pct": cpu_pct,
         "ram_total_mb": ram_total_mb,
         "ram_used_mb": ram_used_mb,
@@ -2871,6 +3095,88 @@ mod tests {
         assert_eq!(product.version, "0.1.55");
         assert_eq!(product.version_tag, "v0.1.55");
         assert_eq!(product.user_agent, "Nexus-BS/v0.1.55");
+    }
+
+    #[test]
+    fn cpu_descriptor_detects_raspberry_pi_zero_2_w_cortex_a53() {
+        let cpuinfo = r#"processor	: 0
+BogoMIPS	: 38.40
+Features	: fp asimd evtstrm crc32 cpuid
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0xd03
+CPU revision	: 4
+
+processor	: 1
+BogoMIPS	: 38.40
+Features	: fp asimd evtstrm crc32 cpuid
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0xd03
+CPU revision	: 4
+
+processor	: 2
+BogoMIPS	: 38.40
+Features	: fp asimd evtstrm crc32 cpuid
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0xd03
+CPU revision	: 4
+
+processor	: 3
+BogoMIPS	: 38.40
+Features	: fp asimd evtstrm crc32 cpuid
+CPU implementer	: 0x41
+CPU architecture: 8
+CPU variant	: 0x0
+CPU part	: 0xd03
+CPU revision	: 4
+
+Revision	: 902120
+Serial		: 000000004d3bc489
+Model		: Raspberry Pi Zero 2 W Rev 1.0
+"#;
+
+        let cpu = build_cpu_descriptor(
+            cpuinfo,
+            Some("Raspberry Pi Zero 2 W Rev 1.0"),
+            Some("raspberrypi,model-zero-2-w\nbrcm,bcm2837"),
+            Some(1_000_000),
+            Some("aarch64"),
+        );
+
+        assert_eq!(
+            cpu,
+            CpuDescriptor {
+                model: "Broadcom Cortex-A53 1GHz 64-bit".to_string(),
+                cores: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn cpu_descriptor_preserves_x86_model_name_and_core_count() {
+        let cpuinfo = r#"processor	: 0
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz
+
+processor	: 1
+vendor_id	: GenuineIntel
+model name	: Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz
+"#;
+
+        let cpu = build_cpu_descriptor(cpuinfo, None, None, None, Some("x86_64"));
+
+        assert_eq!(
+            cpu,
+            CpuDescriptor {
+                model: "Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz 64-bit".to_string(),
+                cores: 2,
+            }
+        );
     }
 
     #[test]

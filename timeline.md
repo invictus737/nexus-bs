@@ -1,5 +1,44 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 23:21:39 EEST - Dashboard CPU model detection across boards
+
+Problem targeted:
+
+- Dashboard System tab showed `unknown (4 cores)` on the live test board.
+- Live board evidence:
+  - `/proc/cpuinfo`: `CPU implementer=0x41`, `CPU part=0xd03`, `CPU architecture=8`, 4 processors.
+  - `/proc/device-tree/model`: `Raspberry Pi Zero 2 W Rev 1.0`.
+  - `/proc/device-tree/compatible`: `raspberrypi,model-zero-2-w`, `brcm,bcm2837`.
+  - `cpuinfo_max_freq`: `1000000`.
+  - `uname -m`: `aarch64`.
+
+Components, simple technical meaning:
+
+- Dashboard `/api/system`: HTTP endpoint that feeds the System tab.
+- CPU descriptor parser: converts Linux kernel CPU identity fields into a readable hardware string such as `Broadcom Cortex-A53 1GHz 64-bit`.
+- This is observability/dashboard work, not TETRA air-interface signalling and not formal conformance evidence.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Replaced single-line `/proc/cpuinfo` lookup with a board-aware parser.
+  - Uses `/proc/cpuinfo`, device-tree `model`/`compatible`, `cpufreq` max frequency, and `uname -m`.
+  - Maps ARM implementer/part IDs to core names including Cortex-A53/A55/A72/A76/A78/A510/A710, Neoverse, Broadcom Brahma, Qualcomm Kryo/Krait/Falkor, and NVIDIA Denver/Carmel.
+  - Keeps x86 `model name` intact while adding architecture width when available.
+  - Added tests for the live Raspberry Pi Zero 2 W case and x86 model-name preservation.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities net_dashboard::server::tests::cpu_descriptor --locked` -> 2 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit, deploy direct to testing with the standard local-build script, and query `/api/system`.
+2. Expected live JSON/UI: `cpu_model` is `Broadcom Cortex-A53 1GHz 64-bit`, `cpu_cores` is `4`, dashboard renders `Broadcom Cortex-A53 1GHz 64-bit (4 cores)`.
+
 ## 2026-06-04 23:09:56 EEST - Private simplex MXP600 last-speaker release guard
 
 Live problem targeted:
