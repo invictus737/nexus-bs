@@ -48,6 +48,7 @@ pub struct MmBs {
     dltime: TdmaTime,
     pending_energy_saving: HashMap<u32, PendingEnergySavingAssignment>,
     pending_swmi_group_transactions: HashMap<u32, PendingSwmiGroupTransaction>,
+    pending_solicited_group_reports: HashMap<u32, TdmaTime>,
     restart_recovery: HashMap<u32, RestartRecoveryProbe>,
 }
 
@@ -127,6 +128,11 @@ impl MmBs {
     // registration procedure, not an ETSI timer value.
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 5;
+    // Local acceptance window for the group-report phase requested by
+    // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
+    // clause 16.4.4. This is not an ETSI timer value; it matches the local
+    // registration-command grace used before declaring the MS stale.
+    const SOLICITED_GROUP_REPORT_WINDOW_TIMESLOTS: i32 = 60 * 18 * 4;
 
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         let client_mgr = MmClientMgr::new(telemetry.clone());
@@ -150,6 +156,7 @@ impl MmBs {
             dltime: TdmaTime::default(),
             pending_energy_saving: HashMap::new(),
             pending_swmi_group_transactions: HashMap::new(),
+            pending_solicited_group_reports: HashMap::new(),
             restart_recovery,
         }
     }
@@ -298,6 +305,7 @@ impl MmBs {
         }
 
         let mut done = Vec::new();
+        let mut commands = Vec::new();
         for (&issi, probe) in self.restart_recovery.iter_mut() {
             if self.client_mgr.client_is_known(issi) {
                 done.push(issi);
@@ -326,13 +334,16 @@ impl MmBs {
                 Self::RESTART_RECOVERY_MAX_ATTEMPTS,
                 issi
             );
-            Self::send_d_location_update_command(queue, issi, 0);
+            commands.push(issi);
             probe.attempts = probe.attempts.saturating_add(1);
             probe.next_due = ts.add_timeslots(Self::RESTART_RECOVERY_RETRY_TIMESLOTS);
         }
 
         for issi in done {
             self.restart_recovery.remove(&issi);
+        }
+        for issi in commands {
+            self.send_d_location_update_command(queue, issi, 0);
         }
     }
 
@@ -615,6 +626,36 @@ impl MmBs {
             if self.pending_swmi_group_transactions.remove(&issi).is_some() {
                 tracing::warn!(
                     "MM: T353 expired for SwMI-initiated group attach/detach transaction to ISSI {}; discarding pending transaction",
+                    issi
+                );
+            }
+        }
+    }
+
+    fn arm_solicited_group_report(&mut self, issi: u32) {
+        let expires_at = self.dltime.add_timeslots(Self::SOLICITED_GROUP_REPORT_WINDOW_TIMESLOTS);
+        self.pending_solicited_group_reports.insert(issi, expires_at);
+    }
+
+    fn solicited_group_report_pending(&self, issi: u32) -> bool {
+        self.pending_solicited_group_reports.contains_key(&issi)
+    }
+
+    fn clear_solicited_group_report(&mut self, issi: u32) {
+        self.pending_solicited_group_reports.remove(&issi);
+    }
+
+    fn expire_pending_solicited_group_reports(&mut self, now: TdmaTime) {
+        let expired: Vec<u32> = self
+            .pending_solicited_group_reports
+            .iter()
+            .filter_map(|(&issi, &expires_at)| if now.diff(expires_at) >= 0 { Some(issi) } else { None })
+            .collect();
+
+        for issi in expired {
+            if self.pending_solicited_group_reports.remove(&issi).is_some() {
+                tracing::debug!(
+                    "MM: solicited group report window expired for ISSI {} after D-LOCATION-UPDATE-COMMAND",
                     issi
                 );
             }
@@ -1033,6 +1074,7 @@ impl MmBs {
             ssi,
             "U-ITSI DETACH terminates the registered MM context before any pending SwMI group ACK",
         );
+        self.clear_solicited_group_report(ssi);
         self.forget_restart_recovery_issi(ssi);
         let detached_client = self.client_mgr.remove_client(ssi);
         if let Some(client) = detached_client {
@@ -1124,6 +1166,7 @@ impl MmBs {
             // Send REJECT so terminal knows to try the other network, but first deregister from Brew.
             let issi = prim.received_address.ssi;
             tracing::info!("MM: ISSI {} migrating to another network — releasing from Brew", issi);
+            self.clear_solicited_group_report(issi);
             self.forget_restart_recovery_issi(issi);
             let detached = self.client_mgr.remove_client(issi);
             if let Some(client) = detached {
@@ -1199,6 +1242,7 @@ impl MmBs {
         // Try to register the client
         let issi = prim.received_address.ssi;
         let handle = prim.handle;
+        let was_solicited_group_report_pending = self.solicited_group_report_pending(issi);
 
         // ISSI whitelist check — reject if whitelist is non-empty and ISSI not in it.
         // The dashboard can override the config whitelist at runtime (state override takes
@@ -1476,6 +1520,9 @@ impl MmBs {
         } else {
             None
         };
+        if group_report_complete {
+            self.clear_solicited_group_report(issi);
+        }
 
         // Coverage-return re-affiliation (fixes "PTT no longer works after leaving and
         // returning to coverage", workaround = DMO→TMO).
@@ -1619,9 +1666,9 @@ impl MmBs {
         //    RoamingLocationUpdating are now known on that second update, so they get no
         //    further COMMAND and can't loop.
         let has_groups = _has_groups || group_report_complete;
-        if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach && !has_groups {
+        if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach && !has_groups && !was_solicited_group_report_pending {
             tracing::info!("Sending D-LOCATION UPDATE COMMAND to returning MS {} to request group report", issi);
-            Self::send_d_location_update_command(queue, issi, handle);
+            self.send_d_location_update_command(queue, issi, handle);
         }
     }
 
@@ -1879,6 +1926,7 @@ impl MmBs {
                                 self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
                             }
                             self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
+                            self.clear_solicited_group_report(issi);
                         }
                         Err(e) => {
                             tracing::warn!("Failed clearing groups for standalone group-report-complete MS {}: {:?}", issi, e);
@@ -1944,6 +1992,48 @@ impl MmBs {
         }
 
         if let Some(response) = &pdu.group_report_response {
+            if self.solicited_group_report_pending(issi) {
+                if response.len == 1 && response.data == 0 {
+                    let Some(giu) = pdu.group_identity_uplink.as_ref() else {
+                        tracing::warn!(
+                            "MM: solicited group report completion from ISSI {} has no group identities after no-uplink handling",
+                            issi
+                        );
+                        self.send_d_attach_detach_ack_reject(queue, issi, prim.handle);
+                        return;
+                    };
+                    tracing::info!(
+                        "MM: accepting solicited U-ATTACH/DETACH GROUP IDENTITY group-report completion from ISSI {} with {} group identity item(s)",
+                        issi,
+                        giu.len()
+                    );
+                    if self.process_attach_detach_group_identity_uplink(
+                        queue,
+                        issi,
+                        prim.handle,
+                        pdu.group_identity_attach_detach_mode,
+                        giu,
+                    ) {
+                        self.clear_solicited_group_report(issi);
+                    }
+                    return;
+                }
+
+                tracing::warn!(
+                    "Rejecting solicited U-ATTACH/DETACH GROUP IDENTITY from {} with reserved/unsupported group_report_response len={} data={}",
+                    issi,
+                    response.len,
+                    response.data
+                );
+                let rejected_groups = pdu
+                    .group_identity_uplink
+                    .as_ref()
+                    .map(|giu| Self::rejected_group_identity_downlinks(giu))
+                    .unwrap_or_default();
+                self.send_d_attach_detach_ack_reject_with_downlink(queue, issi, prim.handle, rejected_groups);
+                return;
+            }
+
             // EN 300 392-2 clause 16.8.2: an MS-initiated attach/detach group
             // identity request shall set "not report request" and shall not
             // include group report response. Treat a mixed report response plus
@@ -1989,86 +2079,11 @@ impl MmBs {
         // feature_check_u_attach_detach_group_identity above guarantees this is Some,
         // but use let-else instead of .unwrap() so a future refactor that loosens that
         // check doesn't crash the MM worker on a malformed PDU.
-        let Some(giu) = pdu.group_identity_uplink else {
+        let Some(giu) = pdu.group_identity_uplink.as_ref() else {
             tracing::warn!("rx_u_attach_detach_group_identity: group_identity_uplink missing after feature_check; ignoring");
             return;
         };
-        let giu_for_mode = Self::group_identity_uplink_for_mode(pdu.group_identity_attach_detach_mode, &giu);
-        let group_result = if self.group_identity_uplink_exceeds_ack_capacity(issi, giu_for_mode.len()) {
-            GroupIdentityProcessResult {
-                group_identity_downlink: Self::rejected_group_identity_downlinks(&giu_for_mode),
-                all_accepted: false,
-            }
-        } else {
-            if pdu.group_identity_attach_detach_mode {
-                let prior_groups: Vec<u32> = self
-                    .client_mgr
-                    .get_client_by_issi(issi)
-                    .map(|client| client.groups.iter().copied().collect())
-                    .unwrap_or_default();
-                match self.client_mgr.client_detach_all_groups(issi) {
-                    Ok(_) => {
-                        if !prior_groups.is_empty() {
-                            {
-                                let mut state = self.config.state_write();
-                                for &gssi in &prior_groups {
-                                    state.subscribers.deaffiliate(issi, gssi);
-                                }
-                            }
-                            self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
-                        return;
-                    }
-                }
-            }
-
-            // Try to attach to requested groups, and retrieve list of accepted GroupIdentityDownlink elements.
-            self.try_attach_detach_groups(queue, issi, &giu_for_mode)
-        };
-        let group_identity_accept_reject = if group_result.all_accepted { 0 } else { 1 };
-        let group_identity_downlink = if group_result.group_identity_downlink.is_empty() {
-            None
-        } else {
-            Some(group_result.group_identity_downlink)
-        };
-
-        // Build reply PDU
-        let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
-            group_identity_accept_reject,
-            // EN 300 392-2 clause 16.9.2.2 table 16.2 defines this as a
-            // mandatory one-bit Reserved field. Keep the reserved bit clear.
-            reserved: false,
-            proprietary: None,
-            group_identity_downlink,
-            group_identity_security_related_information: None,
-        };
-
-        // Write to PDU
-        let mut sdu = BitBuffer::new_autoexpand(32);
-        pdu_response.to_bitbuf(&mut sdu).unwrap(); // We want to know when this happens
-        sdu.seek(0);
-        tracing::debug!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
-
-        let msg = SapMsg {
-            sap: Sap::LmmSap,
-            src: TetraEntity::Mm,
-            dest: TetraEntity::Mle,
-            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
-                sdu,
-                handle: prim.handle,
-                address: TetraAddress::issi(issi),
-                layer2service: Layer2Service::Acknowledged,
-                stealing_permission: false,
-                stealing_repeats_flag: false,
-                encryption_flag: false,
-                is_null_pdu: false,
-                tx_reporter: None,
-            }),
-        };
-        queue.push_back(msg);
+        self.process_attach_detach_group_identity_uplink(queue, issi, prim.handle, pdu.group_identity_attach_detach_mode, giu);
     }
 
     fn rx_u_attach_detach_group_identity_acknowledgement(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -2394,6 +2409,100 @@ impl MmBs {
         }
     }
 
+    fn send_d_attach_detach_ack_for_group_result(
+        &self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        group_result: GroupIdentityProcessResult,
+    ) {
+        let group_identity_accept_reject = if group_result.all_accepted { 0 } else { 1 };
+        let group_identity_downlink = if group_result.group_identity_downlink.is_empty() {
+            None
+        } else {
+            Some(group_result.group_identity_downlink)
+        };
+
+        let pdu_response = DAttachDetachGroupIdentityAcknowledgement {
+            group_identity_accept_reject,
+            // EN 300 392-2 clause 16.9.2.2 table 16.2 defines this as a
+            // mandatory one-bit Reserved field. Keep the reserved bit clear.
+            reserved: false,
+            proprietary: None,
+            group_identity_downlink,
+            group_identity_security_related_information: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu_response.to_bitbuf(&mut sdu).unwrap();
+        sdu.seek(0);
+        tracing::debug!("-> {:?} sdu {}", pdu_response, sdu.dump_bin());
+
+        queue.push_back(SapMsg {
+            sap: Sap::LmmSap,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                sdu,
+                handle,
+                address: TetraAddress::issi(issi),
+                layer2service: Layer2Service::Acknowledged,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                encryption_flag: false,
+                is_null_pdu: false,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    fn process_attach_detach_group_identity_uplink(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        handle: u32,
+        detach_all_then_attach: bool,
+        giu: &[GroupIdentityUplink],
+    ) -> bool {
+        let giu_for_mode = Self::group_identity_uplink_for_mode(detach_all_then_attach, giu);
+        let group_result = if self.group_identity_uplink_exceeds_ack_capacity(issi, giu_for_mode.len()) {
+            GroupIdentityProcessResult {
+                group_identity_downlink: Self::rejected_group_identity_downlinks(&giu_for_mode),
+                all_accepted: false,
+            }
+        } else {
+            if detach_all_then_attach {
+                let prior_groups: Vec<u32> = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|client| client.groups.iter().copied().collect())
+                    .unwrap_or_default();
+                match self.client_mgr.client_detach_all_groups(issi) {
+                    Ok(_) => {
+                        if !prior_groups.is_empty() {
+                            {
+                                let mut state = self.config.state_write();
+                                for &gssi in &prior_groups {
+                                    state.subscribers.deaffiliate(issi, gssi);
+                                }
+                            }
+                            self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
+                        return false;
+                    }
+                }
+            }
+
+            self.try_attach_detach_groups(queue, issi, &giu_for_mode)
+        };
+
+        self.send_d_attach_detach_ack_for_group_result(queue, issi, handle, group_result);
+        true
+    }
+
     fn rejected_group_identity_downlink(giu: &GroupIdentityUplink) -> Option<GroupIdentityDownlink> {
         if giu.gssi.is_none() && giu.vgssi.is_none() {
             return None;
@@ -2666,7 +2775,12 @@ impl MmBs {
         }
     }
 
-    fn send_d_location_update_command(queue: &mut MessageQueue, issi: u32, handle: u32) {
+    fn send_d_location_update_command(&mut self, queue: &mut MessageQueue, issi: u32, handle: u32) {
+        Self::enqueue_d_location_update_command(queue, issi, handle);
+        self.arm_solicited_group_report(issi);
+    }
+
+    fn enqueue_d_location_update_command(queue: &mut MessageQueue, issi: u32, handle: u32) {
         let pdu = DLocationUpdateCommand {
             group_identity_report: true,
             cipher_control: false,
@@ -2872,15 +2986,18 @@ impl MmBs {
             tracing::debug!("DemandLocationUpdating: address_extension present (expected from radio, ignored)");
         }
         if let Some(response) = &pdu.group_report_response {
-            if pdu.group_identity_location_demand.is_some() {
-                tracing::warn!("DemandLocationUpdating: group_report_response present together with group_identity_location_demand");
-                return Some(RejectCause::MessageConsistencyError);
-            }
             if response.len != 1 || response.data != 0 {
                 tracing::warn!(
                     "DemandLocationUpdating: unsupported group_report_response len={} data={}",
                     response.len,
                     response.data
+                );
+                return Some(RejectCause::MessageConsistencyError);
+            }
+            if pdu.group_identity_location_demand.is_some() && pdu.location_update_type != LocationUpdateType::DemandLocationUpdating {
+                tracing::warn!(
+                    "{}: group_report_response present together with group_identity_location_demand outside a BS-commanded DemandLocationUpdating response",
+                    pdu.location_update_type
                 );
                 return Some(RejectCause::MessageConsistencyError);
             }
@@ -2953,6 +3070,7 @@ impl TetraEntityTrait for MmBs {
 
         self.expire_pending_energy_saving(ts);
         self.expire_pending_swmi_group_transactions(ts);
+        self.expire_pending_solicited_group_reports(ts);
         self.tick_restart_recovery(queue, ts);
 
         // Local periodic-registration watchdog. Do not call this T351:
@@ -3005,6 +3123,7 @@ impl TetraEntityTrait for MmBs {
                 let detached = self.client_mgr.remove_client(issi);
                 if let Some(client) = detached {
                     self.forget_energy_saving(issi);
+                    self.clear_solicited_group_report(issi);
                     self.abandon_pending_swmi_group_transaction(
                         issi,
                         "periodic registration reject/removal terminates pending SwMI group procedure",
@@ -3023,7 +3142,7 @@ impl TetraEntityTrait for MmBs {
             // and group state so the terminal re-registers cleanly without losing EE mode.
             // Only notify Brew so it stops routing calls to this terminal until it re-registers.
             let last_handle = self.client_mgr.get_client_by_issi(issi).map(|c| c.last_handle).unwrap_or(0);
-            Self::send_d_location_update_command(queue, issi, last_handle);
+            self.send_d_location_update_command(queue, issi, last_handle);
             // EN 300 392-2 clause 16.8.6: registration overrides group
             // attach/detach/report procedures. Once the BS asks the MS to
             // re-register, a later U-ATTACH/DETACH GROUP IDENTITY ACK must not
@@ -3097,7 +3216,7 @@ impl TetraEntityTrait for MmBs {
                             // send a new U-LOCATION-UPDATING-DEMAND, effectively re-registering.
                             // This is cleaner than a reject: the terminal stays on the network
                             // but goes through a full re-registration cycle.
-                            Self::send_d_location_update_command(queue, issi, 0);
+                            self.send_d_location_update_command(queue, issi, 0);
                             // EN 300 392-2 clause 16.8.6 gives registration
                             // precedence over group attach/detach/report
                             // procedures, so dashboard kick/re-registration
@@ -3145,7 +3264,7 @@ impl MmBs {
         );
         for (issi, handle) in clients {
             tracing::debug!("mm_bs: re-registering ISSI {} (handle={})", issi, handle);
-            Self::send_d_location_update_command(queue, issi, handle);
+            self.send_d_location_update_command(queue, issi, handle);
             // EN 300 392-2 clause 16.4.3 permits SwMI-initiated
             // registration by D-LOCATION UPDATE COMMAND, and clause 16.8.6
             // makes that registration procedure override pending group

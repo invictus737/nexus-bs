@@ -1379,3 +1379,54 @@ Pass criteria:
 - `UMAC voice route` appears after each grant.
 - No `PTT denied`, `NotGranted`, `does not fit STCH`, or active-over `UL inactivity timeout`.
 - Operator audio verdict: each speaker is intelligible to the other group members.
+
+## 2026-06-04 12:37:58 EEST - MM restart recovery accepts solicited complete group reports
+
+Problem observed:
+
+- After BS restart, terminals could show `Unit Not Attached`.
+- Live logs showed `U-ATTACH/DETACH GROUP IDENTITY` from `2260082`/`2260616` carrying:
+  - `group_identity_attach_detach_mode=true`
+  - `group_report_response len=1 data=0`
+  - `group_identity_uplink=[226333]`
+- MM rejected that as a malformed mixed standalone request, which prevented coherent group re-affiliation after restart.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: `D-LOCATION UPDATE COMMAND` may request a group report; the MS may report/re-attach groups either in `U-LOCATION UPDATE DEMAND` or following `U-ATTACH/DETACH GROUP IDENTITY`.
+- EN 300 392-2 clause 16.8.3: for SwMI-initiated group report, `U-ATTACH/DETACH GROUP IDENTITY` uses `not report request`, detach-all-then-attach for the first report PDU, and includes `group report complete` when all reported groups fit.
+- EN 300 392-2 clause 16.8.2 remains enforced for unsolicited MS-initiated attach/detach: `group report response` must not be present.
+- EN 300 392-2 clause 16.10.27a: `group_report_response` length 1 value 0 means complete; value 1 is reserved.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Added a per-ISSI local pending window for group reports solicited by `D-LOCATION UPDATE COMMAND(group_identity_report=true)`.
+  - `U-LOCATION UPDATE DEMAND` now accepts `GroupIdentityLocationDemand` plus `group_report_response(1,0)` only for `DemandLocationUpdating`.
+  - `U-ATTACH/DETACH GROUP IDENTITY` still rejects unsolicited mixed report-response + group-list PDUs, but accepts the same shape when a solicited group report is pending.
+  - A BS-commanded DemandLocationUpdating response with no groups no longer immediately triggers a duplicate `D-LOCATION UPDATE COMMAND` while a follow-up group report is pending.
+  - Registration is still not synthesized from standalone group attach; unknown ISSIs must pass the location-update path.
+
+Focused tests:
+
+- `test_restart_recovery_demand_location_update_accepts_complete_group_report_with_groups`
+- `test_restart_recovery_accepts_solicited_attach_detach_group_report_completion`
+- Existing unsolicited mixed reject tests still pass:
+  - `test_mixed_group_report_response_and_attach_list_rejects_without_affiliation`
+  - `test_mixed_group_report_response_and_mode_one_preserves_existing_groups`
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/mm/mm_bs.rs crates/tetra-entities/tests/test_mm_bs.rs` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 108 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this MM restart recovery patch.
+2. Build Nexus-BS AArch64 locally only with the SoapySDR sysroot command from build memory.
+3. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; no binary backup.
+4. Restart the test BS and verify logs no longer show `Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY` for the solicited restart-recovery report.
+5. Confirm `2260082`, `2260616`, and any visible `2260618` register and affiliate to `226333` after restart.
+6. Resume group-call audio hardening next: UMAC must gate raw/decoded TCH/S media by current floor owner/floor epoch to prevent stale-speaker static.

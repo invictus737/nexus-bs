@@ -4647,6 +4647,167 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
 }
 
 #[test]
+fn test_restart_recovery_demand_location_update_accepts_complete_group_report_with_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("demand-groups-complete");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    let command_details = location_update_command_details(&command_msgs);
+    assert_eq!(command_details.len(), 1);
+    assert_eq!(command_details[0].0, issi);
+    assert!(command_details[0].3.group_identity_report);
+
+    // EN 300 392-2 clause 16.4.4 says a BS-commanded group report may carry
+    // the reported groups in U-LOCATION UPDATE DEMAND. If all reported groups
+    // fit in that PDU, the group report response IE shall also indicate
+    // "group report complete" (clause 16.10.27a value 0).
+    submit_location_update_with_groups_and_group_report_response(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        vec![gssi],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    let gila = accept
+        .group_identity_location_accept
+        .as_ref()
+        .expect("complete group report with groups should be acknowledged");
+    assert_eq!(gila.group_identity_accept_reject, 0);
+    let accepted_groups = gila
+        .group_identity_downlink
+        .as_ref()
+        .expect("accepted group should be listed in GroupIdentityLocationAccept");
+    assert_eq!(accepted_groups.len(), 1);
+    assert_eq!(accepted_groups[0].gssi, Some(gssi));
+    assert!(accepted_groups[0].group_identity_attachment.is_some());
+    assert!(
+        !contains_location_update_command(&demand_msgs),
+        "complete solicited group report must not trigger another D-LOCATION-UPDATE-COMMAND"
+    );
+
+    let updates = subscriber_updates(&demand_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![gssi]);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_accepts_solicited_attach_detach_group_report_completion() {
+    debug::setup_logging_verbose();
+    let issi = 2260082;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("demand-followup-attach-complete");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    let command_details = location_update_command_details(&command_msgs);
+    assert_eq!(command_details.len(), 1);
+    assert_eq!(command_details[0].0, issi);
+    assert!(command_details[0].3.group_identity_report);
+
+    // Some terminals answer D-LOCATION UPDATE COMMAND first with the demanded
+    // registration PDU, then report the desired groups in a following
+    // U-ATTACH/DETACH GROUP IDENTITY. EN 300 392-2 clause 16.4.4 permits that
+    // follow-up path; while the report is pending, the BS must not start a new
+    // location-update-command loop.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(
+        !contains_location_update_command(&demand_msgs),
+        "pending solicited group report should prevent an immediate duplicate command"
+    );
+    let updates = subscriber_updates(&demand_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    submit_attach_detach_group_identity_with_report_response(
+        &mut test,
+        issi,
+        true,
+        vec![GroupIdentityUplink {
+            class_of_usage: Some(0),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let report_msgs = test.dump_sinks();
+
+    let ack = extract_attach_detach_ack(&report_msgs);
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    let accepted_groups = ack
+        .group_identity_downlink
+        .as_ref()
+        .expect("solicited group report completion should ACK accepted groups");
+    assert_eq!(accepted_groups.len(), 1);
+    assert_eq!(accepted_groups[0].gssi, Some(gssi));
+    assert!(accepted_groups[0].group_identity_attachment.is_some());
+
+    let updates = subscriber_updates(&report_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[0].issi, issi);
+    assert_eq!(updates[0].groups, vec![gssi]);
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    test.run_stack(Some(2));
+    let followup_msgs = test.dump_sinks();
+    assert!(
+        location_update_commands(&followup_msgs).is_empty(),
+        "completed solicited attach/detach report must stop restart recovery probes"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_group_report_complete_keeps_groups_empty() {
     debug::setup_logging_verbose();
     let issi = 2260618;
@@ -5293,6 +5454,33 @@ fn submit_location_update_with_groups_and_energy(
         group_identity_uplink,
         energy_saving_mode,
     );
+}
+
+fn submit_location_update_with_groups_and_group_report_response(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    groups: Vec<u32>,
+    len: usize,
+    data: u128,
+) {
+    let group_identity_uplink = groups
+        .into_iter()
+        .map(|gssi| GroupIdentityUplink {
+            class_of_usage: Some(0),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        })
+        .collect();
+    let mut pdu = base_location_update_demand(location_update_type, None);
+    pdu.group_identity_location_demand = Some(GroupIdentityLocationDemand {
+        group_identity_attach_detach_mode: 1,
+        group_identity_uplink: Some(group_identity_uplink),
+    });
+    pdu.group_report_response = Some(Type3FieldGeneric { field_id: 0, len, data });
+    submit_location_update_demand_with_handle(test, issi, pdu, 0);
 }
 
 fn submit_location_update_with_group_identity_uplink(
