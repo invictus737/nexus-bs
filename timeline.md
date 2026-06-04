@@ -46,9 +46,22 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Build/deploy:
+
+- Commit: `5acff30 fix: ack private disconnect initiator promptly`.
+- Deployed with the one-shot local script:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Remote deployed binary SHA-256:
+  - `a74b39670e1af2bd0f09e7a2fbfd518c2c1375b69fc06632d11fe8db01bf5607`
+- Startup banner reports `Build: v0.1.55-5acff30d`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+- Post-restart register/affiliate observed for `2260082`, `2260618`, and `2260616` on GSSI `226333`.
+
 Next live validation:
 
-- Commit, build locally, deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`, restart the test BS, and retest private simplex between `2260082` and `2260616`.
+- Retest private simplex between `2260082` and `2260616`.
 - Expected live evidence: after one terminal hangs up, logs show `U-DISCONNECT`, prompt `D-RELEASE` to that ISSI, `D-DISCONNECT` to the peer with assigned channel response capability, peer `U-RELEASE`, and no `Pending individual D-DISCONNECT timed out`.
 
 ## 2026-06-04 21:01:37 EEST - Fixed private simplex first-PTT floor inversion for hook setup
