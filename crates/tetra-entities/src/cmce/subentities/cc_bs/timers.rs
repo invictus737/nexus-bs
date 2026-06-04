@@ -93,7 +93,10 @@ impl CcBsSubentity {
                         // During hangtime there is no current speaker, but sending NotGranted makes
                         // some terminals treat PTT as denied. Keep them in listener state and allow
                         // floor requests via D-TX-CEASED/TRP=0.
-                        if self.active_calls.contains_key(&call_id) {
+                        if let Some(active) = self.active_calls.get(&call_id) {
+                            if !cached.is_individual {
+                                cached.pdu.calling_party_address_ssi = Some(active.source_issi);
+                            }
                             cached.pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
                             cached.pdu.transmission_request_permission = false;
                         }
@@ -561,30 +564,114 @@ impl CcBsSubentity {
             return;
         }
 
-        let call = self.active_calls.get_mut(&call_id).unwrap();
-        tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
+        let (dest_gssi, usage, queued_request) = {
+            let call = self.active_calls.get(&call_id).unwrap();
+            let queued_request = call.queued_tx_demand.filter(|requester| {
+                let affiliated = self.subscriber_affiliated_to_group(requester.ssi, call.dest_gssi);
+                if !affiliated {
+                    tracing::info!(
+                        "CMCE: dropping queued group floor requester ISSI {} for call_id={} gssi={} after affiliation loss during UL inactivity",
+                        requester.ssi,
+                        call_id,
+                        call.dest_gssi
+                    );
+                }
+                affiliated
+            });
+            (call.dest_gssi, call.usage, queued_request)
+        };
 
-        let dest_gssi = call.dest_gssi;
-        let usage = call.usage;
-        call.tx_active = false;
-        call.hangtime_start = Some(self.dltime);
+        let dest_addr = self
+            .cached_setups
+            .get(&call_id)
+            .map(|cached| cached.dest_addr)
+            .unwrap_or_else(|| TetraAddress::new(dest_gssi, SsiType::Gssi));
 
-        self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, ts, usage);
+        if let Some(requester) = queued_request {
+            tracing::warn!(
+                "UL inactivity timeout on ts={} for group call_id={}, forcing floor handoff to queued ISSI {}",
+                ts,
+                call_id,
+                requester.ssi
+            );
+            {
+                let call = self.active_calls.get_mut(&call_id).unwrap();
+                let _ = call.take_queued_tx_demand();
+                call.grant_floor(requester.ssi, Some(requester));
+            }
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-        });
+            // EN 300 392-2 clause 14.5.2.2.1 permits SwMI to grant a queued
+            // group request after the current transmission ceases. Treat the
+            // local inactivity guard as the cease event; do not require a
+            // second U-TX DEMAND from the waiting MS.
+            self.fsm_send_d_tx_granted_individual(
+                queue,
+                call_id,
+                requester,
+                ts,
+                usage,
+                TransmissionGrant::Granted,
+                Some(requester.ssi),
+            );
+            self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_d_setup_refresh(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
 
-        if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
+            self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
+                call_id,
+                gssi: dest_gssi,
+                speaker_issi: requester.ssi,
+            });
+
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: requester.ssi,
+                    dest_gssi,
+                    ts,
+                }),
+            });
+
+            if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi: requester.ssi,
+                        dest_gssi,
+                        ts,
+                    }),
+                });
+            }
+        } else {
+            tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
+            {
+                let call = self.active_calls.get_mut(&call_id).unwrap();
+                let _ = call.take_queued_tx_demand();
+                call.enter_hangtime(self.dltime);
+            }
+
+            self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, ts, usage);
+
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Umac,
                 msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
             });
+
+            if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
+                });
+            }
         }
     }
 }

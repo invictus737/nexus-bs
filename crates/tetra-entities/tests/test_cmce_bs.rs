@@ -3838,6 +3838,129 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
 }
 
 #[test]
+fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let queued_msgs = test.dump_sinks();
+    let queued_grant = queued_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("second MS should be queued while first MS owns group floor");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+
+    test.submit_message(build_ul_inactivity_timeout_msg(active_ts));
+    test.run_stack(Some(1));
+    let timeout_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 14.5.2.2.1 permits the SwMI to grant a queued
+    // U-TX DEMAND when the current group transmission ceases. A local UL
+    // inactivity guard is the BS-side cease event; the waiting MS must not
+    // need a second PTT attempt.
+    assert_eq!(count_d_tx_ceased(&timeout_msgs), 0);
+    assert_eq!(count_umac_floor_released(&timeout_msgs), 0);
+
+    let grants: Vec<_> = timeout_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grants.len(),
+        2,
+        "queued group timeout handoff should notify requester and group listeners"
+    );
+
+    let requester_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("queued requester should get the group floor");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        requester_grant.0,
+        &requester_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "group UL inactivity handoff requester grant",
+    );
+
+    let group_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi))
+        .expect("group listeners should be told which MS now has the floor");
+    assert_eq!(
+        group_grant.1.transmission_grant,
+        TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    );
+    assert_d_tx_granted_facch_allocation(
+        group_grant.0,
+        &group_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "group UL inactivity listener grant",
+    );
+
+    let setup_refreshes: Vec<_> = timeout_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setup_refreshes.len(),
+        1,
+        "queued timeout handoff should refresh late-entry D-SETUP with the new speaker"
+    );
+    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
+    assert_eq!(setup_refresh.call_identifier, call_id);
+    assert_eq!(setup_refresh.calling_party_address_ssi, Some(LAB_ISSI_B));
+    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi));
+    let setup_alloc = setup_refresh_prim
+        .chan_alloc
+        .as_ref()
+        .expect("group timeout D-SETUP refresh should carry channel allocation");
+    assert_chan_alloc_matches_circuit(setup_alloc, active_ts, active_usage, "group timeout D-SETUP refresh");
+    assert_eq!(setup_alloc.ul_dl_assigned, UlDlAssignment::Both);
+
+    assert!(timeout_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == LAB_ISSI_B
+                && *dest_gssi == LAB_GROUP_GSSI
+                && *ts == active_ts
+        )
+    }));
+}
+
+#[test]
 fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     debug::setup_logging_verbose();
 

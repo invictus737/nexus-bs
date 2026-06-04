@@ -2163,3 +2163,92 @@ Next non-repeating execution:
 2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
 3. Ask the operator to retest alternating group PTT on `226333` with `2260082` and `2260616`.
 4. If static persists after this deploy, the next patch target is not cached D-SETUP; inspect whether repeated FACCH/STCH refresh steals too much audio and whether late `NormalTrainSeq2` arrivals occur while no active group floor is present.
+
+## 2026-06-04 20:45:30 EEST - Deployed CMCE D-SETUP speaker refresh build to test BS
+
+Commit deployed:
+
+- `d518c03 fix: refresh group setup speaker on floor handoff`
+
+Local verification before deploy:
+
+- `cargo fmt` -> pass.
+- `git diff --check` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 120 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Deploy:
+
+- Command: `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Build was local on macOS only; no Rust/TETRA compile was done on `chris@192.168.1.179`.
+- Remote target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- No binary backup was created.
+- Build line: `Build: v0.1.55-d518c03c`
+- Remote SHA256: `cf022002aabcafcf85ee4299cfb3686020707bd9928d61e5f338f5bc5ac19143`
+- Remote processes after restart:
+  - control wrapper pid `21076`
+  - control-service pid `21079`
+  - nexus-bs pid `21081`
+
+Post-restart terminal state:
+
+- `2260082`: CMCE register then affiliate to `226333`.
+- `2260618`: CMCE register then affiliate to `226333`.
+- `2260616`: CMCE register then affiliate to `226333` twice during startup settling.
+
+Required next physical test:
+
+1. Retest alternating group PTT on `226333` between `2260082` and `2260616`.
+2. Verify each entry gets first-try transmit permission and intelligible audio, not static.
+3. If static repeats, capture the 30 seconds around the event and inspect:
+   - stale `DSetup ... calling_party_address_ssi`
+   - `FACCH stealing ... speech_present=false` density during talk spurts
+   - `rx_tpsap_prim got NormalTrainSeq2` without `UMAC voice route`
+   - any `PTT denied`, `NotGranted`, `Service unavailable`, or `UL inactivity`
+
+## 2026-06-04 20:58:20 EEST - Group UL inactivity grants queued requester
+
+Problem targeted:
+
+- Post-deploy logs showed `UL inactivity timeout on ts=2` during group-call testing.
+- Before this patch, the group-call timeout path forced `D-TX CEASED`/hangtime even when another MS already had a queued U-TX DEMAND. That can make the waiting MS need a second PTT attempt.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group floor request/grant/cease controls who may transmit.
+- The local UL inactivity guard is treated as the BS-side cease event. If a valid requester was already queued, SwMI grants that requester immediately instead of requiring another demand.
+- Clause-scoped hardening only; no formal certification claim.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Late-entry timer D-SETUP resend now re-derives group `calling_party_address_ssi` from `active_calls[call_id].source_issi` before serialization.
+  - Group UL inactivity timeout now:
+    - filters queued requester by current group affiliation,
+    - grants queued requester with individual `D-TX GRANTED`,
+    - sends group FACCH `D-TX GRANTED`,
+    - refreshes group D-SETUP with the new speaker,
+    - emits UMAC/Brew `FloorGranted`.
+  - If no valid requester is queued, old behavior remains: enter hangtime, send `D-TX CEASED`, emit `FloorReleased`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Made the existing compact group individual-grant helper visible inside the CC-BS module for timer reuse.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_group_ul_inactivity_hands_floor_to_queued_requester` for GSSI `226333`.
+
+Verification:
+
+- `cargo fmt` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_ul_inactivity_hands_floor_to_queued_requester --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 121 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this timeout handoff patch.
+2. Deploy direct to test BS with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest alternating group PTT on `226333`; expected behavior is first queued PTT becomes speaker after timeout/cease without a second press.
