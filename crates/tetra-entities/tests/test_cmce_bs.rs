@@ -1614,6 +1614,19 @@ fn test_network_group_hangtime_release_waits_for_reporter_before_network_call_en
     let reporters = extract_d_release_reporters(&mut release_msgs);
     assert_eq!(reporters.len(), 1, "Only FACCH D-RELEASE should be reporter-tracked");
 
+    test.run_stack(Some(2));
+    let duplicate_timer_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&duplicate_timer_msgs),
+        0,
+        "pending hangtime release must not resend D-RELEASE on every CMCE timer tick"
+    );
+    assert_eq!(
+        count_network_call_end(&duplicate_timer_msgs, brew_uuid),
+        0,
+        "pending hangtime release must wait for reporter completion before notifying Brew"
+    );
+
     // EN 300 392-2 clauses 14.5.2.3.2 and 14.5.2.3.3: SwMI sends
     // D-RELEASE to the group, receives no MS response, and subsequently
     // releases the call. The local circuit/Brew cleanup must wait until the
@@ -3825,6 +3838,24 @@ fn test_network_group_call_timeout_reports_network_end_after_expiry_release_deli
         count_umac_call_ended_or_close(&release_msgs),
         0,
         "Network-origin group timeout must not close before D-RELEASE is reported"
+    );
+
+    test.run_stack(Some(2));
+    let duplicate_timer_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&duplicate_timer_msgs),
+        0,
+        "pending call-timeout release must not resend D-RELEASE on every CMCE timer tick"
+    );
+    assert_eq!(
+        count_network_call_end(&duplicate_timer_msgs, brew_uuid),
+        0,
+        "pending call-timeout release must wait for reporter completion before notifying Brew"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&duplicate_timer_msgs),
+        0,
+        "pending call-timeout release must keep the traffic circuit open until reporter completion"
     );
 
     reporters[0].mark_transmitted();

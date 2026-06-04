@@ -23,6 +23,7 @@ use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
 use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaUnitdataReq};
+use tetra_saps::tmd::TmdCircuitDataInd;
 use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
@@ -391,6 +392,71 @@ fn floor_granted_msg(call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8) -> 
     }
 }
 
+fn private_call_open_msg_with_peer(active_issi: u32, peer_issi: u32, ts: u8, peer_ts: u8) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: Some(peer_ts),
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::LocalLoopback,
+            active_addr: Some(TetraAddress::issi(active_issi)),
+            active_secondary_addrs: vec![TetraAddress::issi(peer_issi)],
+        })),
+    }
+}
+
+fn submit_ul_voice_frame(test: &mut ComponentTest, ts: u8, data: Vec<u8>) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataInd(TmdCircuitDataInd { ts, data }),
+    });
+}
+
+fn acelp_test_bits() -> Vec<u8> {
+    (0..274)
+        .map(|idx| match idx % 7 {
+            0 | 3 | 5 => 1,
+            _ => 0,
+        })
+        .collect()
+}
+
+fn collect_dl_tch_bits(msgs: &[SapMsg], ts: u8) -> Vec<Vec<u8>> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(prim) if prim.ts.t == ts => Some(prim),
+            _ => None,
+        })
+        .flat_map(|prim| [prim.blk1.as_ref(), prim.blk2.as_ref()].into_iter().flatten())
+        .filter(|blk| blk.logical_channel == LogicalChannel::TchS)
+        .map(|blk| {
+            let mut bits = vec![0u8; 274];
+            let mut block = blk.mac_block.clone();
+            block.seek(0);
+            block.to_bitarr(&mut bits);
+            bits
+        })
+        .collect()
+}
+
+fn assert_dl_tch_contains_bits(msgs: &[SapMsg], ts: u8, expected_bits: &[u8], context: &str) {
+    let observed = collect_dl_tch_bits(msgs, ts);
+    assert!(
+        observed.iter().any(|bits| bits == expected_bits),
+        "{context}: expected ACELP bit pattern on DL TCH/S ts {ts}, observed {} TCH/S blocks",
+        observed.len()
+    );
+}
+
 fn mac_u_signal_pdu_for_test(second_half_stolen: bool) -> BitBuffer {
     let mut pdu = BitBuffer::new_autoexpand(124);
     MacUSignal { second_half_stolen }.to_bitbuf(&mut pdu);
@@ -458,6 +524,93 @@ fn reserve_current_uplink_for_mac_u_blck(test: &mut ComponentTest, start: TdmaTi
             &ReservationRequirement::Req1Slot,
         )
         .expect("test setup should reserve the uplink slot that carries MAC-U-BLCK");
+}
+
+#[test]
+fn test_group_ul_voice_loopback_preserves_tch_s_bits() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x1201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    test.run_stack(Some(1));
+
+    let ul_bits = acelp_test_bits();
+    submit_ul_voice_frame(&mut test, traffic_ts, ul_bits.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        traffic_ts,
+        &ul_bits,
+        "EN 300 392-2 clauses 14.5.2.1.3, 14.5.2.2.1 and 23.5: group-call UL speech must be reflected to the assigned DL TCH/S without bit corruption",
+    );
+}
+
+#[test]
+fn test_private_simplex_ul_voice_loopback_preserves_tch_s_bits() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x3201;
+    let called_issi = 0x3202;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(caller_issi, called_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(1, caller_issi, 0, traffic_ts));
+    test.run_stack(Some(1));
+
+    let ul_bits = acelp_test_bits();
+    submit_ul_voice_frame(&mut test, traffic_ts, ul_bits.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        traffic_ts,
+        &ul_bits,
+        "EN 300 392-2 clauses 14.5.1.2.1 and 23.5: private simplex speech on an assigned channel must remain a valid TCH/S frame after UMAC loopback",
+    );
+}
+
+#[test]
+fn test_private_duplex_ul_voice_cross_route_preserves_tch_s_bits() {
+    debug::setup_logging_verbose();
+
+    let first_issi = 0x3211;
+    let second_issi = 0x3212;
+    let first_ts = 2;
+    let second_ts = 3;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg_with_peer(first_issi, second_issi, first_ts, second_ts));
+    test.submit_message(private_call_open_msg_with_peer(second_issi, first_issi, second_ts, first_ts));
+    test.run_stack(Some(1));
+
+    let ul_bits = acelp_test_bits();
+    submit_ul_voice_frame(&mut test, second_ts, ul_bits.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        first_ts,
+        &ul_bits,
+        "EN 300 392-2 clauses 14.5.1.2.1 and 23.5: duplex private-call UL speech must be cross-routed to the peer DL TCH/S without bit corruption",
+    );
+    assert!(
+        !collect_dl_tch_bits(&msgs, second_ts).iter().any(|bits| bits == &ul_bits),
+        "duplex private-call UL speech from ts {second_ts} must not be looped back to the transmitting party"
+    );
 }
 
 #[test]
