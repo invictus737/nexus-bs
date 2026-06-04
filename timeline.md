@@ -1430,3 +1430,56 @@ Next non-repeating execution:
 4. Restart the test BS and verify logs no longer show `Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY` for the solicited restart-recovery report.
 5. Confirm `2260082`, `2260616`, and any visible `2260618` register and affiliate to `226333` after restart.
 6. Resume group-call audio hardening next: UMAC must gate raw/decoded TCH/S media by current floor owner/floor epoch to prevent stale-speaker static.
+
+## 2026-06-04 12:41:48 EEST - Deployed MM solicited group-report fix to test BS
+
+Commit deployed:
+
+- `8981c33 fix: accept solicited restart group reports`
+
+Local verification before deploy:
+
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 108 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Local binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `c103827eb5bce81ad5e340766178b130fdb9b54dbf90532b0df89a10fec8cf72`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Stopped the previous test BS/control-service from pidfile PIDs before copying.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `c103827eb5bce81ad5e340766178b130fdb9b54dbf90532b0df89a10fec8cf72`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `17434`
+  - control-service pid `17437`
+  - nexus-bs pid `17439`
+- Dashboard root responds on configured port `8080`.
+
+Live restart evidence:
+
+- `2260082`:
+  - `U-LOCATION UPDATE DEMAND(DemandLocationUpdating)` accepted.
+  - Group `226333` accepted in `D-LOCATION UPDATE ACCEPT`.
+  - Later solicited `U-ATTACH/DETACH GROUP IDENTITY` with `group_report_response len=1 data=0` and `gssi=226333` was accepted, ACKed, and re-affiliated.
+- `2260616`:
+  - Same solicited mixed group-report completion was accepted and ACKed.
+  - CMCE received final `Affiliate` for `226333`.
+- `2260618`:
+  - Roaming update accepted with EG3 allocation and group `226333`.
+  - CMCE received `Register` then `Affiliate`.
+- `grep "Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY"` returned no post-deploy entries.
+
+Remaining observations:
+
+- Startup still had short LLC retransmission bursts for `2260082`, `2260616`, and `2260618` before the final ACK/affiliate state settled.
+- One startup PHY warning appeared: `Too late to produce TX block ...`; do not chase RF until a live RF symptom repeats after attach stability.
+- Next protocol hardening target remains group/private call audio static: UMAC media should be gated by current CMCE floor owner/floor epoch, and stale queued raw TCH/S should be purged on floor transitions.
