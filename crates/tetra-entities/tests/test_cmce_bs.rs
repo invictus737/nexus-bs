@@ -60,6 +60,7 @@ const LAB_GROUP_GSSI: u32 = 226333;
 const LAB_ISSI_A: u32 = 2260616;
 const LAB_ISSI_B: u32 = 2260082;
 const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
+const PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS: i32 = 16;
@@ -100,6 +101,12 @@ fn register_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
     test.submit_message(affiliate);
     test.run_stack(Some(1));
     test.dump_sinks();
+}
+
+fn drain_private_simplex_tail(test: &mut ComponentTest, dltime: TdmaTime) {
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
 }
 
 /// Helper: submit a real MM U-LOCATION UPDATE DEMAND carrying group affiliation.
@@ -5354,12 +5361,21 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(disconnect_reporters.len(), 1);
-    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
-    assert_eq!(release_ack_reporters.len(), 1);
 
     disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
@@ -6182,6 +6198,33 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     // both the prompt D-RELEASE and peer clearance are complete.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(
+        count_d_disconnects(&initiator_release_msgs),
+        0,
+        "simplex floor-holder U-DISCONNECT must tail-drain before peer D-DISCONNECT"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&initiator_release_msgs),
+        0,
+        "traffic circuit must remain open while peer clear is tail-draining"
+    );
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(
+        release_ack_reporters.len(),
+        1,
+        "U-DISCONNECT initiator must receive one prompt assigned-channel D-RELEASE"
+    );
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
     let mut disconnect_msgs = test.dump_sinks();
 
     let d_disconnects: Vec<_> = disconnect_msgs
@@ -6207,7 +6250,6 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
         UlDlAssignment::Both,
         "D-DISCONNECT expects U-RELEASE, so its assigned-channel allocation must permit the uplink response"
     );
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     assert_eq!(
         count_umac_call_ended_or_close(&disconnect_msgs),
         0,
@@ -6215,11 +6257,10 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     );
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(disconnect_reporters.len(), 1);
-    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
     assert_eq!(
-        release_ack_reporters.len(),
-        1,
-        "U-DISCONNECT initiator must receive one prompt assigned-channel D-RELEASE"
+        count_d_releases(&disconnect_msgs),
+        0,
+        "tail-drained peer D-DISCONNECT must not duplicate initiator D-RELEASE"
     );
     disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
@@ -7344,7 +7385,18 @@ fn test_simplex_p2p_u_tx_demand_after_idle_floor_grants_with_bidirectional_alloc
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
-    let _ = test.dump_sinks();
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let tail_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_tx_ceased(&tail_msgs),
+        2,
+        "idle simplex private floor should emit D-TX CEASED only after bearer-tail drain"
+    );
 
     test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -7424,7 +7476,18 @@ fn test_simplex_p2p_field_issis_u_tx_demand_after_idle_floor_uses_bidirectional_
 
     test.submit_message(build_u_tx_ceased_msg(caller_issi, call_id));
     test.run_stack(Some(1));
-    let _ = test.dump_sinks();
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let tail_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_tx_ceased(&tail_msgs),
+        2,
+        "field private floor should become idle only after bearer-tail D-TX CEASED"
+    );
 
     test.submit_message(build_u_tx_demand_msg(called_issi, call_id));
     test.run_stack(Some(1));
@@ -7688,6 +7751,20 @@ fn test_simplex_p2p_field_issis_queued_u_tx_ceased_withdraws_before_handoff() {
 
         test.submit_message(build_u_tx_ceased_msg(caller_issi, call_id));
         test.run_stack(Some(1));
+        let cease_after_withdraw_start_msgs = test.dump_sinks();
+
+        assert_eq!(count_d_tx_granted(&cease_after_withdraw_start_msgs), 0);
+        assert_eq!(
+            count_d_tx_ceased(&cease_after_withdraw_start_msgs),
+            0,
+            "withdrawn field queue must not emit D-TX CEASED before bearer-tail drain"
+        );
+        assert_eq!(count_umac_floor_granted(&cease_after_withdraw_start_msgs), 0);
+        assert_eq!(count_umac_floor_released(&cease_after_withdraw_start_msgs), 0);
+
+        test.router
+            .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+        test.run_stack(Some(1));
         let cease_after_withdraw_msgs = test.dump_sinks();
 
         assert_eq!(count_d_tx_granted(&cease_after_withdraw_msgs), 0);
@@ -7728,11 +7805,22 @@ fn test_simplex_p2p_u_tx_ceased_without_queued_request_does_not_grant_peer() {
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
-    let ceased_msgs = test.dump_sinks();
+    let ceased_start_msgs = test.dump_sinks();
 
     // EN 300 392-2 clause 14.5.1.2.1 b/e) forbids unsolicited D-TX
     // GRANTED, but allows D-TX CEASED to each MS so both CC entities leave
-    // the active transmission state.
+    // the active transmission state. Peer-facing cease is delayed by the
+    // bearer-tail drain before it is sent.
+    assert_eq!(count_d_tx_granted(&ceased_start_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let ceased_msgs = test.dump_sinks();
+
     assert_eq!(count_d_tx_granted(&ceased_msgs), 0);
     let ceased: Vec<_> = ceased_msgs
         .iter()
@@ -7990,6 +8078,26 @@ fn test_unsolicited_private_u_release_does_not_start_disconnect_pending() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let disconnect_start_msgs = test.dump_sinks();
+    assert_eq!(
+        disconnect_start_msgs
+            .iter()
+            .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_disconnect(prim).is_some()))
+            .count(),
+        0,
+        "simplex floor-holder U-DISCONNECT should tail-drain before D-DISCONNECT"
+    );
+    assert_established_p2p_release_pdus_to(
+        &disconnect_start_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_umac_call_ended_or_close(&disconnect_start_msgs), 0);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
     let disconnect_msgs = test.dump_sinks();
     assert_eq!(
         disconnect_msgs
@@ -8173,6 +8281,38 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     // D-DISCONNECT and U-RELEASE. Neither leg may close the bearer early.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(
+        count_d_disconnects(&initiator_release_msgs),
+        0,
+        "simplex floor-holder U-DISCONNECT must tail-drain before peer D-DISCONNECT"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&initiator_release_msgs),
+        0,
+        "P2P circuit must stay open while peer clear is tail-draining"
+    );
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(
+        release_ack_reporters.len(),
+        1,
+        "U-DISCONNECT initiator should receive one prompt assigned-channel D-RELEASE"
+    );
+
+    test.run_stack(Some(3));
+    let early_tail_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&early_tail_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&early_tail_msgs), 0);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
     let mut disconnect_msgs = test.dump_sinks();
 
     let d_disconnects: Vec<_> = disconnect_msgs
@@ -8199,7 +8339,11 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
         "D-DISCONNECT expects U-RELEASE, so its assigned-channel allocation must permit the uplink response"
     );
     assert_eq!(disconnect_prim.layer2service, Layer2Service::Unacknowledged);
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
+    assert_eq!(
+        count_d_releases(&disconnect_msgs),
+        0,
+        "tail-drained peer D-DISCONNECT must not duplicate initiator D-RELEASE"
+    );
     assert_eq!(
         count_umac_call_ended_or_close(&disconnect_msgs),
         0,
@@ -8212,13 +8356,6 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
         "Assigned-channel D-DISCONNECT must carry one TxReporter"
     );
     assert_eq!(disconnect_reporters[0].get_state(), TxState::Pending);
-    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
-    assert_eq!(
-        release_ack_reporters.len(),
-        1,
-        "U-DISCONNECT initiator should receive one prompt assigned-channel D-RELEASE"
-    );
-
     test.run_stack(Some(3));
     let pending_delivery_msgs = test.dump_sinks();
     assert_eq!(
@@ -8377,16 +8514,25 @@ fn test_p2p_peer_u_disconnect_does_not_ack_pending_d_disconnect() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(
         disconnect_reporters.len(),
         1,
         "Assigned-channel D-DISCONNECT must carry one TxReporter"
     );
-    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
-    assert_eq!(release_ack_reporters.len(), 1);
 
     disconnect_reporters[0].mark_transmitted();
     release_ack_reporters[0].mark_transmitted();
@@ -8436,12 +8582,21 @@ fn test_p2p_pending_release_ignores_duplicate_u_disconnect_and_tx_demand() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(disconnect_reporters.len(), 1);
-    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
-    assert_eq!(release_ack_reporters.len(), 1);
 
     disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
@@ -8503,6 +8658,16 @@ fn test_p2p_disconnect_pending_suppresses_d_setup_resend() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let initiator_release_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(disconnect_reporters.len(), 1);
@@ -8541,8 +8706,17 @@ fn test_p2p_pending_disconnect_delivery_suppresses_floor_pdus() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(
         disconnect_reporters.len(),
@@ -8594,8 +8768,17 @@ fn test_p2p_u_disconnect_delivery_guard_falls_back_to_release_without_peer_wait(
     // back to the established-call D-RELEASE clearing path.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(
         disconnect_reporters.len(),
@@ -8617,8 +8800,9 @@ fn test_p2p_u_disconnect_delivery_guard_falls_back_to_release_without_peer_wait(
         "D-DISCONNECT delivery guard must keep the P2P circuit open"
     );
 
-    test.router
-        .set_dl_time(dltime.add_timeslots(PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.router.set_dl_time(dltime.add_timeslots(
+        PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS,
+    ));
     test.run_stack(Some(1));
     let mut guard_msgs = test.dump_sinks();
     assert_established_p2p_release_pdus_to(
@@ -8667,6 +8851,16 @@ fn test_p2p_discarded_d_disconnect_falls_back_to_d_release() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(
@@ -8884,9 +9078,18 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
+
+    drain_private_simplex_tail(&mut test, dltime);
     let mut disconnect_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
-    assert_eq!(count_umac_call_ended_or_close(&disconnect_msgs), 0);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(
         disconnect_reporters.len(),
@@ -8916,8 +9119,12 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
         "Pending peer U-RELEASE guard must keep the assigned circuit open"
     );
 
-    test.router
-        .set_dl_time(dltime.add_timeslots(PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.router.set_dl_time(dltime.add_timeslots(
+        PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS
+            + PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS
+            + (2 * PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS)
+            + 1,
+    ));
     test.run_stack(Some(1));
     let release_msgs = test.dump_sinks();
     assert_established_p2p_release_pdus_to(
@@ -8941,7 +9148,11 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
     );
 
     test.router.set_dl_time(dltime.add_timeslots(
-        PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS + PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS,
+        PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS
+            + PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS
+            + PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS
+            + (2 * PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS)
+            + 1,
     ));
     test.run_stack(Some(1));
     let closed_msgs = test.dump_sinks();

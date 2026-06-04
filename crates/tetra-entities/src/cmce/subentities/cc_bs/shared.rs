@@ -13,6 +13,11 @@ const GROUP_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 360 * 4;
 // this is a local safety guard, not a replacement for the peer U-RELEASE path.
 const INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 const INDIVIDUAL_DISCONNECT_DELIVERY_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
+// EN 300 392-2 clause 23.8.5 BS operation mandates this ordering for N=4/8
+// circuit-mode data. CMCE does not yet expose bearer-specific interleaving
+// depth here, so simplex speech uses the same short N=4-equivalent guard as a
+// conservative bearer-tail compatibility drain before peer-facing clear state.
+const INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 
 // EN 300 392-2 table 14.33 uses pointer 0 for an unsupported whole PDU.
 // Non-zero pointers below are bit offsets into the received-PDU extract, which
@@ -40,8 +45,10 @@ impl CcBsSubentity {
             active_calls: HashMap::new(),
             pending_group_releases: HashMap::new(),
             individual_calls: HashMap::new(),
+            pending_individual_disconnect_tail_drains: HashMap::new(),
             pending_individual_disconnect_deliveries: HashMap::new(),
             pending_individual_disconnect_release_acks: HashMap::new(),
+            pending_individual_tx_ceased_tail_drains: HashMap::new(),
             pending_individual_releases: HashMap::new(),
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
@@ -896,6 +903,270 @@ impl CcBsSubentity {
         delivery_reporter
     }
 
+    pub(super) fn begin_individual_tx_ceased_tail_drain(
+        &mut self,
+        call_id: u16,
+        sender: IndividualTailDrainLeg,
+        peer: IndividualTailDrainLeg,
+        notify_brew: bool,
+    ) {
+        if self.pending_individual_tx_ceased_tail_drains.contains_key(&call_id) {
+            tracing::debug!("CMCE: simplex private TX-CEASED tail drain already pending for call_id={}", call_id);
+            return;
+        }
+
+        tracing::debug!(
+            "CMCE: delaying simplex private TX-CEASED/floor handoff call_id={} sender ISSI {} for {} timeslots of TCH tail drain",
+            call_id,
+            sender.addr.ssi,
+            INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS
+        );
+        self.pending_individual_tx_ceased_tail_drains.insert(
+            call_id,
+            PendingIndividualTxCeasedTailDrain {
+                call_id,
+                sender,
+                peer,
+                notify_brew,
+                started_at: self.dltime,
+            },
+        );
+    }
+
+    pub(super) fn begin_individual_disconnect_tail_drain(
+        &mut self,
+        call_id: u16,
+        sender: TetraAddress,
+        peer_issi: u32,
+        disconnect_cause: DisconnectCause,
+    ) {
+        if self.pending_individual_disconnect_tail_drains.contains_key(&call_id) {
+            tracing::debug!(
+                "CMCE: simplex private disconnect tail drain already pending for call_id={}",
+                call_id
+            );
+            return;
+        }
+
+        let started_at = if self
+            .pending_individual_tx_ceased_tail_drains
+            .get(&call_id)
+            .is_some_and(|pending| pending.sender.addr.ssi == sender.ssi)
+        {
+            self.pending_individual_tx_ceased_tail_drains
+                .remove(&call_id)
+                .map(|pending| pending.started_at)
+                .unwrap_or(self.dltime)
+        } else {
+            self.dltime
+        };
+
+        tracing::debug!(
+            "CMCE: delaying simplex private peer disconnect call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
+            call_id,
+            sender.ssi,
+            peer_issi
+        );
+        self.pending_individual_disconnect_tail_drains.insert(
+            call_id,
+            PendingIndividualDisconnectTailDrain {
+                sender,
+                peer_issi,
+                cause: disconnect_cause,
+                started_at,
+            },
+        );
+    }
+
+    pub(super) fn has_pending_individual_disconnect_tail_drain(&self, call_id: u16) -> bool {
+        self.pending_individual_disconnect_tail_drains.contains_key(&call_id)
+    }
+
+    pub(super) fn drain_pending_individual_tx_ceased_tail_drains(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<u16> = self
+            .pending_individual_tx_ceased_tail_drains
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.started_at.age(self.dltime) >= INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS {
+                    Some(call_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for call_id in ready {
+            let Some(pending) = self.pending_individual_tx_ceased_tail_drains.remove(&call_id) else {
+                continue;
+            };
+            self.complete_individual_tx_ceased_tail_drain(queue, pending);
+        }
+    }
+
+    fn complete_individual_tx_ceased_tail_drain(&mut self, queue: &mut MessageQueue, pending: PendingIndividualTxCeasedTailDrain) {
+        let queued_requester = {
+            let Some(call) = self.individual_calls.get_mut(&pending.call_id) else {
+                return;
+            };
+            if !call.is_active() || call.simplex_duplex {
+                return;
+            }
+            if call.floor_holder != Some(pending.sender.addr.ssi) {
+                tracing::debug!(
+                    "CMCE: simplex private TX-CEASED tail drain call_id={} skipped; floor holder changed from ISSI {} to {:?}",
+                    pending.call_id,
+                    pending.sender.addr.ssi,
+                    call.floor_holder
+                );
+                return;
+            }
+            call.floor_holder = None;
+            call.take_queued_tx_demand()
+        };
+
+        if let Some(requester) = queued_requester {
+            let (requester_leg, listener_leg) = if requester.ssi == pending.peer.addr.ssi {
+                (pending.peer, pending.sender)
+            } else {
+                (pending.sender, pending.peer)
+            };
+
+            tracing::info!(
+                "U-TX CEASED (individual) call_id={} tail-drained from ISSI {} -> granting queued floor to ISSI {}",
+                pending.call_id,
+                pending.sender.addr.ssi,
+                requester_leg.addr.ssi
+            );
+
+            if let Some(call) = self.individual_calls.get_mut(&pending.call_id) {
+                call.floor_holder = Some(requester_leg.addr.ssi);
+            }
+
+            Self::push_individual_d_tx_granted(
+                queue,
+                pending.call_id,
+                requester_leg.addr,
+                requester_leg.ts,
+                requester_leg.usage,
+                UlDlAssignment::Both,
+                TransmissionGrant::Granted,
+                requester_leg.addr.ssi,
+            );
+            Self::push_individual_d_tx_granted(
+                queue,
+                pending.call_id,
+                listener_leg.addr,
+                listener_leg.ts,
+                listener_leg.usage,
+                UlDlAssignment::Both,
+                TransmissionGrant::GrantedToOtherUser,
+                requester_leg.addr.ssi,
+            );
+
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id: pending.call_id,
+                    source_issi: requester_leg.addr.ssi,
+                    dest_gssi: listener_leg.addr.ssi,
+                    ts: requester_leg.ts,
+                }),
+            });
+
+            if pending.notify_brew {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id: pending.call_id,
+                        source_issi: requester_leg.addr.ssi,
+                        dest_gssi: listener_leg.addr.ssi,
+                        ts: requester_leg.ts,
+                    }),
+                });
+            }
+            return;
+        }
+
+        tracing::info!(
+            "-> D-TX CEASED (individual simplex, tail-drained FACCH) call_id={} to sender ISSI {} and peer ISSI {}",
+            pending.call_id,
+            pending.sender.addr.ssi,
+            pending.peer.addr.ssi
+        );
+        Self::push_individual_d_tx_ceased(queue, pending.call_id, pending.sender.addr, pending.sender.ts, pending.sender.usage);
+        Self::push_individual_d_tx_ceased(queue, pending.call_id, pending.peer.addr, pending.peer.ts, pending.peer.usage);
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased {
+                call_id: pending.call_id,
+                ts: pending.sender.ts,
+            }),
+        });
+
+        if pending.notify_brew {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased {
+                    call_id: pending.call_id,
+                    ts: pending.sender.ts,
+                }),
+            });
+        }
+    }
+
+    pub(super) fn drain_pending_individual_disconnect_tail_drains(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<u16> = self
+            .pending_individual_disconnect_tail_drains
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.started_at.age(self.dltime) >= INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS {
+                    Some(call_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for call_id in ready {
+            let Some(pending) = self.pending_individual_disconnect_tail_drains.remove(&call_id) else {
+                continue;
+            };
+            let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() else {
+                continue;
+            };
+            if !call_snapshot.is_active() {
+                tracing::debug!(
+                    "CMCE: simplex private disconnect tail drain call_id={} skipped; call is no longer active",
+                    call_id
+                );
+                continue;
+            }
+            if call_snapshot.peer_issi_for(pending.sender.ssi) != Some(pending.peer_issi) {
+                tracing::warn!(
+                    "CMCE: simplex private disconnect tail drain call_id={} participant mismatch for sender ISSI {}",
+                    call_id,
+                    pending.sender.ssi
+                );
+                continue;
+            }
+
+            if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, pending.sender, pending.cause) {
+                self.begin_individual_disconnect_delivery(call_id, pending.peer_issi, pending.sender.ssi, reporter, pending.cause);
+            } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.begin_disconnect_pending(pending.peer_issi, pending.sender.ssi, self.dltime, pending.cause);
+            }
+        }
+    }
+
     pub(super) fn begin_individual_disconnect_delivery(
         &mut self,
         call_id: u16,
@@ -1731,8 +2002,10 @@ impl CcBsSubentity {
         }
         self.cached_setups.remove(&call_id);
         self.individual_calls.remove(&call_id);
+        self.pending_individual_disconnect_tail_drains.remove(&call_id);
         self.pending_individual_disconnect_deliveries.remove(&call_id);
         self.pending_individual_disconnect_release_acks.remove(&call_id);
+        self.pending_individual_tx_ceased_tail_drains.remove(&call_id);
 
         if notify_brew
             && (call.called_over_brew || call.calling_over_brew)
@@ -1832,8 +2105,10 @@ impl CcBsSubentity {
             tracing::debug!("CMCE: individual release already pending for call_id={}", call_id);
             return;
         }
+        self.pending_individual_disconnect_tail_drains.remove(&call_id);
         self.pending_individual_disconnect_deliveries.remove(&call_id);
         self.pending_individual_disconnect_release_acks.remove(&call_id);
+        self.pending_individual_tx_ceased_tail_drains.remove(&call_id);
 
         let Some(call_snapshot) = self.individual_calls.remove(&call_id) else {
             tracing::warn!("No individual call for call_id={}", call_id);

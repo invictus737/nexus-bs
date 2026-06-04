@@ -94,12 +94,34 @@ struct PendingIndividualDisconnectDelivery {
     started_at: TdmaTime,
 }
 
+struct PendingIndividualDisconnectTailDrain {
+    sender: TetraAddress,
+    peer_issi: u32,
+    cause: DisconnectCause,
+    started_at: TdmaTime,
+}
+
 struct PendingIndividualDisconnectReleaseAck {
     release_to_issi: u32,
     cause: DisconnectCause,
     reporters: Vec<TxReporter>,
     started_at: TdmaTime,
     peer_release_received: bool,
+}
+
+#[derive(Clone, Copy)]
+struct IndividualTailDrainLeg {
+    addr: TetraAddress,
+    ts: u8,
+    usage: u8,
+}
+
+struct PendingIndividualTxCeasedTailDrain {
+    call_id: u16,
+    sender: IndividualTailDrainLeg,
+    peer: IndividualTailDrainLeg,
+    notify_brew: bool,
+    started_at: TdmaTime,
 }
 
 /// Clause 14 Call Control CMCE sub-entity (ETSI EN 300 392-2)
@@ -117,10 +139,14 @@ pub struct CcBsSubentity {
     pending_group_releases: HashMap<u16, PendingGroupRelease>,
     /// Active or pending individual calls (P2P / duplex)
     individual_calls: HashMap<u16, IndividualCall>,
+    /// Simplex private-call release signalling waiting for traffic interleaver tail bits.
+    pending_individual_disconnect_tail_drains: HashMap<u16, PendingIndividualDisconnectTailDrain>,
     /// Active D-DISCONNECT deliveries that must reach MAC before the peer-response timer starts.
     pending_individual_disconnect_deliveries: HashMap<u16, PendingIndividualDisconnectDelivery>,
     /// Prompt D-RELEASE acknowledgements already sent to the MS that requested individual disconnection.
     pending_individual_disconnect_release_acks: HashMap<u16, PendingIndividualDisconnectReleaseAck>,
+    /// Simplex private-call TX-CEASED/floor handoff signalling waiting for traffic tail bits.
+    pending_individual_tx_ceased_tail_drains: HashMap<u16, PendingIndividualTxCeasedTailDrain>,
     /// Individual releases waiting for assigned-channel D-RELEASE transmission or a bounded guard timeout.
     pending_individual_releases: HashMap<u16, PendingIndividualRelease>,
     /// Registered subscriber groups (ISSI -> set of GSSIs)

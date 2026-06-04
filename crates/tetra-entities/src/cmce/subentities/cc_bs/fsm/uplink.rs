@@ -156,9 +156,9 @@ impl CcBsSubentity {
             // send D-TX-GRANTED only when an earlier U-TX DEMAND is queued.
             // EN 300 392-2 clause 14.5.1.2.1 forbids unsolicited grants but
             // allows D-TX CEASED to each MS at end of transmission.
-            if self.has_pending_individual_disconnect_delivery(call_id) {
+            if self.has_pending_individual_disconnect_tail_drain(call_id) || self.has_pending_individual_disconnect_delivery(call_id) {
                 tracing::debug!(
-                    "U-TX CEASED ignored while individual D-DISCONNECT delivery is pending call_id={}",
+                    "U-TX CEASED ignored while individual disconnect clear is pending call_id={}",
                     call_id
                 );
                 return;
@@ -234,12 +234,16 @@ impl CcBsSubentity {
                 return;
             }
 
-            let queued_requester = self.individual_calls.get_mut(&call_id).and_then(|c| {
-                c.floor_holder = None;
-                c.take_queued_tx_demand()
-            });
+            let queued_requester = call.queued_tx_demand;
 
-            if let Some(requester) = queued_requester {
+            if queued_requester.is_some() {
+                let queued_requester = self.individual_calls.get_mut(&call_id).and_then(|c| {
+                    c.floor_holder = None;
+                    c.take_queued_tx_demand()
+                });
+                let Some(requester) = queued_requester else {
+                    return;
+                };
                 let (requester_addr, requester_ts, requester_usage, listener_addr, listener_ts, listener_usage) =
                     if requester.ssi == peer_addr.ssi {
                         (peer_addr, peer_ts, peer_usage, sender, sender_ts, sender_usage)
@@ -318,7 +322,7 @@ impl CcBsSubentity {
             }
 
             tracing::info!(
-                "U-TX CEASED (individual) call_id={} from ISSI {} -> sending D-TX-CEASED to both parties without unsolicited peer grant",
+                "U-TX CEASED (individual) call_id={} from ISSI {} -> delaying D-TX-CEASED for bearer tail drain",
                 call_id,
                 sender.ssi
             );
@@ -327,33 +331,20 @@ impl CcBsSubentity {
             // the peer leaves the "other user transmitting" state. Clause
             // 14.5.1.2.1 b) still forbids unsolicited D-TX GRANTED, so the
             // peer is not granted merely because the current speaker stopped.
-            tracing::info!(
-                "-> D-TX CEASED (individual simplex, FACCH) call_id={} to sender ISSI {} and peer ISSI {}",
+            self.begin_individual_tx_ceased_tail_drain(
                 call_id,
-                sender.ssi,
-                peer_addr.ssi
+                IndividualTailDrainLeg {
+                    addr: sender,
+                    ts: sender_ts,
+                    usage: sender_usage,
+                },
+                IndividualTailDrainLeg {
+                    addr: peer_addr,
+                    ts: peer_ts,
+                    usage: peer_usage,
+                },
+                call.called_over_brew || call.calling_over_brew,
             );
-            Self::push_individual_d_tx_ceased(queue, call_id, sender, sender_ts, sender_usage);
-            Self::push_individual_d_tx_ceased(queue, call_id, peer_addr, peer_ts, peer_usage);
-
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts: sender_ts }),
-            });
-
-            if (call.called_over_brew || call.calling_over_brew)
-                && let Some(brew_uuid) = call.brew_uuid
-            {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts: sender_ts }),
-                });
-                let _ = brew_uuid;
-            }
 
             return;
         }
@@ -403,9 +394,9 @@ impl CcBsSubentity {
 
         if let Some(call) = self.individual_calls.get(&call_id).cloned() {
             // For simplex PTT individual calls: MS requests PTT floor.
-            if self.has_pending_individual_disconnect_delivery(call_id) {
+            if self.has_pending_individual_disconnect_tail_drain(call_id) || self.has_pending_individual_disconnect_delivery(call_id) {
                 tracing::debug!(
-                    "U-TX DEMAND ignored while individual D-DISCONNECT delivery is pending call_id={}",
+                    "U-TX DEMAND ignored while individual disconnect clear is pending call_id={}",
                     call_id
                 );
                 return;
@@ -847,14 +838,18 @@ impl CcBsSubentity {
             };
 
             if !call_snapshot.called_over_brew && !call_snapshot.calling_over_brew && call_snapshot.is_active() {
-                if self.has_pending_individual_disconnect_delivery(call_id) {
+                if self.has_pending_individual_disconnect_tail_drain(call_id) || self.has_pending_individual_disconnect_delivery(call_id) {
                     tracing::debug!(
-                        "U-DISCONNECT duplicate ignored while D-DISCONNECT delivery is pending call_id={}",
+                        "U-DISCONNECT duplicate ignored while individual disconnect clear is pending call_id={}",
                         call_id
                     );
                     return;
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
+                if !call_snapshot.simplex_duplex && call_snapshot.floor_holder == Some(sender.ssi) {
+                    self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause);
+                    return;
+                }
                 if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {
                     self.begin_individual_disconnect_delivery(call_id, peer_issi, sender.ssi, reporter, disconnect_cause);
                 } else if let Some(call) = self.individual_calls.get_mut(&call_id) {

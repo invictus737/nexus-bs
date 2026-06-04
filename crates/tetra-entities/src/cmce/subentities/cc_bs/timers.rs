@@ -34,6 +34,8 @@ impl CcBsSubentity {
 
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
         self.dltime = dltime;
+        self.drain_pending_individual_tx_ceased_tail_drains(queue);
+        self.drain_pending_individual_disconnect_tail_drains(queue);
         self.drain_pending_group_releases(queue);
         self.drain_pending_individual_releases(queue);
         self.drain_pending_individual_disconnect_deliveries(queue);
