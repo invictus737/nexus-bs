@@ -512,3 +512,93 @@ Current conclusion:
 - SDS/status/WAP component evidence is current locally.
 - Live WAP terminal-browser validation still remains separate from component tests.
 - Voice static/PTT denial remains the active live blocker and needs a fresh PTT trace.
+
+## 2026-06-04 11:06:54 EEST - PM/review/architecture/QA orchestration checkpoint
+
+User directive:
+
+- Keep a Project Manager agent responsible for orchestration and delegation.
+- Split work across review, architecture, and QA agents.
+- Keep `timeline.md` current enough that the next resume knows exactly what has been done and what comes next.
+- Reload the ETSI law/status/project log before protocol work.
+- Avoid loops, repeated hypotheses, and unsupported certification claims.
+
+Law/status reload completed before this checkpoint:
+
+- `/Users/ctermure/.codex/memories/tetra-etsi-compliance-law.md`
+- `/Users/ctermure/.codex/memories/flowstation-tetra-eg-swmi-resume-2026-06-02.md`
+- `/Users/ctermure/.codex/memories/flowstation-aarch64-soapysdr-build.md`
+- Active goal remains clause-scoped ETSI EN 300 392-2 hardening. Do not claim formal certification without official conformance evidence.
+
+Current repo state:
+
+- Workdir: `/Users/ctermure/Work/basestion`
+- Branch: `nexus-bs-v0.1.55`
+- HEAD: `3776497 chore: trace live voice circuit routing`
+- Worktree: clean
+- Latest relevant commits:
+  - `3776497 chore: trace live voice circuit routing`
+  - `6a13dd1 docs: refresh SDS and live validation evidence`
+  - `7f85bc0 test: harden MM restart recovery evidence`
+
+Agent orchestration state:
+
+- A new PM spawn was attempted, but the sub-agent thread limit was already reached.
+- Existing agent `019e911b-1c4b-7f02-a72f-2bdf280d6c35` (`Aquinas the 3rd`) remains assigned as Project Manager.
+- Review agent: `019e911b-1cad-75a2-8032-1bd9fe865e83` (`Heisenberg the 3rd`).
+- Voice-path architecture agent: `019e911b-1d27-7b91-a06c-c8393037b7e7` (`Arendt the 3rd`).
+- QA agent: `019e9134-b662-7ac0-a27f-dd8446c1c03b` (`Maxwell the 3rd`).
+- MAC/UMAC scheduling architect: `019e9134-cc83-7793-a243-e7e1428e2587` (`Ohm the 3rd`).
+- MM/SDS robustness architect: `019e9134-e2c2-7cb1-a626-0f86672f87f6` (`Herschel the 3rd`).
+
+Agent feedback integrated:
+
+- PM: keep execution ordered by evidence. Do not reopen solved UMAC bit-copy, MLE handle ambiguity, or MM restart-recovery coverage unless fresh logs/tests prove a new gap.
+- Review: the MM restart-recovery evidence is now committed and no formal certification wording was introduced.
+- QA: BASIC validation must still prove private simplex both directions, group call on `226333`, SDS/status, WAP terminal delivery, restart re-affiliation, scan/group retention, and long-run stability.
+- Voice architecture: live symptom still looks like media starvation or lower-layer traffic handling after a valid floor grant. The next live proof must compare good and bad PTT directions using `CallControl::Open`, `FloorGranted`, UMAC circuit metadata, LMAC TCH/S decode, and PHY train/block logs.
+- MAC/UMAC architecture: pure UMAC TCH/S bit preservation is already covered. The strongest non-repeating code suspect is BS LMAC handling of `NormalTrainSeq2` second half (`Block2`) when the first half is STCH and the second half is non-stolen TCH/S.
+- MM/SDS architecture: MM restart recovery is closed for current scope; WAP MVP is SDS Type 4/WAP PID delivery, not full SNDCP/IP WAP.
+
+Simple component meanings for next work:
+
+- CMCE is call control: setup, PTT/floor, call release, and who is allowed to talk.
+- UMAC/MAC is the scheduler: grants resources, maps speech/signalling to slots, and routes uplink voice to the right downlink slot.
+- LMAC is burst framing: turns physical traffic blocks into TCH/S voice frames and drops bad CRC frames.
+- PHY is the radio burst layer: train sequence, half-slot/block identity, RF decode quality, and timing.
+- MM is terminal mobility: registration, restart recovery, group affiliation, and energy economy.
+- SDS/status is short data/status messaging.
+- WAP MVP is the terminal browser page path over SDS Type 4/WAP PID; full SNDCP/IP WAP remains a separate open track.
+
+Immediate non-repeating execution order:
+
+1. Do not add more MM restart-recovery tests unless a new gap appears; current MM batch is committed in `7f85bc0`.
+2. Use the current observability commit `3776497` to capture fresh live PTT logs after a real test:
+   - private simplex `2260082 -> 2260616`;
+   - private simplex `2260616 -> 2260082`;
+   - group PTT on GSSI `226333`.
+3. In those logs, answer first:
+   - does CMCE open the expected local `CircuitDlMediaSource::LocalLoopback` circuit for local private/group calls?
+   - does `FloorGranted source_issi` match the radio pressing PTT?
+   - does UMAC route UL TCH/S to the expected DL slot/peer slot?
+   - does LMAC report valid TCH/S frames, CRC failures, or ignored partial blocks?
+4. If logs prove CMCE opens the wrong circuit, patch CMCE under EN 300 392-2 clause 14.5.1/14.5.2 with a focused test.
+5. If CMCE is correct but LMAC ignores or drops real TCH/S, patch LMAC under EN 300 392-2 clause 23.5.4 with tests around `NormalTrainSeq2`/STCH/TCH half-slot behavior.
+6. If LMAC sees CRC failures or PHY train mismatch only for one terminal/direction, isolate RF/PHY quality before masking it with call-control changes.
+7. After a focused local patch passes tests, build locally only and deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; do not compile on `chris@192.168.1.179` and do not create binary backups.
+
+ETSI anchors for the next likely patch:
+
+- EN 300 392-2 clause 14.5.1: private/individual call control and floor handling.
+- EN 300 392-2 clause 14.5.2: group call control and floor handling.
+- EN 300 392-2 clause 23.5 / 23.5.4: MAC traffic channel, FACCH/STCH/TCH behavior, and traffic block handling.
+- EN 300 392-2 clause 13.2 and tables 14.14/14.27: SDS/status if the next patch touches data/status.
+- EN 300 392-2 clauses 16.4.4, 16.7.1, 16.10.9, 16.10.10, 16.10.23, 16.10.35a, 23.7.6/T.210: MM/EG only if the next patch touches restart or energy economy.
+
+Anti-loop rules from this checkpoint:
+
+- Do not repeat UMAC pure bit-copy tests as the main static-audio investigation; they already pass.
+- Do not treat SDS/WAP component tests as proof that the terminal browser live page works; live WAP validation remains required.
+- Do not call the stack `100% certified`; only clause-scoped engineering evidence exists.
+- Keep `call_preemptive` / transmission interruption default off.
+- Encryption remains out of focus unless explicitly requested.
