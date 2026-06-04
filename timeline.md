@@ -3051,6 +3051,7 @@ Post-start live state:
 - `2260618` registered and affiliated to `226333`.
 - `2260616` registered and affiliated to `226333`.
 - `2260082` registered and affiliated to `226333`.
+- A bounded post-deploy tail for P2P/floor-control/audio-route events expired without observing a new private simplex attempt.
 
 Next non-repeating execution:
 
