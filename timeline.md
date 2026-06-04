@@ -2667,3 +2667,50 @@ Next non-repeating execution:
 1. User retests private simplex `2260616 -> 2260618`.
 2. Watch logs for `U-TX CEASED`, tail-drain debug/info, prompt `D-RELEASE`, delayed peer `D-DISCONNECT`, peer `U-RELEASE`, and absence of fallback timeout.
 3. If MXP600 still soft reboots, capture exact recipient of the last downlink PDU before reattach.
+
+## 2026-06-04 22:49:59 EEST - Private simplex peer-floor clear uses D-RELEASE
+
+Problem targeted:
+
+- Field retest: private simplex `2260616 -> 2260618` voice worked, but when `2260616` ended the call with the red key, peer `2260618` Motorola MXP600 soft rebooted.
+- The risky case is peer-floor shutdown: the peer may still be the current simplex floor holder while the disconnecting MS receives prompt `D-RELEASE`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: after `U-DISCONNECT`, the disconnecting MS waits for `D-RELEASE`; the SwMI should inform the other MS of call clearance either by `D-DISCONNECT` or by `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: `D-DISCONNECT` requires `U-RELEASE`, while `D-RELEASE` requires no response.
+- EN 300 392-2 clause 23.8.5: after `U-TX CEASED` or `U-DISCONNECT` from a transmitting MS, BS should drain `N-1` traffic slots before sending `D-TX CEASED`, `D-RELEASE`, or `D-DISCONNECT` to receiving MSs.
+- This is clause-scoped hardening plus a bounded Motorola compatibility guard; it is not formal certification evidence.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`
+  - Added `IndividualDisconnectPeerClear::{Disconnect, Release}` and peer-clear reporter state for pending private disconnects.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Tail-drained private disconnect can now complete peer clear with `D-RELEASE` instead of `D-DISCONNECT`.
+  - Peer `D-RELEASE` is reporter-tracked; the traffic circuit closes only after both the prompt initiator `D-RELEASE` and peer `D-RELEASE` transmit, or after the bounded local delivery guard.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - If a simplex private peer is the current floor holder and the other MS disconnects, BS now tail-drains then sends peer `D-RELEASE`.
+  - Duplicate `U-DISCONNECT`, `U-TX DEMAND`, and `U-TX CEASED` are suppressed while the peer-release clear is pending.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated MXP600 field regression to require zero peer `D-DISCONNECT` and a tail-drained peer `D-RELEASE`.
+  - Updated symmetric called-party disconnect test for floor-holder peer release.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_close --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 62 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 124 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 9 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+2. Retest private simplex `2260616 -> 2260618`; make `2260618` talk last, then close from `2260616`.
+3. Expected live behavior: prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE` to `2260618`, no MXP600 soft reboot.
+4. Continue SDS/LLC hardening next: SDS status-preserving Brew forward and bounded LLC duplicate suppression.

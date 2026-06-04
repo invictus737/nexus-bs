@@ -939,6 +939,7 @@ impl CcBsSubentity {
         sender: TetraAddress,
         peer_issi: u32,
         disconnect_cause: DisconnectCause,
+        peer_clear: IndividualDisconnectPeerClear,
     ) {
         if self.pending_individual_disconnect_tail_drains.contains_key(&call_id) {
             tracing::debug!(
@@ -962,7 +963,8 @@ impl CcBsSubentity {
         };
 
         tracing::debug!(
-            "CMCE: delaying simplex private peer disconnect call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
+            "CMCE: delaying simplex private peer {:?} call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
+            peer_clear,
             call_id,
             sender.ssi,
             peer_issi
@@ -973,6 +975,7 @@ impl CcBsSubentity {
                 sender,
                 peer_issi,
                 cause: disconnect_cause,
+                peer_clear,
                 started_at,
             },
         );
@@ -1159,10 +1162,18 @@ impl CcBsSubentity {
                 continue;
             }
 
-            if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, pending.sender, pending.cause) {
-                self.begin_individual_disconnect_delivery(call_id, pending.peer_issi, pending.sender.ssi, reporter, pending.cause);
-            } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                call.begin_disconnect_pending(pending.peer_issi, pending.sender.ssi, self.dltime, pending.cause);
+            match pending.peer_clear {
+                IndividualDisconnectPeerClear::Disconnect => {
+                    if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, pending.sender, pending.cause)
+                    {
+                        self.begin_individual_disconnect_delivery(call_id, pending.peer_issi, pending.sender.ssi, reporter, pending.cause);
+                    } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                        call.begin_disconnect_pending(pending.peer_issi, pending.sender.ssi, self.dltime, pending.cause);
+                    }
+                }
+                IndividualDisconnectPeerClear::Release => {
+                    self.send_individual_disconnect_peer_release(queue, call_id, pending.peer_issi, pending.cause);
+                }
             }
         }
     }
@@ -1211,6 +1222,10 @@ impl CcBsSubentity {
 
     pub(super) fn has_pending_individual_disconnect_delivery(&self, call_id: u16) -> bool {
         self.pending_individual_disconnect_deliveries.contains_key(&call_id)
+    }
+
+    pub(super) fn has_pending_individual_disconnect_release_ack(&self, call_id: u16) -> bool {
+        self.pending_individual_disconnect_release_acks.contains_key(&call_id)
     }
 
     pub(super) fn has_pending_individual_release(&self, call_id: u16) -> bool {
@@ -1284,10 +1299,45 @@ impl CcBsSubentity {
                 cause: disconnect_cause,
                 reporters,
                 started_at: self.dltime,
-                peer_release_received: false,
+                peer_clear_reporters: Vec::new(),
+                peer_clear_started_at: None,
+                peer_clear_complete: false,
             },
         );
         self.complete_individual_disconnect_if_ready(queue, call_id);
+    }
+
+    pub(super) fn send_individual_disconnect_peer_release(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        release_to_issi: u32,
+        disconnect_cause: DisconnectCause,
+    ) {
+        let Some(call) = self.individual_calls.get(&call_id).cloned() else {
+            return;
+        };
+
+        // EN 300 392-2 clause 14.5.1.3.1 permits the SwMI to inform the
+        // other individual-call MS of clearance by either D-DISCONNECT or
+        // D-RELEASE. For simplex peer-floor shutdown, D-RELEASE avoids a
+        // response exchange while the peer is simultaneously leaving U-plane.
+        tracing::info!(
+            "CMCE: simplex private peer clear by D-RELEASE call_id={} peer ISSI {} cause={:?}",
+            call_id,
+            release_to_issi,
+            disconnect_cause
+        );
+        let reporters = self.send_established_individual_release_pdus(queue, call_id, &call, disconnect_cause, Some(release_to_issi));
+
+        if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
+            pending.peer_clear_reporters = reporters;
+            pending.peer_clear_started_at = Some(self.dltime);
+            pending.peer_clear_complete = pending.peer_clear_reporters.is_empty();
+            self.complete_individual_disconnect_if_ready(queue, call_id);
+        } else {
+            self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true, Some(release_to_issi));
+        }
     }
 
     pub(super) fn complete_individual_disconnect_peer_release(
@@ -1298,7 +1348,7 @@ impl CcBsSubentity {
         release_to_issi: u32,
     ) {
         if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
-            pending.peer_release_received = true;
+            pending.peer_clear_complete = true;
             self.complete_individual_disconnect_if_ready(queue, call_id);
         } else {
             self.release_individual_call_to_issi(queue, call_id, disconnect_cause, release_to_issi);
@@ -1328,11 +1378,29 @@ impl CcBsSubentity {
     }
 
     pub(super) fn drain_pending_individual_disconnect_release_acks(&mut self, queue: &mut MessageQueue) {
+        for (&call_id, pending) in self.pending_individual_disconnect_release_acks.iter_mut() {
+            if pending.peer_clear_complete || pending.peer_clear_reporters.is_empty() {
+                continue;
+            }
+            let peer_reporters_transmitted = pending.peer_clear_reporters.iter().all(TxReporter::is_transmitted);
+            let peer_started_at = pending.peer_clear_started_at.unwrap_or(pending.started_at);
+            if peer_reporters_transmitted || peer_started_at.age(self.dltime) >= INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS {
+                if !peer_reporters_transmitted {
+                    tracing::warn!(
+                        "CMCE: completing individual peer D-RELEASE call_id={} after local delivery guard cause={:?}",
+                        call_id,
+                        pending.cause
+                    );
+                }
+                pending.peer_clear_complete = true;
+            }
+        }
+
         let ready: Vec<u16> = self
             .pending_individual_disconnect_release_acks
             .iter()
             .filter_map(|(&call_id, pending)| {
-                if pending.peer_release_received && self.individual_disconnect_release_ack_done(pending) {
+                if pending.peer_clear_complete && self.individual_disconnect_release_ack_done(pending) {
                     Some(call_id)
                 } else {
                     None
@@ -1354,7 +1422,7 @@ impl CcBsSubentity {
         let ready = self
             .pending_individual_disconnect_release_acks
             .get(&call_id)
-            .is_some_and(|pending| pending.peer_release_received && self.individual_disconnect_release_ack_done(pending));
+            .is_some_and(|pending| pending.peer_clear_complete && self.individual_disconnect_release_ack_done(pending));
         if !ready {
             return;
         }

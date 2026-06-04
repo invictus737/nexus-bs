@@ -156,7 +156,10 @@ impl CcBsSubentity {
             // send D-TX-GRANTED only when an earlier U-TX DEMAND is queued.
             // EN 300 392-2 clause 14.5.1.2.1 forbids unsolicited grants but
             // allows D-TX CEASED to each MS at end of transmission.
-            if self.has_pending_individual_disconnect_tail_drain(call_id) || self.has_pending_individual_disconnect_delivery(call_id) {
+            if self.has_pending_individual_disconnect_tail_drain(call_id)
+                || self.has_pending_individual_disconnect_delivery(call_id)
+                || self.has_pending_individual_disconnect_release_ack(call_id)
+            {
                 tracing::debug!(
                     "U-TX CEASED ignored while individual disconnect clear is pending call_id={}",
                     call_id
@@ -394,7 +397,10 @@ impl CcBsSubentity {
 
         if let Some(call) = self.individual_calls.get(&call_id).cloned() {
             // For simplex PTT individual calls: MS requests PTT floor.
-            if self.has_pending_individual_disconnect_tail_drain(call_id) || self.has_pending_individual_disconnect_delivery(call_id) {
+            if self.has_pending_individual_disconnect_tail_drain(call_id)
+                || self.has_pending_individual_disconnect_delivery(call_id)
+                || self.has_pending_individual_disconnect_release_ack(call_id)
+            {
                 tracing::debug!(
                     "U-TX DEMAND ignored while individual disconnect clear is pending call_id={}",
                     call_id
@@ -838,7 +844,10 @@ impl CcBsSubentity {
             };
 
             if !call_snapshot.called_over_brew && !call_snapshot.calling_over_brew && call_snapshot.is_active() {
-                if self.has_pending_individual_disconnect_tail_drain(call_id) || self.has_pending_individual_disconnect_delivery(call_id) {
+                if self.has_pending_individual_disconnect_tail_drain(call_id)
+                    || self.has_pending_individual_disconnect_delivery(call_id)
+                    || self.has_pending_individual_disconnect_release_ack(call_id)
+                {
                     tracing::debug!(
                         "U-DISCONNECT duplicate ignored while individual disconnect clear is pending call_id={}",
                         call_id
@@ -847,7 +856,18 @@ impl CcBsSubentity {
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
                 if !call_snapshot.simplex_duplex && call_snapshot.floor_holder.is_some() {
-                    self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause);
+                    let peer_clear = if call_snapshot.floor_holder != Some(sender.ssi) {
+                        // EN 300 392-2 clause 14.5.1.3.1 allows the SwMI to
+                        // inform the other individual-call MS by D-RELEASE as
+                        // an alternative to D-DISCONNECT. If that peer is the
+                        // current simplex floor holder, avoid a response
+                        // exchange during U-plane clear and send tail-drained
+                        // D-RELEASE instead.
+                        IndividualDisconnectPeerClear::Release
+                    } else {
+                        IndividualDisconnectPeerClear::Disconnect
+                    };
+                    self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause, peer_clear);
                     return;
                 }
                 if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {

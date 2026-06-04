@@ -94,10 +94,17 @@ struct PendingIndividualDisconnectDelivery {
     started_at: TdmaTime,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndividualDisconnectPeerClear {
+    Disconnect,
+    Release,
+}
+
 struct PendingIndividualDisconnectTailDrain {
     sender: TetraAddress,
     peer_issi: u32,
     cause: DisconnectCause,
+    peer_clear: IndividualDisconnectPeerClear,
     started_at: TdmaTime,
 }
 
@@ -106,7 +113,9 @@ struct PendingIndividualDisconnectReleaseAck {
     cause: DisconnectCause,
     reporters: Vec<TxReporter>,
     started_at: TdmaTime,
-    peer_release_received: bool,
+    peer_clear_reporters: Vec<TxReporter>,
+    peer_clear_started_at: Option<TdmaTime>,
+    peer_clear_complete: bool,
 }
 
 #[derive(Clone, Copy)]
