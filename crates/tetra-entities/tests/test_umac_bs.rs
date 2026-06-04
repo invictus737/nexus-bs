@@ -584,6 +584,18 @@ fn has_lmac_blk2_stolen_configure(msgs: &[SapMsg]) -> bool {
     })
 }
 
+fn count_ul_inactivity_timeouts(msgs: &[SapMsg], ts: u8) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::UlInactivityTimeout { ts: timeout_ts })
+                    if *timeout_ts == ts
+            )
+        })
+        .count()
+}
+
 fn reserve_current_uplink_for_mac_u_blck(test: &mut ComponentTest, start: TdmaTime, issi: u32) {
     let msg_dltime = start.add_timeslots(-2);
     let umac = test
@@ -924,6 +936,43 @@ fn test_private_simplex_cross_route_floor_grant_keeps_new_peer_audio() {
     assert!(
         observed.iter().any(|bits| bits == &fresh_raw_block2),
         "EN 300 392-2 clauses 14.5.1.2.1 b) and 23.5: private simplex P2P on separate assigned timeslots must cross-route the granted speaker's TCH/S to the peer DL timeslot"
+    );
+}
+
+#[test]
+fn test_unsupported_ul_voice_does_not_refresh_inactivity_timer() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x3221;
+    let called_issi = 0x3222;
+    let traffic_ts = 2;
+    let call_id = 1;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.ul_inactivity_secs = 1;
+    let mut test = ComponentTest::from_config(config, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce, TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(caller_issi, called_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, caller_issi, called_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.run_stack(Some(60));
+    let _ = test.dump_sinks();
+
+    submit_ul_voice_frame(&mut test, traffic_ts, vec![1; 13]);
+    test.run_stack(Some(20));
+
+    let msgs = test.dump_sinks();
+    assert_eq!(
+        count_ul_inactivity_timeouts(&msgs, traffic_ts),
+        1,
+        "EN 300 392-2 clauses 14.5.1.2.1 and 23.8.3/23.8.5: unsupported TCH/S must not refresh the BS-side UL voice timer for a simplex private floor holder"
+    );
+    assert!(
+        collect_dl_tch_bits(&msgs, traffic_ts).is_empty(),
+        "unsupported UL voice must not be emitted as clean downlink TCH/S"
     );
 }
 

@@ -3058,3 +3058,42 @@ Next non-repeating execution:
 1. RF retest private simplex both directions between `2260616` and `2260618`.
 2. Expected on reverse PTT: `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, then `UMAC voice route` from granted UL TS to peer DL TS.
 3. If terminal still shows PTT denied or no P2P setup appears, collect a fresh bounded log around the attempt and inspect MAC/LLC decode before another CMCE/LLC semantic patch.
+
+## 2026-06-05 00:42:56 EEST - UMAC invalid TCH/S no longer refreshes floor voice timer
+
+Problem targeted:
+
+- Current post-deploy RF log still has no new private simplex setup/floor-control sequence after `82297b5`.
+- Code inspection showed UMAC refreshed `last_ul_voice` immediately after any `TmdCircuitDataInd` on an active UL circuit, before validating that the media was a supported TCH/S payload and before scheduling it to downlink or forwarding it to Brew.
+- Unsupported UL voice could therefore mask the BS-side inactivity timeout for a simplex private floor holder and keep floor state alive while no valid speech was delivered.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: simplex private floor ownership must be released/handoff-driven when the current speaker stops transmitting valid speech.
+- EN 300 392-2 clauses 23.8.3 and 23.8.5: bad/unsupported TCH/S media must not be treated as clean speech on the downlink path.
+- This is clause-scoped engineering hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Validates UL media before treating it as voice activity.
+  - For full-slot ACELP, accepts only payloads that `pack_ul_acelp_bits` can pack and forwards to Brew only after validation.
+  - For raw TCH/S half-slot media, accepts only `Block2` with 216 bits.
+  - Refreshes `last_ul_voice` only after valid media is actually delivered to Brew or scheduled to a downlink circuit.
+  - Refreshes the peer timeslot timer for crossed P2P only after successful media delivery.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_unsupported_ul_voice_does_not_refresh_inactivity_timer`.
+
+Verification:
+
+- `cargo fmt --all` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs unsupported_ul_voice --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 50 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC invalid-media timer guard.
+2. Decide deploy after commit: deploy if we want the RF BS to include this guard before the next private/group PTT retest.
+3. Continue next hardening candidate if no RF retest evidence arrives: CMCE Brew-routed private simplex initial `floor_holder`, or UMAC media admission requiring explicit floor epochs for local-loopback traffic.

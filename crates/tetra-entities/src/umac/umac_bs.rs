@@ -1773,23 +1773,55 @@ impl UmacBs {
                     );
                     return;
                 }
-                // Track last UL voice frame time for inactivity detection only
-                // after the CMCE floor state says U-plane media is valid.
-                self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                enum AcceptedUlMedia {
+                    RawTchSHalfSlot { block_num: PhyBlockNum, type5_bits: Vec<u8> },
+                    AcElp { original_bits: Vec<u8>, packed_bits: Vec<u8> },
+                }
 
-                // Forward UL voice to Brew (User plane) if loaded
-                if raw_tch_s_block.is_none() && self.config.config().brew.is_some() {
-                    let msg = SapMsg {
+                let accepted_media = if let Some(block_num) = raw_tch_s_block {
+                    if block_num == PhyBlockNum::Block2 && data.len() == 216 {
+                        AcceptedUlMedia::RawTchSHalfSlot {
+                            block_num,
+                            type5_bits: data,
+                        }
+                    } else {
+                        tracing::warn!(
+                            "rx_tmd_prim: unsupported raw TCH/S block {:?} length {} on ts={}, skipping",
+                            block_num,
+                            data.len(),
+                            ts
+                        );
+                        return;
+                    }
+                } else if let Some(packed_bits) = pack_ul_acelp_bits(&data) {
+                    AcceptedUlMedia::AcElp {
+                        original_bits: data,
+                        packed_bits,
+                    }
+                } else {
+                    tracing::warn!("rx_tmd_prim: unsupported UL voice length {} on ts={}, skipping", data.len(), ts);
+                    return;
+                };
+
+                let mut delivered_media = false;
+
+                // Forward valid full-slot ACELP UL voice to Brew (User plane) if loaded.
+                // Do this after validating the TMD payload so unsupported local
+                // media cannot mask inactivity or leak as clean speech to Brew.
+                if let AcceptedUlMedia::AcElp { original_bits, .. } = &accepted_media
+                    && self.config.config().brew.is_some()
+                {
+                    queue.push_back(SapMsg {
                         sap: Sap::TmdSap,
                         src: TetraEntity::Umac,
                         dest: TetraEntity::Brew,
                         msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
                             ts,
-                            data: data.clone(),
+                            data: original_bits.clone(),
                             raw_tch_s_block: None,
                         }),
-                    };
-                    queue.push_back(msg);
+                    });
+                    delivered_media = true;
                 }
 
                 // Determine DL target timeslot:
@@ -1802,9 +1834,6 @@ impl UmacBs {
                 // only the other party is talking.
                 let dl_target_ts = match self.channel_scheduler.ul_circuit_peer_ts(ts) {
                     Some(peer_ts) => {
-                        if (1..=4).contains(&peer_ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, peer_ts) {
-                            self.last_ul_voice[peer_ts as usize - 1] = Some(self.dltime);
-                        }
                         tracing::debug!("rx_tmd_prim: duplex P2P cross-route UL ts={} -> DL ts={}", ts, peer_ts);
                         peer_ts
                     }
@@ -1814,6 +1843,9 @@ impl UmacBs {
                             // Circuit call via Brew: DL comes from TetraPack, not local loopback.
                             // Suppress UL->DL reflection so the caller doesn't hear their own voice.
                             tracing::debug!("rx_tmd_prim: circuit call ts={}, suppressing local UL loopback (SwMI)", ts);
+                            if delivered_media {
+                                self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                            }
                             return;
                         }
                         ts
@@ -1830,46 +1862,37 @@ impl UmacBs {
                 }
 
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
-                    if let Some(block_num) = raw_tch_s_block {
-                        if block_num == PhyBlockNum::Block2 && data.len() == 216 {
+                    match accepted_media {
+                        AcceptedUlMedia::RawTchSHalfSlot { block_num, type5_bits } => {
                             tracing::debug!(
                                 "UMAC voice route: UL ts={} raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} media_source={:?}",
                                 ts,
                                 block_num,
-                                data.len(),
+                                type5_bits.len(),
                                 dl_target_ts,
                                 self.channel_scheduler.ul_circuit_peer_ts(ts),
                                 self.channel_scheduler.ul_circuit_dl_media_source(ts)
                             );
                             self.channel_scheduler
-                                .dl_schedule_raw_tch_s_half_slot(dl_target_ts, block_num, data);
-                        } else {
-                            tracing::warn!(
-                                "rx_tmd_prim: unsupported raw TCH/S block {:?} length {} on ts={} (target ts={}), skipping",
-                                block_num,
-                                data.len(),
-                                ts,
-                                dl_target_ts
-                            );
+                                .dl_schedule_raw_tch_s_half_slot(dl_target_ts, block_num, type5_bits);
+                            delivered_media = true;
                         }
-                    } else if let Some(packed) = pack_ul_acelp_bits(&data) {
-                        tracing::debug!(
-                            "UMAC voice route: UL ts={} bits={} -> DL ts={} packed_bytes={} peer_ts={:?} media_source={:?}",
-                            ts,
-                            data.len(),
-                            dl_target_ts,
-                            packed.len(),
-                            self.channel_scheduler.ul_circuit_peer_ts(ts),
-                            self.channel_scheduler.ul_circuit_dl_media_source(ts)
-                        );
-                        self.channel_scheduler.dl_schedule_tmd(dl_target_ts, packed);
-                    } else {
-                        tracing::warn!(
-                            "rx_tmd_prim: unsupported UL voice length {} on ts={} (target ts={}), skipping",
-                            data.len(),
-                            ts,
-                            dl_target_ts
-                        );
+                        AcceptedUlMedia::AcElp {
+                            original_bits,
+                            packed_bits,
+                        } => {
+                            tracing::debug!(
+                                "UMAC voice route: UL ts={} bits={} -> DL ts={} packed_bytes={} peer_ts={:?} media_source={:?}",
+                                ts,
+                                original_bits.len(),
+                                dl_target_ts,
+                                packed_bits.len(),
+                                self.channel_scheduler.ul_circuit_peer_ts(ts),
+                                self.channel_scheduler.ul_circuit_dl_media_source(ts)
+                            );
+                            self.channel_scheduler.dl_schedule_tmd(dl_target_ts, packed_bits);
+                            delivered_media = true;
+                        }
                     }
                 } else {
                     tracing::debug!(
@@ -1877,6 +1900,15 @@ impl UmacBs {
                         dl_target_ts,
                         ts
                     );
+                }
+                if delivered_media {
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                    if let Some(peer_ts) = self.channel_scheduler.ul_circuit_peer_ts(ts)
+                        && (1..=4).contains(&peer_ts)
+                        && self.channel_scheduler.circuit_is_active(Direction::Ul, peer_ts)
+                    {
+                        self.last_ul_voice[peer_ts as usize - 1] = Some(self.dltime);
+                    }
                 }
             }
             _ => {
