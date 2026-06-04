@@ -4732,9 +4732,9 @@ fn test_restart_recovery_failed_location_update_accept_reprobes_registration() {
 
     // LLC/MLE reports are local SAP confirmations. EN 300 392-2 clause 16.4.4
     // lets the SwMI repeat D-LOCATION UPDATE COMMAND when the accepted
-    // registration was not confirmed at layer 2; this avoids a BS/MS split
-    // where BS thinks the MS is registered but the terminal still displays
-    // Unit Not Attached.
+    // registration was not confirmed at layer 2. The reprobe must not
+    // immediately deregister the already observed subscriber, because the MS
+    // may still be transmitting MAC access while it answers the new command.
     submit_lmm_mle_report(&mut test, accept_handle, TLA_REPORT_FAILED_TRANSFER);
     test.run_stack(Some(1));
     let failed_msgs = test.dump_sinks();
@@ -4745,15 +4745,21 @@ fn test_restart_recovery_failed_location_update_accept_reprobes_registration() {
     assert!(commands[0].2.group_identity_report);
 
     let updates = subscriber_updates(&failed_msgs);
-    assert_eq!(updates.len(), 2);
-    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
-    assert_eq!(updates[0].groups, vec![gssi]);
-    assert_eq!(updates[1].action, BrewSubscriberAction::Deregister);
-    assert!(updates[1].groups.is_empty());
+    assert!(
+        updates.is_empty(),
+        "failed D-LOCATION UPDATE ACCEPT transfer should reprobe without dropping the local CMCE/Brew subscriber route"
+    );
 
     let state = test.config.state_read();
-    assert!(!state.subscribers.is_registered(issi));
-    assert!(state.subscribers.group_members(gssi).is_empty());
+    assert!(
+        state.subscribers.is_registered(issi),
+        "registration reprobe should preserve the local subscriber until timeout/detach/reject"
+    );
+    assert_eq!(
+        state.subscribers.group_members(gssi),
+        vec![issi],
+        "registration reprobe should preserve group affiliation for PTT while the MS answers D-LOCATION-UPDATE-COMMAND"
+    );
     assert!(
         !state.energy_saving.contains_key(&issi),
         "failed registration accept must fail open to StayAlive before re-probing"

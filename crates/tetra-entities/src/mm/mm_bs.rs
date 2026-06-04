@@ -374,11 +374,11 @@ impl MmBs {
             .get_client_by_issi(issi)
             .map(|c| c.groups.iter().copied().collect())
             .unwrap_or_default();
-        if !groups.is_empty() {
-            self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
-        }
-        self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
-        self.config.state_write().subscribers.deregister(issi);
+        tracing::info!(
+            "MM: preserving provisional subscriber state for ISSI {} groups={:?} while registration reprobe is pending",
+            issi,
+            groups
+        );
     }
 
     fn rx_lmm_mle_report_ind(&mut self, queue: &mut MessageQueue, handle: MleHandle, transfer_result: i32) {

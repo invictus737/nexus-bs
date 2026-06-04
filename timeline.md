@@ -3145,3 +3145,49 @@ Next non-repeating execution:
 2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
 3. Confirm remote build banner and SHA.
 4. Retest private simplex `2260616 <-> 2260618`. If no `U-SETUP` appears, diagnose MAC/LLC decode before changing floor semantics again.
+
+## 2026-06-05 01:09:30 EEST - MM recovery preserves subscriber state during failed accept reprobe
+
+Live diagnostic:
+
+- Remote test BS was running `Build: v0.1.55-dd16dae5`.
+- The bounded log search after the build marker found no private simplex call-control sequence: no `U-SETUP`, `D-SETUP`, `U-CONNECT`, `D-CONNECT`, `U-TX`, `D-TX`, `FloorGranted`, or `UMAC voice route`.
+- The same log showed `2260616` reappearing on RF with good RSSI and MAC access, then being deaffiliated/deregistered after a failed `D-LOCATION UPDATE ACCEPT` transfer report, then soft re-attaching shortly after.
+- This means the observed "broken P2P simplex" path was blocked before CMCE private-call setup: MM/LLC recovery temporarily removed a live terminal from CMCE subscriber routing.
+
+Problem targeted:
+
+- `mark_registration_unconfirmed_and_reprobe()` sent a new `D-LOCATION-UPDATE-COMMAND` after failed delivery of an acknowledged `D-LOCATION UPDATE ACCEPT`, but also emitted `Deaffiliate` and `Deregister` and removed the shared subscriber.
+- That made CMCE forget the ISSI and its GSSI during the recovery window even while the MS was still transmitting MAC access and later ACKs. A private or group PTT during that window could be rejected as not attached/not affiliated.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: the SwMI may initiate a location update with `D-LOCATION-UPDATE-COMMAND`; the command is the recovery procedure, not proof that the existing MS context must be torn down immediately.
+- EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4: `DemandLocationUpdating` is the MS response path for BS-initiated location update; subscriber routing should remain coherent until a detach, reject, timeout, or completed replacement update says otherwise.
+- This is clause-scoped engineering hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - `mark_registration_unconfirmed_and_reprobe()` still fails open to `StayAlive`, sends `D-LOCATION-UPDATE-COMMAND`, abandons stale pending group transactions, and marks the command pending.
+  - It no longer emits immediate `Deaffiliate`/`Deregister` or removes the shared subscriber during the reprobe window.
+  - It logs that provisional subscriber state is preserved while the registration reprobe is pending.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Updated `test_restart_recovery_failed_location_update_accept_reprobes_registration` to assert that a failed accept transfer reprobes without dropping CMCE/Brew subscriber routing.
+  - The test now verifies that ISSI registration and GSSI affiliation survive the reprobe, while energy saving is cleared to StayAlive.
+
+Verification:
+
+- `cargo fmt --all` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_failed_location_update_accept_reprobes_registration --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 112 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy this MM recovery hardening directly to the test BS.
+2. Confirm the remote build banner and watch for `2260616` recovery without CMCE deregister/deaffiliate churn.
+3. Retest private simplex only after a fresh `U-SETUP -> D-CONNECT -> U-TX/D-TX -> UMAC voice route` sequence appears in the log.
