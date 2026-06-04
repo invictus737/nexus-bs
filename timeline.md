@@ -34,10 +34,17 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
-Next non-repeating execution:
+Deployment result:
 
-1. Commit, deploy direct to testing with the standard local-build script, and query `/api/system`.
-2. Expected live JSON/UI: `cpu_model` is `Broadcom Cortex-A53 1GHz 64-bit`, `cpu_cores` is `4`, dashboard renders `Broadcom Cortex-A53 1GHz 64-bit (4 cores)`.
+- Committed as `5d4b888 fix: detect dashboard CPU model across boards`.
+- Deployed direct to testing with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Running BS build: `v0.1.55-5d4b888c`.
+- Deployed binary SHA-256: `a251ba3a82d5b5e02054254dd1e27dfe1820efe6c93ae8c4f39a1de39e2bc244`.
+- Live `/api/system` verification:
+  - `cpu_model`: `Broadcom Cortex-A53 1GHz 64-bit`.
+  - `cpu_cores`: `4`.
+  - UI should render `Broadcom Cortex-A53 1GHz 64-bit (4 cores)`.
+- Post-start radio state still showed `2260082`, `2260618`, and `2260616` registered and affiliated to `226333`.
 
 ## 2026-06-04 23:09:56 EEST - Private simplex MXP600 last-speaker release guard
 
