@@ -620,6 +620,102 @@ fn test_group_ul_raw_block2_loopback_preserves_tch_s_halfslot() {
 }
 
 #[test]
+fn test_group_ul_raw_block2_is_dropped_during_hangtime() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x1201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_released_msg(7, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 3 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, raw_block2.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let observed = collect_dl_raw_tch_block2_bits(&msgs, traffic_ts);
+    assert!(
+        !observed.iter().any(|bits| bits == &raw_block2),
+        "EN 300 392-2 clauses 14.5.2.2.1 and 14.5.2.4: U-plane media received after D-TX CEASED/floor release must not be looped during hangtime"
+    );
+}
+
+#[test]
+fn test_group_floor_release_purges_queued_raw_block2_media() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x1201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let stale_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 5 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, stale_raw_block2.clone());
+    test.submit_message(floor_released_msg(7, traffic_ts));
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let observed = collect_dl_raw_tch_block2_bits(&msgs, traffic_ts);
+    assert!(
+        !observed.iter().any(|bits| bits == &stale_raw_block2),
+        "EN 300 392-2 clauses 14.5.2.2.1 and 14.5.2.4: queued old-speaker TCH/S must be purged when the floor is released"
+    );
+}
+
+#[test]
+fn test_group_floor_grant_purges_stale_raw_block2_but_allows_new_media() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x1201;
+    let new_speaker = 0x2201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let stale_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 7 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, stale_raw_block2.clone());
+    test.submit_message(floor_granted_msg(7, new_speaker, gssi, traffic_ts));
+    test.run_stack(Some(12));
+
+    let stale_msgs = test.dump_sinks();
+    let stale_observed = collect_dl_raw_tch_block2_bits(&stale_msgs, traffic_ts);
+    assert!(
+        !stale_observed.iter().any(|bits| bits == &stale_raw_block2),
+        "EN 300 392-2 clauses 14.5.2.2.1 and 14.5.2.4: queued media from the previous floor epoch must not survive a new D-TX GRANTED"
+    );
+
+    let fresh_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 11 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, fresh_raw_block2.clone());
+    test.run_stack(Some(12));
+
+    let fresh_msgs = test.dump_sinks();
+    let fresh_observed = collect_dl_raw_tch_block2_bits(&fresh_msgs, traffic_ts);
+    assert!(
+        fresh_observed.iter().any(|bits| bits == &fresh_raw_block2),
+        "fresh media after the new floor grant should still be routed to DL TCH/S"
+    );
+}
+
+#[test]
 fn test_private_simplex_ul_voice_loopback_preserves_tch_s_bits() {
     debug::setup_logging_verbose();
 

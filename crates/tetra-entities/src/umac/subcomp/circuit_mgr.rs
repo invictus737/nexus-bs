@@ -118,6 +118,17 @@ impl CircuitMgr {
         self.tx_data[ts as usize - 1].push_back(CircuitTxBlock::RawTchSHalfSlot { block_num, type5_bits });
     }
 
+    pub fn clear_tx_data(&mut self, ts: u8) -> usize {
+        if !(1..=4).contains(&ts) {
+            tracing::warn!("CircuitMgr::clear_tx_data on invalid timeslot {}", ts);
+            return 0;
+        }
+        let queue = &mut self.tx_data[ts as usize - 1];
+        let dropped = queue.len();
+        queue.clear();
+        dropped
+    }
+
     /// Take a to-be-transmitted block from the queue
     pub fn take_block(&mut self, ts: u8) -> Option<CircuitTxBlock> {
         if !self.is_active(Direction::Dl, ts) {

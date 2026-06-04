@@ -389,6 +389,18 @@ impl BsChannelScheduler {
         self.hangtime[ts as usize - 1]
     }
 
+    pub fn clear_dl_media_queue(&mut self, ts: u8, reason: &str) {
+        let dropped = self.circuits.clear_tx_data(ts);
+        if dropped > 0 {
+            tracing::info!(
+                "BsChannelScheduler: dropped {} queued DL media block(s) on ts {}: {}",
+                dropped,
+                ts,
+                reason
+            );
+        }
+    }
+
     fn is_hangtime_effective(&self, ts: u8) -> bool {
         if !(1..=4).contains(&ts) {
             tracing::warn!("BsChannelScheduler::is_hangtime_effective: invalid ts {}", ts);

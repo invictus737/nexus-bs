@@ -1746,28 +1746,38 @@ impl UmacBs {
                 let data = prim.data;
                 let raw_tch_s_block = prim.raw_tch_s_block;
 
-                // Track last UL voice frame time for inactivity detection
-                if (1..=4).contains(&ts) {
-                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                if !(1..=4).contains(&ts) {
+                    tracing::warn!("rx_tmd_prim: dropping UL voice on invalid ts={}", ts);
+                    return;
                 }
+                if !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+                    tracing::trace!("rx_tmd_prim: no active UL circuit on ts={}, dropping UL voice", ts);
+                    return;
+                }
+                if self.channel_scheduler.is_hangtime(ts) {
+                    tracing::debug!(
+                        "rx_tmd_prim: dropping UL voice on ts={} during hangtime to keep U-plane stopped",
+                        ts
+                    );
+                    return;
+                }
+                // Track last UL voice frame time for inactivity detection only
+                // after the CMCE floor state says U-plane media is valid.
+                self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
 
                 // Forward UL voice to Brew (User plane) if loaded
                 if raw_tch_s_block.is_none() && self.config.config().brew.is_some() {
-                    if self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
-                        let msg = SapMsg {
-                            sap: Sap::TmdSap,
-                            src: TetraEntity::Umac,
-                            dest: TetraEntity::Brew,
-                            msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
-                                ts,
-                                data: data.clone(),
-                                raw_tch_s_block: None,
-                            }),
-                        };
-                        queue.push_back(msg);
-                    } else {
-                        tracing::trace!("rx_tmd_prim: no active UL circuit on ts={}, dropping UL voice to Brew", ts);
-                    }
+                    let msg = SapMsg {
+                        sap: Sap::TmdSap,
+                        src: TetraEntity::Umac,
+                        dest: TetraEntity::Brew,
+                        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                            ts,
+                            data: data.clone(),
+                            raw_tch_s_block: None,
+                        }),
+                    };
+                    queue.push_back(msg);
                 }
 
                 // Determine DL target timeslot:
@@ -1797,6 +1807,15 @@ impl UmacBs {
                         ts
                     }
                 };
+
+                if self.channel_scheduler.is_hangtime(dl_target_ts) {
+                    tracing::debug!(
+                        "rx_tmd_prim: dropping UL voice from ts={} because DL target ts={} is in hangtime",
+                        ts,
+                        dl_target_ts
+                    );
+                    return;
+                }
 
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
                     if let Some(block_num) = raw_tch_s_block {
@@ -2091,6 +2110,8 @@ impl UmacBs {
             }
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
             CallControl::FloorReleased { ts, .. } => {
+                self.channel_scheduler
+                    .clear_dl_media_queue(ts, "floor released; U-plane enters hangtime");
                 self.channel_scheduler.set_hangtime(ts, true);
                 // Stop checking UL inactivity during hangtime
                 if (1..=4).contains(&ts) {
@@ -2104,6 +2125,8 @@ impl UmacBs {
                 dest_gssi,
                 ts,
             } => {
+                self.channel_scheduler
+                    .clear_dl_media_queue(ts, "new floor grant; discard previous speaker media");
                 self.channel_scheduler.set_hangtime(ts, false);
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
@@ -2132,6 +2155,7 @@ impl UmacBs {
                 }
             }
             CallControl::CallEnded { ts, .. } => {
+                self.channel_scheduler.clear_dl_media_queue(ts, "call ended");
                 self.channel_scheduler.set_hangtime(ts, false);
                 if (1..=4).contains(&ts) {
                     self.last_ul_voice[ts as usize - 1] = None;

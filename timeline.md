@@ -1483,3 +1483,55 @@ Remaining observations:
 - Startup still had short LLC retransmission bursts for `2260082`, `2260616`, and `2260618` before the final ACK/affiliate state settled.
 - One startup PHY warning appeared: `Too late to produce TX block ...`; do not chase RF until a live RF symptom repeats after attach stability.
 - Next protocol hardening target remains group/private call audio static: UMAC media should be gated by current CMCE floor owner/floor epoch, and stale queued raw TCH/S should be purged on floor transitions.
+
+## 2026-06-04 12:47:05 EEST - UMAC purges stale group-call media on floor transitions
+
+Problem targeted:
+
+- Group call audio could become static when speakers alternate.
+- Read-only UMAC/CMCE reviews identified that queued TCH/S media was per-timeslot only and was not purged on CMCE floor transitions.
+- TMD media indications still do not carry source ISSI/floor epoch, so this patch does not claim full speaker-source validation.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group request/grant/cease controls who may transmit.
+- EN 300 392-2 clause 14.5.2.4: CMCE and MAC/UMAC must synchronize U-plane switching with traffic permission state.
+- EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 remain the raw TCH/S half-slot preservation scope.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/umac/subcomp/circuit_mgr.rs`
+  - Added `clear_tx_data(ts)` to drop queued DL media blocks for a traffic slot.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `clear_dl_media_queue(ts, reason)` wrapper with logging.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Drops UL TMD media when no UL circuit is active.
+  - Drops UL TMD media during hangtime before refreshing `last_ul_voice` or routing to DL/Brew.
+  - Drops media if the DL target timeslot is in hangtime.
+  - Clears queued DL media on `FloorReleased`, `FloorGranted`, and `CallEnded`.
+
+Focused tests:
+
+- `test_group_ul_raw_block2_is_dropped_during_hangtime`
+- `test_group_floor_release_purges_queued_raw_block2_media`
+- `test_group_floor_grant_purges_stale_raw_block2_but_allows_new_media`
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit UMAC floor-transition media purge patch.
+2. Build/deploy to test BS only after commit.
+3. Run live alternating group PTT on GSSI `226333`:
+   - `2260616` PTT/speak/release.
+   - `2260082` PTT/speak/release.
+   - `2260618` if available.
+   - Repeat at least three turns.
+4. Watch for `U-TX DEMAND`, `D-TX GRANTED`, `FloorGranted`, `FloorReleased`, raw/decoded TCH/S route, no `PTT denied`, and no stale/static audio.
+5. If static persists, next required design change is extending TMD/CircuitTxBlock metadata with source/floor epoch; the current SAP cannot prove late media belongs to the current floor holder.
