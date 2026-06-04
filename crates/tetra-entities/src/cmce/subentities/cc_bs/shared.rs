@@ -868,7 +868,12 @@ impl CcBsSubentity {
             };
             let reporter = TxReporter::new_unacked();
             delivery_reporter = Some(reporter.clone());
-            Self::build_sapmsg_stealing_ul_dl_reported(sdu, target_addr, target_ts, usage, UlDlAssignment::Dl, Some(reporter))
+            // EN 300 392-2 clauses 14.7.1.6 and 14.5.1.3.3 define
+            // D-DISCONNECT as a downlink request that expects an uplink
+            // U-RELEASE response. Keep the assigned channel response-capable;
+            // the final D-RELEASE path remains DL-only because it expects no
+            // MS response.
+            Self::build_sapmsg_stealing_ul_dl_reported(sdu, target_addr, target_ts, usage, UlDlAssignment::Both, Some(reporter))
         } else if target_addr.ssi == call_snapshot.calling_addr.ssi {
             Self::build_sapmsg_direct(
                 sdu,

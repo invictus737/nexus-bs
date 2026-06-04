@@ -6196,7 +6196,11 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
         .chan_alloc
         .as_ref()
         .expect("D-DISCONNECT must carry FACCH channel allocation");
-    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
+    assert_eq!(
+        chan_alloc.ul_dl_assigned,
+        UlDlAssignment::Both,
+        "D-DISCONNECT expects U-RELEASE, so its assigned-channel allocation must permit the uplink response"
+    );
     assert_eq!(count_d_releases(&disconnect_msgs), 0, "D-RELEASE must wait for peer U-RELEASE");
     assert_eq!(
         count_umac_call_ended_or_close(&disconnect_msgs),
@@ -8179,7 +8183,11 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
         .chan_alloc
         .as_ref()
         .expect("D-DISCONNECT must carry FACCH channel allocation");
-    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
+    assert_eq!(
+        chan_alloc.ul_dl_assigned,
+        UlDlAssignment::Both,
+        "D-DISCONNECT expects U-RELEASE, so its assigned-channel allocation must permit the uplink response"
+    );
     assert_eq!(disconnect_prim.layer2service, Layer2Service::Unacknowledged);
     assert_eq!(
         count_d_releases(&disconnect_msgs),
@@ -8295,7 +8303,11 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
         .chan_alloc
         .as_ref()
         .expect("D-DISCONNECT must carry FACCH channel allocation");
-    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
+    assert_eq!(
+        chan_alloc.ul_dl_assigned,
+        UlDlAssignment::Both,
+        "D-DISCONNECT expects U-RELEASE, so its assigned-channel allocation must permit the uplink response"
+    );
     assert_eq!(disconnect_prim.layer2service, Layer2Service::Unacknowledged);
     assert_eq!(count_d_releases(&disconnect_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&disconnect_msgs), 0);

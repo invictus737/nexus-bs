@@ -2378,3 +2378,47 @@ Next non-repeating execution:
    - close from called party,
    - no Motorola restart/re-attach after remote hangup.
 4. If restart persists, capture the 20 seconds around hangup and inspect `D-DISCONNECT`, peer `U-RELEASE`, final `D-RELEASE`, and circuit close order.
+
+## 2026-06-04 21:29:51 EEST - Private simplex hangup `No answer` follow-up
+
+Problem targeted:
+
+- Field report after build `v0.1.55-78d4644a`: Motorola showed `No answer` at the end of a private simplex call.
+- Live log around `21:24:00` showed `U-DISCONNECT` from `2260616`, BS `D-DISCONNECT` to peer `2260618`, but no peer `U-RELEASE`.
+- At `21:24:06` the local pending-disconnect guard fired and sent fallback `D-RELEASE` to both legs. This explains a timeout-like terminal UI instead of a clean release handshake.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: the MS initiating disconnection sends `U-DISCONNECT` and waits for `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: an MS receiving `D-DISCONNECT` shall respond with `U-RELEASE`; an MS receiving `D-RELEASE` sends no response.
+- EN 300 392-2 clause 14.7.1.6: `D-DISCONNECT` response expected is `U-RELEASE`.
+- EN 300 392-2 clause 14.7.1.9: `D-RELEASE` response expected is none.
+- This is clause-scoped hardening only; no formal certification claim.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Active private-call `D-DISCONNECT` now uses assigned-channel `UlDlAssignment::Both`, because that PDU explicitly expects the MS uplink `U-RELEASE` response.
+  - Final private-call `D-RELEASE` remains downlink-only (`UlDlAssignment::Dl`) through the existing release path, because no MS response is expected.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated the three private-call disconnect tests to assert response-capable `D-DISCONNECT` channel allocation in both caller-hangs-up and called-party-hangs-up directions.
+  - Existing helper coverage still asserts final `D-RELEASE` FACCH/STCH remains `Dl`.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 122 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this private simplex hangup patch.
+2. Deploy direct with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest private simplex between `2260082` and `2260616`/`2260618`:
+   - peer should answer `D-DISCONNECT` with `U-RELEASE`,
+   - initiator should receive final one-leg `D-RELEASE`,
+   - no `Pending individual D-DISCONNECT timed out`,
+   - no Motorola `No answer` at normal hangup.
+4. If the peer still does not send `U-RELEASE`, inspect on-air MAC STCH allocation bits and raw decoded `MacResource` for the `D-DISCONNECT` slot.
