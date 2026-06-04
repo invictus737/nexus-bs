@@ -648,3 +648,47 @@ Current conclusion:
 - This patch removes one plausible static-audio source: synthetic all-zero TCH/S during active call gaps or missing uplink voice.
 - It does not prove live private/group audio is fixed; live PTT validation is still required.
 - Next live test must still capture `2260082 -> 2260616`, `2260616 -> 2260082`, and group `226333`, with logs for `CMCE opening UMAC circuit`, `FloorGranted`, `UMAC voice route`, `rx_blk_traffic`, CRC failures, and STCH/FACCH events.
+
+## 2026-06-04 11:17:37 EEST - Deployed null-idle traffic patch to test BS
+
+Commit deployed:
+
+- `2201923 fix: transmit null traffic idle instead of zero speech`
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape used: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Output binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `bcd5bc2cff5e1f253f80b66c0009db7da5930de9117b348ea63b9bbf49006da5`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- First SCP failed while the old BS process still held the destination open.
+- Stopped test BS/control-service via existing pidfile method.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `bcd5bc2cff5e1f253f80b66c0009db7da5930de9117b348ea63b9bbf49006da5`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `15798`
+  - control-service pid `15801`
+  - nexus-bs pid `15803`
+
+Post-restart live checks:
+
+- Dashboard root on `127.0.0.1:8080` returned Nexus-BS v0.1.55 HTML.
+- `2260082` re-registered/re-affiliated to group `226333`; RSSI around `-22 dBFS`; EG3 allocated after registration.
+- `2260616` re-registered/re-affiliated to group `226333`; RSSI around `-33 dBFS`; EG3 allocated after registration.
+- `2260618` re-registered/re-affiliated to group `226333`; RSSI around `-38 dBFS`; requested EG1 and BS allocated EG3.
+- No post-deploy PTT attempt was present yet in the checked log filters for `U-TX DEMAND`, `D-TX GRANTED`, `UMAC voice route`, `rx_blk_traffic`, `UL inactivity`, `PTT denied`, or `NotGranted`.
+
+Next operator validation:
+
+- Test private simplex `2260082 -> 2260616`, then `2260616 -> 2260082`.
+- Test group PTT on `226333` with at least two radios alternating.
+- If static remains, collect only post-`2201923` logs and decide by evidence:
+  - wrong CMCE circuit/floor -> patch CMCE under EN 300 392-2 clause 14.5.1/14.5.2;
+  - no valid `rx_blk_traffic` after grant -> isolate LMAC/PHY;
+  - valid `UMAC voice route` but bad receive audio -> inspect downlink FACCH/STCH/TCH and RF path.
