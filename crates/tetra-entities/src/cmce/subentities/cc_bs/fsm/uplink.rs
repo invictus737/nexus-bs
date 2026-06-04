@@ -846,7 +846,7 @@ impl CcBsSubentity {
                     return;
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
-                if !call_snapshot.simplex_duplex && call_snapshot.floor_holder == Some(sender.ssi) {
+                if !call_snapshot.simplex_duplex && call_snapshot.floor_holder.is_some() {
                     self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause);
                     return;
                 }

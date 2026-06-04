@@ -1,5 +1,54 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 22:32:27 EEST - Private simplex peer-floor hangup tail-drain
+
+Problem targeted:
+
+- User report: private simplex `2260616 -> 2260618` works for voice, but when `2260616` hangs up with the red key, the peer Motorola MXP600 `2260618` soft reboots.
+- The current deployed build after the previous patch is `Build: v0.1.55-a3bc4078`; the sampled post-deploy log did not contain a fresh private-call attempt, only startup/register/affiliate activity.
+- Audit gap found in the current code: peer-facing `D-DISCONNECT` was tail-drained only when the disconnecting MS was the current simplex floor holder. If the peer MXP600 was the current/last floor holder and the caller hung up, Nexus-BS could still send `D-DISCONNECT` to that peer immediately.
+
+Components, simple technical meaning:
+
+- CMCE/CC-BS: call-control state machine. It decides private-call setup, PTT floor ownership, `D-RELEASE`, `D-DISCONNECT`, and when the traffic circuit may close.
+- UMAC: assigned traffic-channel owner/router. It keeps the simplex bearer open while CMCE drains/release-confirms the call.
+- Tail-drain guard: a short bounded wait before peer-facing clear signalling so the speech bearer is not cleared in the same instant as recent TCH/S traffic.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: simplex individual calls use controlled `U-TX DEMAND`, `D-TX GRANTED`, `U-TX CEASED`, and `D-TX CEASED`; no unsolicited peer grant is introduced.
+- EN 300 392-2 clauses 14.5.1.3.1 and 14.5.1.3.3: the MS that sends `U-DISCONNECT` receives `D-RELEASE`; the peer leg is cleared with `D-DISCONNECT` and answers with `U-RELEASE`.
+- EN 300 392-2 clause 14.7.1.6: `D-DISCONNECT` expects `U-RELEASE`.
+- EN 300 392-2 clause 23.8.5 gives an N-1 traffic-slot tail-bit rule for N=4/8 circuit-mode data. Applying the same short N=4-equivalent guard to TCH/S speech remains a bounded Motorola/bearer compatibility guard, not a formal certification claim.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Private simplex `U-DISCONNECT` now tail-drains peer-facing `D-DISCONNECT` whenever any simplex floor holder is active, not only when the disconnecting MS is the floor holder.
+  - Prompt `D-RELEASE` to the MS that pressed red is still immediate.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added reusable helpers for field-ISSI private-call setup.
+  - Added `LAB_ISSI_MXP600 = 2260618`.
+  - Added regression test for `2260616 -> 2260618`: 2260618 obtains the private simplex floor, 2260616 hangs up, `D-RELEASE` goes promptly to 2260616, and `D-DISCONNECT` to 2260618 appears only after tail-drain.
+  - Updated the mirrored called-party disconnect test so the floor-holding peer is also tail-drained before `D-DISCONNECT`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 62 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 124 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 9 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this patch.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest exact Motorola case: `2260616 -> 2260618`, make 2260618 talk last if possible, then hang up on `2260616`.
+4. Expected live log: prompt `D-RELEASE` to 2260616, no immediate `D-DISCONNECT` to 2260618, delayed `D-DISCONNECT` after tail-drain, peer `U-RELEASE`, no fallback timeout, no MXP600 reboot.
+
 ## 2026-06-04 21:54:29 EEST - Patched private simplex hangup No Answer release acknowledgement
 
 User symptom:

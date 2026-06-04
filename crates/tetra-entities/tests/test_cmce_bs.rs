@@ -59,6 +59,7 @@ const TEST_OTHER_ISSI: u32 = 1000003;
 const LAB_GROUP_GSSI: u32 = 226333;
 const LAB_ISSI_A: u32 = 2260616;
 const LAB_ISSI_B: u32 = 2260082;
+const LAB_ISSI_MXP600: u32 = 2260618;
 const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
 const PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
@@ -1359,7 +1360,11 @@ fn start_group_call_with_u_setup(test: &mut ComponentTest, u_setup: USetup) -> u
 }
 
 fn start_p2p_setup(test: &mut ComponentTest) -> (u16, Vec<SapMsg>) {
-    test.submit_message(build_u_setup_p2p_msg(TEST_ISSI, TEST_CALLED_ISSI));
+    start_p2p_setup_between(test, TEST_ISSI, TEST_CALLED_ISSI)
+}
+
+fn start_p2p_setup_between(test: &mut ComponentTest, caller_issi: u32, called_issi: u32) -> (u16, Vec<SapMsg>) {
+    test.submit_message(build_u_setup_p2p_msg(caller_issi, called_issi));
     test.run_stack(Some(1));
     let msgs = test.dump_sinks();
     let call_id = first_d_setup_call_id(&msgs);
@@ -1380,8 +1385,12 @@ fn start_active_p2p_call(test: &mut ComponentTest) -> u16 {
 }
 
 fn start_active_p2p_call_with_connect_msgs(test: &mut ComponentTest) -> (u16, Vec<SapMsg>) {
-    let (call_id, _setup_msgs) = start_p2p_setup(test);
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    start_active_p2p_call_between_with_connect_msgs(test, TEST_ISSI, TEST_CALLED_ISSI)
+}
+
+fn start_active_p2p_call_between_with_connect_msgs(test: &mut ComponentTest, caller_issi: u32, called_issi: u32) -> (u16, Vec<SapMsg>) {
+    let (call_id, _setup_msgs) = start_p2p_setup_between(test, caller_issi, called_issi);
+    test.submit_message(build_u_connect_msg(called_issi, call_id));
     test.run_stack(Some(1));
     let connect_msgs = test.dump_sinks();
     assert!(count_umac_open(&connect_msgs) >= 1, "U-CONNECT should open the P2P traffic circuit");
@@ -8403,6 +8412,127 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
 }
 
 #[test]
+fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_MXP600, LAB_GROUP_GSSI);
+    let (call_id, _connect_msgs) = start_active_p2p_call_between_with_connect_msgs(&mut test, LAB_ISSI_A, LAB_ISSI_MXP600);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_MXP600, call_id));
+    test.run_stack(Some(1));
+    let queued_msgs = test.dump_sinks();
+    let queued_grants: Vec<_> = queued_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queued_grants.len(), 1);
+    assert_eq!(queued_grants[0].0.main_address, TetraAddress::issi(LAB_ISSI_MXP600));
+    assert_eq!(
+        queued_grants[0].1.transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_grants.len(), 2, "queued private floor handoff should grant both legs");
+    assert!(handoff_grants.iter().any(|(prim, grant)| {
+        prim.main_address == TetraAddress::issi(LAB_ISSI_MXP600) && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+    }));
+    assert!(handoff_grants.iter().any(|(prim, grant)| {
+        prim.main_address == TetraAddress::issi(LAB_ISSI_A)
+            && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    }));
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+
+    // Field regression for 2260616 -> 2260618: if the MXP600 peer is the
+    // current simplex floor holder and the caller presses the red key, keep the
+    // caller D-RELEASE prompt but drain the peer-facing clear before
+    // D-DISCONNECT. The D-DISCONNECT -> U-RELEASE handshake remains EN 300
+    // 392-2 clauses 14.5.1.3.3 and 14.7.1.6; the drain is a bounded bearer
+    // compatibility guard before clearing the active speech path.
+    test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[LAB_ISSI_A],
+    );
+    assert_eq!(
+        count_d_disconnects(&initiator_release_msgs),
+        0,
+        "caller hangup must tail-drain before D-DISCONNECT when the MXP600 peer holds the floor"
+    );
+    assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    test.run_stack(Some(3));
+    let early_tail_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&early_tail_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&early_tail_msgs), 0);
+
+    drain_private_simplex_tail(&mut test, dltime);
+    let mut disconnect_msgs = test.dump_sinks();
+    let d_disconnects: Vec<_> = disconnect_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_disconnect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(d_disconnects.len(), 1);
+    let (disconnect_prim, d_disconnect) = &d_disconnects[0];
+    assert_eq!(disconnect_prim.main_address, TetraAddress::issi(LAB_ISSI_MXP600));
+    assert_eq!(d_disconnect.call_identifier, call_id);
+    assert_eq!(d_disconnect.disconnect_cause, DisconnectCause::UserRequestedDisconnection);
+    let chan_alloc = disconnect_prim
+        .chan_alloc
+        .as_ref()
+        .expect("tail-drained D-DISCONNECT must carry FACCH channel allocation");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert_eq!(count_d_releases(&disconnect_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&disconnect_msgs), 0);
+
+    let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
+    assert_eq!(disconnect_reporters.len(), 1);
+    disconnect_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    test.submit_message(build_u_release_msg(LAB_ISSI_MXP600, call_id));
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    release_ack_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert!(
+        count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
+        "P2P circuit closes only after peer U-RELEASE and caller D-RELEASE delivery"
+    );
+}
+
+#[test]
 fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_close() {
     debug::setup_logging_verbose();
 
@@ -8420,11 +8550,34 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
     // EN 300 392-2 clause 14.5.1.3.1 permits either user application to
     // initiate individual-call disconnection. If the called MS disconnects, it
     // receives D-RELEASE promptly while the calling peer is cleared by
-    // D-DISCONNECT and U-RELEASE.
+    // D-DISCONNECT and U-RELEASE. Because the calling peer is the current
+    // simplex floor holder, the peer-facing clear waits for the bounded bearer
+    // drain before D-DISCONNECT.
     test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
-    let mut disconnect_msgs = test.dump_sinks();
+    let mut called_release_msgs = test.dump_sinks();
 
+    assert_established_p2p_release_pdus_to(
+        &called_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_CALLED_ISSI],
+    );
+    assert_eq!(
+        count_d_disconnects(&called_release_msgs),
+        0,
+        "called-party U-DISCONNECT must tail-drain before clearing the floor-holding caller"
+    );
+    assert_eq!(count_umac_call_ended_or_close(&called_release_msgs), 0);
+    let release_ack_reporters = extract_d_release_reporters(&mut called_release_msgs);
+    assert_eq!(
+        release_ack_reporters.len(),
+        1,
+        "Called-party U-DISCONNECT initiator must receive one prompt assigned-channel D-RELEASE"
+    );
+
+    drain_private_simplex_tail(&mut test, dltime);
+    let mut disconnect_msgs = test.dump_sinks();
     let d_disconnects: Vec<_> = disconnect_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
@@ -8449,12 +8602,7 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
         "D-DISCONNECT expects U-RELEASE, so its assigned-channel allocation must permit the uplink response"
     );
     assert_eq!(disconnect_prim.layer2service, Layer2Service::Unacknowledged);
-    assert_established_p2p_release_pdus_to(
-        &disconnect_msgs,
-        call_id,
-        DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
-    );
+    assert_eq!(count_d_releases(&disconnect_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&disconnect_msgs), 0);
 
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
@@ -8464,12 +8612,6 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
         "Assigned-channel D-DISCONNECT to caller must carry one TxReporter"
     );
     assert_eq!(disconnect_reporters[0].get_state(), TxState::Pending);
-    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
-    assert_eq!(
-        release_ack_reporters.len(),
-        1,
-        "Called-party U-DISCONNECT initiator must receive one prompt assigned-channel D-RELEASE"
-    );
 
     disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
