@@ -2966,3 +2966,27 @@ Next non-repeating execution:
 2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
 3. Retest private simplex both directions on `2260616`/`2260618`: expected live log after reverse PTT is `D-TX GRANTED` followed by TCH/S voice, with no stale post-grant `D-TX CEASED` repeats to the newly granted MS.
 4. Retest group `226333` alternating PTT between two terminals: expected no first-return `PTT denied`, no stale `D-TX CEASED` after grant, and no static-only talk spurt.
+
+## 2026-06-05 00:19:24 EEST - Floor-control repeat guard deployed to RF test BS
+
+Deployment:
+
+- Committed patch: `51f8eb8 fix: single-shot floor-control BL-UDATA`.
+- Deployed direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote binary SHA-256: `1f669e251b134a0af947fe796eb1a6313e8f8ea40318bbf74ff0ffe7f2e13d55`.
+- Remote build banner: `Build: v0.1.55-51f8eb8f`.
+- Remote processes after restart: `nexus-bs-control-service` on `127.0.0.1:9002`, `nexus-bs` with `/home/chris/nexus-bs-v0.1.55-test/config.live.toml`.
+
+Post-start live state:
+
+- `2260618` registered and affiliated to `226333`.
+- `2260082` registered and affiliated to `226333`.
+- `2260616` registered and affiliated to `226333`.
+- A bounded 140 s live tail after deploy saw no new `U-SETUP`, `U-TX DEMAND`, `PTT denied`, `Service unavailable`, or `Unit Not Attached` event, so no RF private-simplex retest has been observed in the post-deploy log yet.
+
+Next non-repeating execution:
+
+1. Run private simplex RF retest `2260616 <-> 2260618`, both PTT directions.
+2. Inspect the post-deploy log for the first reverse-PTT sequence: expected `U-TX DEMAND` then `D-TX GRANTED` then TCH/S voice, with no stale `D-TX CEASED` emitted after the new grant.
+3. If P2P still fails, patch the next proven layer only: likely UMAC bearer/speaker gating or CMCE floor-holder state, not another LLC repetition change without fresh log evidence.
+4. Then retest group `226333` alternating PTT for the same stale floor-control pattern.
