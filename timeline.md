@@ -2714,3 +2714,28 @@ Next non-repeating execution:
 2. Retest private simplex `2260616 -> 2260618`; make `2260618` talk last, then close from `2260616`.
 3. Expected live behavior: prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE` to `2260618`, no MXP600 soft reboot.
 4. Continue SDS/LLC hardening next: SDS status-preserving Brew forward and bounded LLC duplicate suppression.
+
+## 2026-06-04 22:52:49 EEST - Private peer-floor D-RELEASE build deployed
+
+Deployment:
+
+- Committed patch: `5f03000 fix: release private peer floor holder`.
+- Deployed with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote binary SHA-256: `cc58d4a85adb9cc096b16d885b41d2b6ed9fef8f7947007dcea3ed31cb0f2b3f`.
+- Remote build banner: `Build: v0.1.55-5f03000c`.
+- Test service path: `/home/chris/nexus-bs-v0.1.55-test`.
+
+Post-start live state:
+
+- `nexus-bs` running with `/home/chris/nexus-bs-v0.1.55-test/config.live.toml`.
+- `nexus-bs-control-service` running on `127.0.0.1:9002`.
+- Post-start log showed:
+  - `2260618` registered and affiliated to `226333`.
+  - `2260616` registered and affiliated to `226333`.
+  - `2260082` registered and affiliated to `226333`.
+
+Next non-repeating execution:
+
+1. User retests private simplex `2260616 -> 2260618`.
+2. Expected log around hangup: `U-DISCONNECT` from `2260616`, prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained peer `D-RELEASE` to `2260618`, circuit close only after D-RELEASE reporter completion or bounded local guard.
+3. If MXP600 still reboots, inspect the last 20 seconds of `2260618` downlink and registration log before making another protocol change.
