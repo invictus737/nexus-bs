@@ -4529,6 +4529,189 @@ fn test_successful_location_update_persists_restart_recovery_cache() {
     let _ = std::fs::remove_file(format!("{path}.tmp"));
 }
 
+#[test]
+fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("demand-groups-eg3");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    let commands = location_update_commands(&command_msgs);
+    let command_details = location_update_command_details(&command_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, issi);
+    assert!(commands[0].2.group_identity_report);
+    assert_eq!(command_details.len(), 1);
+    assert_eq!(command_details[0].0, issi);
+    assert_eq!(command_details[0].2, Layer2Service::Acknowledged);
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "restart recovery command alone must not fabricate a registered terminal"
+        );
+        assert!(state.subscribers.group_members(gssi).is_empty());
+        assert!(
+            !state.energy_saving.contains_key(&issi),
+            "restart recovery command alone must not install stale EG state before the MS confirms"
+        );
+    }
+
+    // EN 300 392-2 clause 16.4.4 lets the SwMI command a still-camped MS to
+    // perform location update. Clauses 16.9.3.4, 16.10.23 and 16.10.35a keep
+    // the accepted DemandLocationUpdating response and group identity result
+    // coherent. Clauses 16.7.1, 16.10.9, 16.10.10, and 23.7.6/T.210 cover the
+    // rebuilt energy economy assignment and receive-window timing.
+    submit_location_update_with_groups_and_energy(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        vec![gssi],
+        Some(EnergySavingMode::Eg1),
+    );
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    let gila = accept
+        .group_identity_location_accept
+        .as_ref()
+        .expect("DemandLocationUpdating accept should acknowledge reported groups");
+    let accepted_groups = gila
+        .group_identity_downlink
+        .as_ref()
+        .expect("DemandLocationUpdating accept should list accepted groups");
+    assert_eq!(gila.group_identity_accept_reject, 0);
+    assert!(accepted_groups.iter().any(|group| {
+        group.gssi == Some(gssi)
+            && group
+                .group_identity_attachment
+                .as_ref()
+                .is_some_and(|attachment| attachment.group_identity_attachment_lifetime == 0 && attachment.class_of_usage == 0)
+            && group.group_identity_detachment_uplink.is_none()
+    }));
+    let esi = accept
+        .energy_saving_information
+        .expect("DemandLocationUpdating accept should carry allocated EG3");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg3);
+    assert_energy_saving_start_avoids_frame_18(EnergySavingMode::Eg3, esi.frame_number, esi.multiframe_number);
+
+    let updates = subscriber_updates(&demand_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![gssi]);
+
+    {
+        let state = test.config.state_read();
+        assert!(state.subscribers.is_registered(issi));
+        assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+        let assignment = state
+            .energy_saving
+            .get(&issi)
+            .expect("accepted EG3 assignment should be active after DemandLocationUpdating");
+        assert_eq!(assignment.mode, EnergySavingMode::Eg3 as u8);
+        assert_eq!(assignment.frame, esi.frame_number);
+        assert_eq!(assignment.multiframe, esi.multiframe_number);
+        assert!(assignment.awake_until.is_some());
+    }
+
+    test.run_stack(Some(2));
+    let followup_msgs = test.dump_sinks();
+    assert!(
+        location_update_commands(&followup_msgs).is_empty(),
+        "successful restart recovery response must stop further D-LOCATION-UPDATE-COMMAND probes"
+    );
+
+    let cache = std::fs::read_to_string(&path).expect("registration should keep recovery cache");
+    assert!(cache.lines().any(|line| line.trim() == issi.to_string()));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_group_report_complete_keeps_groups_empty() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("demand-no-groups");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    let command_details = location_update_command_details(&command_msgs);
+    assert_eq!(command_details.len(), 1);
+    assert_eq!(command_details[0].0, issi);
+    assert_eq!(command_details[0].2, Layer2Service::Acknowledged);
+    assert!(command_details[0].3.group_identity_report);
+
+    // EN 300 392-2 clause 16.4.4 allows SwMI-driven location updating after
+    // restart. Clauses 16.9.3.4 and 16.10.27a define the terminal's complete
+    // empty group report; the SwMI must rebuild active state from that response
+    // and must not restore stale groups from the restart cache.
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::DemandLocationUpdating, 1, 0);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(
+        accept.group_identity_location_accept.is_none(),
+        "empty complete group report must not advertise stale GSSI entries after restart recovery"
+    );
+
+    let updates = subscriber_updates(&demand_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+
+    {
+        let state = test.config.state_read();
+        assert!(state.subscribers.is_registered(issi));
+        assert!(state.subscribers.group_members(gssi).is_empty());
+        assert!(!state.energy_saving.contains_key(&issi));
+    }
+
+    test.run_stack(Some(2));
+    let followup_msgs = test.dump_sinks();
+    assert!(
+        location_update_commands(&followup_msgs).is_empty(),
+        "successful empty restart recovery response must stop further D-LOCATION-UPDATE-COMMAND probes"
+    );
+
+    let cache = std::fs::read_to_string(&path).expect("registration should keep recovery cache");
+    assert!(cache.lines().any(|line| line.trim() == issi.to_string()));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
 fn assert_location_update_response_stay_alive(energy_saving_mode: Option<EnergySavingMode>) {
     debug::setup_logging_verbose();
 
@@ -4676,6 +4859,19 @@ fn location_update_commands(msgs: &[SapMsg]) -> Vec<(u32, u32, DLocationUpdateCo
                 let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
                 let pdu = DLocationUpdateCommand::from_bitbuf(&mut sdu).ok()?;
                 Some((prim.address.ssi, prim.handle, pdu))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn location_update_command_details(msgs: &[SapMsg]) -> Vec<(u32, u32, Layer2Service, DLocationUpdateCommand)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                let pdu = DLocationUpdateCommand::from_bitbuf(&mut sdu).ok()?;
+                Some((prim.address.ssi, prim.handle, prim.layer2service.clone(), pdu))
             }
             _ => None,
         })
@@ -5070,6 +5266,16 @@ fn submit_u_tei_provide(test: &mut ComponentTest, issi: u32, tei: u64) {
 }
 
 fn submit_location_update_with_groups(test: &mut ComponentTest, issi: u32, location_update_type: LocationUpdateType, groups: Vec<u32>) {
+    submit_location_update_with_groups_and_energy(test, issi, location_update_type, groups, None);
+}
+
+fn submit_location_update_with_groups_and_energy(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    groups: Vec<u32>,
+    energy_saving_mode: Option<EnergySavingMode>,
+) {
     let group_identity_uplink = groups
         .into_iter()
         .map(|gssi| GroupIdentityUplink {
@@ -5080,7 +5286,13 @@ fn submit_location_update_with_groups(test: &mut ComponentTest, issi: u32, locat
             vgssi: None,
         })
         .collect();
-    submit_location_update_with_group_identity_uplink(test, issi, location_update_type, group_identity_uplink);
+    submit_location_update_with_group_identity_uplink_and_energy(
+        test,
+        issi,
+        location_update_type,
+        group_identity_uplink,
+        energy_saving_mode,
+    );
 }
 
 fn submit_location_update_with_group_identity_uplink(
@@ -5089,13 +5301,23 @@ fn submit_location_update_with_group_identity_uplink(
     location_update_type: LocationUpdateType,
     group_identity_uplink: Vec<GroupIdentityUplink>,
 ) {
+    submit_location_update_with_group_identity_uplink_and_energy(test, issi, location_update_type, group_identity_uplink, None);
+}
+
+fn submit_location_update_with_group_identity_uplink_and_energy(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+    group_identity_uplink: Vec<GroupIdentityUplink>,
+    energy_saving_mode: Option<EnergySavingMode>,
+) {
     let pdu = ULocationUpdateDemand {
         location_update_type,
         request_to_append_la: false,
         cipher_control: false,
         ciphering_parameters: None,
         class_of_ms: None,
-        energy_saving_mode: None,
+        energy_saving_mode,
         la_information: None,
         ssi: None,
         address_extension: None,
