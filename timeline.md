@@ -2586,3 +2586,28 @@ Next non-repeating execution:
    - no fallback timeout,
    - no MXP600 soft reboot and no `No answer`.
 4. If MXP600 still reboots, inspect whether it is the `D-RELEASE` recipient or the peer `D-DISCONNECT` recipient in that exact trace before changing sequencing again.
+
+## 2026-06-04 22:22:30 EEST - Private simplex tail-drain test build deployed
+
+Deployment:
+
+- Committed patch: `a3bc407 fix: tail-drain private simplex clear`.
+- Deployed with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote binary SHA-256: `33d97d5e722fb357423c5c5baa355ad3de060f4926ec95d39dbe6aa59f37eea1`.
+- Remote build banner: `Build: v0.1.55-a3bc4078`.
+- Test service path: `/home/chris/nexus-bs-v0.1.55-test`.
+
+Post-start live state:
+
+- `nexus-bs` running with `/home/chris/nexus-bs-v0.1.55-test/config.live.toml`.
+- `nexus-bs-control-service` running on `127.0.0.1:9002`.
+- Post-start log showed:
+  - `2260616` registered and affiliated to `226333`.
+  - `2260082` registered and affiliated to `226333`.
+  - `2260618` registered and affiliated to `226333`.
+
+Next non-repeating execution:
+
+1. User retests private simplex `2260616 -> 2260618`.
+2. Watch logs for `U-TX CEASED`, tail-drain debug/info, prompt `D-RELEASE`, delayed peer `D-DISCONNECT`, peer `U-RELEASE`, and absence of fallback timeout.
+3. If MXP600 still soft reboots, capture exact recipient of the last downlink PDU before reattach.
