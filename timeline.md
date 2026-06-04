@@ -692,3 +692,229 @@ Next operator validation:
   - wrong CMCE circuit/floor -> patch CMCE under EN 300 392-2 clause 14.5.1/14.5.2;
   - no valid `rx_blk_traffic` after grant -> isolate LMAC/PHY;
   - valid `UMAC voice route` but bad receive audio -> inspect downlink FACCH/STCH/TCH and RF path.
+
+## 2026-06-04 11:23:47 EEST - PM orchestration refreshed and delegated
+
+User directive:
+
+- Add a Project Manager agent to orchestrate the work.
+- Split work into review, architecture, and QA responsibilities.
+- Reload ETSI law/status/project log before further protocol work.
+- Keep execution state and next actions in `timeline.md` so the next resume does not loop.
+
+Law/status reload completed before this checkpoint:
+
+- `/Users/ctermure/.codex/memories/tetra-etsi-compliance-law.md`
+- `/Users/ctermure/.codex/memories/flowstation-tetra-eg-swmi-resume-2026-06-02.md`
+- `/Users/ctermure/.codex/memories/flowstation-aarch64-soapysdr-build.md`
+
+Current repo state:
+
+- Workdir: `/Users/ctermure/Work/basestion`
+- Branch: `nexus-bs-v0.1.55`
+- HEAD: `84a15d9 docs: record null-idle test deployment`
+- Worktree: clean
+- Active goal: clause-scoped ETSI EN 300 392-2 hardening only. This is not a formal certification claim.
+
+PM agent status:
+
+- A new PM agent spawn was attempted again, but the agent thread limit is reached.
+- Existing agent `019e911b-1c4b-7f02-a72f-2bdf280d6c35` (`Aquinas the 3rd`) remains assigned as Project Manager.
+- PM role: orchestration only. PM owns execution order, anti-loop discipline, timeline handoff quality, and evidence gates.
+
+Delegated agent roles:
+
+- PM / orchestration: `019e911b-1c4b-7f02-a72f-2bdf280d6c35` (`Aquinas the 3rd`).
+- Review: `019e911b-1cad-75a2-8032-1bd9fe865e83` (`Heisenberg the 3rd`).
+- Voice architecture: `019e911b-1d27-7b91-a06c-c8393037b7e7` (`Arendt the 3rd`).
+- QA: `019e9134-b662-7ac0-a27f-dd8446c1c03b` (`Maxwell the 3rd`).
+- MAC/UMAC architecture: `019e9134-cc83-7793-a243-e7e1428e2587` (`Ohm the 3rd`).
+- MM/SDS robustness: `019e9134-e2c2-7cb1-a626-0f86672f87f6` (`Herschel the 3rd`).
+
+Simple component meanings for operators and next handoff:
+
+- PM: keeps the work ordered and blocks circular work without evidence.
+- Review: looks for regressions, missing tests, and unsupported compliance wording.
+- CMCE: call control. It handles call setup, floor/PTT grant, who may speak, and call release.
+- UMAC/MAC: radio scheduler. It maps signalling and speech to slots and routes uplink voice to downlink users.
+- LMAC: burst framing. It decodes/encodes traffic bursts, including TCH/S speech and CRC/BFI decisions.
+- PHY: radio burst layer. It detects train sequence, block identity, timing, and RF decode quality.
+- MM: mobility management. It handles registration, restart recovery, group affiliation, and energy economy.
+- SDS/status: short data and status messaging.
+- WAP MVP: terminal browser page delivery over SDS Type 4/WAP PID in the current stack. Full SNDCP/IP WAP is still a separate open implementation track.
+
+Agent feedback integrated in this checkpoint:
+
+- PM confirmed current state: `2201923` null-idle traffic patch is deployed and `84a15d9` records the deployment; no post-deploy live PTT result is yet recorded.
+- QA produced a BASIC/24x7 validation matrix. Required live evidence remains private simplex both directions, private duplex if supported, group PTT on `226333`, SDS/status, WAP terminal page, restart re-affiliation, scan/group retention, and soak stability.
+- MM/SDS confirmed restart-recovery and SDS/status component tests are strong for their current scope, but live WAP terminal-browser delivery and EG-window delivery evidence remain separate from unit tests.
+- MM/SDS also confirmed current WAP is SDS Type 4/WAP MVP, not full SNDCP/IP WAP service advertising.
+- Review, Voice Architecture, and MAC/UMAC agents were re-tasked and must be integrated before the next protocol patch if they return concrete risks.
+
+Local technical observation for the next voice investigation:
+
+- `crates/tetra-entities/src/lmac/lmac_bs.rs` classifies `NUB + NormalTrainSeq2 + Block2` as `LogicalChannel::TchS` when the burst is traffic and block 2 is not stolen.
+- The same file's `rx_blk_traffic` currently forwards only `LogicalChannel::TchS` with `PhyBlockNum::Both`; it drops `Block2` as partial/unsupported.
+- This is a credible non-repeating suspect for the live one-way/static-audio path, but it must not be patched by pretending a 216-bit half-block is a clean 274-bit ACELP frame.
+- Clause scope if patched: EN 300 392-2 clause 23.5/23.5.4 for traffic channel STCH/TCH handling and clause 23.8.3 for bad/partial speech-frame handling. Any compatibility behavior must be labelled as such.
+
+Immediate execution order:
+
+1. Do not repeat pure UMAC TCH/S bit-copy tests as the main static-audio hypothesis; they already pass.
+2. Collect fresh post-`2201923` live PTT evidence:
+   - private simplex `2260082 -> 2260616`;
+   - private simplex `2260616 -> 2260082`;
+   - group PTT on GSSI `226333`, alternating radios.
+3. For each attempt, map:
+   - `U-TX DEMAND`;
+   - `D-TX GRANTED`;
+   - `FloorGranted source_issi`;
+   - `CMCE opening UMAC circuit`;
+   - `CircuitDlMediaSource`;
+   - `UMAC voice route`;
+   - `rx_blk_traffic`;
+   - CRC/BFI;
+   - FACCH/STCH/TCH placement;
+   - operator audio result.
+4. If CMCE circuit/floor is wrong, patch CMCE under EN 300 392-2 clause 14.5.1/14.5.2 with a focused test.
+5. If CMCE is correct but LMAC drops valid traffic blocks, patch LMAC under EN 300 392-2 clause 23.5/23.5.4 and 23.8.3 with a focused unit test.
+6. If LMAC sees CRC/PHY quality failures only in one direction, isolate PHY/RF before masking the issue in CMCE or UMAC.
+7. After a focused local patch passes tests, build locally only and deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; do not compile on `chris@192.168.1.179` and do not create binary backups.
+
+Evidence required before BASIC paths are called robust:
+
+- Private simplex: `2260082 -> 2260616` and `2260616 -> 2260082` both have intelligible audio, correct floor owner, and no unjustified `PTT denied`.
+- Group call: at least two radios alternate PTT on `226333` with intelligible audio and no stale floor.
+- Private duplex: setup, media routing, and release are validated separately from simplex, or unsupported terminal behavior is documented without wrong bearer setup.
+- SDS/status: ISSI route uses acknowledged delivery; GSSI route uses unacknowledged delivery; live delivery works.
+- WAP: terminal browser reaches the Nexus-BS greeting page. Unit tests for SDS payload are not enough.
+- Restart recovery: terminals re-register/re-affiliate after BS restart based on real terminal responses, not fabricated stale cache state.
+- Scan/group retention: selected group remains usable after idle/scan cycles and after restart.
+- 24x7 stability: process/dashboard/registry stay healthy, logs are bounded, periodic private/group/SDS/WAP probes pass, and there is no panic, log storm, stale floor, or repeated unjustified PTT denial.
+
+Anti-loop rules:
+
+- No broad refactor before the live voice blocker is classified by evidence.
+- No certification wording. Use clause-scoped ETSI-aligned evidence only.
+- `call_preemptive` / transmission interruption stays default off.
+- Encryption remains out of focus.
+- Do not advertise full SNDCP/IP WAP until that bearer is implemented and tested.
+
+## 2026-06-04 11:26:10 EEST - Review/MAC agent feedback integrated
+
+Agent feedback received:
+
+- QA, PM, MM/SDS, MAC/UMAC, and Review agents returned read-only feedback.
+- Voice Architecture was still running at the wait timeout; do not block on it unless it returns a concrete contradiction.
+
+Review findings:
+
+- High risk: `LMAC` can still drop the likely live half-slot speech path. `NormalTrainSeq2 + Block2` may be classified as `TchS`, but `rx_blk_traffic` only forwards `PhyBlockNum::Both`.
+- High risk: there is still no post-`2201923` live PTT evidence, so null-idle traffic hardening is not proof that live static/audio is fixed.
+- Medium risk: UMAC null-idle tests stop at scheduler output; add/keep LMAC boundary coverage for `STCH+STCH` and `STCH+TCH/S` through `NormalTrainSeq2`.
+- Medium risk: CMCE and UMAC private simplex component coverage is good, but not end-to-end through LMAC/PHY for field ISSIs `2260082` and `2260616`.
+- Low risk: SDS/WAP wording is currently safe because WAP is scoped as SDS Type 4 MVP, not full SNDCP/IP WAP.
+
+MAC/UMAC architecture findings:
+
+- Priority suspect is `LMAC` `NormalTrainSeq2` block semantics:
+  - `determine_logical_channel_ul` may classify `Block2` as `TchS`;
+  - `rx_blk_traffic` then drops non-`Both` traffic as partial/unsupported.
+- This can bypass the existing UMAC voice tests because those tests inject `TmdCircuitDataInd` after LMAC.
+- Do not forward a 216-bit half-block as clean 274-bit ACELP speech unless a correct ETSI/BFI-bearing path exists.
+- Existing bad-CRC behavior is correct for the current SAP: since TMD cannot carry BFI/half-slot condition, corrupt/partial speech must fail closed instead of becoming clean speech/static.
+
+Decision:
+
+- Next local patch, if no fresher live logs contradict it, should be a focused LMAC evidence patch:
+  - add a test proving `NormalTrainSeq2 + Block2` traffic is not silently treated as valid clean speech when only a half TCH/S block is available;
+  - improve LMAC logging/guarding so live logs distinguish:
+    - valid full TCH/S decoded and forwarded;
+    - CRC/BFI drop;
+    - partial `Block2` TCH/S drop due missing full speech frame support.
+- This is an observability/safety patch unless a full ETSI-supported BFI/TMD SAP path is added.
+
+ETSI clause scope for that patch:
+
+- EN 300 392-2 clause 23.5 / 23.5.4: traffic-channel STCH/TCH/FACCH placement and block handling.
+- EN 300 392-2 clause 23.8.3 / 23.8.3.2: bad/undecodable speech frame handling.
+- Any current inability to carry BFI is local implementation limitation and must be labelled as such.
+
+Focused local verification for the LMAC patch:
+
+- `cargo fmt -p tetra-entities`
+- `cargo test -p tetra-entities --test test_lmac_bs --locked`
+- `cargo test -p tetra-entities --lib facch_ --locked`
+- `cargo test -p tetra-entities --test test_umac_bs voice --locked`
+- `git diff --check`
+
+Live validation still required after any patch:
+
+- Test private simplex `2260082 -> 2260616`.
+- Test private simplex `2260616 -> 2260082`.
+- Test group PTT on `226333`.
+- Log filter:
+  - `2260082|2260616|2260618|226333|U-TX DEMAND|D-TX GRANTED|NotGranted|RequestQueued|GrantedToOtherUser|CallControl::Open|FloorGranted|FloorReleased|peer_ts|media_source|UMAC voice route|FACCH|STCH|TCH|NormalTrainSeq2|Block2|blk2_stolen|rx_blk_traffic|CRC fail|partial/unsupported|UL inactivity|T.210|energy`
+
+## 2026-06-04 11:33:05 EEST - LMAC partial TCH/S guard and evidence tests
+
+Patch scope:
+
+- Files changed:
+  - `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - `crates/tetra-entities/tests/test_lmac_bs.rs`
+  - `timeline.md`
+- Component: LMAC, the lower MAC burst-framing layer.
+- Simple meaning: LMAC decides whether a received radio burst is control signalling, full TCH/S speech, or a partial/stolen traffic block. It must not present incomplete or bad speech as clean voice.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.5 / 23.5.4: traffic channel, STCH/FACCH/TCH placement, and burst/block handling.
+- EN 300 392-2 clause 23.8.3 / 23.8.3.2: bad/undecodable speech frame handling.
+- Current implementation limitation: the local TMD SAP does not carry BFI/half-slot condition, so LMAC fails closed for partial/bad speech rather than forwarding static as valid ACELP.
+
+Behavior clarified:
+
+- Before: `rx_blk_traffic` had one generic trace-level drop for every non-`Both` or non-`TchS` traffic block.
+- After: LMAC explicitly distinguishes:
+  - unsupported traffic channel -> trace and drop;
+  - partial `TchS` block such as `NormalTrainSeq2 + Block2` -> debug log and drop because the TMD SAP cannot preserve BFI/half-slot condition;
+  - full-slot `TchS` with good CRC -> decode and forward to UMAC;
+  - full-slot `TchS` with bad speech CRC -> drop, as before.
+
+Tests added/strengthened:
+
+- Added `bs_lmac_forwards_valid_fullslot_tch_s_to_umac`.
+  - Proves a valid 432-bit full-slot TCH/S frame decodes and reaches UMAC as `TmdCircuitDataInd`.
+  - Also verifies the test vector round-trips through `encode_tp`/`decode_tp`.
+- Added `bs_lmac_drops_normal_seq2_block2_tch_s_without_forwarding_clean_speech`.
+  - Proves a `NormalTrainSeq2 + Block2` half TCH/S block is not forwarded as clean speech.
+  - This protects against turning 216-bit partial speech into static/audio corruption.
+- Strengthened `bs_lmac_drops_bad_crc_tch_s_instead_of_forwarding_static_speech`.
+  - The harness now marks all four UL timeslots as traffic before injecting the corrupt TCH/S frame, so the test really exercises the traffic CRC path.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 4 passed.
+- `cargo test -p tetra-entities --lib facch_ --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs voice --locked` -> 3 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Live log check during this checkpoint:
+
+- Remote test BS on `chris@192.168.1.179` is still running:
+  - wrapper/control pid `15798`;
+  - control-service pid `15801`;
+  - nexus-bs pid `15803`.
+- Log still does not contain a complete post-`2201923` live PTT trace with `U-TX DEMAND`, `D-TX GRANTED`, `UMAC voice route`, and `rx_blk_traffic`.
+- Several `rx_tpsap_prim got NormalTrainSeq2 in fullslot` entries exist after deploy. Without this LMAC patch, the log did not say whether those resulted in STCH control, partial TCH/S drop, or valid speech.
+
+Conclusion:
+
+- This patch does not claim live private/group audio is fixed.
+- It makes the LMAC boundary safe and observable:
+  - full valid TCH/S is proven to pass;
+  - partial/bad TCH/S is proven not to become clean speech/static.
+- Next step after commit/deploy is still a live private/group PTT test using the log filter from the previous checkpoint.

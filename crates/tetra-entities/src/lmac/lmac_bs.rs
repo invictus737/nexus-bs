@@ -188,10 +188,22 @@ impl LmacBs {
     }
 
     fn rx_blk_traffic(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel, ul_time: TdmaTime) {
-        // Only full-slot TCH/S supported for now
-        if lchan != LogicalChannel::TchS || blk.block_num != PhyBlockNum::Both {
+        if lchan != LogicalChannel::TchS {
             tracing::trace!(
-                "rx_blk_traffic: ignoring partial/unsupported lchan={:?} blk_num={:?}",
+                "rx_blk_traffic: ignoring unsupported traffic lchan={:?} blk_num={:?}",
+                lchan,
+                blk.block_num
+            );
+            return;
+        }
+        if blk.block_num != PhyBlockNum::Both {
+            // EN 300 392-2 clauses 23.8.3 and 23.8.3.2 permit bad or
+            // partially unavailable speech only when the bad-frame/half-slot
+            // condition is preserved. The current TMD SAP cannot carry that
+            // condition, so do not turn a 216-bit stolen/partial block into
+            // clean ACELP speech.
+            tracing::debug!(
+                "rx_blk_traffic: dropping partial TCH/S lchan={:?} blk_num={:?}; TMD SAP has no BFI/half-slot condition",
                 lchan,
                 blk.block_num
             );
