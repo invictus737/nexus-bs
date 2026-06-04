@@ -1172,7 +1172,12 @@ impl CcBsSubentity {
     }
 
     /// Send D-TX GRANTED via FACCH stealing on the group traffic channel.
-    pub(super) fn send_d_tx_granted_facch(&mut self, queue: &mut MessageQueue, call_id: u16, source_issi: u32, dest_gssi: u32, ts: u8) {
+    pub(super) fn send_d_tx_granted_facch(&mut self, queue: &mut MessageQueue, call_id: u16, _source_issi: u32, dest_gssi: u32, ts: u8) {
+        // EN 300 392-2 table 14.18 makes the transmitting-party address
+        // optional. For assigned-channel FACCH/STCH the compact form is
+        // required to fit the 124-bit STCH block; clause 14.5.2.2.1 is still
+        // satisfied because the granted MS receives an individual D-TX GRANTED
+        // first, and the group-addressed grant carries "granted to other user".
         let pdu = DTxGranted {
             call_identifier: call_id,
             transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
@@ -1180,8 +1185,8 @@ impl CcBsSubentity {
             encryption_control: false,
             reserved: false,
             notification_indicator: None,
-            transmitting_party_type_identifier: Some(1), // SSI
-            transmitting_party_address_ssi: Some(source_issi as u64),
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
             transmitting_party_extension: None,
             external_subscriber_number: None,
             facility: None,

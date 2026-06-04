@@ -1085,3 +1085,86 @@ Current live status:
   - group PTT on `226333`, alternating radios.
 - Required live log filter:
   - `2260082|2260616|2260618|226333|U-SETUP|D-SETUP|D-CONNECT|U-CONNECT|U-TX DEMAND|D-TX GRANTED|FloorGranted|CMCE opening UMAC circuit|media_source|peer_ts|UMAC voice route|rx_blk_traffic|dropping partial TCH/S|CRC fail|NormalTrainSeq2|Block2|PTT denied|NotGranted|UL inactivity|CalledPartyNotReachable`
+
+## 2026-06-04 11:53:57 EEST - Group floor handoff FACCH compacting patch
+
+User live report:
+
+- Group call still failed for alternating speakers; requirement is multiple MSs on one GSSI taking turns normally.
+- Treat this as BASIC TETRA SwMI behavior, not a certification claim.
+
+Live log evidence from `chris@192.168.1.179:/home/chris/nexus-bs-v0.1.55-test/nexus-bs.log`:
+
+- Group call `call_id=4`, GSSI `226333`, traffic slot `ts=2`.
+- `2260616` had floor first and UMAC routed voice repeatedly:
+  - `UMAC floor granted: call_id=4 source_issi=2260616 dest_gssi=226333 ul_ts=2 media_source=LocalLoopback`
+  - repeated `UMAC voice route: UL ts=2 bits=274 -> DL ts=2`.
+- After `U-TX CEASED`, `2260082` requested floor:
+  - `U-TX DEMAND: ISSI 2260082 requests floor on call_id=4`
+  - CMCE emitted `D-TX GRANTED`.
+- Defect observed:
+  - `D-TX GRANTED` with optional transmitting-party address serialized as a 61-bit CMCE SDU.
+  - With the MAC-RESOURCE header it exceeded STCH capacity: `MAC-RESOURCE hdr 70 + SDU 61 bits > 124`.
+  - UMAC therefore fell back to MCCH/SCH-F while the terminals were on the assigned traffic channel.
+  - The preserved `RandomAccessAck` for `2260082` on `ts=2` was discarded by `dl_drop_all_except_stolen`.
+  - No `UMAC voice route` followed for `2260082`; `UL inactivity timeout on ts=2` fired.
+
+Component explanation:
+
+- CMCE group floor control decides who may transmit next in the group.
+- `D-TX GRANTED` is the CMCE message that gives one MS the microphone and tells the group that another user is transmitting.
+- FACCH/STCH is the assigned traffic-channel signalling path. If the floor grant falls back to common-channel SCH/F while radios are listening on the assigned channel, the new speaker may never switch to transmit voice.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: during a group call, SwMI sends individual `D-TX GRANTED` to the granted MS and group-addressed `D-TX GRANTED` to the other MSs.
+- EN 300 392-2 table 14.18: transmitting-party type/address IEs in `D-TX GRANTED` are optional/conditional.
+- EN 300 392-2 clause 23.5 and 23.5 traffic-mode STCH/FACCH text: signalling may be stolen from the traffic channel for call-control messages during an over.
+- Engineering decision: omit optional transmitting-party IEs in assigned-channel `D-TX GRANTED` so the mandatory floor state fits STCH/FACCH. This is clause-scoped ETSI-aligned behavior, not a full-stack certification claim.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - `fsm_send_d_tx_granted_individual` now emits compact `D-TX GRANTED` without optional transmitting-party IEs.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - `send_d_tx_granted_facch` now emits compact group-addressed `D-TX GRANTED`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `assert_compact_d_tx_granted_facch`.
+  - Updated group floor queue, default-off preemption, enabled preemption grant, unaffiliated rejection, and queued handoff tests to require compact 25-bit `D-TX GRANTED`.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs group_tx_demand --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_tx_ceased_hands_floor_to_queued_requester --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_preemptive --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo test -p tetra-entities --test test_umac_bs facch --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_private_floor_grant_stch_carries_preserved_random_access_ack --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 42 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Current conclusion:
+
+- The logged group-call failure is explained by an oversized `D-TX GRANTED` floor handoff that could not be transmitted on assigned-channel STCH/FACCH.
+- The patch removes that cause and keeps preemption default-off.
+- Live group audio is not yet proven fixed until this build is deployed and `2260616`/`2260082` alternate PTT on GSSI `226333` without `UL inactivity timeout`, `PTT denied`, or SCH/F fallback for `D-TX GRANTED`.
+
+Next non-repeating execution:
+
+1. Commit this narrow CMCE group FACCH compacting patch.
+2. Build locally only with the Nexus-BS AArch64 command from build memory.
+3. Deploy direct over `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; no binary backup.
+4. Restart BS test.
+5. Live test:
+   - group PTT `2260616 -> 226333`, release;
+   - group PTT `2260082 -> 226333`, release;
+   - repeat at least three alternating turns.
+6. Required pass evidence:
+   - compact `D-TX GRANTED` does not log `does not fit STCH`;
+   - no `dl_drop_all_except_stolen` discards the requester ACK needed for floor grant;
+   - `UMAC floor granted` changes source ISSI on each turn;
+   - `UMAC voice route` appears for each speaker;
+   - no `UL inactivity timeout` during an active speaker over;
+   - operator audio verdict confirms voice, not static.

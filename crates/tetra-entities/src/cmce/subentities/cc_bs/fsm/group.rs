@@ -54,8 +54,13 @@ impl CcBsSubentity {
         target_addr: TetraAddress,
         ts: u8,
         transmission_grant: TransmissionGrant,
-        transmitting_party_issi: Option<u32>,
+        _transmitting_party_issi: Option<u32>,
     ) {
+        // EN 300 392-2 table 14.18 makes transmitting-party IEs optional.
+        // Keep group floor responses compact so D-TX GRANTED fits on
+        // assigned-channel FACCH/STCH rather than falling back to SCH/F while
+        // the MS is already on the traffic channel. Clause 14.5.2.2.1 floor
+        // state remains encoded by the mandatory transmission-grant IE.
         let d_tx_granted = DTxGranted {
             call_identifier: call_id,
             transmission_grant: transmission_grant.into_raw() as u8,
@@ -63,8 +68,8 @@ impl CcBsSubentity {
             encryption_control: false,
             reserved: false,
             notification_indicator: None,
-            transmitting_party_type_identifier: transmitting_party_issi.map(|_| 1), // SSI
-            transmitting_party_address_ssi: transmitting_party_issi.map(|ssi| ssi as u64),
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
             transmitting_party_extension: None,
             external_subscriber_number: None,
             facility: None,

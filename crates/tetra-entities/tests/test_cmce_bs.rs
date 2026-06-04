@@ -860,6 +860,16 @@ fn parse_d_tx_granted(prim: &LcmcMleUnitdataReq) -> Option<DTxGranted> {
     DTxGranted::from_bitbuf(&mut sdu).ok()
 }
 
+fn assert_compact_d_tx_granted_facch(prim: &LcmcMleUnitdataReq, grant: &DTxGranted) {
+    assert_eq!(grant.transmitting_party_type_identifier, None);
+    assert_eq!(grant.transmitting_party_address_ssi, None);
+    assert_eq!(
+        prim.sdu.get_len(),
+        25,
+        "D-TX GRANTED must omit optional transmitting-party IEs so it fits assigned-channel FACCH/STCH"
+    );
+}
+
 fn parse_d_tx_interrupt(prim: &LcmcMleUnitdataReq) -> Option<DTxInterrupt> {
     if !is_dl_pdu(prim, CmcePduTypeDl::DTxInterrupt) {
         return None;
@@ -2152,7 +2162,7 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
     assert_eq!(grant.1.main_address.ssi_type, SsiType::Gssi);
     assert_eq!(grant.2.call_identifier, call_id);
     assert_eq!(grant.2.transmission_grant, TransmissionGrant::GrantedToOtherUser.into_raw() as u8);
-    assert_eq!(grant.2.transmitting_party_address_ssi, Some(TEST_CALLED_ISSI as u64));
+    assert_compact_d_tx_granted_facch(grant.1, &grant.2);
     assert!(grant.1.stealing_permission);
     assert_eq!(
         grant
@@ -3222,9 +3232,10 @@ fn test_group_tx_demand_from_non_speaker_is_queued_without_floor_handoff() {
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
     let call_id = start_group_call(&mut test);
 
-    // EN 300 392-2 clause 14 D-TX GRANTED can inform a requesting MS that
-    // its floor request is queued while the current group speaker remains
-    // active; this must not prematurely hand over the traffic circuit.
+    // EN 300 392-2 clause 14.5.2.2.1 lets D-TX GRANTED inform a
+    // requesting MS that its floor request is queued while the current group
+    // speaker remains active. Table 14.18 makes transmitting-party IEs
+    // optional; keeping the PDU compact lets it fit assigned-channel FACCH.
     test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let demand_msgs = test.dump_sinks();
@@ -3241,8 +3252,7 @@ fn test_group_tx_demand_from_non_speaker_is_queued_without_floor_handoff() {
     assert_eq!(grant.call_identifier, call_id);
     assert_eq!(grant.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
     assert!(!grant.transmission_request_permission);
-    assert_eq!(grant.transmitting_party_type_identifier, Some(1));
-    assert_eq!(grant.transmitting_party_address_ssi, Some(TEST_ISSI as u64));
+    assert_compact_d_tx_granted_facch(grant_prim, grant);
     assert_eq!(grant_prim.main_address.ssi, TEST_CALLED_ISSI);
     assert_eq!(grant_prim.main_address.ssi_type, SsiType::Issi);
     assert!(grant_prim.stealing_permission);
@@ -3290,11 +3300,7 @@ fn test_group_preemptive_u_tx_demand_default_off_queues_without_interrupt() {
             TransmissionGrant::RequestQueued.into_raw() as u8,
             "priority {tx_demand_priority}"
         );
-        assert_eq!(
-            grants[0].1.transmitting_party_address_ssi,
-            Some(TEST_ISSI as u64),
-            "priority {tx_demand_priority}"
-        );
+        assert_compact_d_tx_granted_facch(grants[0].0, &grants[0].1);
     }
 }
 
@@ -3374,8 +3380,10 @@ fn test_group_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_g
             prim.main_address.ssi == TEST_GSSI
                 && prim.main_address.ssi_type == SsiType::Gssi
                 && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
-                && grant.transmitting_party_address_ssi == Some(TEST_CALLED_ISSI as u64)
         }));
+        for (_, prim, grant) in &grants {
+            assert_compact_d_tx_granted_facch(prim, grant);
+        }
 
         assert_eq!(count_umac_floor_granted(&demand_msgs), 1, "priority {tx_demand_priority}");
         assert!(demand_msgs.iter().any(|msg| {
@@ -3426,7 +3434,7 @@ fn test_group_tx_demand_from_unaffiliated_issi_is_not_queued_or_granted() {
     assert_eq!(grant_prim.main_address.ssi, TEST_CALLED_ISSI);
     assert_eq!(grant_prim.main_address.ssi_type, SsiType::Issi);
     assert_eq!(grant.transmission_grant, TransmissionGrant::NotGranted.into_raw() as u8);
-    assert_eq!(grant.transmitting_party_address_ssi, Some(TEST_ISSI as u64));
+    assert_compact_d_tx_granted_facch(grant_prim, grant);
     assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
@@ -3481,8 +3489,7 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         .expect("expected individual D-TX-GRANTED to queued requester");
     assert_eq!(requester_grant.1.call_identifier, call_id);
     assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
-    assert_eq!(requester_grant.1.transmitting_party_type_identifier, Some(1));
-    assert_eq!(requester_grant.1.transmitting_party_address_ssi, Some(TEST_CALLED_ISSI as u64));
+    assert_compact_d_tx_granted_facch(requester_grant.0, &requester_grant.1);
 
     let group_grant = grants
         .iter()
@@ -3493,7 +3500,7 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         group_grant.1.transmission_grant,
         TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     );
-    assert_eq!(group_grant.1.transmitting_party_address_ssi, Some(TEST_CALLED_ISSI as u64));
+    assert_compact_d_tx_granted_facch(group_grant.0, &group_grant.1);
     let group_alloc = group_grant
         .0
         .chan_alloc
