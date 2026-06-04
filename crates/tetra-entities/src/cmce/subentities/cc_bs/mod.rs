@@ -88,6 +88,7 @@ struct PendingIndividualRelease {
 
 struct PendingIndividualDisconnectDelivery {
     awaiting_release_from: u32,
+    release_to_issi: u32,
     cause: DisconnectCause,
     reporter: TxReporter,
     started_at: TdmaTime,

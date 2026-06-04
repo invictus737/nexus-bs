@@ -1,9 +1,13 @@
 use super::*;
 use crate::net_telemetry::TelemetryEvent;
 
+const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
+
 // Local cleanup guard: EN 300 392-2 14.7.1.6 expects U-RELEASE after
 // D-DISCONNECT, but the BS must eventually free a circuit if the peer vanishes.
-const INDIVIDUAL_DISCONNECT_PENDING_TIMEOUT_TIMESLOTS: i32 = 16;
+// Use a multi-second guard so real MSs have time to process the assigned-channel
+// disconnect and return U-RELEASE before SwMI falls back to D-RELEASE.
+const INDIVIDUAL_DISCONNECT_PENDING_TIMEOUT_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
 
 impl CcBsSubentity {
     pub fn tick_start_with_events(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) -> Vec<TelemetryEvent> {
@@ -154,7 +158,7 @@ impl CcBsSubentity {
                             // pending release and notify UMAC only after
                             // FACCH/STCH D-RELEASE is reported or the local
                             // guard expires.
-                            self.begin_individual_release(queue, call_id, DisconnectCause::ExpiryOfTimer, vec![circuit], true);
+                            self.begin_individual_release(queue, call_id, DisconnectCause::ExpiryOfTimer, vec![circuit], true, None);
                             continue;
                         }
 

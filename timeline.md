@@ -2323,3 +2323,58 @@ Next non-repeating execution:
 1. Commit this timeout handoff patch.
 2. Deploy direct to test BS with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
 3. Retest alternating group PTT on `226333`; expected behavior is first queued PTT becomes speaker after timeout/cease without a second press.
+
+## 2026-06-04 21:21:02 EEST - Private-call shutdown hardening for Motorola restart symptom
+
+Problem targeted:
+
+- Field report: private call voice now works, but when the opposite party closes the private call, a Motorola terminal restarts and re-attaches.
+- Live log evidence showed `U-DISCONNECT` for private `call_id=4`, then `D-DISCONNECT` to the peer, followed by a very short local fallback to `D-RELEASE` and circuit close while FACCH/STCH repeats were still in flight.
+- CMCE auditor also found a spec-order risk: after peer receives `D-DISCONNECT`, EN 300 392-2 expects peer `U-RELEASE` and local call clearing, so sending final `D-RELEASE` again to that same peer can double-clear the call context.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: an MS initiating disconnection sends `U-DISCONNECT` and waits for `D-RELEASE`.
+- EN 300 392-2 clauses 14.5.1.3.2/14.5.1.3.3 and 14.7.1.6/14.7.1.9: BS uses `D-DISCONNECT` to request peer release, peer responds with `U-RELEASE`, and `D-RELEASE` informs that the connection has been released.
+- EN 300 392-2 clause 14.5.1.2.1: simplex private floor control must not race call clearing with new `D-TX GRANTED` / `D-TX CEASED` signalling.
+- This is clause-scoped hardening only; no formal certification claim.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - `DisconnectPending` now tracks both `awaiting_release_from` and `release_to_issi`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Active-call `D-DISCONNECT` now uses assigned-channel `UlDlAssignment::Dl`.
+  - Local delivery guards for private `D-DISCONNECT` and `D-RELEASE` increased from 16 timeslots to 2 seconds, so FACCH/STCH repeats are not cut short.
+  - Added targeted final release: after peer `U-RELEASE`, final `D-RELEASE` is sent only to the original `U-DISCONNECT` initiator, not to the peer that already cleared after `D-DISCONNECT`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Peer `U-RELEASE` response guard increased from 16 timeslots to 5 seconds before fallback `D-RELEASE`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Suppresses private `U-TX DEMAND` / `U-TX CEASED` while `D-DISCONNECT` delivery is pending.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated caller/called private disconnect assertions for one-leg final `D-RELEASE`.
+  - Added `test_p2p_pending_disconnect_delivery_suppresses_floor_pdus`.
+  - Hardened fallback timeout tests to prove no early close before the longer delivery guards.
+
+Verification:
+
+- `rustfmt --edition 2024` on touched CMCE/test files -> pass.
+- `git diff --check` on touched files -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_pending_disconnect_delivery_suppresses_floor_pdus --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_u_disconnect_delivery_guard_falls_back_to_release_without_peer_wait --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_pending_disconnect_closes_after_bounded_timeout --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_active_p2p_discarded_release_reporters_do_not_close_before_guard_timeout --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 122 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+
+Next non-repeating execution:
+
+1. Commit this private-call shutdown patch.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest private simplex call between `2260082` and `2260616`/`2260618`:
+   - voice in both directions,
+   - close from caller,
+   - close from called party,
+   - no Motorola restart/re-attach after remote hangup.
+4. If restart persists, capture the 20 seconds around hangup and inspect `D-DISCONNECT`, peer `U-RELEASE`, final `D-RELEASE`, and circuit close order.

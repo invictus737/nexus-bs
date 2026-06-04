@@ -59,6 +59,10 @@ const TEST_OTHER_ISSI: u32 = 1000003;
 const LAB_GROUP_GSSI: u32 = 226333;
 const LAB_ISSI_A: u32 = 2260616;
 const LAB_ISSI_B: u32 = 2260082;
+const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
+const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
+const PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
+const PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS: i32 = 16;
 
 fn type3_marker() -> Type3FieldGeneric {
     Type3FieldGeneric {
@@ -1115,6 +1119,10 @@ fn count_d_disconnects(msgs: &[SapMsg]) -> usize {
 }
 
 fn assert_established_p2p_release_pdus(msgs: &[SapMsg], call_id: u16, disconnect_cause: DisconnectCause) {
+    assert_established_p2p_release_pdus_to(msgs, call_id, disconnect_cause, &[TEST_ISSI, TEST_CALLED_ISSI]);
+}
+
+fn assert_established_p2p_release_pdus_to(msgs: &[SapMsg], call_id: u16, disconnect_cause: DisconnectCause, expected_ssis: &[u32]) {
     let releases: Vec<_> = msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
@@ -1125,8 +1133,8 @@ fn assert_established_p2p_release_pdus(msgs: &[SapMsg], call_id: u16, disconnect
 
     assert_eq!(
         releases.len(),
-        4,
-        "Established P2P release should send FACCH/STCH D-RELEASE plus MCCH fallback to both MSs"
+        expected_ssis.len() * 2,
+        "Established P2P release should send FACCH/STCH D-RELEASE plus MCCH fallback to the expected MS leg(s)"
     );
 
     let mut facch_ssis = Vec::new();
@@ -1156,8 +1164,10 @@ fn assert_established_p2p_release_pdus(msgs: &[SapMsg], call_id: u16, disconnect
 
     facch_ssis.sort_unstable();
     mcch_ssis.sort_unstable();
-    assert_eq!(facch_ssis, vec![TEST_ISSI, TEST_CALLED_ISSI]);
-    assert_eq!(mcch_ssis, vec![TEST_ISSI, TEST_CALLED_ISSI]);
+    let mut expected = expected_ssis.to_vec();
+    expected.sort_unstable();
+    assert_eq!(facch_ssis, expected);
+    assert_eq!(mcch_ssis, expected);
 }
 
 fn assert_p2p_setup_rejected_with_dummy_call_id(msgs: &[SapMsg], calling_issi: u32) {
@@ -5355,9 +5365,9 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
     test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let mut release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let release_reporters = extract_d_release_reporters(&mut release_msgs);
-    assert_eq!(release_reporters.len(), 2);
+    assert_eq!(release_reporters.len(), 1);
     assert_eq!(
         count_umac_call_ended_or_close(&release_msgs),
         0,
@@ -6182,7 +6192,11 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     assert_eq!(disconnect_prim.main_address.ssi, TEST_CALLED_ISSI);
     assert_eq!(disconnect_prim.main_address.ssi_type, SsiType::Issi);
     assert!(disconnect_prim.stealing_permission);
-    assert!(disconnect_prim.chan_alloc.is_some());
+    let chan_alloc = disconnect_prim
+        .chan_alloc
+        .as_ref()
+        .expect("D-DISCONNECT must carry FACCH channel allocation");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
     assert_eq!(count_d_releases(&disconnect_msgs), 0, "D-RELEASE must wait for peer U-RELEASE");
     assert_eq!(
         count_umac_call_ended_or_close(&disconnect_msgs),
@@ -6202,9 +6216,13 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let mut release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let release_reporters = extract_d_release_reporters(&mut release_msgs);
-    assert_eq!(release_reporters.len(), 2, "assigned-channel D-RELEASEs should be reporter-tracked");
+    assert_eq!(
+        release_reporters.len(),
+        1,
+        "final D-RELEASE should be reporter-tracked only for the U-DISCONNECT initiator"
+    );
     assert_eq!(
         count_umac_call_ended_or_close(&release_msgs),
         0,
@@ -8157,7 +8175,11 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     assert_eq!(disconnect_prim.main_address.ssi, TEST_CALLED_ISSI);
     assert_eq!(disconnect_prim.main_address.ssi_type, SsiType::Issi);
     assert!(disconnect_prim.stealing_permission);
-    assert!(disconnect_prim.chan_alloc.is_some());
+    let chan_alloc = disconnect_prim
+        .chan_alloc
+        .as_ref()
+        .expect("D-DISCONNECT must carry FACCH channel allocation");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
     assert_eq!(disconnect_prim.layer2service, Layer2Service::Unacknowledged);
     assert_eq!(
         count_d_releases(&disconnect_msgs),
@@ -8197,9 +8219,13 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let mut release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let reporters = extract_d_release_reporters(&mut release_msgs);
-    assert_eq!(reporters.len(), 2, "Only assigned-channel D-RELEASEs should carry TxReporters");
+    assert_eq!(
+        reporters.len(),
+        1,
+        "Only the U-DISCONNECT initiator should receive final assigned-channel D-RELEASE"
+    );
     for reporter in &reporters {
         assert_eq!(reporter.get_state(), TxState::Pending);
     }
@@ -8265,7 +8291,11 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
     assert_eq!(disconnect_prim.main_address.ssi, TEST_ISSI);
     assert_eq!(disconnect_prim.main_address.ssi_type, SsiType::Issi);
     assert!(disconnect_prim.stealing_permission);
-    assert!(disconnect_prim.chan_alloc.is_some());
+    let chan_alloc = disconnect_prim
+        .chan_alloc
+        .as_ref()
+        .expect("D-DISCONNECT must carry FACCH channel allocation");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
     assert_eq!(disconnect_prim.layer2service, Layer2Service::Unacknowledged);
     assert_eq!(count_d_releases(&disconnect_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&disconnect_msgs), 0);
@@ -8286,9 +8316,18 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
     test.submit_message(build_u_release_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let mut release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
+    assert_established_p2p_release_pdus_to(
+        &release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_CALLED_ISSI],
+    );
     let reporters = extract_d_release_reporters(&mut release_msgs);
-    assert_eq!(reporters.len(), 2, "Only assigned-channel D-RELEASEs should carry TxReporters");
+    assert_eq!(
+        reporters.len(),
+        1,
+        "Only the called U-DISCONNECT initiator should receive final assigned-channel D-RELEASE"
+    );
     assert_eq!(
         count_umac_call_ended_or_close(&release_msgs),
         0,
@@ -8335,9 +8374,9 @@ fn test_p2p_pending_release_ignores_duplicate_u_disconnect_and_tx_demand() {
     test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let mut release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
     let release_reporters = extract_d_release_reporters(&mut release_msgs);
-    assert_eq!(release_reporters.len(), 2);
+    assert_eq!(release_reporters.len(), 1);
     assert_eq!(count_umac_call_ended_or_close(&release_msgs), 0);
 
     // EN 300 392-2 clause 14.5.1.3.2 releases an established individual call
@@ -8411,6 +8450,54 @@ fn test_p2p_disconnect_pending_suppresses_d_setup_resend() {
 }
 
 #[test]
+fn test_p2p_pending_disconnect_delivery_suppresses_floor_pdus() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let call_id = start_active_p2p_call(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut disconnect_msgs = test.dump_sinks();
+    let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
+    assert_eq!(
+        disconnect_reporters.len(),
+        1,
+        "Assigned-channel D-DISCONNECT must carry one TxReporter"
+    );
+    assert_eq!(disconnect_reporters[0].get_state(), TxState::Pending);
+
+    // EN 300 392-2 clauses 14.5.1.3.1/14.5.1.3.3 move the call into
+    // disconnect clearance. Until D-DISCONNECT delivery is resolved, floor
+    // control must not race the shutdown with D-TX GRANTED/D-TX CEASED.
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_granted(&demand_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+    assert_eq!(count_d_disconnects(&demand_msgs), 0);
+    assert_eq!(count_d_releases(&demand_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let ceased_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_msgs), 0);
+    assert_eq!(count_d_disconnects(&ceased_msgs), 0);
+    assert_eq!(count_d_releases(&ceased_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&ceased_msgs), 0);
+}
+
+#[test]
 fn test_p2p_u_disconnect_delivery_guard_falls_back_to_release_without_peer_wait() {
     debug::setup_logging_verbose();
 
@@ -8440,7 +8527,22 @@ fn test_p2p_u_disconnect_delivery_guard_falls_back_to_release_without_peer_wait(
     );
     assert_eq!(disconnect_reporters[0].get_state(), TxState::Pending);
 
-    test.run_stack(Some(17));
+    test.run_stack(Some(20));
+    let early_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&early_msgs),
+        0,
+        "D-DISCONNECT delivery guard must not fall back while FACCH repeats are still in flight"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&early_msgs),
+        0,
+        "D-DISCONNECT delivery guard must keep the P2P circuit open"
+    );
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
     let mut guard_msgs = test.dump_sinks();
     assert_established_p2p_release_pdus(&guard_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
     let release_reporters = extract_d_release_reporters(&mut guard_msgs);
@@ -8605,6 +8707,16 @@ fn test_active_p2p_discarded_release_reporters_do_not_close_before_guard_timeout
 
     test.run_stack(Some(20));
     let closed_msgs = test.dump_sinks();
+    assert_eq!(
+        count_umac_call_ended_or_close(&closed_msgs),
+        0,
+        "Discarded private D-RELEASE reporters must not close before the two-second delivery guard"
+    );
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
         "Local guard timeout should eventually close a discarded private release"
@@ -8703,7 +8815,22 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
         "D-DISCONNECT delivery report starts peer U-RELEASE wait without closing the circuit"
     );
 
-    test.run_stack(Some(20));
+    test.run_stack(Some(80));
+    let early_wait_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&early_wait_msgs),
+        0,
+        "Pending peer U-RELEASE guard must not release the call before the multi-second response window"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&early_wait_msgs),
+        0,
+        "Pending peer U-RELEASE guard must keep the assigned circuit open"
+    );
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
     let release_msgs = test.dump_sinks();
     assert_established_p2p_release_pdus(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection);
     assert_eq!(
@@ -8713,6 +8840,17 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
     );
 
     test.run_stack(Some(20));
+    let early_release_msgs = test.dump_sinks();
+    assert_eq!(
+        count_umac_call_ended_or_close(&early_release_msgs),
+        0,
+        "Fallback D-RELEASE must also wait for the two-second delivery guard before closing"
+    );
+
+    test.router.set_dl_time(dltime.add_timeslots(
+        PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS + PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS,
+    ));
+    test.run_stack(Some(1));
     let closed_msgs = test.dump_sinks();
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,

@@ -1,12 +1,18 @@
 use super::*;
 
+const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
+
 // Local bounded cleanup guard; ETSI EN 300 392-2 clauses 14.5.2.3.2/14.5.2.3.3
 // define group-call release with D-RELEASE, while clauses 23.5.2.2.7/23.7.6
 // require downlink signalling to account for energy-economy receive windows.
 // EG7 sleeps for 359 frames, so one full receive cycle is 360 TDMA frames.
 const GROUP_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 360 * 4;
-const INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 16;
-const INDIVIDUAL_DISCONNECT_DELIVERY_TIMEOUT_TIMESLOTS: i32 = 16;
+// EN 300 392-2 clauses 14.5.1.3.2/14.5.1.3.3 require D-RELEASE/D-DISCONNECT
+// before the MS clears an established individual call. Keep assigned-channel
+// FACCH/STCH alive long enough for all repeated BL-UDATA fragments to finish;
+// this is a local safety guard, not a replacement for the peer U-RELEASE path.
+const INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
+const INDIVIDUAL_DISCONNECT_DELIVERY_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 
 // EN 300 392-2 table 14.33 uses pointer 0 for an unsupported whole PDU.
 // Non-zero pointers below are bit offsets into the received-PDU extract, which
@@ -862,7 +868,7 @@ impl CcBsSubentity {
             };
             let reporter = TxReporter::new_unacked();
             delivery_reporter = Some(reporter.clone());
-            Self::build_sapmsg_stealing_ul_dl_reported(sdu, target_addr, target_ts, usage, UlDlAssignment::Both, Some(reporter))
+            Self::build_sapmsg_stealing_ul_dl_reported(sdu, target_addr, target_ts, usage, UlDlAssignment::Dl, Some(reporter))
         } else if target_addr.ssi == call_snapshot.calling_addr.ssi {
             Self::build_sapmsg_direct(
                 sdu,
@@ -888,6 +894,7 @@ impl CcBsSubentity {
         &mut self,
         call_id: u16,
         awaiting_release_from: u32,
+        release_to_issi: u32,
         reporter: TxReporter,
         disconnect_cause: DisconnectCause,
     ) {
@@ -899,6 +906,7 @@ impl CcBsSubentity {
             call_id,
             PendingIndividualDisconnectDelivery {
                 awaiting_release_from,
+                release_to_issi,
                 cause: disconnect_cause,
                 reporter,
                 started_at: self.dltime,
@@ -906,11 +914,11 @@ impl CcBsSubentity {
         );
     }
 
-    pub(super) fn take_individual_disconnect_delivery_cause_if_awaited_by(
+    pub(super) fn take_individual_disconnect_delivery_release_if_awaited_by(
         &mut self,
         call_id: u16,
         sender_issi: u32,
-    ) -> Option<DisconnectCause> {
+    ) -> Option<(DisconnectCause, u32)> {
         if self
             .pending_individual_disconnect_deliveries
             .get(&call_id)
@@ -919,7 +927,7 @@ impl CcBsSubentity {
             return self
                 .pending_individual_disconnect_deliveries
                 .remove(&call_id)
-                .map(|pending| pending.cause);
+                .map(|pending| (pending.cause, pending.release_to_issi));
         }
         None
     }
@@ -957,7 +965,7 @@ impl CcBsSubentity {
                 if let Some(call) = self.individual_calls.get_mut(&call_id)
                     && call.is_active()
                 {
-                    call.begin_disconnect_pending(pending.awaiting_release_from, self.dltime, pending.cause);
+                    call.begin_disconnect_pending(pending.awaiting_release_from, pending.release_to_issi, self.dltime, pending.cause);
                 }
             } else if pending.reporter.is_discarded() {
                 tracing::warn!(
@@ -1514,10 +1522,14 @@ impl CcBsSubentity {
         call_id: u16,
         call: &IndividualCall,
         disconnect_cause: DisconnectCause,
+        release_to_issi: Option<u32>,
     ) -> Vec<TxReporter> {
         let mut reporters = Vec::new();
 
-        if !call.calling_over_brew {
+        let send_calling_leg = !call.calling_over_brew && release_to_issi.map_or(true, |issi| issi == call.calling_addr.ssi);
+        let send_called_leg = !call.called_over_brew && release_to_issi.map_or(true, |issi| issi == call.called_addr.ssi);
+
+        if send_calling_leg {
             let reporter = TxReporter::new_unacked();
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
                 self.build_individual_release_sdu(call_id, disconnect_cause),
@@ -1540,7 +1552,7 @@ impl CcBsSubentity {
             queue.push_back(mcch);
         }
 
-        if !call.called_over_brew {
+        if send_called_leg {
             let reporter = TxReporter::new_unacked();
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
                 self.build_individual_release_sdu(call_id, disconnect_cause),
@@ -1662,7 +1674,7 @@ impl CcBsSubentity {
     /// Release an individual call: send D-RELEASE to both parties, close circuits, clean up state.
     /// Handles active assigned-channel delivery with a reporter drain and setup-phase MCCH delivery.
     pub(super) fn release_individual_call(&mut self, queue: &mut MessageQueue, call_id: u16, disconnect_cause: DisconnectCause) {
-        self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true);
+        self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true, None);
     }
 
     pub(super) fn release_individual_call_without_brew_echo(
@@ -1671,7 +1683,17 @@ impl CcBsSubentity {
         call_id: u16,
         disconnect_cause: DisconnectCause,
     ) {
-        self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), false);
+        self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), false, None);
+    }
+
+    pub(super) fn release_individual_call_to_issi(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+        release_to_issi: u32,
+    ) {
+        self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true, Some(release_to_issi));
     }
 
     pub(super) fn begin_individual_release(
@@ -1681,6 +1703,7 @@ impl CcBsSubentity {
         disconnect_cause: DisconnectCause,
         preclosed_circuits: Vec<CmceCircuit>,
         notify_brew: bool,
+        release_to_issi: Option<u32>,
     ) {
         if self.pending_individual_releases.contains_key(&call_id) {
             tracing::debug!("CMCE: individual release already pending for call_id={}", call_id);
@@ -1693,8 +1716,9 @@ impl CcBsSubentity {
             return;
         };
 
-        let send_calling_leg = !call_snapshot.calling_over_brew;
-        let send_called_leg = !call_snapshot.called_over_brew;
+        let send_calling_leg =
+            !call_snapshot.calling_over_brew && release_to_issi.map_or(true, |issi| issi == call_snapshot.calling_addr.ssi);
+        let send_called_leg = !call_snapshot.called_over_brew && release_to_issi.map_or(true, |issi| issi == call_snapshot.called_addr.ssi);
 
         const SETUP_RELEASE_REPEATS: usize = 3;
 
@@ -1704,7 +1728,8 @@ impl CcBsSubentity {
             // CC signalling on the assigned channel, so keep the circuit open
             // until FACCH/STCH D-RELEASE transmission is reported or a local
             // guard timeout expires.
-            let reporters = self.send_established_individual_release_pdus(queue, call_id, &call_snapshot, disconnect_cause);
+            let reporters =
+                self.send_established_individual_release_pdus(queue, call_id, &call_snapshot, disconnect_cause, release_to_issi);
             self.pending_individual_releases.insert(
                 call_id,
                 PendingIndividualRelease {

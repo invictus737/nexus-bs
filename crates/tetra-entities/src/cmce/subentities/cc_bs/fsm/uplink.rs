@@ -156,6 +156,13 @@ impl CcBsSubentity {
             // send D-TX-GRANTED only when an earlier U-TX DEMAND is queued.
             // EN 300 392-2 clause 14.5.1.2.1 forbids unsolicited grants but
             // allows D-TX CEASED to each MS at end of transmission.
+            if self.has_pending_individual_disconnect_delivery(call_id) {
+                tracing::debug!(
+                    "U-TX CEASED ignored while individual D-DISCONNECT delivery is pending call_id={}",
+                    call_id
+                );
+                return;
+            }
             if !call.is_active() {
                 tracing::debug!("U-TX CEASED for inactive individual call_id={}, ignoring", call_id);
                 return;
@@ -396,6 +403,13 @@ impl CcBsSubentity {
 
         if let Some(call) = self.individual_calls.get(&call_id).cloned() {
             // For simplex PTT individual calls: MS requests PTT floor.
+            if self.has_pending_individual_disconnect_delivery(call_id) {
+                tracing::debug!(
+                    "U-TX DEMAND ignored while individual D-DISCONNECT delivery is pending call_id={}",
+                    call_id
+                );
+                return;
+            }
             if !call.is_active() {
                 tracing::debug!("U-TX DEMAND for inactive individual call_id={}, ignoring", call_id);
                 return;
@@ -717,23 +731,25 @@ impl CcBsSubentity {
         tracing::info!("U-RELEASE: call_id={} cause={}", call_id, disconnect_cause);
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
             tracing::info!("U-RELEASE (individual) call_id={} cause={}", call_id, disconnect_cause);
-            if let Some(pending_cause) = self.take_individual_disconnect_delivery_cause_if_awaited_by(call_id, sender.ssi) {
+            if let Some((pending_cause, release_to_issi)) =
+                self.take_individual_disconnect_delivery_release_if_awaited_by(call_id, sender.ssi)
+            {
                 tracing::info!(
                     "U-RELEASE completes pending individual D-DISCONNECT delivery call_id={} from ISSI {}",
                     call_id,
                     sender.ssi
                 );
-                self.release_individual_call(queue, call_id, pending_cause);
+                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
                 return;
             }
 
-            if let Some(pending_cause) = call_snapshot.pending_disconnect_cause_if_awaited_by(sender.ssi) {
+            if let Some((pending_cause, release_to_issi)) = call_snapshot.pending_disconnect_release_if_awaited_by(sender.ssi) {
                 tracing::info!(
                     "U-RELEASE completes pending individual disconnect call_id={} from ISSI {}",
                     call_id,
                     sender.ssi
                 );
-                self.release_individual_call(queue, call_id, pending_cause);
+                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
                 return;
             }
 
@@ -808,23 +824,25 @@ impl CcBsSubentity {
 
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
             tracing::info!("U-DISCONNECT (individual) call_id={} cause={}", call_id, disconnect_cause);
-            if let Some(pending_cause) = self.take_individual_disconnect_delivery_cause_if_awaited_by(call_id, sender.ssi) {
+            if let Some((pending_cause, release_to_issi)) =
+                self.take_individual_disconnect_delivery_release_if_awaited_by(call_id, sender.ssi)
+            {
                 tracing::info!(
                     "U-DISCONNECT completes pending individual D-DISCONNECT delivery call_id={} from ISSI {}",
                     call_id,
                     sender.ssi
                 );
-                self.release_individual_call(queue, call_id, pending_cause);
+                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
                 return;
             }
 
-            if let Some(pending_cause) = call_snapshot.pending_disconnect_cause_if_awaited_by(sender.ssi) {
+            if let Some((pending_cause, release_to_issi)) = call_snapshot.pending_disconnect_release_if_awaited_by(sender.ssi) {
                 tracing::info!(
                     "U-DISCONNECT completes pending individual disconnect call_id={} from ISSI {}",
                     call_id,
                     sender.ssi
                 );
-                self.release_individual_call(queue, call_id, pending_cause);
+                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
                 return;
             }
 
@@ -859,9 +877,9 @@ impl CcBsSubentity {
                     return;
                 }
                 if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {
-                    self.begin_individual_disconnect_delivery(call_id, peer_issi, reporter, disconnect_cause);
+                    self.begin_individual_disconnect_delivery(call_id, peer_issi, sender.ssi, reporter, disconnect_cause);
                 } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                    call.begin_disconnect_pending(peer_issi, self.dltime, disconnect_cause);
+                    call.begin_disconnect_pending(peer_issi, sender.ssi, self.dltime, disconnect_cause);
                 }
                 return;
             }

@@ -232,6 +232,7 @@ pub(super) enum IndividualCallState {
     /// D-DISCONNECT was sent to one party; EN 300 392-2 14.7.1.6 expects U-RELEASE.
     DisconnectPending {
         awaiting_release_from: u32,
+        release_to_issi: u32,
         started_at: TdmaTime,
         cause: DisconnectCause,
     },
@@ -336,9 +337,16 @@ impl IndividualCall {
         }
     }
 
-    pub(super) fn begin_disconnect_pending(&mut self, awaiting_release_from: u32, started_at: TdmaTime, cause: DisconnectCause) {
+    pub(super) fn begin_disconnect_pending(
+        &mut self,
+        awaiting_release_from: u32,
+        release_to_issi: u32,
+        started_at: TdmaTime,
+        cause: DisconnectCause,
+    ) {
         self.state = IndividualCallState::DisconnectPending {
             awaiting_release_from,
+            release_to_issi,
             started_at,
             cause,
         };
@@ -366,13 +374,14 @@ impl IndividualCall {
     }
 
     #[inline]
-    pub(super) fn pending_disconnect_cause_if_awaited_by(&self, sender_issi: u32) -> Option<DisconnectCause> {
+    pub(super) fn pending_disconnect_release_if_awaited_by(&self, sender_issi: u32) -> Option<(DisconnectCause, u32)> {
         match self.state {
             IndividualCallState::DisconnectPending {
                 awaiting_release_from,
+                release_to_issi,
                 cause,
                 ..
-            } if awaiting_release_from == sender_issi => Some(cause),
+            } if awaiting_release_from == sender_issi => Some((cause, release_to_issi)),
             _ => None,
         }
     }
