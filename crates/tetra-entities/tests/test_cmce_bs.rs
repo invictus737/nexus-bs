@@ -2148,7 +2148,7 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
     );
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
-    let call_id = start_group_call(&mut test);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
     let brew_uuid = uuid::Uuid::new_v4();
     test.submit_message(SapMsg {
@@ -2202,6 +2202,7 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
             .chan_alloc
             .as_ref()
             .expect("FACCH D-TX-INTERRUPT should carry channel allocation");
+        assert_chan_alloc_matches_circuit(chan_alloc, active_ts, active_usage, "group D-TX-INTERRUPT");
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
     }
 
@@ -3898,7 +3899,7 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
     test.populate_entities(components, sinks);
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
-    let call_id = start_group_call(&mut test);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
@@ -3922,6 +3923,7 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
         .chan_alloc
         .as_ref()
         .expect("FACCH D-TX-CEASED should carry channel allocation");
+    assert_chan_alloc_matches_circuit(ceased_alloc, active_ts, active_usage, "group D-TX-CEASED");
     assert_eq!(ceased_alloc.ul_dl_assigned, UlDlAssignment::Dl);
 
     assert_eq!(count_umac_floor_granted(&ceased_msgs), 0);

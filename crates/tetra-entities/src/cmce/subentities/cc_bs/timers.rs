@@ -565,10 +565,11 @@ impl CcBsSubentity {
         tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
 
         let dest_gssi = call.dest_gssi;
+        let usage = call.usage;
         call.tx_active = false;
         call.hangtime_start = Some(self.dltime);
 
-        self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, ts);
+        self.send_d_tx_ceased_facch(queue, call_id, dest_gssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,

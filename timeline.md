@@ -1,5 +1,55 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 20:08:31 EEST - Extended assigned-channel usage marker to group floor cease/interrupt
+
+Live evidence after `33ef3ca`:
+
+- The deployed build no longer showed `PTT denied`, `NotGranted`, or `RequestedServiceNotAvailable` in the sampled group PTT window.
+- Group floor grants were accepted at CMCE/UMAC level:
+  - `2260082` and `2260618` each received `FSM -> D-TX GRANTED (individual, Granted)` on `call_id=4`.
+  - `UMAC floor granted` followed the active speaker ISSI.
+- Remaining defect moved lower: repeated `UL inactivity timeout on ts=2` showed the BS granted floor but did not receive/accept valid uplink traffic consistently after some grants.
+- The live log also showed `D-TX CEASED` FACCH/STCH still carried `chan_alloc.usage=None`, while `D-TX GRANTED` had already been fixed to carry `usage=Some(4)`.
+
+Component in simple technical terms:
+
+- `D-TX CEASED` tells group listeners that the current speaker stopped and the floor is released.
+- `D-TX INTERRUPT` withdraws a current speaker during supported pre-emption.
+- Both are CMCE floor-control messages carried by UMAC as MAC-RESOURCE/STCH on the same assigned traffic channel.
+- If their STCH wrapper lacks the active usage marker, a terminal may treat the signalling as not belonging to the traffic circuit it is monitoring.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 defines SwMI group floor control, including granting, queueing, denial, interruption, and floor release while MSs remain in `CALL-ACTIVE`.
+- EN 300 392-2 clause 23.8.1 says TCH/STCH on the assigned channel uses the corresponding traffic usage marker.
+- EN 300 392-2 clause 23.8.2.3.1 says transmit traffic needs both CC authorization and an applicable uplink traffic usage marker.
+- EN 300 392-2 clause 23.8.4.2 permits downlink C-plane signalling on STCH using MAC-RESOURCE.
+- This remains clause-scoped engineering alignment, not formal conformance certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - `send_d_tx_ceased_facch` now accepts `usage` and sends DL-only FACCH/STCH with `chan_alloc.usage=Some(usage)`.
+  - `send_d_tx_interrupt_facch` now accepts `usage` and sends DL-only FACCH/STCH with `chan_alloc.usage=Some(usage)`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Passes active call usage into floor cease and pre-emption interrupt paths.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - UL-inactivity-forced floor release now preserves the call usage marker in `D-TX CEASED`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - `D-TX CEASED` and `D-TX INTERRUPT` tests now assert the actual circuit timeslot, usage marker, and DL-only direction.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 118 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
+- `git diff --check` -> pass.
+
+Next live validation:
+
+- Deploy and retest alternating group PTT on GSSI `226333`.
+- Required evidence: no terminal `PTT denied`, no BS `NotGranted` unless another MS is truly active, `D-TX CEASED` FACCH/STCH shows `usage=Some(4)`, no repeated `UL inactivity timeout` immediately after floor grants, and audio is intelligible.
+
 ## 2026-06-04 20:01:36 EEST - Patched group return-PTT alias to pure floor control
 
 User symptom:

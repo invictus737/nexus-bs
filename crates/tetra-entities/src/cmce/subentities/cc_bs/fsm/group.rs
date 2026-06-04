@@ -269,6 +269,7 @@ impl CcBsSubentity {
                 TetraAddress::new(current_speaker, SsiType::Issi),
                 requesting_party.ssi,
                 ts,
+                usage,
                 TransmissionGrant::GrantedToOtherUser,
             );
             self.send_d_tx_interrupt_facch(
@@ -277,6 +278,7 @@ impl CcBsSubentity {
                 dest_addr,
                 requesting_party.ssi,
                 ts,
+                usage,
                 TransmissionGrant::GrantedToOtherUser,
             );
 
@@ -533,7 +535,7 @@ impl CcBsSubentity {
             return Ok(());
         }
 
-        self.send_d_tx_ceased_facch(queue, call_id, dest_addr.ssi, ts);
+        self.send_d_tx_ceased_facch(queue, call_id, dest_addr.ssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -576,6 +578,7 @@ impl CcBsSubentity {
         }
 
         let ts = call.ts;
+        let usage = call.usage;
         let dest_ssi = call.dest_gssi;
 
         let Some(call) = self.active_calls.get_mut(&call_id) else {
@@ -592,7 +595,7 @@ impl CcBsSubentity {
         // EN 300 392-2 clause 14.5.2.2.1 says the SwMI fully controls which MS
         // may transmit. If the current speaker leaves the group, withdraw the
         // active permission and make remaining listeners receive-only again.
-        self.send_d_tx_ceased_facch(queue, call_id, dest_addr.ssi, ts);
+        self.send_d_tx_ceased_facch(queue, call_id, dest_addr.ssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -666,13 +669,22 @@ impl CcBsSubentity {
             // EN 300 392-2 clause 14.5.2.2.1 f) requires D-TX INTERRUPT to
             // the MS that currently has transmit permission. Table 14.19
             // carries the new transmitting party when the floor moves now.
-            self.send_d_tx_interrupt_facch(queue, call_id, speaker, source_issi, ts, TransmissionGrant::GrantedToOtherUser);
+            self.send_d_tx_interrupt_facch(
+                queue,
+                call_id,
+                speaker,
+                source_issi,
+                ts,
+                usage,
+                TransmissionGrant::GrantedToOtherUser,
+            );
             self.send_d_tx_interrupt_facch(
                 queue,
                 call_id,
                 TetraAddress::new(dest_gssi, SsiType::Gssi),
                 source_issi,
                 ts,
+                usage,
                 TransmissionGrant::GrantedToOtherUser,
             );
         }
@@ -729,7 +741,7 @@ impl CcBsSubentity {
                 active_call.brew_uuid = None;
             }
 
-            self.send_d_tx_ceased_facch(queue, call_id, call.dest_gssi, call.ts);
+            self.send_d_tx_ceased_facch(queue, call_id, call.dest_gssi, call.ts, call.usage);
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,

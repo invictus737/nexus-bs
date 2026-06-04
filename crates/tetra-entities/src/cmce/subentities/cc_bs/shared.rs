@@ -1224,6 +1224,7 @@ impl CcBsSubentity {
         target_addr: TetraAddress,
         source_issi: u32,
         ts: u8,
+        usage: u8,
         transmission_grant: TransmissionGrant,
     ) {
         let pdu = DTxInterrupt {
@@ -1248,12 +1249,14 @@ impl CcBsSubentity {
         sdu.seek(0);
 
         // DL-only on group FACCH: the interrupted MS/listeners must not retain UL permission.
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, target_addr, ts, None, UlDlAssignment::Dl);
+        // Keep the active traffic usage marker so the STCH MAC-RESOURCE is
+        // still tied to the assigned channel carrying the call.
+        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, target_addr, ts, Some(usage), UlDlAssignment::Dl);
         queue.push_back(msg);
     }
 
     /// Send D-TX CEASED via FACCH stealing on the group traffic channel.
-    pub(super) fn send_d_tx_ceased_facch(&mut self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, ts: u8) {
+    pub(super) fn send_d_tx_ceased_facch(&mut self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, ts: u8, usage: u8) {
         let pdu = DTxCeased {
             call_identifier: call_id,
             transmission_request_permission: false, // ETSI 14.8.43: 0 = allowed to request transmission
@@ -1270,7 +1273,7 @@ impl CcBsSubentity {
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         // DL-only on group FACCH: signalling to all members, no UL expected here.
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, dest_addr, ts, None, UlDlAssignment::Dl);
+        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl);
         queue.push_back(msg);
     }
 
