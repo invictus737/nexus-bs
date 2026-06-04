@@ -56,11 +56,23 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Deployment:
+
+- Commit: `89404b9 fix: release last private simplex speaker`.
+- Deployed direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot path; no build on `chris@192.168.1.179`.
+- Remote build banner: `Build: v0.1.55-89404b98`.
+- Remote binary SHA-256: `fdd966e670a3bd1895880537566e7ae930fb0688a377b59e2ea8de18b4746fcf`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+- Post-start log showed `2260618`, `2260616`, and `2260082` registered and affiliated to GSSI `226333`.
+
 Next non-repeating execution:
 
-1. Commit and deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
-2. Retest the exact field case: `2260616 -> 2260618`, let `2260618` speak last and release PTT, then hang up from `2260616`.
-3. Expected live evidence: prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE` to `2260618`, no `U-RELEASE` required from `2260618`, no MXP600 reboot.
+1. Retest the exact field case: `2260616 -> 2260618`, let `2260618` speak last and release PTT, then hang up from `2260616`.
+2. Expected live evidence: prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE` to `2260618`, no `U-RELEASE` required from `2260618`, no MXP600 reboot.
+3. If reboot still occurs, capture whether any peer-directed `D-DISCONNECT` remains in the release window; do not patch further without fresh log evidence.
+
 
 ## 2026-06-04 22:32:27 EEST - Private simplex peer-floor hangup tail-drain
 
