@@ -468,3 +468,47 @@ Next non-repeating execution:
 - Resume live static-audio investigation with post-deploy logs for private simplex and group PTT.
 - First live log question: does CMCE open the correct circuit/media source and floor state for both `2260082` and `2260616` before UMAC/LMAC traffic starts?
 - Second live log question: if CMCE is correct, does UMAC/LMAC preserve valid TCH/S traffic around `D-TX GRANTED`, FACCH/STCH stealing, and `D-TX CEASED`?
+
+## 2026-06-04 10:57:25 EEST - MM committed and SDS/status/WAP evidence refreshed
+
+Committed local evidence batch:
+
+- Commit: `7f85bc0 test: harden MM restart recovery evidence`
+- Scope: MM restart-recovery tests and project timeline only.
+- Verification immediately before commit:
+  - `cargo fmt -p tetra-entities` -> pass.
+  - `cargo test -p tetra-entities --test test_mm_bs --locked` -> 106 passed.
+  - `git diff --check` -> pass.
+
+Live BS/log inspection:
+
+- Remote test BS process still running on `chris@192.168.1.179`: `bin/nexus-bs config.live.toml`, pid `15161`.
+- Active log: `/home/chris/nexus-bs-v0.1.55-test/nexus-bs.log`.
+- No fresh post-checkpoint private/group PTT evidence was found in the current log tail.
+- Older log entries contain `U-TX CEASED`, repeated `Hangtime expired`, and soft reattach markers before the current non-repeat checkpoint; do not use those as proof of the current static-audio defect without a fresh PTT attempt.
+
+SDS/status/WAP component meaning:
+
+- SDS is short data service: small user/application data over CMCE.
+- STATUS is pre-coded SDS signalling: compact 16-bit status codes.
+- WAP MVP currently rides on SDS Type 4/SDS-TL style delivery, not full SNDCP packet WAP.
+
+SDS/status/WAP evidence refreshed:
+
+- ETSI anchors checked locally:
+  - EN 300 392-2 clause 13.2: individual/group SDS services.
+  - EN 300 392-2 D-STATUS table 14.14 and U-STATUS table 14.27.
+  - EN 300 392-2 clause 18.3.5.3.1: layer 2 service selection.
+- `cargo test -p tetra-entities --test test_sds_bs --locked` -> 112 passed.
+- Passing coverage includes:
+  - ISSI D-STATUS uses `Layer2Service::Acknowledged`.
+  - GSSI D-STATUS uses `Layer2Service::Unacknowledged`.
+  - local group SDS/status routes as GSSI.
+  - all-ones broadcast SDS/status uses GSSI and unacknowledged delivery.
+  - WAP MVP text variants preserve the requested Nexus-BS message and Type 4 payload budget.
+
+Current conclusion:
+
+- SDS/status/WAP component evidence is current locally.
+- Live WAP terminal-browser validation still remains separate from component tests.
+- Voice static/PTT denial remains the active live blocker and needs a fresh PTT trace.
