@@ -45,10 +45,31 @@ Verification:
 - `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
 - `git diff --check` -> pass.
 
+Build/deploy:
+
+- Commit: `dcb542d fix: preserve group floor signalling usage marker`.
+- Deployed with the one-shot local script:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Remote deployed binary SHA-256:
+  - `3a075b027925d89c986032ca82ab06514e0be38cb9ef652fae2e1b49578901b1`
+- Restarted test BS with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live evidence after deploy:
+
+- Startup banner reports `Build: v0.1.55-dcb542dd`.
+- `2260616` and `2260082` registered and affiliated to `226333`.
+- Operator clarified that the active radios are now both on GSSI `226333`, so the next defect isolation must stay on group floor/traffic handling instead of treating the current issue as a group mismatch.
+
 Next live validation:
 
-- Deploy and retest alternating group PTT on GSSI `226333`.
+- Test BS is already running `v0.1.55-dcb542dd`.
+- Retest alternating group PTT on GSSI `226333`, preferably first between `2260616` and `2260082`.
 - Required evidence: no terminal `PTT denied`, no BS `NotGranted` unless another MS is truly active, `D-TX CEASED` FACCH/STCH shows `usage=Some(4)`, no repeated `UL inactivity timeout` immediately after floor grants, and audio is intelligible.
+- If CMCE grants floor but audio is static or one-way, move immediately to UMAC/LMAC traffic evidence: valid TCH/S uplink frames after `UMAC floor granted`, direction by direction, before changing call-control again.
+- Parallel audit agents are active for CMCE group/private control, UMAC/MAC traffic path, MM restart affiliation/EG, QA tests, and project-log continuity.
 
 ## 2026-06-04 20:01:36 EEST - Patched group return-PTT alias to pure floor control
 
