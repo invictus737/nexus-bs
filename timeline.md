@@ -1,5 +1,68 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 13:09:59 EEST - MM restart recovery made long-lived and group-report pending cleared
+
+User symptom:
+
+- After BS restart, some terminals still show `Unit Not Attached` during the recovery window.
+
+Component in simple terms:
+
+- MM restart recovery is the BS-side procedure that asks locally known/cached terminals to perform location update again after the Nexus-BS process restarts.
+- LLC carries those MM commands with ACK/retry. If recovery commands are retried too aggressively during SDR startup, they can exhaust while the radio/air path is still settling.
+- The solicited group-report window is a local MM bookkeeping window opened after `D-LOCATION-UPDATE-COMMAND(group identity report=1)`.
+
+Live evidence from `chris@192.168.1.179` before this patch:
+
+- Running binary was current deployed build `Nexus-BS v0.1.55`, `Build: v0.1.55-acbba6d5`.
+- Recovery cache `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` contained `2260082`, `2260616`, and `2260618`.
+- Startup log:
+  - `2260082` self re-registered and affiliated to `226333` almost immediately.
+  - `2260616` needed repeated restart-recovery `D-LOCATION-UPDATE-COMMAND` attempts before registration/affiliation recovered.
+  - `2260618` recovered later, but the local solicited group-report window still expired even though its later `U-LOCATION UPDATE DEMAND` carried group `226333`.
+- Conclusion: current cache/recovery path works eventually, but early retries are too compressed and one local pending flag remains misleading after a late group-bearing location update.
+
+ETSI scope:
+
+- EN 300 392-2 clause 16.4.4 / figure 16.6 permits SwMI-initiated registration using `D-LOCATION UPDATE COMMAND`, including group identity report request.
+- EN 300 392-2 clauses 16.9.3.4, 16.10.17, 16.10.23, and 16.10.35a define the accepted location-update and group identity response handling used by the existing MM path.
+- This patch does not change standardized PDU fields. It changes local Nexus-BS retry cadence and local pending-window cleanup only.
+- No formal certification claim is made.
+
+Patch:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Recovery command spacing changed from 18 timeslots to `18 * 4` timeslots (about 1 s).
+  - Recovery retry cadence changed from `18 * 4` timeslots (about 1 s) to `5 * 18 * 4` timeslots (about 5 s).
+  - Max recovery attempts changed from 5 to 60, making recovery long-lived for several minutes instead of giving up in a few seconds.
+  - A group-bearing `U-LOCATION UPDATE DEMAND` now clears the local solicited group-report window even when the optional group-report-response IE is absent.
+  - If a terminal recovers registration but still has no attached groups when the solicited group-report window expires, MM re-requests the group report with `D-LOCATION UPDATE COMMAND` instead of leaving CMCE with no group listener.
+  - Added a debug-only MM test accessor for the solicited group-report pending flag.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Updated restart recovery pacing assertions for 1 s inter-ISSI spacing.
+  - Added assertion that reported group identities complete the solicited restart group-report window.
+  - Added `test_restart_recovery_re_requests_group_report_when_recovered_without_groups`.
+  - Added `test_restart_recovery_retries_are_long_lived_and_paced`.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 8 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 110 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating actions:
+
+- Commit this MM patch.
+- Build locally for AArch64 with the Nexus-BS SoapySDR sysroot command.
+- Deploy direct over `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; do not compile on the Pi and do not create binary backups.
+- Restart test BS and verify:
+  - build hash changed from `acbba6d5`;
+  - recovery attempts are spaced about 1 s per ISSI and about 5 s per retry;
+  - `2260082`, `2260616`, and `2260618` all re-register/re-affiliate to `226333`;
+  - no stale `solicited group report window expired` appears after a group-bearing location update already restored the terminal.
+
 ## 2026-06-04 13:00:32 EEST - MM restart recovery pacing for post-restart Unit Not Attached window
 
 User symptom:

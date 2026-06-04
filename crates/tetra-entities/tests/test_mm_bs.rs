@@ -4494,7 +4494,7 @@ fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
     assert_eq!(commands[0].1, 0);
     assert!(commands[0].2.group_identity_report);
 
-    test.run_stack(Some(17));
+    test.run_stack(Some(71));
     assert!(
         location_update_commands(&test.dump_sinks()).is_empty(),
         "restart recovery must pace configured/cached ISSIs instead of sending a burst"
@@ -4621,6 +4621,10 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
         .expect("DemandLocationUpdating accept should carry allocated EG3");
     assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg3);
     assert_energy_saving_start_avoids_frame_18(EnergySavingMode::Eg3, esi.frame_number, esi.multiframe_number);
+    assert!(
+        !debug_mm_solicited_group_report_pending(&mut test, issi),
+        "reported group identities must complete the solicited restart group-report window"
+    );
 
     let updates = subscriber_updates(&demand_msgs);
     assert_eq!(updates.len(), 2);
@@ -4881,6 +4885,97 @@ fn test_restart_recovery_group_report_complete_keeps_groups_empty() {
 
     let cache = std::fs::read_to_string(&path).expect("registration should keep recovery cache");
     assert!(cache.lines().any(|line| line.trim() == issi.to_string()));
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_re_requests_group_report_when_recovered_without_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2260082;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("demand-no-followup-groups");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(145));
+    assert_eq!(location_update_commands(&test.dump_sinks()).len(), 1);
+
+    // EN 300 392-2 clause 16.4.4 lets the SwMI request a group report with
+    // D-LOCATION UPDATE COMMAND. If the terminal answers the location update
+    // but does not include groups and does not send the promised follow-up
+    // U-ATTACH/DETACH GROUP IDENTITY, local restart recovery must continue
+    // requesting the group report instead of leaving CMCE with no listener for
+    // the terminal's scan group.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(!contains_location_update_command(&demand_msgs));
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+
+    {
+        let state = test.config.state_read();
+        assert!(state.subscribers.is_registered(issi));
+        assert!(state.subscribers.group_members(gssi).is_empty());
+    }
+
+    test.run_stack(Some(60 * 18 * 4 + 1));
+    let retry_msgs = test.dump_sinks();
+    let retry_commands = location_update_commands(&retry_msgs);
+    assert_eq!(retry_commands.len(), 1);
+    assert_eq!(retry_commands[0].0, issi);
+    assert!(retry_commands[0].2.group_identity_report);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_retries_are_long_lived_and_paced() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let path = unique_restart_recovery_path("retry-paced");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    test.run_stack(Some(145));
+    let first_msgs = test.dump_sinks();
+    let first_commands = location_update_commands(&first_msgs);
+    assert_eq!(first_commands.len(), 1);
+    assert_eq!(first_commands[0].0, issi);
+
+    // EN 300 392-2 clause 16.4.4 gives the SwMI the registration command
+    // procedure; the retry cadence here is local RF policy. Keep retries
+    // long-lived enough for post-restart radios that miss early commands, but
+    // do not inject another acknowledged MM command every TDMA second.
+    test.run_stack(Some(5 * 18 * 4 - 1));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "restart recovery retry must wait for the paced local retry interval"
+    );
+
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    let retry_commands = location_update_commands(&retry_msgs);
+    assert_eq!(retry_commands.len(), 1);
+    assert_eq!(retry_commands[0].0, issi);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
@@ -5205,6 +5300,16 @@ fn debug_mm_client_tei(test: &mut ComponentTest, issi: u32) -> Option<Option<u64
         .downcast_mut::<MmBs>()
         .expect("registered MM entity should be MmBs")
         .debug_client_tei_for_test(issi)
+}
+
+fn debug_mm_solicited_group_report_pending(test: &mut ComponentTest, issi: u32) -> bool {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_solicited_group_report_pending_for_test(issi)
 }
 
 fn begin_swmi_group_transaction_for_test(

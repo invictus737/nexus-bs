@@ -133,9 +133,9 @@ impl MmBs {
     // lose the very D-LOCATION UPDATE COMMANDs that are meant to clear
     // "Unit Not Attached" states.
     const RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS: i32 = 2 * 18 * 4;
-    const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18;
-    const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 18 * 4;
-    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 5;
+    const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18 * 4;
+    const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 5 * 18 * 4;
+    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 60;
     // Local acceptance window for the group-report phase requested by
     // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
     // clause 16.4.4. This is not an ETSI timer value; it matches the local
@@ -387,6 +387,12 @@ impl MmBs {
     #[doc(hidden)]
     pub fn debug_client_tei_for_test(&mut self, issi: u32) -> Option<Option<u64>> {
         self.client_mgr.get_client_by_issi(issi).map(|client| client.tei)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_solicited_group_report_pending_for_test(&self, issi: u32) -> bool {
+        self.solicited_group_report_pending(issi)
     }
 
     #[cfg(debug_assertions)]
@@ -661,7 +667,7 @@ impl MmBs {
         self.pending_solicited_group_reports.remove(&issi);
     }
 
-    fn expire_pending_solicited_group_reports(&mut self, now: TdmaTime) {
+    fn expire_pending_solicited_group_reports(&mut self, queue: &mut MessageQueue, now: TdmaTime) {
         let expired: Vec<u32> = self
             .pending_solicited_group_reports
             .iter()
@@ -670,10 +676,28 @@ impl MmBs {
 
         for issi in expired {
             if self.pending_solicited_group_reports.remove(&issi).is_some() {
-                tracing::debug!(
-                    "MM: solicited group report window expired for ISSI {} after D-LOCATION-UPDATE-COMMAND",
-                    issi
-                );
+                let retry_group_report = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|client| (client.last_handle, client.groups.is_empty()))
+                    .filter(|(_, groups_empty)| *groups_empty);
+
+                if let Some((last_handle, _)) = retry_group_report {
+                    tracing::info!(
+                        "MM: solicited group report window expired for ISSI {} with no attached groups; re-requesting group report",
+                        issi
+                    );
+                    // EN 300 392-2 clause 16.4.4 lets the SwMI request a
+                    // group identity report with D-LOCATION UPDATE COMMAND.
+                    // Reuse the same standardized procedure if a restarted BS
+                    // recovered terminal registration but no group affiliation.
+                    self.send_d_location_update_command(queue, issi, last_handle);
+                } else {
+                    tracing::debug!(
+                        "MM: solicited group report window expired for ISSI {} after D-LOCATION-UPDATE-COMMAND",
+                        issi
+                    );
+                }
             }
         }
     }
@@ -1536,7 +1560,12 @@ impl MmBs {
         } else {
             None
         };
-        if group_report_complete {
+        if group_report_complete || _has_groups {
+            // EN 300 392-2 clause 16.4.4 allows the MS to answer a SwMI
+            // D-LOCATION-UPDATE-COMMAND group-report request by reporting group
+            // identities in U-LOCATION UPDATE DEMAND. Once a group identity
+            // demand has been processed, the local recovery window is complete
+            // even if the optional group-report-response IE is absent.
             self.clear_solicited_group_report(issi);
         }
 
@@ -3086,7 +3115,7 @@ impl TetraEntityTrait for MmBs {
 
         self.expire_pending_energy_saving(ts);
         self.expire_pending_swmi_group_transactions(ts);
-        self.expire_pending_solicited_group_reports(ts);
+        self.expire_pending_solicited_group_reports(queue, ts);
         self.tick_restart_recovery(queue, ts);
 
         // Local periodic-registration watchdog. Do not call this T351:
