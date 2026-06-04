@@ -1,5 +1,67 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 23:09:56 EEST - Private simplex MXP600 last-speaker release guard
+
+Live problem targeted:
+
+- User retested `2260616 -> 2260618`, let `2260618` speak last, then hung up with red key on `2260616`.
+- Deployed test BS was already `Build: v0.1.55-5f03000c`.
+- Live log evidence:
+  - `22:54:54` private simplex `call_id=4` opened from `2260616` to `2260618`; initial floor holder `2260616`.
+  - `22:54:59` `2260618` obtained the private simplex floor.
+  - `22:55:04` `2260618` sent `U-TX CEASED`; CMCE tail-drained and sent `D-TX CEASED`.
+  - `22:55:05` `2260616` sent `U-DISCONNECT`; because `floor_holder` had already been cleared to `None`, the previous code fell back to peer `D-DISCONNECT`.
+  - `22:55:05.339` `2260618` sent `U-RELEASE`, then `22:55:23` re-attached, matching the reported MXP600 soft reboot.
+
+Components, simple technical meaning:
+
+- CMCE/CC-BS: private-call control. It tracks who is in the call, who has PTT floor, and which release PDU is sent.
+- `floor_holder`: current simplex private speaker, if someone is actively transmitting.
+- `last_floor_holder`: new retained memory of the last simplex private speaker after `U-TX CEASED`.
+- UMAC: assigned-channel bearer/router. It stays open until CMCE release reporters prove the release messages were sent.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: private simplex transmit permission is controlled by SwMI with `D-TX GRANTED`/`D-TX CEASED`.
+- EN 300 392-2 clause 14.5.1.3.1: either user may initiate disconnection; the MS sending `U-DISCONNECT` waits for `D-RELEASE`; the SwMI may inform the other MS by either `D-DISCONNECT` or `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: `D-DISCONNECT` expects `U-RELEASE`; `D-RELEASE` expects no response.
+- EN 300 392-2 clause 23.8.5 still motivates the bounded speech-bearer tail drain before peer clear signalling. This is clause-scoped engineering hardening plus a Motorola compatibility guard, not formal certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - Added `last_floor_holder` to `IndividualCall`.
+  - Added `set_floor_holder`, `clear_floor_holder`, and `peer_is_current_or_last_floor_holder` helpers so floor transitions retain the last simplex speaker.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Private simplex `U-DISCONNECT` now sends peer `D-RELEASE` if the peer is the current or most recent floor holder, even if it already sent `U-TX CEASED`.
+  - Passive-peer cases may still use the existing `D-DISCONNECT -> U-RELEASE` path after tail drain.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/network.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Replaced direct floor mutations with the new helpers so queued handoff, normal floor grant, inactivity recovery, and setup activation all keep `last_floor_holder` coherent.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added field regression test for exact live sequence: `2260616 -> 2260618`, peer gets floor, peer sends `U-TX CEASED`, caller hangs up, peer receives tail-drained `D-RELEASE` and no `D-DISCONNECT`.
+
+Verification:
+
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_disconnect_releases_mxp600_peer_after_peer_ceased_last_floor --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 63 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 125 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 9 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+2. Retest the exact field case: `2260616 -> 2260618`, let `2260618` speak last and release PTT, then hang up from `2260616`.
+3. Expected live evidence: prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE` to `2260618`, no `U-RELEASE` required from `2260618`, no MXP600 reboot.
+
 ## 2026-06-04 22:32:27 EEST - Private simplex peer-floor hangup tail-drain
 
 Problem targeted:

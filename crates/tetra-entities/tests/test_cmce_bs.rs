@@ -8523,6 +8523,123 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
 }
 
 #[test]
+fn test_p2p_caller_disconnect_releases_mxp600_peer_after_peer_ceased_last_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_MXP600, LAB_GROUP_GSSI);
+    let (call_id, _connect_msgs) = start_active_p2p_call_between_with_connect_msgs(&mut test, LAB_ISSI_A, LAB_ISSI_MXP600);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_MXP600, call_id));
+    test.run_stack(Some(1));
+    let queued_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_tx_granted(&queued_msgs),
+        1,
+        "MXP600 peer floor request should be queued while caller still has the simplex floor"
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_grants.len(), 2, "queued floor handoff should grant both private legs");
+    assert!(handoff_grants.iter().any(|(prim, grant)| {
+        prim.main_address == TetraAddress::issi(LAB_ISSI_MXP600) && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+    }));
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_MXP600, call_id));
+    test.run_stack(Some(1));
+    let peer_cease_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_cease_msgs), 0);
+    assert_eq!(count_d_disconnects(&peer_cease_msgs), 0);
+    assert_eq!(
+        count_umac_call_ended_or_close(&peer_cease_msgs),
+        0,
+        "peer U-TX CEASED must not close the private bearer"
+    );
+
+    let after_peer_cease_tail = dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS);
+    test.router.set_dl_time(after_peer_cease_tail);
+    test.run_stack(Some(1));
+    let peer_ceased_tail_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_tx_ceased(&peer_ceased_tail_msgs),
+        2,
+        "tail-drained peer U-TX CEASED should notify both private-call legs"
+    );
+    assert_eq!(count_umac_floor_released(&peer_ceased_tail_msgs), 1);
+    assert_eq!(count_umac_call_ended_or_close(&peer_ceased_tail_msgs), 0);
+
+    // Field regression for the live MXP600 reboot: 2260618 was the last
+    // simplex speaker, sent U-TX CEASED, and then 2260616 cleared the call.
+    // Clause 14.5.1.3.1 lets the SwMI inform the other MS by D-RELEASE rather
+    // than D-DISCONNECT; since D-RELEASE expects no U-RELEASE, avoid the peer
+    // response exchange that the MXP600 crashes on.
+    test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[LAB_ISSI_A],
+    );
+    assert_eq!(
+        count_d_disconnects(&initiator_release_msgs),
+        0,
+        "caller hangup must not send peer D-DISCONNECT while peer clear is tail-draining"
+    );
+    assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    let after_disconnect_tail =
+        after_peer_cease_tail.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS);
+    test.router.set_dl_time(after_disconnect_tail);
+    test.run_stack(Some(1));
+    let mut peer_release_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_disconnects(&peer_release_msgs),
+        0,
+        "last-speaker MXP600 peer should be cleared by D-RELEASE instead of D-DISCONNECT"
+    );
+    assert_established_p2p_release_pdus_to(
+        &peer_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[LAB_ISSI_MXP600],
+    );
+    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+
+    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    assert_eq!(peer_release_reporters.len(), 1);
+    peer_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    release_ack_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert!(
+        count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
+        "P2P circuit closes only after peer and caller D-RELEASE delivery"
+    );
+}
+
+#[test]
 fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_close() {
     debug::setup_logging_verbose();
 

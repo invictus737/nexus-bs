@@ -399,7 +399,7 @@ impl CcBsSubentity {
                     )
                 };
 
-                call.floor_holder = None;
+                call.clear_floor_holder();
                 let queued_requester = call.take_queued_tx_demand();
 
                 (
@@ -434,7 +434,7 @@ impl CcBsSubentity {
                 );
 
                 if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                    call.floor_holder = Some(requester_addr.ssi);
+                    call.set_floor_holder(requester_addr.ssi);
                 }
 
                 // EN 300 392-2 clause 14.5.1.2.1 b/e): D-TX GRANTED is a

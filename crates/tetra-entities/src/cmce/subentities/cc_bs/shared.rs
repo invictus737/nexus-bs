@@ -1023,7 +1023,7 @@ impl CcBsSubentity {
                 );
                 return;
             }
-            call.floor_holder = None;
+            call.clear_floor_holder();
             call.take_queued_tx_demand()
         };
 
@@ -1042,7 +1042,7 @@ impl CcBsSubentity {
             );
 
             if let Some(call) = self.individual_calls.get_mut(&pending.call_id) {
-                call.floor_holder = Some(requester_leg.addr.ssi);
+                call.set_floor_holder(requester_leg.addr.ssi);
             }
 
             Self::push_individual_d_tx_granted(

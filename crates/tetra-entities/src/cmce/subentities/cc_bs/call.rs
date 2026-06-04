@@ -282,6 +282,9 @@ pub(super) struct IndividualCall {
     /// SSI of the party currently holding the floor (simplex P2P only).
     /// None until the call is active. Used by UL inactivity timeout to force TX-CEASED.
     pub(super) floor_holder: Option<u32>,
+    /// Most recent simplex P2P floor holder, retained after U-TX CEASED so
+    /// disconnect cleanup can distinguish the last speaker from a passive peer.
+    pub(super) last_floor_holder: Option<u32>,
     /// Pending simplex P2P request-to-transmit while the peer still has the floor.
     pub(super) queued_tx_demand: Option<TetraAddress>,
 }
@@ -350,8 +353,24 @@ impl IndividualCall {
             started_at,
             cause,
         };
-        self.floor_holder = None;
+        self.clear_floor_holder();
         self.queued_tx_demand = None;
+    }
+
+    pub(super) fn set_floor_holder(&mut self, holder_issi: u32) {
+        self.floor_holder = Some(holder_issi);
+        self.last_floor_holder = Some(holder_issi);
+    }
+
+    pub(super) fn clear_floor_holder(&mut self) {
+        if let Some(holder_issi) = self.floor_holder {
+            self.last_floor_holder = Some(holder_issi);
+        }
+        self.floor_holder = None;
+    }
+
+    pub(super) fn peer_is_current_or_last_floor_holder(&self, peer_issi: u32) -> bool {
+        self.floor_holder == Some(peer_issi) || (self.floor_holder.is_none() && self.last_floor_holder == Some(peer_issi))
     }
 
     pub(super) fn queue_tx_demand(&mut self, requester: TetraAddress) -> TxDemandQueueResult {

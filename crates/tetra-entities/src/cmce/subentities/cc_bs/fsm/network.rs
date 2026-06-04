@@ -250,6 +250,7 @@ impl CcBsSubentity {
                 network_call: Some(call),
                 connect_request_sent: false,
                 floor_holder: None,
+                last_floor_holder: None,
                 queued_tx_demand: None,
             },
         ) {

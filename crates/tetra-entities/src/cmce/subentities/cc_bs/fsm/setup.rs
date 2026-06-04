@@ -783,6 +783,7 @@ impl CcBsSubentity {
                 network_call: None,
                 connect_request_sent: false,
                 floor_holder: None,
+                last_floor_holder: None,
                 queued_tx_demand: None,
             },
         ) {
@@ -1011,6 +1012,7 @@ impl CcBsSubentity {
                 network_call: Some(network_call),
                 connect_request_sent: false,
                 floor_holder: None,
+                last_floor_holder: None,
                 queued_tx_demand: None,
             },
         ) {
@@ -1188,6 +1190,7 @@ impl CcBsSubentity {
                 network_call: None,
                 connect_request_sent: false,
                 floor_holder: Some(calling_party.ssi),
+                last_floor_holder: Some(calling_party.ssi),
                 queued_tx_demand: None,
             },
         );

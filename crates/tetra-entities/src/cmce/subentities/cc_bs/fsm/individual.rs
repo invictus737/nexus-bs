@@ -769,7 +769,7 @@ impl CcBsSubentity {
                 } else {
                     calling_addr.ssi
                 };
-                c.floor_holder = Some(initial_floor_holder);
+                c.set_floor_holder(initial_floor_holder);
                 tracing::info!(
                     "Simplex P2P call_id={} initial floor_holder = ISSI {}",
                     call_id,

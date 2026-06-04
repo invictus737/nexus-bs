@@ -241,7 +241,7 @@ impl CcBsSubentity {
 
             if queued_requester.is_some() {
                 let queued_requester = self.individual_calls.get_mut(&call_id).and_then(|c| {
-                    c.floor_holder = None;
+                    c.clear_floor_holder();
                     c.take_queued_tx_demand()
                 });
                 let Some(requester) = queued_requester else {
@@ -262,7 +262,7 @@ impl CcBsSubentity {
                 );
 
                 if let Some(c) = self.individual_calls.get_mut(&call_id) {
-                    c.floor_holder = Some(requester_addr.ssi);
+                    c.set_floor_holder(requester_addr.ssi);
                 }
 
                 // EN 300 392-2 clause 14.5.1.2.1 e): if a request was queued
@@ -507,7 +507,7 @@ impl CcBsSubentity {
             // receive audio; UMAC's FloorGranted control gates the active UL
             // speaker by ISSI.
             if let Some(c) = self.individual_calls.get_mut(&call_id) {
-                c.floor_holder = Some(requesting_party.ssi);
+                c.set_floor_holder(requesting_party.ssi);
             }
             Self::push_individual_d_tx_granted(
                 queue,
@@ -855,14 +855,14 @@ impl CcBsSubentity {
                     return;
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
-                if !call_snapshot.simplex_duplex && call_snapshot.floor_holder.is_some() {
-                    let peer_clear = if call_snapshot.floor_holder != Some(sender.ssi) {
+                if !call_snapshot.simplex_duplex {
+                    let peer_clear = if call_snapshot.peer_is_current_or_last_floor_holder(peer_issi) {
                         // EN 300 392-2 clause 14.5.1.3.1 allows the SwMI to
                         // inform the other individual-call MS by D-RELEASE as
                         // an alternative to D-DISCONNECT. If that peer is the
-                        // current simplex floor holder, avoid a response
-                        // exchange during U-plane clear and send tail-drained
-                        // D-RELEASE instead.
+                        // current or most recent simplex floor holder, avoid a
+                        // response exchange during U-plane clear and send
+                        // tail-drained D-RELEASE instead.
                         IndividualDisconnectPeerClear::Release
                     } else {
                         IndividualDisconnectPeerClear::Disconnect
