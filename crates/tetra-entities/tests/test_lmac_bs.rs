@@ -177,6 +177,39 @@ fn bs_lmac_forwards_valid_fullslot_tch_s_to_umac() {
 }
 
 #[test]
+fn bs_lmac_recovers_first_fullslot_tch_s_before_ul_phy_channel_marker() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+
+    let codec_bits = acelp_test_bits();
+    let encoded = encoded_tch_s(&codec_bits, 1);
+
+    test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq1,
+        PhyBlockNum::Both,
+        encoded,
+    ));
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "EN 300 392-2 clauses 14.5.1.2.1 and 23.5.2.2.1: first private-call TCH/S must not be lost only because the UL channel marker lags setup"
+    );
+    assert_eq!(traffic[0].data, codec_bits);
+}
+
+#[test]
 fn bs_lmac_forwards_normal_seq2_block2_tch_s_as_raw_halfslot() {
     debug::setup_logging_verbose();
 
@@ -214,6 +247,43 @@ fn bs_lmac_forwards_normal_seq2_block2_tch_s_as_raw_halfslot() {
         TdmaTime::default().add_timeslots(-2).t,
         "EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 require BS to preserve the TCH half-slot timing/position"
     );
+}
+
+#[test]
+fn bs_lmac_recovers_first_seq2_block2_tch_s_before_ul_phy_channel_marker() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+
+    let codec_bits = acelp_test_bits();
+    let encoded = encoded_tch_s(&codec_bits, 2);
+    let mut expected_raw = vec![0u8; encoded.get_len()];
+    let mut encoded_for_read = encoded.clone();
+    encoded_for_read.to_bitarr(&mut expected_raw);
+
+    test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq2,
+        PhyBlockNum::Block2,
+        encoded,
+    ));
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "EN 300 392-2 clause 23.8.5: a first non-stolen TCH/S half-slot must be preserved while the traffic marker catches up"
+    );
+    assert_eq!(traffic[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
+    assert_eq!(traffic[0].data, expected_raw);
 }
 
 #[test]
@@ -287,5 +357,23 @@ fn bs_lmac_drops_bad_crc_tch_s_instead_of_forwarding_static_speech() {
             .iter()
             .all(|msg| !matches!(msg.msg, SapMsgInner::TmdCircuitDataInd(_))),
         "EN 300 392-2 clauses 23.8.3 and 23.8.3.2 permit undecodable TCH delivery only with a bad half-slot condition; this SAP cannot carry that condition, so LMAC-BS must not forward it as speech"
+    );
+}
+
+#[test]
+fn bs_lmac_unknown_channel_fallback_drops_bad_crc_fullslot_tch_s() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+
+    test.submit_message(build_corrupt_uplink_tch_s_ind());
+    test.deliver_all_messages();
+
+    assert!(
+        test.dump_sinks()
+            .iter()
+            .all(|msg| !matches!(msg.msg, SapMsgInner::TmdCircuitDataInd(_))),
+        "EN 300 392-2 clauses 23.8.3 and 23.8.3.2: unknown-channel TCH/S fallback must still reject bad CRC so static is not forwarded as speech"
     );
 }

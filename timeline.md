@@ -1,5 +1,58 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 01:23:50 EEST - LMAC first private-simplex TCH/S recovery before traffic marker
+
+Live problem targeted:
+
+- User reported current private simplex P2P is broken.
+- Fresh live grep on running build `v0.1.55-bcc5e08b` did not show any decoded private-call CMCE sequence (`U-SETUP`, `D-CONNECT`, `U-TX DEMAND`, `D-TX GRANTED`) after the report.
+- The same log did show uplink `NormalTrainSeq` fullslot bursts without higher-layer P2P decode, which is consistent with first traffic bursts arriving while the BS-side lower MAC has not yet marked that UL timeslot as `Tp`, or with a terminal still transmitting on a traffic slot the current BS state has not opened.
+
+Components, simple technical meaning:
+
+- LMAC: lower MAC classifier. It receives demodulated bursts from PHY and decides whether they are control signalling (`SCH/F`, `SCH/HU`, `STCH`) or speech traffic (`TCH/S`).
+- UMAC: upper MAC circuit/router. It accepts speech only when CMCE has opened a matching circuit, so an LMAC fallback cannot create a call by itself.
+- CMCE private simplex: call-control state machine that opens the private call and owns PTT floor permission. This patch does not change CMCE grants or release rules.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: private simplex calls use SwMI-controlled transmit permission; initial transmit permission from setup must still allow valid speech once the assigned channel is opened.
+- EN 300 392-2 clause 23.5.2.2.1: MAC resource/channel allocation transitions the MS to the assigned physical channel.
+- EN 300 392-2 clauses 23.8.3, 23.8.3.2 and 23.8.5: TCH/S speech frames must not be converted from bad CRC or partial conditions into clean audio; a non-stolen second half-slot must preserve its half-slot timing/position.
+- This is clause-scoped engineering hardening and RF-retest preparation, not formal ETSI/TETRA certification evidence.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - `rx_blk_control` now returns whether a valid control block was actually forwarded.
+  - If a `NUB` on an as-yet `Unallocated` UL slot fails as control, LMAC retries only the TCH/S-compatible cases:
+    - `NormalTrainSeq1 + Both` full-slot TCH/S.
+    - `NormalTrainSeq2 + Block2` non-stolen raw TCH/S half-slot.
+  - Full-slot fallback still requires the TCH/S speech CRC to pass; bad CRC remains dropped so static is not forwarded as clean speech.
+  - Raw Block2 fallback is still handed to UMAC, where it is dropped unless a matching active circuit exists.
+- `crates/tetra-entities/tests/test_lmac_bs.rs`
+  - Added first-burst fallback coverage for full-slot TCH/S before the UL traffic marker is present.
+  - Added first-burst fallback coverage for raw `NormalTrainSeq2` Block2 TCH/S before the UL traffic marker is present.
+  - Added bad-CRC unknown-channel fallback regression so corrupt speech is not emitted as audio.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added private simplex initial-floor media regression proving UMAC routes the first TCH/S burst after `CallControl::Open` without requiring an extra `FloorGranted`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 8 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 63 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 51 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Run `git diff --check`, commit, and deploy direct to `/home/chris/nexus-bs-v0.1.55-test`.
+2. Retest private simplex `2260616 <-> 2260618`.
+3. Expected live evidence for the targeted race: if the terminal sends immediate speech, log should now show `LMAC: retrying undecoded NUB as candidate TCH/S`, then `rx_blk_traffic: decoded valid TCH/S frame` or raw Block2 forwarding, followed by `UMAC voice route`.
+4. If no `U-SETUP`/`U-TX DEMAND` appears and only raw `NormalTrainSeq` continues, diagnose stale terminal traffic-channel state/recovery separately instead of changing CMCE floor logic.
+
 ## 2026-06-04 23:34:48 EEST - LLC inbound duplicate guard bounded by T.251/N.252
 
 Live problem targeted:

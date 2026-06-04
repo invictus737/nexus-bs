@@ -877,6 +877,33 @@ fn test_private_simplex_ul_voice_loopback_preserves_tch_s_bits() {
 }
 
 #[test]
+fn test_private_simplex_initial_floor_routes_without_extra_floor_grant() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x3231;
+    let called_issi = 0x3232;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(caller_issi, called_issi, traffic_ts));
+    test.run_stack(Some(1));
+
+    let ul_bits = acelp_test_bits();
+    submit_ul_voice_frame(&mut test, traffic_ts, ul_bits.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        traffic_ts,
+        &ul_bits,
+        "EN 300 392-2 clauses 14.5.1.2.1 and 23.5.2.2.1: initial private simplex floor opened by D-CONNECT must route the first TCH/S burst before any later D-TX GRANTED",
+    );
+}
+
+#[test]
 fn test_private_simplex_cross_route_floor_release_purges_peer_dl_media() {
     debug::setup_logging_verbose();
 

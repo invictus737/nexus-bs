@@ -278,13 +278,13 @@ impl LmacBs {
         queue.push_back(msg);
     }
 
-    fn rx_blk_control(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) {
+    fn rx_blk_control(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) -> bool {
         // AACH is a control channel but uses a completely different decode path
         // (decode_aach); decode_cp() below explicitly rejects it. Guard here so a future
         // routing change that sends AACH this way logs and drops instead of panicking.
         if !lchan.is_control_channel() || lchan == LogicalChannel::Aach {
             tracing::warn!("LMAC: rx_blk_control called with unsupported channel {:?}, ignoring", lchan);
-            return;
+            return false;
         }
 
         let block_num = blk.block_num;
@@ -298,7 +298,7 @@ impl LmacBs {
                 "LMAC: decode_cp returned None for {:?} despite scrambling code set, dropping",
                 lchan
             );
-            return;
+            return false;
         };
 
         // tracing::debug!("rx_blk_cp {:?} CRC: {} type1 {:?}",
@@ -311,7 +311,7 @@ impl LmacBs {
         // TODO FIXME, for now, we're not passing broken CRC msgs up to Lmac
         // If we see purpose, we may pass it up in the future
         if !crc_pass {
-            return;
+            return false;
         }
 
         // Pass block to the upper mac
@@ -333,6 +333,16 @@ impl LmacBs {
         // We then don't know whether blk2 is also stolen, as that will be shown by the Umac
         // We thus push this with prio, and the umac will signal with prio if blk2 is stolen too
         queue.push_prio(m, MessagePrio::Immediate);
+        true
+    }
+
+    fn should_fallback_unknown_nub_to_tch_s(blk: &TpUnitdataInd, pchan: PhysicalChannel) -> bool {
+        pchan == PhysicalChannel::Unallocated
+            && blk.burst_type == BurstType::NUB
+            && matches!(
+                (blk.train_type, blk.block_num),
+                (TrainingSequence::NormalTrainSeq1, PhyBlockNum::Both) | (TrainingSequence::NormalTrainSeq2, PhyBlockNum::Block2)
+            )
     }
 
     fn rx_tp_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -368,7 +378,23 @@ impl LmacBs {
                 self.rx_blk_traffic(queue, prim, lchan, msg_dltime)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
-                self.rx_blk_control(queue, prim, lchan);
+                let fallback_candidate = prim.clone();
+                let control_forwarded = self.rx_blk_control(queue, prim, lchan);
+                if !control_forwarded && Self::should_fallback_unknown_nub_to_tch_s(&fallback_candidate, pchan) {
+                    // EN 300 392-2 clauses 23.5.2.2.1 and 23.8.5 require the
+                    // BS to accept TCH/S on an assigned traffic channel. During
+                    // private-call setup the UL channel marker can lag the
+                    // downlink allocation by two timeslots; try TCH/S only
+                    // after the candidate failed as control. UMAC still drops
+                    // the result unless a matching circuit is active.
+                    tracing::debug!(
+                        "LMAC: retrying undecoded NUB as candidate TCH/S on unknown UL ts={} train={:?} block={:?}",
+                        msg_dltime.t,
+                        fallback_candidate.train_type,
+                        fallback_candidate.block_num
+                    );
+                    self.rx_blk_traffic(queue, fallback_candidate, LogicalChannel::TchS, msg_dltime);
+                }
             }
             _ => {
                 tracing::error!("BUG: unexpected message or state -- routing error");
