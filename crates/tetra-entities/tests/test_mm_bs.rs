@@ -34,8 +34,9 @@ use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_pdus::mm::pdus::u_mm_status::UMmStatus;
 use tetra_pdus::mm::pdus::u_tei_provide::UTeiProvide;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
-use tetra_saps::lmm::LmmMleUnitdataInd;
+use tetra_saps::lmm::{LmmMleReportInd, LmmMleUnitdataInd};
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tla::TLA_REPORT_FAILED_TRANSFER;
 
 use crate::common::ComponentTest;
 
@@ -4267,11 +4268,6 @@ fn test_unsupported_location_update_features_emit_reject() {
         },
         {
             let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
-            pdu.extended_capabilities = Some(type3_field(MmType34ElemIdUl::ExtendedCapabilities, 8, 0));
-            (pdu, RejectCause::MessageConsistencyError)
-        },
-        {
-            let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
             pdu.proprietary = Some(type3_field(MmType34ElemIdUl::Proprietary, 8, 0));
             (pdu, RejectCause::MessageConsistencyError)
         },
@@ -4295,6 +4291,33 @@ fn test_unsupported_location_update_features_emit_reject() {
         assert_eq!(reject.reject_cause, expected_cause as u8);
         assert!(!test.config.state_read().subscribers.is_registered(issi));
     }
+}
+
+#[test]
+fn test_location_update_accepts_extended_capabilities_without_acting_on_them() {
+    debug::setup_logging_verbose();
+
+    let issi = 2260082;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.extended_capabilities = Some(type3_field(MmType34ElemIdUl::ExtendedCapabilities, 8, 0));
+
+    // EN 300 392-2 clause 16.4.4 permits/requires this IE in U-LOCATION
+    // UPDATE DEMAND when supported extended features are present. Nexus-BS does
+    // not consume the bits yet, but accepting the registration keeps restart
+    // recovery and normal attach from failing on standards-compliant radios.
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 1);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
 }
 
 #[test]
@@ -4480,7 +4503,7 @@ fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
     // Keep the local restart probe behind a short startup guard and pace
     // recovered ISSIs so the first RF frames are not overloaded with several
     // acknowledged MM commands at once.
-    test.run_stack(Some(144));
+    test.run_stack(Some(72));
     assert!(
         location_update_commands(&test.dump_sinks()).is_empty(),
         "restart recovery must not blast commands during the startup RF guard"
@@ -4559,7 +4582,7 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(145));
+    test.run_stack(Some(73));
     let command_msgs = test.dump_sinks();
     let commands = location_update_commands(&command_msgs);
     let command_details = location_update_command_details(&command_msgs);
@@ -4664,6 +4687,83 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
 }
 
 #[test]
+fn test_restart_recovery_failed_location_update_accept_reprobes_registration() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("failed-accept-reprobe");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    assert_eq!(location_update_commands(&test.dump_sinks()).len(), 1);
+
+    submit_location_update_with_groups_and_energy(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        vec![gssi],
+        Some(EnergySavingMode::Eg1),
+    );
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let accept_details = location_update_accept_details(&demand_msgs);
+    assert_eq!(accept_details.len(), 1);
+    let accept_handle = accept_details[0].1;
+    assert!(
+        accept_handle >= 0x8000_0000,
+        "D-LOCATION UPDATE ACCEPT should use a tracked local MLE handle"
+    );
+    assert_eq!(accept_details[0].2, Layer2Service::Acknowledged);
+    assert_eq!(
+        accept_details[0].3.location_update_accept_type,
+        LocationUpdateAcceptType::DemandLocationUpdating
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(test.config.state_read().energy_saving.contains_key(&issi));
+
+    // LLC/MLE reports are local SAP confirmations. EN 300 392-2 clause 16.4.4
+    // lets the SwMI repeat D-LOCATION UPDATE COMMAND when the accepted
+    // registration was not confirmed at layer 2; this avoids a BS/MS split
+    // where BS thinks the MS is registered but the terminal still displays
+    // Unit Not Attached.
+    submit_lmm_mle_report(&mut test, accept_handle, TLA_REPORT_FAILED_TRANSFER);
+    test.run_stack(Some(1));
+    let failed_msgs = test.dump_sinks();
+
+    let commands = location_update_commands(&failed_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, issi);
+    assert!(commands[0].2.group_identity_report);
+
+    let updates = subscriber_updates(&failed_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    assert_eq!(updates[0].groups, vec![gssi]);
+    assert_eq!(updates[1].action, BrewSubscriberAction::Deregister);
+    assert!(updates[1].groups.is_empty());
+
+    let state = test.config.state_read();
+    assert!(!state.subscribers.is_registered(issi));
+    assert!(state.subscribers.group_members(gssi).is_empty());
+    assert!(
+        !state.energy_saving.contains_key(&issi),
+        "failed registration accept must fail open to StayAlive before re-probing"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_demand_location_update_accepts_complete_group_report_with_groups() {
     debug::setup_logging_verbose();
     let issi = 2260616;
@@ -4679,7 +4779,7 @@ fn test_restart_recovery_demand_location_update_accepts_complete_group_report_wi
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(145));
+    test.run_stack(Some(73));
     let command_msgs = test.dump_sinks();
     let command_details = location_update_command_details(&command_msgs);
     assert_eq!(command_details.len(), 1);
@@ -4753,7 +4853,7 @@ fn test_restart_recovery_accepts_solicited_attach_detach_group_report_completion
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(145));
+    test.run_stack(Some(73));
     let command_msgs = test.dump_sinks();
     let command_details = location_update_command_details(&command_msgs);
     assert_eq!(command_details.len(), 1);
@@ -4840,7 +4940,7 @@ fn test_restart_recovery_group_report_complete_keeps_groups_empty() {
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(145));
+    test.run_stack(Some(73));
     let command_msgs = test.dump_sinks();
     let command_details = location_update_command_details(&command_msgs);
     assert_eq!(command_details.len(), 1);
@@ -4906,7 +5006,7 @@ fn test_restart_recovery_re_requests_group_report_when_recovered_without_groups(
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(145));
+    test.run_stack(Some(73));
     assert_eq!(location_update_commands(&test.dump_sinks()).len(), 1);
 
     // EN 300 392-2 clause 16.4.4 lets the SwMI request a group report with
@@ -4955,7 +5055,7 @@ fn test_restart_recovery_retries_are_long_lived_and_paced() {
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
 
-    test.run_stack(Some(145));
+    test.run_stack(Some(73));
     let first_msgs = test.dump_sinks();
     let first_commands = location_update_commands(&first_msgs);
     assert_eq!(first_commands.len(), 1);
@@ -4964,8 +5064,8 @@ fn test_restart_recovery_retries_are_long_lived_and_paced() {
     // EN 300 392-2 clause 16.4.4 gives the SwMI the registration command
     // procedure; the retry cadence here is local RF policy. Keep retries
     // long-lived enough for post-restart radios that miss early commands, but
-    // do not inject another acknowledged MM command every TDMA second.
-    test.run_stack(Some(5 * 18 * 4 - 1));
+    // leave a quiet gap after LLC retransmission exhaustion before retrying.
+    test.run_stack(Some(2 * 18 * 4 - 1));
     assert!(
         location_update_commands(&test.dump_sinks()).is_empty(),
         "restart recovery retry must wait for the paced local retry interval"
@@ -5099,6 +5199,19 @@ fn extract_location_update_accept(msgs: &[SapMsg]) -> DLocationUpdateAccept {
             _ => None,
         })
         .expect("expected D-LOCATION UPDATE ACCEPT")
+}
+
+fn location_update_accept_details(msgs: &[SapMsg]) -> Vec<(u32, u32, Layer2Service, DLocationUpdateAccept)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                let pdu = DLocationUpdateAccept::from_bitbuf(&mut sdu).ok()?;
+                Some((prim.address.ssi, prim.handle, prim.layer2service.clone(), pdu))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn contains_location_update_accept(msgs: &[SapMsg]) -> bool {
@@ -5502,6 +5615,15 @@ fn submit_location_update_demand_with_handle_and_received_address(
             handle,
             received_address,
         }),
+    });
+}
+
+fn submit_lmm_mle_report(test: &mut ComponentTest, handle: u32, transfer_result: i32) {
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleReportInd(LmmMleReportInd { handle, transfer_result }),
     });
 }
 

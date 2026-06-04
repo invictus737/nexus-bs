@@ -6,9 +6,10 @@ use std::path::Path;
 use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::{Type3FieldGeneric, delimiters, typed};
-use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
+use tetra_core::{BitBuffer, Layer2Service, MleHandle, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::lmm::LmmMleUnitdataReq;
+use tetra_saps::tla::{TLA_REPORT_FAILED_TRANSFER, TLA_REPORT_SUCCESSFUL_TRANSFER};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::mm::components::client_state::{ClientMgrErr, GroupAttachmentInfo, MmClientMgr, MmClientState};
@@ -50,6 +51,8 @@ pub struct MmBs {
     pending_swmi_group_transactions: HashMap<u32, PendingSwmiGroupTransaction>,
     pending_solicited_group_reports: HashMap<u32, TdmaTime>,
     restart_recovery: HashMap<u32, RestartRecoveryProbe>,
+    pending_critical_downlinks: HashMap<MleHandle, PendingCriticalMmDownlink>,
+    next_critical_downlink_handle: MleHandle,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +73,18 @@ struct PendingSwmiGroupTransaction {
     expires_at: TdmaTime,
     group_identity_downlink: Vec<GroupIdentityDownlink>,
     detach_all_then_attach: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CriticalMmDownlinkKind {
+    LocationUpdateAccept,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCriticalMmDownlink {
+    issi: u32,
+    retry_handle: u32,
+    kind: CriticalMmDownlinkKind,
 }
 
 struct GroupIdentityProcessResult {
@@ -132,10 +147,10 @@ impl MmBs {
     // blasting several acknowledged MM commands in the same first TDMA tick can
     // lose the very D-LOCATION UPDATE COMMANDs that are meant to clear
     // "Unit Not Attached" states.
-    const RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS: i32 = 2 * 18 * 4;
+    const RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18 * 4;
-    const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 5 * 18 * 4;
-    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 60;
+    const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 2 * 18 * 4;
+    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 150;
     // Local acceptance window for the group-report phase requested by
     // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
     // clause 16.4.4. This is not an ETSI timer value; it matches the local
@@ -168,6 +183,8 @@ impl MmBs {
             pending_swmi_group_transactions: HashMap::new(),
             pending_solicited_group_reports: HashMap::new(),
             restart_recovery,
+            pending_critical_downlinks: HashMap::new(),
+            next_critical_downlink_handle: 0x8000_0000,
         }
     }
 
@@ -305,6 +322,109 @@ impl MmBs {
         if issis.remove(&issi) {
             if let Err(err) = Self::write_restart_recovery_cache(&path, &issis) {
                 tracing::warn!("MM: failed removing ISSI {} from restart recovery cache '{}': {}", issi, path, err);
+            }
+        }
+    }
+
+    fn allocate_critical_downlink_handle(&mut self) -> MleHandle {
+        loop {
+            let handle = self.next_critical_downlink_handle;
+            self.next_critical_downlink_handle = self.next_critical_downlink_handle.wrapping_add(1);
+            if self.next_critical_downlink_handle < 0x8000_0000 {
+                self.next_critical_downlink_handle = 0x8000_0000;
+            }
+            if handle != 0 && !self.pending_critical_downlinks.contains_key(&handle) {
+                return handle;
+            }
+        }
+    }
+
+    fn track_location_update_accept_downlink(&mut self, issi: u32, retry_handle: u32) -> MleHandle {
+        self.pending_critical_downlinks
+            .retain(|_, pending| !(pending.issi == issi && pending.kind == CriticalMmDownlinkKind::LocationUpdateAccept));
+        let handle = self.allocate_critical_downlink_handle();
+        self.pending_critical_downlinks.insert(
+            handle,
+            PendingCriticalMmDownlink {
+                issi,
+                retry_handle,
+                kind: CriticalMmDownlinkKind::LocationUpdateAccept,
+            },
+        );
+        handle
+    }
+
+    fn clear_critical_downlinks_for_issi(&mut self, issi: u32) {
+        self.pending_critical_downlinks.retain(|_, pending| pending.issi != issi);
+    }
+
+    fn mark_registration_unconfirmed_and_reprobe(&mut self, queue: &mut MessageQueue, issi: u32, retry_handle: u32, reason: &str) {
+        tracing::warn!(
+            "MM: registration for ISSI {} is not confirmed after {}; sending D-LOCATION-UPDATE-COMMAND",
+            issi,
+            reason
+        );
+        self.set_client_stay_alive(issi);
+        self.send_d_location_update_command(queue, issi, retry_handle);
+        self.abandon_pending_swmi_group_transaction(issi, reason);
+        self.client_mgr.set_pending_command(issi, 60);
+
+        let groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|c| c.groups.iter().copied().collect())
+            .unwrap_or_default();
+        if !groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+        }
+        self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+        self.config.state_write().subscribers.deregister(issi);
+    }
+
+    fn rx_lmm_mle_report_ind(&mut self, queue: &mut MessageQueue, handle: MleHandle, transfer_result: i32) {
+        let Some(pending) = self.pending_critical_downlinks.remove(&handle) else {
+            tracing::trace!(
+                "MM: MLE-REPORT indication handle={} transfer_result={} for untracked MM downlink",
+                handle,
+                transfer_result
+            );
+            return;
+        };
+
+        match transfer_result {
+            TLA_REPORT_SUCCESSFUL_TRANSFER => {
+                tracing::trace!(
+                    "MM: critical {:?} downlink to ISSI {} confirmed by MLE handle={}",
+                    pending.kind,
+                    pending.issi,
+                    handle
+                );
+            }
+            TLA_REPORT_FAILED_TRANSFER => match pending.kind {
+                CriticalMmDownlinkKind::LocationUpdateAccept => {
+                    // EN 300 392-2 clause 16.4.4 allows the SwMI to initiate a
+                    // fresh registration at any time with D-LOCATION UPDATE
+                    // COMMAND. If the acknowledged D-LOCATION UPDATE ACCEPT is
+                    // not delivered, the BS-side registration state is only
+                    // provisional; reprobe instead of leaving the MS/BS views
+                    // split.
+                    self.mark_registration_unconfirmed_and_reprobe(
+                        queue,
+                        pending.issi,
+                        pending.retry_handle,
+                        "D-LOCATION UPDATE ACCEPT failed transfer",
+                    );
+                }
+            },
+            other => {
+                tracing::debug!(
+                    "MM: ignoring non-terminal MLE-REPORT {} for critical {:?} downlink to ISSI {} handle={}",
+                    other,
+                    pending.kind,
+                    pending.issi,
+                    handle
+                );
+                self.pending_critical_downlinks.insert(handle, pending);
             }
         }
     }
@@ -1115,6 +1235,7 @@ impl MmBs {
             "U-ITSI DETACH terminates the registered MM context before any pending SwMI group ACK",
         );
         self.clear_solicited_group_report(ssi);
+        self.clear_critical_downlinks_for_issi(ssi);
         self.forget_restart_recovery_issi(ssi);
         let detached_client = self.client_mgr.remove_client(ssi);
         if let Some(client) = detached_client {
@@ -1207,6 +1328,7 @@ impl MmBs {
             let issi = prim.received_address.ssi;
             tracing::info!("MM: ISSI {} migrating to another network — releasing from Brew", issi);
             self.clear_solicited_group_report(issi);
+            self.clear_critical_downlinks_for_issi(issi);
             self.forget_restart_recovery_issi(issi);
             let detached = self.client_mgr.remove_client(issi);
             if let Some(client) = detached {
@@ -1665,6 +1787,8 @@ impl MmBs {
         sdu.seek(0);
         tracing::debug!("-> {} sdu {}", pdu_response, sdu.dump_bin());
 
+        let response_handle = self.track_location_update_accept_downlink(issi, handle);
+
         // Build and submit response prim
         let msg = SapMsg {
             sap: Sap::LmmSap,
@@ -1672,7 +1796,7 @@ impl MmBs {
             dest: TetraEntity::Mle,
             msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
                 sdu,
-                handle: prim.handle,
+                handle: response_handle,
                 address: TetraAddress::issi(issi),
                 layer2service: Layer2Service::Acknowledged,
                 stealing_permission: false,
@@ -3052,8 +3176,12 @@ impl MmBs {
             return Some(RejectCause::MessageConsistencyError);
         }
         if pdu.extended_capabilities.is_some() {
-            unimplemented_log!("Unsupported extended_capabilities present");
-            return Some(RejectCause::MessageConsistencyError);
+            // EN 300 392-2 clause 16.4.4 says the MS includes extended
+            // capabilities in U-LOCATION UPDATE DEMAND when it supports one or
+            // more of the listed items. Nexus-BS does not currently consume
+            // those feature bits, but the IE itself is not a registration
+            // consistency error.
+            tracing::debug!("DemandLocationUpdating: extended_capabilities present (accepted, not acted on)");
         }
         if pdu.proprietary.is_some() {
             unimplemented_log!("Unsupported proprietary present");
@@ -3169,6 +3297,7 @@ impl TetraEntityTrait for MmBs {
                 if let Some(client) = detached {
                     self.forget_energy_saving(issi);
                     self.clear_solicited_group_report(issi);
+                    self.clear_critical_downlinks_for_issi(issi);
                     self.abandon_pending_swmi_group_transaction(
                         issi,
                         "periodic registration reject/removal terminates pending SwMI group procedure",
@@ -3218,11 +3347,7 @@ impl TetraEntityTrait for MmBs {
                     self.rx_lmm_mle_unitdata_ind(queue, message);
                 }
                 SapMsgInner::LmmMleReportInd(prim) => {
-                    tracing::trace!(
-                        "MM: MLE-REPORT indication handle={} transfer_result={}",
-                        prim.handle,
-                        prim.transfer_result
-                    );
+                    self.rx_lmm_mle_report_ind(queue, prim.handle, prim.transfer_result);
                 }
                 _ => {
                     tracing::error!("BUG: unexpected message or state -- routing error");
@@ -3278,6 +3403,8 @@ impl TetraEntityTrait for MmBs {
                             self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
                             self.client_mgr.remove_client(issi);
                             self.forget_energy_saving(issi);
+                            self.clear_solicited_group_report(issi);
+                            self.clear_critical_downlinks_for_issi(issi);
                             self.config.state_write().subscribers.deregister(issi);
                         }
                     }
