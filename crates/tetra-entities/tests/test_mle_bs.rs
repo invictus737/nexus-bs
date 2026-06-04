@@ -114,6 +114,7 @@ fn build_lcmc_req(layer2service: Layer2Service) -> SapMsg {
             layer2_qos: 0,
             stealing_permission: true,
             stealing_repeats_flag: true,
+            unacked_bl_repetitions: None,
             main_address: gssi_addr(),
             chan_alloc: None,
             tx_reporter: None,
@@ -440,7 +441,29 @@ fn test_lcmc_unacknowledged_request_stays_tl_unitdata_request() {
     assert!(prim.stealing_permission);
     assert_eq!(prim.stealing_repeats_flag, Some(true));
     assert_ne!(prim.req_handle, 0);
+    assert_eq!(prim.n_tlsdu_repeats, None);
     assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Cmce);
+}
+
+#[test]
+fn test_lcmc_unacknowledged_request_preserves_explicit_n253_zero() {
+    let mut msg = build_lcmc_req(Layer2Service::Unacknowledged);
+    let SapMsgInner::LcmcMleUnitdataReq(prim) = &mut msg.msg else {
+        panic!("expected CMCE MLE-UNITDATA request");
+    };
+    prim.unacked_bl_repetitions = Some(0);
+
+    let sink_msgs = route_through_mle(msg);
+
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::TlaTlUnitdataReqBl(prim) = &sink_msgs[0].msg else {
+        panic!("expected TL-UNITDATA request for unacknowledged CMCE service");
+    };
+    assert_eq!(
+        prim.n_tlsdu_repeats,
+        Some(0),
+        "EN 300 392-2 clause 22.3.2.4.1 defines N.253 + 1 BL-UDATA transmissions; explicit zero means one complete floor-control transmission"
+    );
 }
 
 #[test]

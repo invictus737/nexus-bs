@@ -97,7 +97,7 @@ impl CcBsSubentity {
         } else {
             UlDlAssignment::Dl
         };
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, target_addr, ts, Some(usage), ul_dl_assigned);
+        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, target_addr, ts, Some(usage), ul_dl_assigned, Some(0));
         queue.push_back(msg);
     }
 

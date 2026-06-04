@@ -649,7 +649,7 @@ impl MleBs {
                     air_interface_encryption: None,
                     stealing_repeats_flag: Some(prim.stealing_repeats_flag),
                     packet_data_flag: false,
-                    n_tlsdu_repeats: None,
+                    n_tlsdu_repeats: prim.unacked_bl_repetitions,
                     data_class_info: None,
                     // EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.4.1 use
                     // request handles to relate subsequent LLC/MAC reports

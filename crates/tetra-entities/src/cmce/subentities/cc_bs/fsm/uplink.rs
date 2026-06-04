@@ -64,12 +64,13 @@ impl CcBsSubentity {
         let mut sdu = BitBuffer::new_autoexpand(50);
         pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DTxGranted");
         sdu.seek(0);
-        queue.push_back(Self::build_sapmsg_stealing_ul_dl(
+        queue.push_back(Self::build_sapmsg_stealing_ul_dl_with_repetitions(
             sdu,
             target_addr,
             target_ts,
             Some(target_usage),
             ul_dl_assigned,
+            Some(0),
         ));
     }
 
@@ -95,12 +96,13 @@ impl CcBsSubentity {
         let mut sdu = BitBuffer::new_autoexpand(30);
         pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DTxCeased");
         sdu.seek(0);
-        queue.push_back(Self::build_sapmsg_stealing_ul_dl(
+        queue.push_back(Self::build_sapmsg_stealing_ul_dl_with_repetitions(
             sdu,
             target_addr,
             target_ts,
             Some(target_usage),
             UlDlAssignment::Dl,
+            Some(0),
         ));
     }
 
@@ -930,6 +932,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
                 chan_alloc: None,
                 main_address: sender_addr,
                 tx_reporter: None,

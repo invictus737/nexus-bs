@@ -879,6 +879,11 @@ fn assert_compact_d_tx_granted_facch(prim: &LcmcMleUnitdataReq, grant: &DTxGrant
     assert_eq!(grant.transmitting_party_type_identifier, None);
     assert_eq!(grant.transmitting_party_address_ssi, None);
     assert_eq!(
+        prim.unacked_bl_repetitions,
+        Some(0),
+        "D-TX GRANTED FACCH is time-sensitive floor control and must not repeat stale BL-UDATA over a later floor state"
+    );
+    assert_eq!(
         prim.sdu.get_len(),
         25,
         "D-TX GRANTED must omit optional transmitting-party IEs so it fits assigned-channel FACCH/STCH"
@@ -7337,6 +7342,7 @@ fn test_simplex_p2p_u_tx_ceased_hands_floor_to_queued_requester() {
     assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
     assert_eq!(requester_grant.1.transmitting_party_type_identifier, None);
     assert_eq!(requester_grant.1.transmitting_party_address_ssi, None);
+    assert_eq!(requester_grant.0.unacked_bl_repetitions, Some(0));
     assert_eq!(requester_grant.0.sdu.get_len(), 25);
     let requester_alloc = requester_grant
         .0
@@ -7355,6 +7361,7 @@ fn test_simplex_p2p_u_tx_ceased_hands_floor_to_queued_requester() {
     );
     assert_eq!(listener_grant.1.transmitting_party_type_identifier, None);
     assert_eq!(listener_grant.1.transmitting_party_address_ssi, None);
+    assert_eq!(listener_grant.0.unacked_bl_repetitions, Some(0));
     assert_eq!(listener_grant.0.sdu.get_len(), 25);
     let listener_alloc = listener_grant
         .0
@@ -7432,6 +7439,7 @@ fn test_simplex_p2p_u_tx_demand_after_idle_floor_grants_with_bidirectional_alloc
     assert_eq!(requester_grant.1.call_identifier, call_id);
     assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
     assert!(!requester_grant.1.transmission_request_permission);
+    assert_eq!(requester_grant.0.unacked_bl_repetitions, Some(0));
     let requester_alloc = requester_grant
         .0
         .chan_alloc
@@ -7448,6 +7456,7 @@ fn test_simplex_p2p_u_tx_demand_after_idle_floor_grants_with_bidirectional_alloc
         TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     );
     assert!(!listener_grant.1.transmission_request_permission);
+    assert_eq!(listener_grant.0.unacked_bl_repetitions, Some(0));
     let listener_alloc = listener_grant
         .0
         .chan_alloc
@@ -7839,9 +7848,14 @@ fn test_simplex_p2p_u_tx_ceased_without_queued_request_does_not_grant_peer() {
         })
         .collect();
     assert_eq!(ceased.len(), 2, "end of simplex private transmission should notify both MSs");
-    for (_, pdu) in &ceased {
+    for (prim, pdu) in &ceased {
         assert_eq!(pdu.call_identifier, call_id);
         assert!(!pdu.transmission_request_permission);
+        assert_eq!(
+            prim.unacked_bl_repetitions,
+            Some(0),
+            "D-TX CEASED FACCH must be single-shot so it cannot repeat over a later D-TX GRANTED"
+        );
     }
     assert!(ceased.iter().any(|(prim, _)| prim.main_address.ssi == TEST_ISSI));
     assert!(ceased.iter().any(|(prim, _)| prim.main_address.ssi == TEST_CALLED_ISSI));

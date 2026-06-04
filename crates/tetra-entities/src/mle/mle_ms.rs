@@ -649,7 +649,7 @@ impl MleMs {
                 air_interface_encryption: None,
                 stealing_repeats_flag: Some(prim.stealing_repeats_flag),
                 packet_data_flag: false,
-                n_tlsdu_repeats: None,
+                n_tlsdu_repeats: prim.unacked_bl_repetitions,
                 data_class_info: None,
                 req_handle,
                 chan_alloc,

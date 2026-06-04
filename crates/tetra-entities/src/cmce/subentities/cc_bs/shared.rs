@@ -192,6 +192,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
                 chan_alloc,
                 main_address: address,
                 tx_reporter: reporter,
@@ -217,6 +218,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
                 chan_alloc: None,
                 main_address: address,
                 tx_reporter: None,
@@ -306,7 +308,18 @@ impl CcBsSubentity {
         usage: Option<u8>,
         ul_dl_assigned: UlDlAssignment,
     ) -> SapMsg {
-        Self::build_sapmsg_stealing_ul_dl_reported(sdu, address, ts, usage, ul_dl_assigned, None)
+        Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(sdu, address, ts, usage, ul_dl_assigned, None, None)
+    }
+
+    pub(super) fn build_sapmsg_stealing_ul_dl_with_repetitions(
+        sdu: BitBuffer,
+        address: TetraAddress,
+        ts: u8,
+        usage: Option<u8>,
+        ul_dl_assigned: UlDlAssignment,
+        unacked_bl_repetitions: Option<u8>,
+    ) -> SapMsg {
+        Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(sdu, address, ts, usage, ul_dl_assigned, None, unacked_bl_repetitions)
     }
 
     pub(super) fn build_sapmsg_stealing_ul_dl_reported(
@@ -316,6 +329,18 @@ impl CcBsSubentity {
         usage: Option<u8>,
         ul_dl_assigned: UlDlAssignment,
         reporter: Option<TxReporter>,
+    ) -> SapMsg {
+        Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(sdu, address, ts, usage, ul_dl_assigned, reporter, None)
+    }
+
+    fn build_sapmsg_stealing_ul_dl_reported_with_repetitions(
+        sdu: BitBuffer,
+        address: TetraAddress,
+        ts: u8,
+        usage: Option<u8>,
+        ul_dl_assigned: UlDlAssignment,
+        reporter: Option<TxReporter>,
+        unacked_bl_repetitions: Option<u8>,
     ) -> SapMsg {
         let mut timeslots = [false; 4];
         timeslots[(ts - 1) as usize] = true;
@@ -341,6 +366,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: true,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions,
                 chan_alloc: Some(chan_alloc),
                 main_address: address,
                 tx_reporter: reporter,
@@ -630,6 +656,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
                 chan_alloc: None,
                 main_address: prim.received_tetra_address,
                 tx_reporter: None,
@@ -682,6 +709,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
                 chan_alloc: None,
                 main_address: calling_addr,
                 tx_reporter: None,
@@ -1738,7 +1766,7 @@ impl CcBsSubentity {
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         // DL-only on group FACCH: only the current speaker holds UL.
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl);
+        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
         queue.push_back(msg);
     }
 
@@ -1777,7 +1805,7 @@ impl CcBsSubentity {
         // DL-only on group FACCH: the interrupted MS/listeners must not retain UL permission.
         // Keep the active traffic usage marker so the STCH MAC-RESOURCE is
         // still tied to the assigned channel carrying the call.
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, target_addr, ts, Some(usage), UlDlAssignment::Dl);
+        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, target_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
         queue.push_back(msg);
     }
 
@@ -1799,7 +1827,7 @@ impl CcBsSubentity {
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         // DL-only on group FACCH: signalling to all members, no UL expected here.
-        let msg = Self::build_sapmsg_stealing_ul_dl(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl);
+        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
         queue.push_back(msg);
     }
 

@@ -2918,3 +2918,51 @@ Next non-repeating execution:
 1. User retests private simplex `2260616 -> 2260618`.
 2. Expected log around hangup: `U-DISCONNECT` from `2260616`, prompt `D-RELEASE` to `2260616`, no `D-DISCONNECT` to `2260618`, tail-drained peer `D-RELEASE` to `2260618`, circuit close only after D-RELEASE reporter completion or bounded local guard.
 3. If MXP600 still reboots, inspect the last 20 seconds of `2260618` downlink and registration log before making another protocol change.
+
+## 2026-06-04 23:53:42 EEST - P2P/group floor-control BL-UDATA repeat guard
+
+Problem targeted:
+
+- Live private simplex `2260618 -> 2260616` at `23:37:36` reached `U-CONNECT` and opened the traffic bearer.
+- First speaker `2260618` sent voice normally on ts=2.
+- At `23:37:49.500`, `2260618` sent `U-TX CEASED`; CMCE tail-drained and sent `D-TX CEASED` to both MSs.
+- At `23:37:49.952`, `2260616` sent `U-TX DEMAND` and CMCE granted the floor, but stale `D-TX CEASED` BL-UDATA repetitions were still interleaved after the new `D-TX GRANTED`.
+- Result: no TCH/S voice followed from `2260616`, UMAC timed out at `23:37:53.012`, and later `U-TX CEASED` from `2260616` was ignored because CMCE had already cleared the floor.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b/e: simplex individual-call floor control uses `U-TX DEMAND`, `D-TX GRANTED`, `U-TX CEASED`, and `D-TX CEASED`; a queued handover may grant the next MS without a separate `D-TX CEASED`.
+- EN 300 392-2 clause 14.5.2.2.1: group-call floor control uses the same request/grant/cease pattern for one speaker at a time.
+- EN 300 392-2 clause 22.3.2.4.1 and Annex A.2: for unacknowledged BL-UDATA, `N.253 + 1` complete transmissions are sent; an explicit `N.253=0` means one complete transmission.
+- This patch is clause-scoped hardening of time-sensitive floor-control delivery; it is not formal ETSI certification evidence.
+
+Patch implemented:
+
+- `crates/tetra-saps/src/lcmc/mod.rs`
+  - Added optional `LcmcMleUnitdataReq.unacked_bl_repetitions`.
+- `crates/tetra-entities/src/mle/mle_bs.rs` and `crates/tetra-entities/src/mle/mle_ms.rs`
+  - Pass CMCE's explicit unacknowledged BL repetition request through to LLC as `n_tlsdu_repeats`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Private simplex `D-TX GRANTED` and `D-TX CEASED` now request `N.253=0`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs` and `shared.rs`
+  - Group FACCH `D-TX GRANTED`, `D-TX INTERRUPT`, and `D-TX CEASED` now request `N.253=0`.
+- Other CMCE/SDS/MM-originating LCMC messages keep `None`, so setup/release/status retain the existing LLC default repetition behavior.
+
+Verification:
+
+- `cargo fmt --all` -> pass.
+- `cargo test -p tetra-entities --test test_mle_bs lcmc_unacknowledged --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` -> 49 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 125 passed.
+- `cargo test -p tetra-entities --test test_mle_bs --locked` -> 27 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 80 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this floor-control repeat guard.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest private simplex both directions on `2260616`/`2260618`: expected live log after reverse PTT is `D-TX GRANTED` followed by TCH/S voice, with no stale post-grant `D-TX CEASED` repeats to the newly granted MS.
+4. Retest group `226333` alternating PTT between two terminals: expected no first-return `PTT denied`, no stale `D-TX CEASED` after grant, and no static-only talk spurt.

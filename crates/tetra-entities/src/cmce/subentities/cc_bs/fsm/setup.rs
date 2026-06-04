@@ -301,6 +301,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
                 chan_alloc: Some(CmceChanAllocReq {
                     usage: Some(circuit.usage),
                     alloc_type: ChanAllocType::Replace,
@@ -1144,6 +1145,7 @@ impl CcBsSubentity {
                     layer2_qos: 0,
                     stealing_permission: false,
                     stealing_repeats_flag: false,
+                    unacked_bl_repetitions: None,
                     chan_alloc: Some(CmceChanAllocReq {
                         usage: Some(usage),
                         alloc_type: ChanAllocType::Replace,

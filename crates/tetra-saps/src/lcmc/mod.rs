@@ -181,6 +181,10 @@ pub struct LcmcMleUnitdataReq {
     pub layer2_qos: Todo,
     pub stealing_permission: bool,
     pub stealing_repeats_flag: bool,
+    /// Optional LLC N.253 request for unacknowledged BL-UDATA transfer.
+    /// `None` leaves the LLC designer value in force; `Some(0)` means one
+    /// complete BL-UDATA transmission.
+    pub unacked_bl_repetitions: Option<u8>,
     /// We use this to indicate it may be retransmitted
     /// This may differ from what ETSI envisioned
     // pub eligible_for_graceful_degradation: bool,
