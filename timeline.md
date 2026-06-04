@@ -1037,3 +1037,51 @@ Conclusion:
 
 - This is a private-call routing hardening patch. It does not claim live audio is fixed.
 - It prevents one misleading local-vs-external call setup path for lab ISSIs such as `2260082`, `2260616`, and `2260618` when they are configured local but not currently registered.
+
+## 2026-06-04 11:43:35 EEST - Deployed CMCE local setup guard to test BS
+
+Commit deployed:
+
+- `1b390c8 fix: reject local unregistered private setup locally`
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape used: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Output binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `57875e881f324b462a03f893aa705fdbcf2ae02bbf74a7a7729e5cb0a024253d`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Stopped the prior test BS/control-service using existing pidfiles.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `57875e881f324b462a03f893aa705fdbcf2ae02bbf74a7a7729e5cb0a024253d`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `16325`
+  - control-service pid `16328`
+  - nexus-bs pid `16330`
+
+Post-restart checks:
+
+- Dashboard root returned `Nexus-BS v0.1.55 Dashboard`.
+- `2260082` reappeared, re-affiliated to group `226333`, and showed RSSI/ACK activity around `-22 dBFS`.
+- `2260616` re-registered/re-affiliated to group `226333`, RSSI around `-26 dBFS`, and EG3 assignment was attempted.
+- `2260618` had post-restart retry/LLC activity in the sampled log tail; confirm full registration/affiliation again before using it for WAP/live call evidence.
+- `T352 expired` appeared for BS-initiated EG assignment to `2260082`; fail-safe behavior kept `StayAlive`.
+
+Current live status:
+
+- The test BS now includes:
+  - null-idle traffic patch `2201923`;
+  - LMAC partial TCH/S guard `bfc1960`;
+  - CMCE local-unregistered private setup guard `1b390c8`.
+- No post-`1b390c8` private/group PTT attempt has been recorded yet.
+- Next operator validation is unchanged:
+  - private simplex `2260082 -> 2260616`;
+  - private simplex `2260616 -> 2260082`;
+  - group PTT on `226333`, alternating radios.
+- Required live log filter:
+  - `2260082|2260616|2260618|226333|U-SETUP|D-SETUP|D-CONNECT|U-CONNECT|U-TX DEMAND|D-TX GRANTED|FloorGranted|CMCE opening UMAC circuit|media_source|peer_ts|UMAC voice route|rx_blk_traffic|dropping partial TCH/S|CRC fail|NormalTrainSeq2|Block2|PTT denied|NotGranted|UL inactivity|CalledPartyNotReachable`
