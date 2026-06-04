@@ -8358,6 +8358,64 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
 }
 
 #[test]
+fn test_p2p_peer_u_disconnect_does_not_ack_pending_d_disconnect() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let call_id = start_active_p2p_call(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut disconnect_msgs = test.dump_sinks();
+    let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
+    assert_eq!(
+        disconnect_reporters.len(),
+        1,
+        "Assigned-channel D-DISCONNECT must carry one TxReporter"
+    );
+
+    disconnect_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    // EN 300 392-2 clauses 14.7.1.6 and 14.7.2.9 make U-RELEASE, not
+    // U-DISCONNECT, the MS acknowledgement to D-DISCONNECT. A peer
+    // U-DISCONNECT during the pending release handshake must not be treated as
+    // the expected acknowledgement and must not trigger final one-leg
+    // D-RELEASE to the original disconnecting MS.
+    test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&peer_disconnect_msgs), 0);
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&peer_disconnect_msgs), 0);
+
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(
+        reporters.len(),
+        1,
+        "Only peer U-RELEASE should complete the pending D-DISCONNECT handshake"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "P2P circuit must stay open until final D-RELEASE transmission is reported"
+    );
+}
+
+#[test]
 fn test_p2p_pending_release_ignores_duplicate_u_disconnect_and_tx_demand() {
     debug::setup_logging_verbose();
 

@@ -824,31 +824,9 @@ impl CcBsSubentity {
 
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
             tracing::info!("U-DISCONNECT (individual) call_id={} cause={}", call_id, disconnect_cause);
-            if let Some((pending_cause, release_to_issi)) =
-                self.take_individual_disconnect_delivery_release_if_awaited_by(call_id, sender.ssi)
-            {
-                tracing::info!(
-                    "U-DISCONNECT completes pending individual D-DISCONNECT delivery call_id={} from ISSI {}",
-                    call_id,
-                    sender.ssi
-                );
-                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
-                return;
-            }
-
-            if let Some((pending_cause, release_to_issi)) = call_snapshot.pending_disconnect_release_if_awaited_by(sender.ssi) {
-                tracing::info!(
-                    "U-DISCONNECT completes pending individual disconnect call_id={} from ISSI {}",
-                    call_id,
-                    sender.ssi
-                );
-                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
-                return;
-            }
-
             if matches!(call_snapshot.state, IndividualCallState::DisconnectPending { .. }) {
                 tracing::debug!(
-                    "U-DISCONNECT ignored for pending individual disconnect call_id={} from non-awaited ISSI {}",
+                    "U-DISCONNECT ignored for pending individual disconnect call_id={} from ISSI {}; expected U-RELEASE response to D-DISCONNECT",
                     call_id,
                     sender.ssi
                 );

@@ -2422,3 +2422,42 @@ Next non-repeating execution:
    - no `Pending individual D-DISCONNECT timed out`,
    - no Motorola `No answer` at normal hangup.
 4. If the peer still does not send `U-RELEASE`, inspect on-air MAC STCH allocation bits and raw decoded `MacResource` for the `D-DISCONNECT` slot.
+
+## 2026-06-04 21:34:15 EEST - Private disconnect collision semantics tightened
+
+Problem targeted:
+
+- Agent CMCE audit found that BS accepted peer `U-DISCONNECT` as if it were the `U-RELEASE` acknowledgement to a pending private-call `D-DISCONNECT`.
+- That is too loose for ETSI call clearing: it can hide a missing `U-RELEASE` and complete the wrong state transition.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.7.1.6: `D-DISCONNECT` response expected is `U-RELEASE`.
+- EN 300 392-2 clause 14.7.2.4: `U-DISCONNECT` is an MS request to disconnect a call and expects `D-DISCONNECT`/`D-RELEASE`; it is not the acknowledgement to `D-DISCONNECT`.
+- EN 300 392-2 clause 14.7.2.9: `U-RELEASE` is the acknowledgement to `D-DISCONNECT`.
+- EN 300 392-2 clause 14.5.1.3.5: in colliding disconnection, the MS shall respond to incoming `D-DISCONNECT` as in clause 14.5.1.3.3, i.e. with `U-RELEASE`.
+- This is clause-scoped hardening only; no formal certification claim.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Removed the two branches that allowed `U-DISCONNECT` from the awaited peer to complete pending `D-DISCONNECT` delivery or pending `DisconnectPending` state.
+  - Pending private disconnect now ignores peer `U-DISCONNECT` and continues waiting for real `U-RELEASE` or bounded fallback timeout.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_p2p_peer_u_disconnect_does_not_ack_pending_d_disconnect`.
+  - The test proves peer `U-DISCONNECT` does not trigger final `D-RELEASE`; peer `U-RELEASE` remains the completing PDU.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_peer_u_disconnect_does_not_ack_pending_d_disconnect --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 123 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to test BS.
+2. Retest private simplex hangup. Expected clean log is `U-DISCONNECT` -> `D-DISCONNECT` -> peer `U-RELEASE` -> final one-leg `D-RELEASE`, with no fallback timeout and no terminal `No answer`.
+3. If the peer sends `U-DISCONNECT` instead of `U-RELEASE`, treat that as a remaining terminal/protocol collision signal to inspect on-air delivery, not as a successful acknowledgement.
