@@ -126,6 +126,14 @@ impl MmBs {
     // Local restart recovery retry cadence. This is an operator-side SwMI
     // policy around the ETSI clause 16.4.4 infrastructure-initiated
     // registration procedure, not an ETSI timer value.
+    //
+    // The initial guard and inter-ISSI spacing are local RF robustness policy:
+    // after process restart the SDR/PHY path may still be settling, and
+    // blasting several acknowledged MM commands in the same first TDMA tick can
+    // lose the very D-LOCATION UPDATE COMMANDs that are meant to clear
+    // "Unit Not Attached" states.
+    const RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS: i32 = 2 * 18 * 4;
+    const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18;
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 5;
     // Local acceptance window for the group-report phase requested by
@@ -136,14 +144,16 @@ impl MmBs {
 
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         let client_mgr = MmClientMgr::new(telemetry.clone());
+        let restart_recovery_start = TdmaTime::default().add_timeslots(Self::RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS);
         let restart_recovery = Self::load_restart_recovery_candidates(&config)
             .into_iter()
-            .map(|issi| {
+            .enumerate()
+            .map(|(index, issi)| {
                 (
                     issi,
                     RestartRecoveryProbe {
                         attempts: 0,
-                        next_due: TdmaTime::default(),
+                        next_due: restart_recovery_start.add_timeslots(index as i32 * Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS),
                     },
                 )
             })
@@ -306,6 +316,7 @@ impl MmBs {
 
         let mut done = Vec::new();
         let mut commands = Vec::new();
+        let mut command_scheduled_this_tick = false;
         for (&issi, probe) in self.restart_recovery.iter_mut() {
             if self.client_mgr.client_is_known(issi) {
                 done.push(issi);
@@ -327,6 +338,10 @@ impl MmBs {
             if ts.diff(probe.next_due) < 0 {
                 continue;
             }
+            if command_scheduled_this_tick {
+                probe.next_due = ts.add_timeslots(Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS);
+                continue;
+            }
 
             tracing::info!(
                 "MM: restart recovery attempt {}/{} for ISSI {} — sending D-LOCATION-UPDATE-COMMAND",
@@ -335,6 +350,7 @@ impl MmBs {
                 issi
             );
             commands.push(issi);
+            command_scheduled_this_tick = true;
             probe.attempts = probe.attempts.saturating_add(1);
             probe.next_due = ts.add_timeslots(Self::RESTART_RECOVERY_RETRY_TIMESLOTS);
         }

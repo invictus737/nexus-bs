@@ -4477,23 +4477,36 @@ fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
     // EN 300 392-2 clause 16.4.4 permits the SwMI to initiate registration at
     // any time with D-LOCATION UPDATE COMMAND. Nexus-BS uses that procedure
     // after process restart for locally known ISSIs that may still be camped.
+    // Keep the local restart probe behind a short startup guard and pace
+    // recovered ISSIs so the first RF frames are not overloaded with several
+    // acknowledged MM commands at once.
+    test.run_stack(Some(144));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "restart recovery must not blast commands during the startup RF guard"
+    );
+
     test.run_stack(Some(1));
     let sink_msgs = test.dump_sinks();
     let commands = location_update_commands(&sink_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, cached_issi);
+    assert_eq!(commands[0].1, 0);
+    assert!(commands[0].2.group_identity_report);
 
-    assert_eq!(commands.len(), 2);
+    test.run_stack(Some(17));
     assert!(
-        commands
-            .iter()
-            .any(|(issi, handle, pdu)| *issi == cached_issi && *handle == 0 && pdu.group_identity_report),
-        "expected restart recovery command for cached ISSI {cached_issi}, got {commands:?}"
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "restart recovery must pace configured/cached ISSIs instead of sending a burst"
     );
-    assert!(
-        commands
-            .iter()
-            .any(|(issi, handle, pdu)| *issi == seeded_issi && *handle == 0 && pdu.group_identity_report),
-        "expected restart recovery command for configured seed ISSI {seeded_issi}, got {commands:?}"
-    );
+
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let commands = location_update_commands(&sink_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, seeded_issi);
+    assert_eq!(commands[0].1, 0);
+    assert!(commands[0].2.group_identity_report);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
@@ -4546,7 +4559,7 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(1));
+    test.run_stack(Some(145));
     let command_msgs = test.dump_sinks();
     let commands = location_update_commands(&command_msgs);
     let command_details = location_update_command_details(&command_msgs);
@@ -4662,7 +4675,7 @@ fn test_restart_recovery_demand_location_update_accepts_complete_group_report_wi
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(1));
+    test.run_stack(Some(145));
     let command_msgs = test.dump_sinks();
     let command_details = location_update_command_details(&command_msgs);
     assert_eq!(command_details.len(), 1);
@@ -4736,7 +4749,7 @@ fn test_restart_recovery_accepts_solicited_attach_detach_group_report_completion
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(1));
+    test.run_stack(Some(145));
     let command_msgs = test.dump_sinks();
     let command_details = location_update_command_details(&command_msgs);
     assert_eq!(command_details.len(), 1);
@@ -4823,7 +4836,7 @@ fn test_restart_recovery_group_report_complete_keeps_groups_empty() {
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    test.run_stack(Some(1));
+    test.run_stack(Some(145));
     let command_msgs = test.dump_sinks();
     let command_details = location_update_command_details(&command_msgs);
     assert_eq!(command_details.len(), 1);

@@ -1,5 +1,59 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 13:00:32 EEST - MM restart recovery pacing for post-restart Unit Not Attached window
+
+User symptom:
+
+- After BS restart, terminals can show `Unit Not Attached`.
+
+Component in simple terms:
+
+- MM is Mobility Management. It owns terminal registration/location update and group affiliation rebuild after restart.
+- Restart recovery is the MM procedure that asks still-camped radios to re-register after the Nexus-BS process has lost in-memory subscriber state.
+
+Live evidence from `chris@192.168.1.179`:
+
+- Active process: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`.
+- Recovery cache exists at `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` and contains `2260082`, `2260616`, `2260618`.
+- At `12:49:26` Nexus-BS armed restart recovery for all three ISSIs and immediately sent `D-LOCATION-UPDATE-COMMAND` to all three in the same startup window.
+- The live log also showed startup PHY timing loss/late TX warnings, then LLC retransmission exhaustion for some initial recovery commands.
+- All three terminals later recovered:
+  - `2260082`: `D-LOCATION UPDATE ACCEPT`, CMCE Register, CMCE Affiliate `[226333]`, solicited group report accepted.
+  - `2260618`: `DemandLocationUpdating`, `D-LOCATION UPDATE ACCEPT`, EG3 allocation, CMCE Register/Affiliate `[226333]`.
+  - `2260616`: slower recovery after repeated `D-LOCATION-UPDATE-COMMAND`, then Register/Affiliate `[226333]`.
+- No literal `Unit Not Attached` appears in `nexus-bs.log` or `control.log`; the label is likely the radio/Brew symptom during the temporary not-yet-recovered MM state.
+
+ETSI scope:
+
+- EN 300 392-2 clause 16.4.4 / figure 16.6 permits infrastructure-initiated registration using `D-LOCATION UPDATE COMMAND`, optionally with group report request.
+- This patch does not change the standardized PDU or registration semantics. It changes only local Nexus-BS retry timing so acknowledged MM commands are not blasted during SDR startup.
+- No formal certification claim is made.
+
+Patch:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Added a 2-second TDMA startup guard before restart recovery probes.
+  - Added 250 ms inter-ISSI spacing for cached/configured recovery ISSIs.
+  - Added one-command-per-tick deferral so multiple due probes cannot burst together.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Updated restart recovery tests to assert no command during startup guard.
+  - Asserted cached/configured ISSIs are paced instead of sent in the same tick.
+  - Preserved existing tests proving that actual registration/group/EG state is rebuilt only from terminal responses.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 6 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 108 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating actions:
+
+- Commit, build locally for AArch64, deploy direct over `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`.
+- Restart test BS and verify post-restart logs show spaced recovery attempts, not three immediate commands at `t=0`.
+- After this MM patch is live, return to CMCE group queued `U-TX CEASED` withdrawal and live group/private audio validation. Do not reopen the solved pure UMAC bit-copy hypothesis.
+
 ## 2026-06-04 10:22:33 EEST - PM orchestration checkpoint
 
 Goal in force: clause-scoped ETSI EN 300 392-2 hardening for a robust Nexus-BS TETRA stack. The target remains practical engineering evidence for group call, private call simplex/duplex, SDS/status, MM attach/affiliation persistence, scan/group retention, WAP MVP, and long-running BS stability. This is not a formal certification claim; formal certification requires official conformance evidence.
