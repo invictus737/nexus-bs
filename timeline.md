@@ -1,5 +1,56 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 21:54:29 EEST - Patched private simplex hangup No Answer release acknowledgement
+
+User symptom:
+
+- Motorola showed `No answer` at the end of a private simplex call.
+- The live test BS was already running `Build: v0.1.55-a26e3a23`, which had `D-DISCONNECT` response capability and required peer `U-RELEASE`, but the current post-restart log sample did not contain a fresh private-call release attempt.
+
+Component in simple technical terms:
+
+- CMCE/CC-BS is the call-control state machine for private and group calls.
+- `U-DISCONNECT` is the terminal request to end a private call.
+- `D-RELEASE` is the BS response expected by the terminal that requested the end of the call.
+- `D-DISCONNECT` is the BS request to clear the other terminal; that peer answers with `U-RELEASE`.
+- UMAC stays responsible for keeping the assigned traffic channel open until the required release messages are reported transmitted.
+
+ETSI clause scope checked:
+
+- EN 300 392-2 clause 14.5.1.3.1 says an MS that sends `U-DISCONNECT` waits for `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3 says an MS receiving `D-DISCONNECT` responds with `U-RELEASE`, while `D-RELEASE` expects no response.
+- EN 300 392-2 clause 14.7.1.6 defines `D-DISCONNECT` with response expected `U-RELEASE`.
+- EN 300 392-2 clause 14.7.1.9 defines `D-RELEASE` as the infrastructure release message with no response expected.
+- This is clause-scoped engineering alignment only, not formal ETSI/TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - A valid active private-call `U-DISCONNECT` now sends prompt `D-RELEASE` to the requesting MS before/alongside peer clearing.
+  - Peer clearing still uses `D-DISCONNECT` and waits for peer `U-RELEASE`; peer `U-DISCONNECT` is still not treated as the acknowledgement.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added pending prompt-release ACK tracking so the traffic circuit closes only after the initiator `D-RELEASE` is transmitted and peer clearing completes.
+  - Fallback paths for lost/discarded `D-DISCONNECT` now avoid duplicating `D-RELEASE` to the initiator; they release only the remaining peer leg when the prompt ACK was already sent.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Timer drain now includes pending private disconnect release ACKs.
+  - Peer `U-RELEASE` timeout uses the new peer-leg fallback release path.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated private-call release tests to assert prompt initiator `D-RELEASE`, peer `D-DISCONNECT` with `UlDlAssignment::Both`, no duplicate initiator release after peer `U-RELEASE`, and no UMAC close before release reporters complete.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 61 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 123 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 9 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next live validation:
+
+- Commit, build locally, deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`, restart the test BS, and retest private simplex between `2260082` and `2260616`.
+- Expected live evidence: after one terminal hangs up, logs show `U-DISCONNECT`, prompt `D-RELEASE` to that ISSI, `D-DISCONNECT` to the peer with assigned channel response capability, peer `U-RELEASE`, and no `Pending individual D-DISCONNECT timed out`.
+
 ## 2026-06-04 21:01:37 EEST - Fixed private simplex first-PTT floor inversion for hook setup
 
 User symptom:

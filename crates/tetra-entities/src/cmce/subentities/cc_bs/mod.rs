@@ -94,6 +94,14 @@ struct PendingIndividualDisconnectDelivery {
     started_at: TdmaTime,
 }
 
+struct PendingIndividualDisconnectReleaseAck {
+    release_to_issi: u32,
+    cause: DisconnectCause,
+    reporters: Vec<TxReporter>,
+    started_at: TdmaTime,
+    peer_release_received: bool,
+}
+
 /// Clause 14 Call Control CMCE sub-entity (ETSI EN 300 392-2)
 /// Supports group calls (simplex PTT), individual calls (full-duplex P2P),
 /// and circuit-switched calls bridged over Brew/TetraPack.
@@ -111,6 +119,8 @@ pub struct CcBsSubentity {
     individual_calls: HashMap<u16, IndividualCall>,
     /// Active D-DISCONNECT deliveries that must reach MAC before the peer-response timer starts.
     pending_individual_disconnect_deliveries: HashMap<u16, PendingIndividualDisconnectDelivery>,
+    /// Prompt D-RELEASE acknowledgements already sent to the MS that requested individual disconnection.
+    pending_individual_disconnect_release_acks: HashMap<u16, PendingIndividualDisconnectReleaseAck>,
     /// Individual releases waiting for assigned-channel D-RELEASE transmission or a bounded guard timeout.
     pending_individual_releases: HashMap<u16, PendingIndividualRelease>,
     /// Registered subscriber groups (ISSI -> set of GSSIs)

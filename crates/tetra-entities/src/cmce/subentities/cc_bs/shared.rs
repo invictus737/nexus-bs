@@ -41,6 +41,7 @@ impl CcBsSubentity {
             pending_group_releases: HashMap::new(),
             individual_calls: HashMap::new(),
             pending_individual_disconnect_deliveries: HashMap::new(),
+            pending_individual_disconnect_release_acks: HashMap::new(),
             pending_individual_releases: HashMap::new(),
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
@@ -977,15 +978,131 @@ impl CcBsSubentity {
                     "CMCE: D-DISCONNECT discarded before delivery for call_id={}; sending D-RELEASE instead of waiting for peer U-RELEASE",
                     call_id
                 );
-                self.release_individual_call(queue, call_id, pending.cause);
+                self.release_individual_disconnect_fallback(queue, call_id, pending.cause, Some(pending.awaiting_release_from));
             } else {
                 tracing::warn!(
                     "CMCE: D-DISCONNECT delivery reporter still pending for call_id={} after local guard; sending D-RELEASE instead of waiting for peer U-RELEASE",
                     call_id
                 );
-                self.release_individual_call(queue, call_id, pending.cause);
+                self.release_individual_disconnect_fallback(queue, call_id, pending.cause, Some(pending.awaiting_release_from));
             }
         }
+    }
+
+    pub(super) fn send_individual_disconnect_release_ack(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        call: &IndividualCall,
+        release_to_issi: u32,
+        disconnect_cause: DisconnectCause,
+    ) {
+        if self.pending_individual_disconnect_release_acks.contains_key(&call_id) {
+            return;
+        }
+
+        // EN 300 392-2 clause 14.5.1.3.1 says the MS that sent
+        // U-DISCONNECT waits for D-RELEASE. Send that acknowledgement promptly
+        // to the requesting leg, while the peer leg is cleared separately with
+        // D-DISCONNECT -> U-RELEASE per clauses 14.5.1.3.3 and 14.7.1.6.
+        let reporters = self.send_established_individual_release_pdus(queue, call_id, call, disconnect_cause, Some(release_to_issi));
+        self.pending_individual_disconnect_release_acks.insert(
+            call_id,
+            PendingIndividualDisconnectReleaseAck {
+                release_to_issi,
+                cause: disconnect_cause,
+                reporters,
+                started_at: self.dltime,
+                peer_release_received: false,
+            },
+        );
+        self.complete_individual_disconnect_if_ready(queue, call_id);
+    }
+
+    pub(super) fn complete_individual_disconnect_peer_release(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+        release_to_issi: u32,
+    ) {
+        if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
+            pending.peer_release_received = true;
+            self.complete_individual_disconnect_if_ready(queue, call_id);
+        } else {
+            self.release_individual_call_to_issi(queue, call_id, disconnect_cause, release_to_issi);
+        }
+    }
+
+    pub(super) fn release_individual_disconnect_fallback(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+        release_to_issi: Option<u32>,
+    ) {
+        if let Some(pending_ack) = self.pending_individual_disconnect_release_acks.get(&call_id) {
+            let release_to_peer = release_to_issi.or_else(|| {
+                self.individual_calls
+                    .get(&call_id)
+                    .and_then(|call| call.peer_issi_for(pending_ack.release_to_issi))
+            });
+            if let Some(peer_issi) = release_to_peer {
+                self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true, Some(peer_issi));
+                return;
+            }
+        }
+
+        self.release_individual_call(queue, call_id, disconnect_cause);
+    }
+
+    pub(super) fn drain_pending_individual_disconnect_release_acks(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<u16> = self
+            .pending_individual_disconnect_release_acks
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.peer_release_received && self.individual_disconnect_release_ack_done(pending) {
+                    Some(call_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for call_id in ready {
+            self.complete_individual_disconnect_if_ready(queue, call_id);
+        }
+    }
+
+    fn individual_disconnect_release_ack_done(&self, pending: &PendingIndividualDisconnectReleaseAck) -> bool {
+        pending.reporters.iter().all(TxReporter::is_transmitted)
+            || pending.started_at.age(self.dltime) >= INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS
+    }
+
+    fn complete_individual_disconnect_if_ready(&mut self, queue: &mut MessageQueue, call_id: u16) {
+        let ready = self
+            .pending_individual_disconnect_release_acks
+            .get(&call_id)
+            .is_some_and(|pending| pending.peer_release_received && self.individual_disconnect_release_ack_done(pending));
+        if !ready {
+            return;
+        }
+
+        let Some(pending) = self.pending_individual_disconnect_release_acks.remove(&call_id) else {
+            return;
+        };
+        if !pending.reporters.iter().all(TxReporter::is_transmitted) {
+            tracing::warn!(
+                "CMCE: completing individual disconnect call_id={} after D-RELEASE acknowledgement guard for ISSI {} cause={:?}",
+                call_id,
+                pending.release_to_issi,
+                pending.cause
+            );
+        }
+        let Some(call) = self.individual_calls.remove(&call_id) else {
+            return;
+        };
+        self.complete_individual_release_cleanup(queue, call_id, call, pending.cause, Vec::new(), true);
     }
 
     /// Notify UMAC to open a traffic circuit (ETSI §21 circuit management).
@@ -1615,6 +1732,7 @@ impl CcBsSubentity {
         self.cached_setups.remove(&call_id);
         self.individual_calls.remove(&call_id);
         self.pending_individual_disconnect_deliveries.remove(&call_id);
+        self.pending_individual_disconnect_release_acks.remove(&call_id);
 
         if notify_brew
             && (call.called_over_brew || call.calling_over_brew)
@@ -1715,6 +1833,7 @@ impl CcBsSubentity {
             return;
         }
         self.pending_individual_disconnect_deliveries.remove(&call_id);
+        self.pending_individual_disconnect_release_acks.remove(&call_id);
 
         let Some(call_snapshot) = self.individual_calls.remove(&call_id) else {
             tracing::warn!("No individual call for call_id={}", call_id);

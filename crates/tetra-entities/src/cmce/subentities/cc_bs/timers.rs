@@ -37,6 +37,7 @@ impl CcBsSubentity {
         self.drain_pending_group_releases(queue);
         self.drain_pending_individual_releases(queue);
         self.drain_pending_individual_disconnect_deliveries(queue);
+        self.drain_pending_individual_disconnect_release_acks(queue);
         self.check_individual_disconnect_pending_timeout(queue);
 
         // ETSI T310 equivalent for active calls.
@@ -224,7 +225,7 @@ impl CcBsSubentity {
                 "Pending individual D-DISCONNECT timed out for call_id={}, releasing circuit",
                 call_id
             );
-            self.release_individual_call(queue, call_id, cause);
+            self.release_individual_disconnect_fallback(queue, call_id, cause, None);
         }
     }
 

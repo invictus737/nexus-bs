@@ -739,7 +739,7 @@ impl CcBsSubentity {
                     call_id,
                     sender.ssi
                 );
-                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
+                self.complete_individual_disconnect_peer_release(queue, call_id, pending_cause, release_to_issi);
                 return;
             }
 
@@ -749,7 +749,7 @@ impl CcBsSubentity {
                     call_id,
                     sender.ssi
                 );
-                self.release_individual_call_to_issi(queue, call_id, pending_cause, release_to_issi);
+                self.complete_individual_disconnect_peer_release(queue, call_id, pending_cause, release_to_issi);
                 return;
             }
 
@@ -854,6 +854,7 @@ impl CcBsSubentity {
                     );
                     return;
                 }
+                self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
                 if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {
                     self.begin_individual_disconnect_delivery(call_id, peer_issi, sender.ssi, reporter, disconnect_cause);
                 } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
