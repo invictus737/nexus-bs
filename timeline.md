@@ -1,5 +1,53 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 13:17:51 EEST - Deployed long-lived MM restart recovery to test BS
+
+Deployed commit:
+
+- `4588590 fix: extend MM restart recovery`
+
+Build/deploy:
+
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Local/remote deployed binary SHA-256:
+  - `dd061b3bf5169c5ff0ff45a5505cc0d3dca1a7b30f21584f39a74a8ea1722bda`
+- Deployed direct over `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`.
+- No binary backup was created.
+- Restarted test BS with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live evidence:
+
+- Startup banner reports `Build: v0.1.55-4588590b`.
+- MM armed restart recovery for cached/configured ISSIs `{2260082, 2260616, 2260618}`.
+- `2260082` self re-registered and CMCE received:
+  - `subscriber register issi=2260082`
+  - `subscriber affiliate issi=2260082 groups=[226333]`
+- `2260616` self re-registered and CMCE received:
+  - `subscriber register issi=2260616`
+  - `subscriber affiliate issi=2260616 groups=[226333]`
+- `2260618` missed early recovery commands, then the new 5 s long-lived retry sequence ran:
+  - attempts `1/60`, `2/60`, `3/60`, `4/60`
+  - then `2260618` re-registered and CMCE received `subscriber affiliate issi=2260618 groups=[226333]`.
+- After waiting past the prior 60 s group-report window, no `solicited group report window expired` or `re-requesting group report` appeared after the group-bearing `U-LOCATION UPDATE DEMAND`.
+- No literal `Unit Not Attached` appeared in `nexus-bs.log` or `control.log`.
+
+Residual observations:
+
+- BS-initiated EG3 assignment still timed out for `2260082` and `2260616`; fail-safe behavior kept `StayAlive`.
+- That EG fallback is not a blocker for group/private PTT validation, but EG3 default should be revisited after the voice path is stable because terminals are not confirming the BS-initiated EG assignment in this live run.
+
+Next non-repeating actions:
+
+- Test group PTT on `226333` in sequence:
+  - `2260616` PTT/speak/release.
+  - `2260082` PTT/speak/release.
+  - `2260618` PTT/speak/release if available.
+- Capture logs for `U-TX DEMAND`, `D-TX GRANTED`, `FloorGranted`, `UMAC floor granted`, `rx_blk_traffic`, `TCH/S`, `UL inactivity`, `PTT denied`, and `NotGranted`.
+- Then repeat private simplex `2260082 <-> 2260616`.
+- Do not re-open the pure UMAC bit-copy hypothesis unless new evidence contradicts the existing component tests.
+
 ## 2026-06-04 13:09:59 EEST - MM restart recovery made long-lived and group-report pending cleared
 
 User symptom:
