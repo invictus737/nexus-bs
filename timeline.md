@@ -43,11 +43,21 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Deployment result:
+
+- Committed as `8452f9b fix: bound LLC inbound duplicate suppression`.
+- Deployed direct to testing with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Running BS build: `v0.1.55-8452f9b2`.
+- Deployed binary SHA-256: `f385e880db8df5cd5e79541d004c616cf9583f1b8d4027a424eadf6fac01cc08`.
+- Post-start log showed `2260082`, `2260618`, and `2260616` registered and affiliated to `226333`.
+- Post-start log also showed the new bounded behaviour:
+  - `LLC: expiring inbound duplicate guard for SSI 2260082 endpoint 0 N(S) 1`.
+- No immediate `PTT denied`, `RequestedServiceNotAvailable`, `Service unavailable`, or `Unit Not Attached` lines appeared in the post-deploy filter.
+
 Next non-repeating execution:
 
-1. Commit and deploy direct to testing.
-2. Retest group alternating PTT with `2260616`, `2260618`, and `2260082` on GSSI `226333`.
-3. Expected live evidence: no stale `LLC: suppressing duplicate inbound ...` for new group-call control after the T.251/N.252 horizon; CMCE should receive the control PDU and either grant or explicitly log any real floor denial reason.
+1. Retest group alternating PTT with `2260616`, `2260618`, and `2260082` on GSSI `226333`.
+2. Expected live evidence: no stale `LLC: suppressing duplicate inbound ...` for new group-call control after the T.251/N.252 horizon; CMCE should receive the control PDU and either grant or explicitly log any real floor denial reason.
 
 ## 2026-06-04 23:21:39 EEST - Dashboard CPU model detection across boards
 
