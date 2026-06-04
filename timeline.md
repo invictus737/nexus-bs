@@ -44,9 +44,35 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Build/deploy:
+
+- Commit: `deefa8d fix: reassert group floor on repeated setup`
+- Deployed with the new one-shot local script:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Remote deployed binary SHA-256:
+  - `ddbb38afa84973c83b9f727ede434fa571423c7ef94255f9780f23f0513b81b6`
+- Restarted test BS with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live evidence after deploy:
+
+- Startup banner reports `Build: v0.1.55-deefa8d4`.
+- `2260082`, `2260616`, and `2260618` registered and affiliated to `226333`.
+- Repeated same-GSSI `U-SETUP` from current speaker now emits:
+  - individual `D-TX GRANTED (Granted)`;
+  - group FACCH `D-TX GRANTED (GrantedToOtherUser)`;
+  - UMAC `FloorGranted` on the same `call_id`.
+- Concrete post-deploy examples:
+  - `19:50:48` `2260618` repeated `U-SETUP` on `call_id=4` -> `D-TX GRANTED Granted` + `UMAC floor granted`.
+  - `19:50:55` `2260616` repeated `U-SETUP` on `call_id=4` -> `D-TX GRANTED Granted` + `UMAC floor granted`.
+- No `rejecting colliding`, `RequestedServiceNotAvailable`, `Service unavailable`, `PTT denied`, or `Unit Not Attached` appeared in the filtered post-deploy group-call log sample.
+
 Next non-repeating action:
 
-- Commit, build/deploy with `scripts/nexus-bs-test-deploy.sh`, then repeat field group PTT intervention test.
+- Operator validates first-try group PTT audio from `2260616` and `2260618`.
+- If first-try floor now works but audio remains static/silent, move to UMAC/TCH-S uplink media evidence; do not reopen the CMCE setup-collision hypothesis.
 
 ## 2026-06-04 19:37:30 EEST - Patched repeated group PTT U-SETUP service-unavailable path
 
