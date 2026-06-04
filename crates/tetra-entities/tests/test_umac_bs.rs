@@ -2,7 +2,11 @@ mod common;
 
 use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Direction, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, debug};
+use tetra_core::{
+    BitBuffer, BurstType, Direction, Layer2Service, PhyBlockNum, PhyBlockType, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress,
+    TrainingSequence, TxReporter, TxState, debug,
+};
+use tetra_entities::lmac::components::{errorcontrol, scrambler};
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::cmce::enums::transmission_grant::TransmissionGrant;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
@@ -25,6 +29,7 @@ use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
 use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaUnitdataReq};
 use tetra_saps::tmd::TmdCircuitDataInd;
 use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq, enums::logical_chans::LogicalChannel};
+use tetra_saps::tp::TpUnitdataInd;
 
 use crate::common::ComponentTest;
 
@@ -447,6 +452,37 @@ fn acelp_test_bits() -> Vec<u8> {
         .collect()
 }
 
+fn test_scrambling_code() -> u32 {
+    scrambler::tetra_scramb_get_init(204, 1337, 1)
+}
+
+fn encoded_tch_s(codec_bits: &[u8], blk_num: u8) -> BitBuffer {
+    errorcontrol::encode_tp(
+        TmvUnitdataReq {
+            mac_block: BitBuffer::from_bitarr(codec_bits),
+            logical_channel: LogicalChannel::TchS,
+            scrambling_code: test_scrambling_code(),
+        },
+        blk_num,
+    )
+}
+
+fn build_uplink_tch_s_ind(train_type: TrainingSequence, block_num: PhyBlockNum, block: BitBuffer) -> SapMsg {
+    SapMsg {
+        sap: Sap::TpSap,
+        src: TetraEntity::Phy,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TpUnitdataInd(TpUnitdataInd {
+            train_type,
+            burst_type: BurstType::NUB,
+            block_type: PhyBlockType::NUB,
+            block_num,
+            block,
+            rssi_dbfs: f32::NAN,
+        }),
+    }
+}
+
 fn collect_dl_tch_bits(msgs: &[SapMsg], ts: u8) -> Vec<Vec<u8>> {
     msgs.iter()
         .filter_map(|msg| match &msg.msg {
@@ -713,6 +749,91 @@ fn test_group_floor_grant_purges_stale_raw_block2_but_allows_new_media() {
         fresh_observed.iter().any(|bits| bits == &fresh_raw_block2),
         "fresh media after the new floor grant should still be routed to DL TCH/S"
     );
+}
+
+#[test]
+fn test_group_floor_handoff_reopens_ul_traffic_for_lmac_tch_s_decode() {
+    debug::setup_logging_verbose();
+
+    let gssi = 226333;
+    let first_speaker = 2260616;
+    let second_speaker = 2260082;
+    let call_id = 77;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut umac_test = ComponentTest::new(StackMode::Bs, Some(start));
+    umac_test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    umac_test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    umac_test.run_stack(Some(2));
+    let _ = umac_test.dump_sinks();
+
+    umac_test.submit_message(floor_released_msg(call_id, traffic_ts));
+    umac_test.run_stack(Some(2));
+    let _ = umac_test.dump_sinks();
+
+    umac_test.submit_message(floor_granted_msg(call_id, second_speaker, gssi, traffic_ts));
+    umac_test.run_stack(Some(10));
+    let umac_msgs = umac_test.dump_sinks();
+
+    let granted_traffic_slot = umac_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == traffic_ts => Some(slot),
+            _ => None,
+        })
+        .find(|slot| slot.ul_phy_chan == PhysicalChannel::Tp)
+        .cloned()
+        .expect("FloorGranted after hangtime must schedule the group UL timeslot as traffic/TP");
+
+    assert_eq!(
+        granted_traffic_slot.ul_phy_chan,
+        PhysicalChannel::Tp,
+        "EN 300 392-2 clauses 14.5.2.2.1 and 23.5: once D-TX GRANTED moves the floor, the assigned UL slot must be TP/TCH, not CP signalling"
+    );
+
+    let mut lmac_test = ComponentTest::new(StackMode::Bs, Some(granted_traffic_slot.ts.add_timeslots(2)));
+    lmac_test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+    lmac_test.run_stack(Some(1));
+    let _ = lmac_test.dump_sinks();
+
+    lmac_test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TmvUnitdataReq(granted_traffic_slot),
+    });
+    lmac_test.deliver_all_messages();
+    let _ = lmac_test.dump_sinks();
+
+    let codec_bits = acelp_test_bits();
+    lmac_test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq1,
+        PhyBlockNum::Both,
+        encoded_tch_s(&codec_bits, 1),
+    ));
+    lmac_test.deliver_all_messages();
+
+    let lmac_msgs = lmac_test.dump_sinks();
+    let traffic: Vec<_> = lmac_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "valid TCH/S from the newly granted group speaker should reach UMAC once, not be treated as FACCH/SCH"
+    );
+    assert_eq!(traffic[0].ts, traffic_ts);
+    assert_eq!(traffic[0].data, codec_bits);
+    assert_eq!(
+        traffic[0].raw_tch_s_block, None,
+        "full-slot TCH/S speech should be decoded as a complete ACELP frame"
+    );
+    assert_ne!(first_speaker, second_speaker, "test setup must exercise a real speaker handoff");
 }
 
 #[test]

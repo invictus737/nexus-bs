@@ -98,6 +98,63 @@ impl CcBsSubentity {
         (sdu, chan_alloc)
     }
 
+    pub(super) fn refresh_group_cached_d_setup_speaker(&mut self, call_id: u16, speaker_issi: u32) {
+        let Some(cached) = self.cached_setups.get_mut(&call_id) else {
+            tracing::warn!(
+                "CMCE: cannot refresh group D-SETUP speaker for call_id={} (missing cached setup)",
+                call_id
+            );
+            return;
+        };
+        if cached.is_individual {
+            tracing::warn!("CMCE: refusing to refresh group D-SETUP speaker for individual call_id={}", call_id);
+            return;
+        }
+
+        // EN 300 392-2 clauses 14.5.2.1.1/14.5.2.1.2 make D-SETUP carry
+        // the call's current calling/transmitting party for group-call setup
+        // and late entry. Clause 14.5.2.2.1 then moves the active floor with
+        // D-TX GRANTED; keep the cached back-up D-SETUP coherent with that
+        // floor so late-entry resends do not advertise a stale speaker.
+        cached.pdu.calling_party_address_ssi = Some(speaker_issi);
+        cached.pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
+        cached.pdu.transmission_request_permission = false;
+        cached.last_resend_reporter = None;
+    }
+
+    pub(super) fn send_group_d_setup_refresh(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        speaker_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+    ) {
+        self.refresh_group_cached_d_setup_speaker(call_id, speaker_issi);
+        let Some(cached) = self.cached_setups.get(&call_id) else {
+            return;
+        };
+        if cached.is_individual {
+            return;
+        }
+
+        let expected_dest = TetraAddress::new(dest_gssi, SsiType::Gssi);
+        if cached.dest_addr != expected_dest {
+            tracing::warn!(
+                "CMCE: group D-SETUP refresh call_id={} cached dest {:?} differs from active GSSI {}",
+                call_id,
+                cached.dest_addr,
+                dest_gssi
+            );
+        }
+
+        let dest_addr = cached.dest_addr;
+        let (sdu, chan_alloc) = Self::build_d_setup_prim(&cached.pdu, usage, ts, UlDlAssignment::Both);
+        let msg = Self::build_sapmsg(sdu, Some(chan_alloc), dest_addr, Layer2Service::Unacknowledged, None);
+        queue.push_back(msg);
+    }
+
     /// Build a generic SAP message addressed to MLE via LCMC.
     /// `layer2service` controls acknowledged vs unacknowledged LLC.
     pub(super) fn build_sapmsg(

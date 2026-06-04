@@ -2110,3 +2110,56 @@ Required next physical test:
 5. Post-test log filter:
    - `2260082|2260616|2260618|226333|U-TX DEMAND|U-TX CEASED|D-TX GRANTED|D-TX CEASED|FloorGranted|FloorReleased|UMAC floor granted|UMAC voice route|dropped .*queued DL media|rx_blk_traffic: forwarding raw TCH/S Block2|rx_blk_traffic: decoded valid TCH/S frame|PTT denied|NotGranted|UL inactivity`
 6. Pass requires operator audio verdict: each speaker intelligible to the other group members, not static.
+
+## 2026-06-04 20:42:01 EEST - CMCE group D-SETUP speaker refresh before redeploy
+
+Live symptom:
+
+- User again reported static/no intelligible audio when the other station entered with PTT on group call.
+- Current group context remains GSSI `226333`; recent logs include radios `2260082`, `2260616`, and stale `2260618`.
+
+Log evidence:
+
+- Live test BS still showed group traffic where voice was sometimes routed correctly:
+  - `UMAC voice route: UL ts=2 bits=274 -> DL ts=2`
+  - `UMAC voice route: UL ts=2 raw TCH/S Block2 bits=216 -> DL ts=2`
+- The same live log also showed stale late-entry group setup:
+  - `DSetup ... calling_party_address_ssi: Some(2260618)` while the active test context had moved to `2260082`/`2260616` on GSSI `226333`.
+- This points at CMCE late-entry/back-up D-SETUP speaker coherence during floor handoff, not encryption.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.2.1.1 and 14.5.2.1.2: group `D-SETUP` carries the group-call setup/late-entry context.
+- EN 300 392-2 clause 14.5.2.2.1: `D-TX GRANTED` moves transmit permission/floor.
+- EN 300 392-2 clauses 23.5 and 23.8: assigned-channel TCH/S media must remain traffic, including FACCH/STCH stealing cases.
+- This is clause-scoped hardening only; no formal certification claim.
+
+Patch status:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added cached group D-SETUP speaker refresh helper.
+  - Added immediate group D-SETUP refresh with channel allocation after floor changes.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Repeated U-TX DEMAND from current speaker now reasserts the existing floor.
+  - Floor handoff paths now refresh late-entry D-SETUP with the new speaker.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `226333` alternating PTT regression.
+  - Added hangtime retake/queued handoff assertions that D-SETUP refresh uses the new speaker.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added UMAC/LMAC boundary regression proving that after `FloorReleased` then `FloorGranted`, UMAC schedules `ul_phy_chan=Tp` and LMAC decodes a valid full-slot TCH/S frame to `TmdCircuitDataInd`.
+
+Verification so far:
+
+- `cargo fmt` -> pass.
+- `git diff --check` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 120 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 47 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit the CMCE D-SETUP speaker refresh and UMAC/LMAC boundary test.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Ask the operator to retest alternating group PTT on `226333` with `2260082` and `2260616`.
+4. If static persists after this deploy, the next patch target is not cached D-SETUP; inspect whether repeated FACCH/STCH refresh steals too much audio and whether late `NormalTrainSeq2` arrivals occur while no active group floor is present.

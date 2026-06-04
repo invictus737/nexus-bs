@@ -158,6 +158,7 @@ impl CcBsSubentity {
         if let Some(call) = self.active_calls.get_mut(&call_id) {
             call.reset_timeout(self.dltime);
         }
+        self.refresh_group_cached_d_setup_speaker(call_id, speaker.ssi);
 
         // EN 300 392-2 clause 14.5.2.2.1 b) defines D-TX GRANTED as the
         // explicit SwMI floor response. A repeated same-GSSI U-SETUP accepted
@@ -292,6 +293,7 @@ impl CcBsSubentity {
                 Some(requesting_party.ssi),
             );
             self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_d_setup_refresh(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
                 call_id,
@@ -348,10 +350,11 @@ impl CcBsSubentity {
             match queue_result {
                 TxDemandQueueResult::FromCurrentSpeaker => {
                     tracing::trace!(
-                        "FSM: U-TX DEMAND call_id={} from current speaker ISSI {}, ignoring duplicate",
+                        "FSM: U-TX DEMAND call_id={} from current speaker ISSI {}, reasserting existing floor",
                         call_id,
                         requesting_party.ssi
                     );
+                    self.fsm_group_reassert_current_speaker_floor(queue, call_id, requesting_party)?;
                 }
                 TxDemandQueueResult::Queued | TxDemandQueueResult::AlreadyQueuedBySameUser => {
                     // Non-pre-emptive: keep current speaker active, queue requester.
@@ -391,6 +394,7 @@ impl CcBsSubentity {
             Some(requesting_party.ssi),
         );
         self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
+        self.send_group_d_setup_refresh(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
         // Notify dashboard that the speaker changed (hangtime -> new speaker).
         self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
@@ -499,6 +503,7 @@ impl CcBsSubentity {
                 Some(requester.ssi),
             );
             self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_d_setup_refresh(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
 
             // Notify dashboard that the queued speaker got the floor.
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
@@ -690,6 +695,7 @@ impl CcBsSubentity {
         }
 
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
+        self.send_group_d_setup_refresh(queue, call_id, source_issi, dest_gssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,

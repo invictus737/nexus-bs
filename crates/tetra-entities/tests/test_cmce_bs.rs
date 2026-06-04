@@ -56,6 +56,9 @@ const TEST_ISSI: u32 = 1000001;
 const TEST_CALLED_GSSI: u32 = 92;
 const TEST_CALLED_ISSI: u32 = 1000002;
 const TEST_OTHER_ISSI: u32 = 1000003;
+const LAB_GROUP_GSSI: u32 = 226333;
+const LAB_ISSI_A: u32 = 2260616;
+const LAB_ISSI_B: u32 = 2260082;
 
 fn type3_marker() -> Type3FieldGeneric {
     Type3FieldGeneric {
@@ -1303,7 +1306,11 @@ fn start_group_call(test: &mut ComponentTest) -> u16 {
 }
 
 fn start_group_call_with_circuit(test: &mut ComponentTest) -> (u16, u8, u8) {
-    let u_setup_msg = build_u_setup_msg(TEST_ISSI, TEST_GSSI);
+    start_group_call_with_circuit_for(test, TEST_ISSI, TEST_GSSI)
+}
+
+fn start_group_call_with_circuit_for(test: &mut ComponentTest, calling_issi: u32, dest_gssi: u32) -> (u16, u8, u8) {
+    let u_setup_msg = build_u_setup_msg(calling_issi, dest_gssi);
     test.submit_message(u_setup_msg);
     test.run_stack(Some(1));
     let initial_msgs = test.dump_sinks();
@@ -1319,7 +1326,7 @@ fn start_group_call_with_circuit(test: &mut ComponentTest) -> (u16, u8, u8) {
         .expect("group U-SETUP should open a traffic circuit");
     assert_eq!(
         circuit.active_addr,
-        Some(TetraAddress::new(TEST_GSSI, SsiType::Gssi)),
+        Some(TetraAddress::new(dest_gssi, SsiType::Gssi)),
         "group traffic circuit should be scoped to the destination GSSI"
     );
     (call_id, circuit.ts, circuit.usage)
@@ -3128,7 +3135,22 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
         );
     }
 
-    assert_eq!(count_d_setups(&repeated_msgs), 0, "hangtime retake must not send a second D-SETUP");
+    let setup_refreshes: Vec<_> = repeated_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setup_refreshes.len(),
+        1,
+        "hangtime retake should refresh the maintained call D-SETUP without opening a second call"
+    );
+    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
+    assert_eq!(setup_refresh.call_identifier, active_call_id);
+    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
+    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
     assert_eq!(count_umac_open(&repeated_msgs), 0, "hangtime retake must not open a second circuit");
     assert_eq!(
         count_umac_call_ended_or_close(&repeated_msgs),
@@ -3721,7 +3743,7 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
-    let call_id = start_group_call(&mut test);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
     test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -3769,6 +3791,31 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         .expect("FACCH group grant should carry channel allocation");
     assert_eq!(group_alloc.ul_dl_assigned, UlDlAssignment::Dl);
 
+    let setup_refreshes: Vec<_> = ceased_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setup_refreshes.len(),
+        1,
+        "queued group floor handoff should refresh late-entry D-SETUP with the new speaker"
+    );
+    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
+    assert_eq!(setup_refresh.call_identifier, call_id);
+    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
+    assert_eq!(setup_refresh.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+    assert!(!setup_refresh.transmission_request_permission);
+    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
+    let setup_refresh_alloc = setup_refresh_prim
+        .chan_alloc
+        .as_ref()
+        .expect("group D-SETUP refresh should carry channel allocation");
+    assert_chan_alloc_matches_circuit(setup_refresh_alloc, active_ts, active_usage, "queued handoff D-SETUP refresh");
+    assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
+
     assert!(
         ceased_msgs
             .iter()
@@ -3788,6 +3835,196 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
             }) if *got_call_id == call_id && *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_GSSI
         )
     }));
+}
+
+#[test]
+fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let first_return_msgs = test.dump_sinks();
+    let first_return_grants: Vec<_> = first_return_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_return_grants.len(), 1);
+    assert_eq!(first_return_grants[0].0.main_address, TetraAddress::issi(LAB_ISSI_B));
+    assert_eq!(
+        first_return_grants[0].1.transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8
+    );
+    assert_d_tx_granted_facch_allocation(
+        first_return_grants[0].0,
+        &first_return_grants[0].1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "226333 first return PTT while another MS has floor",
+    );
+    assert_eq!(count_d_releases(&first_return_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&first_return_msgs), 0);
+    assert_eq!(count_umac_floor_released(&first_return_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&first_return_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let handoff_to_b_msgs = test.dump_sinks();
+    let handoff_to_b_grants: Vec<_> = handoff_to_b_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_to_b_grants.len(), 2);
+    let grant_to_b = handoff_to_b_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("queued ISSI should get the floor");
+    assert_eq!(grant_to_b.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        grant_to_b.0,
+        &grant_to_b.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "226333 handoff to queued requester",
+    );
+    assert_eq!(count_d_tx_ceased(&handoff_to_b_msgs), 0);
+    assert_eq!(count_umac_floor_released(&handoff_to_b_msgs), 0);
+    assert!(handoff_to_b_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *got_call_id == call_id && *source_issi == LAB_ISSI_B && *dest_gssi == LAB_GROUP_GSSI
+        )
+    }));
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let queued_back_msgs = test.dump_sinks();
+    let queued_back_grants: Vec<_> = queued_back_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queued_back_grants.len(), 1);
+    assert_eq!(queued_back_grants[0].0.main_address, TetraAddress::issi(LAB_ISSI_A));
+    assert_eq!(
+        queued_back_grants[0].1.transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8
+    );
+    assert_ne!(
+        queued_back_grants[0].1.transmission_grant,
+        TransmissionGrant::NotGranted.into_raw() as u8
+    );
+    assert_d_tx_granted_facch_allocation(
+        queued_back_grants[0].0,
+        &queued_back_grants[0].1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "226333 return request while second MS has floor",
+    );
+    assert_eq!(count_d_releases(&queued_back_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&queued_back_msgs), 0);
+    assert_eq!(count_umac_floor_released(&queued_back_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&queued_back_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&queued_back_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let handoff_to_a_msgs = test.dump_sinks();
+    let handoff_to_a_grants: Vec<_> = handoff_to_a_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_to_a_grants.len(), 2);
+    let grant_to_a = handoff_to_a_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_A))
+        .expect("original speaker should get the floor back");
+    assert_eq!(grant_to_a.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        grant_to_a.0,
+        &grant_to_a.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "226333 handoff back to original speaker",
+    );
+    assert_eq!(count_d_tx_ceased(&handoff_to_a_msgs), 0);
+    assert_eq!(count_umac_floor_released(&handoff_to_a_msgs), 0);
+    assert!(handoff_to_a_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *got_call_id == call_id && *source_issi == LAB_ISSI_A && *dest_gssi == LAB_GROUP_GSSI
+        )
+    }));
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let current_speaker_retry_msgs = test.dump_sinks();
+    let current_speaker_grants: Vec<_> = current_speaker_retry_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        current_speaker_grants.len(),
+        2,
+        "current-speaker U-TX DEMAND should reassert permission instead of being silently ignored"
+    );
+    let current_individual = current_speaker_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_A))
+        .expect("current speaker should receive explicit D-TX-GRANTED");
+    assert_eq!(current_individual.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        current_individual.0,
+        &current_individual.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "226333 current speaker retry",
+    );
+    assert_eq!(count_d_releases(&current_speaker_retry_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&current_speaker_retry_msgs), 0);
+    assert_eq!(count_umac_floor_released(&current_speaker_retry_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&current_speaker_retry_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&current_speaker_retry_msgs), 1);
 }
 
 #[test]
@@ -3937,6 +4174,76 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
             }) if *got_call_id == call_id
         )
     }));
+}
+
+#[test]
+fn test_group_hangtime_tx_demand_refreshes_late_entry_speaker() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let _hangtime_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 14.5.2.1.1/14.5.2.1.2 use D-SETUP for
+    // group-call setup/late entry; clause 14.5.2.2.1 moves the active floor
+    // with D-TX GRANTED. A new U-TX DEMAND after hangtime must not leave the
+    // cached back-up D-SETUP advertising the previous speaker.
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let setup_refreshes: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        setup_refreshes.len(),
+        1,
+        "hangtime floor retake should refresh late-entry D-SETUP with the new speaker"
+    );
+    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
+    assert_eq!(setup_refresh.call_identifier, call_id);
+    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
+    assert_eq!(setup_refresh.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+    assert!(!setup_refresh.transmission_request_permission);
+    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
+    let setup_refresh_alloc = setup_refresh_prim
+        .chan_alloc
+        .as_ref()
+        .expect("group D-SETUP refresh should carry channel allocation");
+    assert_chan_alloc_matches_circuit(setup_refresh_alloc, active_ts, active_usage, "hangtime retake D-SETUP refresh");
+    assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
+
+    let grants: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grants.len(), 2);
+    assert!(grants.iter().any(|(prim, grant)| {
+        prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+    }));
+    assert!(grants.iter().any(|(prim, grant)| {
+        prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+            && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    }));
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
 }
 
 #[test]
