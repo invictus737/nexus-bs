@@ -1311,3 +1311,71 @@ Next non-repeating execution:
    - `UMAC voice route` appears after each grant.
    - No `PTT denied`, `NotGranted`, `does not fit STCH`, or `UL inactivity timeout` during active overs.
    - Operator audio verdict confirms each subscriber can be heard by the others, not static.
+
+## 2026-06-04 12:16:30 EEST - Deployed raw TCH/S Block2 build to test BS
+
+Commit deployed:
+
+- `d96db1c fix: preserve raw group traffic half slots`
+
+Local verification before deploy:
+
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 43 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Local binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `43063625f0bd962c17b67175a0dc2e8ce32a524b65efef1f6935eb556f32c5b7`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Stopped the prior test BS/control-service from pidfile PIDs before copying.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `43063625f0bd962c17b67175a0dc2e8ce32a524b65efef1f6935eb556f32c5b7`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `17009`
+  - control-service pid `17012`
+  - nexus-bs pid `17014`
+- Dashboard root returned Nexus-BS HTML.
+
+Post-restart terminal state:
+
+- `2260082` registered and affiliated to `[226333]`; RSSI about `-22 dBFS`.
+- `2260616` registered and affiliated to `[226333]`; RSSI about `-23 dBFS`.
+- Both `2260082` and `2260616` had BS-initiated EG3 assignment started, but T352 expired and the BS kept/fell back to `StayAlive`, so group PTT testing is not blocked by EG sleep.
+- `2260618` was not present in the final concise post-deploy affiliate summary yet.
+- MM still logs the pre-existing mixed `U-ATTACH/DETACH GROUP IDENTITY` reject for `group_report_response len=1 data=0` plus a GSSI list. Do not patch this under the group-audio fix unless the next log proves it is the active blocker.
+
+Current live status:
+
+- No post-`d96db1c` physical group PTT attempt has been captured yet.
+- The BS is running the raw half-slot preservation build and is ready for live group test on GSSI `226333`.
+
+Required next physical test:
+
+1. `2260616` PTT on group `226333`, speak, release.
+2. `2260082` PTT on group `226333`, speak, release.
+3. Repeat at least three alternating turns.
+4. If `2260618` appears/reattaches, add it as a third speaker.
+
+Post-test log filter:
+
+- `2260082|2260616|2260618|226333|U-TX DEMAND|D-TX GRANTED|FloorGranted|UMAC floor granted|rx_blk_traffic: forwarding raw TCH/S Block2|rx_blk_traffic: decoded valid TCH/S frame|UMAC voice route|FACCH stealing|preserving raw TCH/S|UL inactivity|PTT denied|NotGranted|does not fit STCH`
+
+Pass criteria:
+
+- Every speaker receives `D-TX GRANTED`.
+- `UMAC floor granted` follows the active speaker.
+- Either decoded full-slot TCH/S or raw `Block2` TCH/S reaches UMAC after each grant.
+- `UMAC voice route` appears after each grant.
+- No `PTT denied`, `NotGranted`, `does not fit STCH`, or active-over `UL inactivity timeout`.
+- Operator audio verdict: each speaker is intelligible to the other group members.
