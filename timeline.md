@@ -1165,6 +1165,72 @@ Next non-repeating execution:
    - compact `D-TX GRANTED` does not log `does not fit STCH`;
    - no `dl_drop_all_except_stolen` discards the requester ACK needed for floor grant;
    - `UMAC floor granted` changes source ISSI on each turn;
-   - `UMAC voice route` appears for each speaker;
-   - no `UL inactivity timeout` during an active speaker over;
-   - operator audio verdict confirms voice, not static.
+  - `UMAC voice route` appears for each speaker;
+  - no `UL inactivity timeout` during an active speaker over;
+  - operator audio verdict confirms voice, not static.
+
+## 2026-06-04 11:58:30 EEST - Deployed compact group floor grant build to test BS
+
+Commit deployed:
+
+- `419ce67 fix: compact group floor grants for FACCH`
+
+Local verification before deploy:
+
+- `cargo fmt -p tetra-entities`
+- `cargo test -p tetra-entities --test test_cmce_bs group_tx_demand --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_tx_ceased_hands_floor_to_queued_requester --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_preemptive --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo test -p tetra-entities --test test_umac_bs facch --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_private_floor_grant_stch_carries_preserved_random_access_ack --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 42 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Local binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `427626e5f9bffc708884aa77534fad5d63673ff9049ed489d0f6a383c1f16c12`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Stopped the prior test BS/control-service via existing pidfiles before copying.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `427626e5f9bffc708884aa77534fad5d63673ff9049ed489d0f6a383c1f16c12`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `16704`
+  - control-service pid `16707`
+  - nexus-bs pid `16709`
+- Dashboard root returned HTML.
+
+Post-restart terminal state:
+
+- `2260082` registered and affiliated to `[226333]` twice during restart recovery; RSSI about `-22 dBFS`.
+- `2260616` registered and affiliated to `[226333]`; it also deaffiliated/re-affiliated once during group update; EG assignment later timed out and stayed/fell back to `StayAlive`.
+- `2260618` registered and affiliated to `[226333]`; RSSI about `-46 dBFS`; EG3 was allocated.
+
+Current live status:
+
+- No post-`419ce67` PTT test has been recorded yet.
+- The BS is ready for physical group test on GSSI `226333`.
+- Required test sequence:
+  - `2260616` PTT on group `226333`, speak, release.
+  - `2260082` PTT on group `226333`, speak, release.
+  - Repeat at least three alternating turns.
+- Required log filter after the test:
+  - `2260082|2260616|226333|U-TX DEMAND|D-TX GRANTED|does not fit STCH|FACCH stealing|FloorGranted|UMAC floor granted|UMAC voice route|dl_drop_all_except_stolen|RandomAccessAck|UL inactivity|PTT denied|NotGranted`
+
+Pass criteria for this patch:
+
+- No `D-TX GRANTED ... does not fit STCH` on the group floor handoff path.
+- No requester `RandomAccessAck` is discarded at the handoff.
+- `UMAC floor granted` alternates `source_issi` between `2260616` and `2260082`.
+- `UMAC voice route` appears after each grant.
+- No `UL inactivity timeout` during an active over.
+- Operator audio verdict: both directions are voice, not static.
