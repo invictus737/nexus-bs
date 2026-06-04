@@ -188,3 +188,47 @@ Next non-repeating execution:
   - whether live CMCE sends the expected `CallControl::Open`/`FloorGranted` sequence for both `2260082` and `2260616`;
   - whether LMAC reports valid TCH/S uplink frames after each `D-TX GRANTED`;
   - whether static appears only when FACCH stealing occurs near speech start.
+
+## 2026-06-04 10:34:05 EEST - Built and deployed test BS
+
+Commit deployed:
+
+- `21f2b4c test: track CMCE release timers and UMAC voice routing`
+
+Local build:
+
+- Built locally on macOS only.
+- Command used: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Output binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs` (`11M`).
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target path: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Deployed direct over the testing binary; no binary backup was created.
+- Started from `/home/chris/nexus-bs-v0.1.55-test` with `bin/nexus-bs config.live.toml`.
+- Active process after wrapper cleanup: `15161 bin/nexus-bs config.live.toml`
+- Dashboard listens on `0.0.0.0:8080`.
+
+Post-deploy observations:
+
+- Terminals re-registered/re-affiliated shortly after restart:
+  - `2260616` registered and affiliated to `[226333]`, RSSI about `-26 dBFS`.
+  - `2260082` registered and affiliated to `[226333]`, RSSI about `-26 dBFS`.
+  - `2260618` registered and affiliated to `[226333]`, RSSI about `-41 dBFS`, requested `Eg1`, BS allocated `Eg3`.
+- Dashboard root returned HTML.
+- After `10:31:00` there were no matches for:
+  - `req_handle=0 ambiguous`
+  - `Hangtime expired`
+  - `group release already pending`
+  - `D-RELEASE`
+  - `UL inactivity`
+  - `U-TX DEMAND`
+  - `D-TX GRANTED`
+  - `TCH`
+
+Interpretation:
+
+- Restart recovery did bring the observed terminals back after the new deploy.
+- No post-deploy PTT test has run yet, so the static-audio defect is not proven fixed.
+- Next live action: trigger private simplex and group PTT again, then inspect only post-deploy logs for CMCE `CallControl::Open`/`FloorGranted`, UMAC traffic mode, LMAC TCH/S uplink indications, and any FACCH stealing around speech start.
