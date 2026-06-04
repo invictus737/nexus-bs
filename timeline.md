@@ -48,6 +48,19 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Build/deploy:
+
+- Commit: `9469dd2 fix: align private simplex initial floor`.
+- Deployed with the one-shot local script:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Remote deployed binary SHA-256:
+  - `7eafdfa7df28472caee5f776411b56fdeffb39b0d0b7dd0e173605bf7f2f95cb`
+- Startup banner reports `Build: v0.1.55-9469dd20`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+- Post-restart register/affiliate observed for `2260618`, `2260082`, and `2260616` on GSSI `226333`.
+
 Next live validation:
 
 - Deploy this patch to the test BS.
