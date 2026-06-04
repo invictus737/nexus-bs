@@ -2937,6 +2937,84 @@ fn test_repeated_group_u_setup_same_active_gssi_uses_existing_call_without_servi
 }
 
 #[test]
+fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let active_call_id = start_group_call(&mut test);
+
+    // Some terminals repeat U-SETUP when the user presses PTT again even
+    // though the SwMI still has that MS as current speaker. Treating that as
+    // a duplicate with only D-CONNECT is too weak in the field: clause
+    // 14.5.2.2.1 floor control needs an explicit D-TX GRANTED response for
+    // transmit permission, and UMAC must keep the current speaker mapped.
+    test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let repeated_msgs = test.dump_sinks();
+
+    assert_eq!(count_d_releases(&repeated_msgs), 0);
+    assert_eq!(count_d_setups(&repeated_msgs), 0);
+    assert_eq!(count_umac_open(&repeated_msgs), 0);
+
+    let connect = repeated_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("current-speaker repeated U-SETUP should receive D-CONNECT for the existing call");
+    assert_eq!(connect.1.call_identifier, active_call_id);
+    assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
+    assert!(connect.1.call_ownership);
+    assert_eq!(connect.0.main_address.ssi, TEST_ISSI);
+    assert!(connect.0.chan_alloc.is_some());
+
+    let grants: Vec<_> = repeated_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grants.len(),
+        2,
+        "current-speaker repeated setup must explicitly reassert floor to the MS and group"
+    );
+    assert!(grants.iter().any(|(prim, grant)| {
+        prim.main_address.ssi == TEST_ISSI
+            && prim.main_address.ssi_type == SsiType::Issi
+            && grant.call_identifier == active_call_id
+            && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+    }));
+    assert!(grants.iter().any(|(prim, grant)| {
+        prim.main_address.ssi == TEST_GSSI
+            && prim.main_address.ssi_type == SsiType::Gssi
+            && grant.call_identifier == active_call_id
+            && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    }));
+    for (prim, grant) in &grants {
+        assert_compact_d_tx_granted_facch(prim, grant);
+    }
+
+    assert_eq!(
+        count_umac_floor_granted(&repeated_msgs),
+        1,
+        "current-speaker repeated setup must refresh the UMAC speaker mapping"
+    );
+    assert_eq!(count_umac_call_ended_or_close(&repeated_msgs), 0);
+}
+
+#[test]
 fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_floor() {
     debug::setup_logging_verbose();
 

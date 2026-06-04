@@ -1,5 +1,53 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-04 19:47:00 EEST - Patched first-PTT retry caused by missing floor reassert
+
+User symptom:
+
+- Group PTT intervention no longer shows the earlier `Service unavailable`, but first PTT sometimes only takes effect on the second attempt.
+
+Live evidence:
+
+- Logs after `4693056` showed repeated same-GSSI `U-SETUP` from the MS that Nexus-BS already considered the current speaker, for example:
+  - `CMCE: mapping repeated U-SETUP ... call_id=5 state=Transmitting`
+  - `DConnect { transmission_grant: Granted ... }`
+- In that current-speaker path, the existing floor FSM returned `FromCurrentSpeaker` and did not emit a fresh `D-TX GRANTED` or UMAC `FloorGranted`.
+
+Component in simple technical terms:
+
+- CMCE tells the terminal whether it may transmit using `D-TX GRANTED`.
+- UMAC needs `FloorGranted` to keep the traffic-channel uplink speaker mapped to the correct ISSI.
+- `D-CONNECT Granted` is call setup/connection signalling; for repeated PTT inside an active group call it was not enough for this field behavior.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1.2 covers `D-CONNECT` as group-call setup/through-connect.
+- EN 300 392-2 clause 14.5.2.2.1 b) defines `D-TX GRANTED` as the SwMI response that grants, queues, or denies group transmit permission, while MSs remain in `CALL-ACTIVE`.
+- The reassert path is a compatibility handling of a repeated same-GSSI `U-SETUP` accepted as existing-call re-entry/floor intent. It is explicitly responsive to the received PDU, not an unsolicited random grant. This is clause-scoped engineering alignment only, not formal ETSI/TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Added `fsm_group_reassert_current_speaker_floor`.
+  - Validates the call exists, is transmitting, and the requester is the current speaker and affiliated to the GSSI.
+  - Sends individual `D-TX GRANTED Granted`, group FACCH `D-TX GRANTED GrantedToOtherUser`, and UMAC `FloorGranted`.
+  - Resets the local call timeout clock when the floor is reasserted.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Repeated same-GSSI `U-SETUP` from current speaker now uses the reassert path instead of the duplicate `U-TX DEMAND` path that ignored `FromCurrentSpeaker`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs repeated_group_u_setup --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 118 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating action:
+
+- Commit, build/deploy with `scripts/nexus-bs-test-deploy.sh`, then repeat field group PTT intervention test.
+
 ## 2026-06-04 19:37:30 EEST - Patched repeated group PTT U-SETUP service-unavailable path
 
 User symptom:
@@ -46,12 +94,32 @@ Verification:
 - `cargo check -p tetra-entities --locked` -> pass.
 - `git diff --check` -> pass.
 
+Build/deploy:
+
+- Commit: `4693056 fix: reuse active group call for repeated setup`
+- Built locally only with the Nexus-BS AArch64 SoapySDR sysroot command.
+- Local and remote deployed binary SHA-256:
+  - `0c9f655795931d9dfd924e40b6f16b63ff8c58baa5b2b35abd052e681bbc3eaa`
+- Deployed direct over `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`.
+- No binary backup was created.
+- Restarted test BS with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`.
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live evidence after deploy:
+
+- Startup banner reports `Build: v0.1.55-46930568`.
+- MM armed restart recovery for cached/configured ISSIs `{2260082, 2260616, 2260618}`.
+- `2260618` registered/affiliated to `226333` at about 4 s after restart.
+- `2260616` registered/affiliated to `226333` at about 5 s after restart.
+- `2260082` registered/affiliated to `226333` at about 6 s after restart, then repeated its attach/affiliation once.
+- Initial post-restart log filter found no `rejecting colliding`, `RequestedServiceNotAvailable`, `Service unavailable`, `PTT denied`, or `Unit Not Attached`.
+- No live PTT attempt had occurred in the sampled post-restart log yet, so the field validation step remains required.
+
 Next non-repeating actions:
 
-- Commit this CMCE patch.
-- Build locally for AArch64 with the remembered Nexus-BS SoapySDR sysroot command.
-- Deploy direct to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs` on `chris@192.168.1.179`; do not compile on the Pi and do not create a binary backup.
 - Restart test BS and validate group PTT on `226333`, especially repeated PTT from `2260616` and `2260082` during active speaker and hangtime.
+- If static audio persists after this service-unavailable fix, the next non-repeating investigation is UMAC/TCH-S voice-direction evidence, not another CMCE setup-collision hypothesis.
 
 ## 2026-06-04 19:28:03 EEST - Deployed MM attach-confirmation hardening to test BS
 

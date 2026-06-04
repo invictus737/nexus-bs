@@ -91,6 +91,92 @@ impl CcBsSubentity {
         queue.push_back(msg);
     }
 
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_group_reassert_current_speaker_floor(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        speaker: TetraAddress,
+    ) -> Result<(), GroupTransitionError> {
+        if self.pending_group_releases.contains_key(&call_id) {
+            tracing::debug!("FSM: ignoring floor reassert for pending group release call_id={}", call_id);
+            return Ok(());
+        }
+
+        let Some(call_snapshot) = self.active_calls.get(&call_id) else {
+            return Err(GroupTransitionError::UnknownCall(call_id));
+        };
+
+        let state = call_snapshot.state();
+        Self::validate_group_transition(call_id, state, GroupEvent::TxDemand)?;
+        if !call_snapshot.is_current_speaker(speaker.ssi) {
+            return Err(GroupTransitionError::NotCurrentSpeaker {
+                call_id,
+                sender_issi: speaker.ssi,
+                current_speaker_issi: call_snapshot.source_issi,
+            });
+        }
+
+        let ts = call_snapshot.ts;
+        let dest_ssi = call_snapshot.dest_gssi;
+        let current_speaker = call_snapshot.source_issi;
+
+        if !self.subscriber_affiliated_to_group(speaker.ssi, dest_ssi) {
+            tracing::info!(
+                "FSM: rejecting floor reassert call_id={} from unaffiliated ISSI {} for GSSI {}",
+                call_id,
+                speaker.ssi,
+                dest_ssi
+            );
+            self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, TransmissionGrant::NotGranted, Some(current_speaker));
+            return Ok(());
+        }
+
+        let Some(cached) = self.cached_setups.get(&call_id) else {
+            return Err(GroupTransitionError::MissingCachedSetup(call_id));
+        };
+        let dest_addr = cached.dest_addr;
+
+        if let Some(call) = self.active_calls.get_mut(&call_id) {
+            call.reset_timeout(self.dltime);
+        }
+
+        // EN 300 392-2 clause 14.5.2.2.1 b) defines D-TX GRANTED as the
+        // explicit SwMI floor response. A repeated same-GSSI U-SETUP accepted
+        // as an existing-call re-entry is not treated as unsolicited floor
+        // signalling; this confirms that the already-current speaker still has
+        // transmit permission and refreshes the local traffic scheduler.
+        self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, TransmissionGrant::Granted, Some(speaker.ssi));
+        self.send_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts);
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id,
+                source_issi: speaker.ssi,
+                dest_gssi: dest_addr.ssi,
+                ts,
+            }),
+        });
+
+        if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: speaker.ssi,
+                    dest_gssi: dest_addr.ssi,
+                    ts,
+                }),
+            });
+        }
+
+        Ok(())
+    }
+
     pub(in crate::cmce::subentities::cc_bs) fn fsm_group_on_tx_demand(
         &mut self,
         queue: &mut MessageQueue,

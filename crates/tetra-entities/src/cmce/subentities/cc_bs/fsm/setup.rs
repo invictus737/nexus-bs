@@ -250,7 +250,12 @@ impl CcBsSubentity {
                 }),
             });
 
-            if let Err(err) = self.fsm_group_on_tx_demand(queue, active_call_id, calling_party, 0) {
+            let floor_result = if matches!(active_state, GroupCallState::Transmitting) && current_speaker == calling_party.ssi {
+                self.fsm_group_reassert_current_speaker_floor(queue, active_call_id, calling_party)
+            } else {
+                self.fsm_group_on_tx_demand(queue, active_call_id, calling_party, 0)
+            };
+            if let Err(err) = floor_result {
                 tracing::warn!(
                     "CMCE: repeated U-SETUP floor handling failed call_id={} issi={} gssi={} err={:?}",
                     active_call_id,
