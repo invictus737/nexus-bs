@@ -1535,3 +1535,58 @@ Next non-repeating execution:
    - Repeat at least three turns.
 4. Watch for `U-TX DEMAND`, `D-TX GRANTED`, `FloorGranted`, `FloorReleased`, raw/decoded TCH/S route, no `PTT denied`, and no stale/static audio.
 5. If static persists, next required design change is extending TMD/CircuitTxBlock metadata with source/floor epoch; the current SAP cannot prove late media belongs to the current floor holder.
+
+## 2026-06-04 12:50:07 EEST - Deployed UMAC stale-media purge build to test BS
+
+Commit deployed:
+
+- `32ee733 fix: purge stale UMAC media on floor changes`
+
+Local verification before deploy:
+
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 46 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 116 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 5 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Local build:
+
+- Built locally on macOS only; no compilation was done on `chris@192.168.1.179`.
+- Command shape: Nexus-BS AArch64 `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` with the SoapySDR AArch64 sysroot env from build memory.
+- Local binary: `target/aarch64-unknown-linux-gnu/release/nexus-bs`
+- Local SHA256: `d228a02bfbceee2e8ce4bb2975c39932f574152f0c241031b9e269a7bb7a98b1`
+
+Remote deploy:
+
+- Host: `chris@192.168.1.179`
+- Target: `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`
+- Stopped the prior test BS/control-service from pidfile PIDs before copying.
+- Deployed direct over the testing binary; no binary backup was created.
+- Remote SHA256 matches local: `d228a02bfbceee2e8ce4bb2975c39932f574152f0c241031b9e269a7bb7a98b1`
+- Restarted with `/home/chris/nexus-bs-v0.1.55-test/start-test.sh`
+- New remote processes:
+  - control wrapper pid `17696`
+  - control-service pid `17699`
+  - nexus-bs pid `17701`
+
+Post-restart terminal state:
+
+- `2260082`: Register/Affiliate to `226333`, RSSI about `-23 dBFS`.
+- `2260618`: Register/Affiliate to `226333`, RSSI about `-46 dBFS`.
+- `2260616`: Register/Affiliate to `226333`, RSSI about `-25 dBFS`.
+- Solicited group-report completion was accepted for all three:
+  - `2260082`
+  - `2260618`
+  - `2260616`
+- `grep "Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY"` returned no post-deploy entries.
+
+Required next physical test:
+
+1. On group `226333`, have `2260616` PTT/speak/release.
+2. Then `2260082` PTT/speak/release.
+3. Then `2260618` PTT/speak/release if available.
+4. Repeat at least three alternating turns.
+5. Post-test log filter:
+   - `2260082|2260616|2260618|226333|U-TX DEMAND|U-TX CEASED|D-TX GRANTED|D-TX CEASED|FloorGranted|FloorReleased|UMAC floor granted|UMAC voice route|dropped .*queued DL media|rx_blk_traffic: forwarding raw TCH/S Block2|rx_blk_traffic: decoded valid TCH/S frame|PTT denied|NotGranted|UL inactivity`
+6. Pass requires operator audio verdict: each speaker intelligible to the other group members, not static.
