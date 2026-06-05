@@ -165,10 +165,13 @@ pub enum DlSchedElem {
 /// ETSI EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require the BS to account for
 /// an MS's energy economy receive windows when sending downlink PDUs. A single
 /// GSSI MAC-RESOURCE may be missed by sleeping affiliates, so the scheduler keeps
-/// transmitting the same GSSI-addressed PDU until every known affiliated ISSI has
-/// had a listening opportunity. For the predefined all-ones broadcast GSSI we use
-/// the registered ISSI set for coverage, but we do not extend T.210 because clause
-/// 23.7.6 explicitly excludes that address from sleep-cycle suspension.
+/// transmitting the same GSSI-addressed PDU until every affiliated ISSI with a
+/// valid Energy Economy assignment has had a listening opportunity. StayAlive or
+/// fail-open affiliates listen to the ordinary group-addressed transmission and
+/// do not need per-member repeat state. For the predefined all-ones broadcast
+/// GSSI we use the registered ISSI set for EG coverage, but we do not extend
+/// T.210 because clause 23.7.6 explicitly excludes that address from sleep-cycle
+/// suspension.
 #[derive(Debug, Clone)]
 pub struct GroupDeliveryState {
     original_pdu: MacResource,
@@ -1149,13 +1152,15 @@ impl BsChannelScheduler {
         addr: TetraAddress,
         subscribers: &SubscriberRegistry,
         readiness_cache: &mut GroupReadinessCache,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) {
         // EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require delivery to match
         // current EG listening opportunities. If MM removes a registration or
         // group affiliation while a repeated GSSI transfer is pending, stale
         // snapshot targets are no longer valid local addresses.
         let current_targets = readiness_cache.targets_for(addr, subscribers);
-        state.retain_targets(current_targets);
+        let current_targets = Self::energy_economy_targets(current_targets, energy_saving);
+        state.retain_targets(&current_targets);
     }
 
     fn retain_current_group_stealing_targets(
@@ -1163,11 +1168,13 @@ impl BsChannelScheduler {
         addr: TetraAddress,
         subscribers: &SubscriberRegistry,
         readiness_cache: &mut GroupReadinessCache,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) {
         // Same current-address pruning as MAC-RESOURCE delivery, applied to
         // FACCH/STCH repeats whose block is already encoded.
         let current_targets = readiness_cache.targets_for(addr, subscribers);
-        state.retain_targets(current_targets);
+        let current_targets = Self::energy_economy_targets(current_targets, energy_saving);
+        state.retain_targets(&current_targets);
     }
 
     fn prune_completed_stale_group_states_for_slot(
@@ -1175,6 +1182,7 @@ impl BsChannelScheduler {
         slot: usize,
         subscribers: &SubscriberRegistry,
         readiness_cache: &mut GroupReadinessCache,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) {
         let Some(queue) = self.dltx_queues.get_mut(slot) else {
             return;
@@ -1183,15 +1191,15 @@ impl BsChannelScheduler {
         queue.retain_mut(|elem| {
             let completed_reporter = match elem {
                 DlSchedElem::Resource(pdu, _, _, Some(state)) => pdu.addr.and_then(|addr| {
-                    Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache);
+                    Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache, energy_saving);
                     state.is_complete().then(|| state.tx_reporter.clone()).flatten()
                 }),
                 DlSchedElem::FragBuf(fragger, Some(state)) => fragger.addr().and_then(|addr| {
-                    Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache);
+                    Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache, energy_saving);
                     state.is_complete().then(|| state.tx_reporter.clone()).flatten()
                 }),
                 DlSchedElem::Stealing(_, addr, _, Some(state)) => {
-                    Self::retain_current_group_stealing_targets(state, *addr, subscribers, readiness_cache);
+                    Self::retain_current_group_stealing_targets(state, *addr, subscribers, readiness_cache, energy_saving);
                     state.is_complete().then(|| state.tx_reporter.clone()).flatten()
                 }
                 _ => None,
@@ -1227,21 +1235,26 @@ impl BsChannelScheduler {
         if targets.is_empty() {
             return None;
         }
-        if !Self::targets_have_energy_saving_assignment(targets, energy_saving) {
+        let energy_economy_targets = Self::energy_economy_targets(targets, energy_saving);
+        if energy_economy_targets.is_empty() {
             return None;
         }
 
         Some(GroupDeliveryState::new(
             pdu.clone(),
             sdu.clone(),
-            targets.to_vec(),
+            energy_economy_targets,
             tx_reporter,
             addr.ssi != PREDEFINED_BROADCAST_GSSI,
         ))
     }
 
-    fn targets_have_energy_saving_assignment(targets: &[u32], energy_saving: &HashMap<u32, EnergySavingAssignment>) -> bool {
-        targets.iter().any(|issi| energy_saving.contains_key(issi))
+    fn energy_economy_targets(targets: &[u32], energy_saving: &HashMap<u32, EnergySavingAssignment>) -> Vec<u32> {
+        targets
+            .iter()
+            .copied()
+            .filter(|issi| energy_saving.get(issi).is_some_and(|assignment| assignment.is_energy_economy()))
+            .collect()
     }
 
     fn group_state_ready_for_tx(
@@ -1949,7 +1962,13 @@ impl BsChannelScheduler {
                             });
                             if let Some(state) = group_state.as_mut() {
                                 if let Some(addr) = addr {
-                                    Self::retain_current_group_delivery_targets(state, addr, subscribers, &mut readiness_cache);
+                                    Self::retain_current_group_delivery_targets(
+                                        state,
+                                        addr,
+                                        subscribers,
+                                        &mut readiness_cache,
+                                        energy_saving,
+                                    );
                                 }
                                 state.begin_batch_if_needed(ts, energy_saving);
                             }
@@ -1989,7 +2008,13 @@ impl BsChannelScheduler {
                             let addr = fragger.addr();
                             if let Some(state) = group_state.as_mut() {
                                 if let Some(addr) = addr {
-                                    Self::retain_current_group_delivery_targets(state, addr, subscribers, &mut readiness_cache);
+                                    Self::retain_current_group_delivery_targets(
+                                        state,
+                                        addr,
+                                        subscribers,
+                                        &mut readiness_cache,
+                                        energy_saving,
+                                    );
                                 }
                                 state.begin_batch_if_needed(ts, energy_saving);
                             }
@@ -2105,7 +2130,7 @@ impl BsChannelScheduler {
         // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)
         let (stch_opt, stealing_addr_opt, tx_reporter_opt, group_state_opt) = {
             if ts.t >= 1 && (ts.t as usize) <= self.dltx_queues.len() {
-                self.prune_completed_stale_group_states_for_slot(ts.t as usize - 1, subscribers, &mut readiness_cache);
+                self.prune_completed_stale_group_states_for_slot(ts.t as usize - 1, subscribers, &mut readiness_cache, energy_saving);
             }
             let q = &mut self.dltx_queues[ts.t as usize - 1];
             if let Some(i) = q.iter().position(|e| {
@@ -2131,14 +2156,19 @@ impl BsChannelScheduler {
             && addr.ssi_type == SsiType::Gssi
         {
             let targets = readiness_cache.targets_for(addr, subscribers);
-            if !Self::targets_have_energy_saving_assignment(targets, energy_saving) {
+            let energy_economy_targets = Self::energy_economy_targets(targets, energy_saving);
+            if energy_economy_targets.is_empty() {
                 Self::mark_stealing_signalling_activity(addr, None, ts, subscribers, energy_saving);
             } else {
                 let mut group_state = group_state_opt.unwrap_or_else(|| {
-                    GroupStealingState::new(targets.to_vec(), tx_reporter_opt.clone(), addr.ssi != PREDEFINED_BROADCAST_GSSI)
+                    GroupStealingState::new(
+                        energy_economy_targets,
+                        tx_reporter_opt.clone(),
+                        addr.ssi != PREDEFINED_BROADCAST_GSSI,
+                    )
                 });
                 if !group_state.targets.is_empty() {
-                    Self::retain_current_group_stealing_targets(&mut group_state, addr, subscribers, &mut readiness_cache);
+                    Self::retain_current_group_stealing_targets(&mut group_state, addr, subscribers, &mut readiness_cache, energy_saving);
                 }
                 if !group_state.targets.is_empty() {
                     group_state.begin_batch_if_needed(ts, energy_saving);
@@ -2202,7 +2232,7 @@ impl BsChannelScheduler {
             return None;
         }
         let slot = ts.t as usize - 1;
-        self.prune_completed_stale_group_states_for_slot(slot, subscribers, readiness_cache);
+        self.prune_completed_stale_group_states_for_slot(slot, subscribers, readiness_cache, energy_saving);
         let Some(q) = self.dltx_queues.get_mut(slot) else {
             return None;
         };
@@ -4450,6 +4480,97 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_stayalive_eg_gssi_resource_tracks_only_energy_economy_targets() {
+        let gssi = 91;
+        let stayalive_count = 4096;
+        let eg_issi = 61_000;
+        let (pdu, sdu) = test_resource_for_gssi(gssi, 8);
+        let addr = pdu.addr.expect("test GSSI resource must be addressed");
+
+        let mut subscribers = SubscriberRegistry::new();
+        for offset in 0..stayalive_count {
+            let issi = 56_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+        }
+        subscribers.register(eg_issi);
+        assert!(subscribers.affiliate(eg_issi, gssi));
+
+        let mut energy_saving = HashMap::new();
+        energy_saving.insert(
+            eg_issi,
+            EnergySavingAssignment {
+                mode: 7,
+                frame: Some(3),
+                multiframe: Some(1),
+                awake_until: None,
+                suspension_count: 0,
+            },
+        );
+
+        let mut readiness_cache = GroupReadinessCache::default();
+        let state = BsChannelScheduler::group_state_for_resource(
+            addr,
+            &pdu,
+            &sdu,
+            Some(TxReporter::new_unacked()),
+            &subscribers,
+            &mut readiness_cache,
+            &energy_saving,
+        )
+        .expect("one valid EG member should require repeat tracking");
+
+        // EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require EG receive
+        // windows to be covered. StayAlive affiliates listen to the ordinary
+        // GSSI transmission and must not inflate the retained repeat snapshot.
+        assert_eq!(state.targets, vec![eg_issi]);
+        assert_eq!(subscribers.group_members(gssi).len(), stayalive_count as usize + 1);
+    }
+
+    #[test]
+    fn test_fail_open_energy_assignment_does_not_create_gssi_repeat_snapshot() {
+        let gssi = 91;
+        let issi = 62_000;
+        let (pdu, sdu) = test_resource_for_gssi(gssi, 8);
+        let addr = pdu.addr.expect("test GSSI resource must be addressed");
+
+        let mut subscribers = SubscriberRegistry::new();
+        subscribers.register(issi);
+        assert!(subscribers.affiliate(issi, gssi));
+
+        let mut energy_saving = HashMap::new();
+        energy_saving.insert(
+            issi,
+            EnergySavingAssignment {
+                mode: 7,
+                frame: Some(18),
+                multiframe: Some(1),
+                awake_until: None,
+                suspension_count: 0,
+            },
+        );
+
+        let mut readiness_cache = GroupReadinessCache::default();
+        let state = BsChannelScheduler::group_state_for_resource(
+            addr,
+            &pdu,
+            &sdu,
+            Some(TxReporter::new_unacked()),
+            &subscribers,
+            &mut readiness_cache,
+            &energy_saving,
+        );
+
+        // Frame-18 EG is fail-open in this scheduler. Treat it as StayAlive
+        // for repeat-state sizing instead of retaining a stale per-member EG
+        // target that can never receive on the unsupported frame.
+        assert!(
+            state.is_none(),
+            "invalid/fail-open EG assignments must not allocate GSSI repeat snapshots"
+        );
+    }
+
+    #[test]
     fn test_large_stayalive_gssi_resource_transmits_once_without_per_member_repeat() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
@@ -4571,6 +4692,18 @@ mod tests {
             1,
             "GSSI repeat must stay one queued resource for the EG7 receive batch, not one per member"
         );
+        let repeat_state = sched.dltx_queues[0]
+            .iter()
+            .find_map(|elem| match elem {
+                DlSchedElem::Resource(_, _, _, Some(state)) => Some(state),
+                _ => None,
+            })
+            .expect("mixed EG7 GSSI resource should retain repeat state");
+        assert_eq!(
+            repeat_state.targets.len(),
+            eg7_count as usize,
+            "repeat snapshot must track only EG7 listeners, not the StayAlive half of the group"
+        );
         assert!(
             energy_saving.values().all(|assignment| assignment.awake_until.is_none()),
             "sleeping EG7 members must not get T.210 from the StayAlive batch"
@@ -4645,6 +4778,18 @@ mod tests {
                 .count(),
             1,
             "GSSI FACCH repeat must remain one queued STCH block for the EG7 receive batch, not one per member"
+        );
+        let repeat_state = sched.dltx_queues[1]
+            .iter()
+            .find_map(|elem| match elem {
+                DlSchedElem::Stealing(_, _, _, Some(state)) => Some(state),
+                _ => None,
+            })
+            .expect("mixed EG7 GSSI FACCH should retain repeat state");
+        assert_eq!(
+            repeat_state.targets.len(),
+            eg7_count as usize,
+            "FACCH repeat snapshot must track only EG7 listeners, not the StayAlive half of the group"
         );
         assert!(
             energy_saving.values().all(|assignment| assignment.awake_until.is_none()),

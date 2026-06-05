@@ -5477,3 +5477,46 @@ Agent audit integration:
 - UMAC/MAC EG agent flagged stale GSSI repeat snapshots after floor changes, late-affiliating EG listeners during active group calls, mixed StayAlive+EG groups retaining too much per-member repeat state, and 5000-member grant/RA storms exceeding existing 4096 scheduler cap assumptions.
 - SDS/status/WAP agent flagged unbounded ingress/control queues before LLC caps, live SDS queue/repeat pressure, dashboard "sent" logging before confirmed acceptance, and missing queue/failure observability.
 - CMCE group/private call auditor did not return before this commit gate; keep CMCE floor/private release robustness as an active next audit/patch target rather than treating it as completed.
+
+## 2026-06-05 17:53:08 EEST - UMAC GSSI repeat state tracks only real EG listeners
+
+User goal:
+
+- Group call and group signalling must scale to thousands of terminals, including mixed StayAlive and EG members.
+- A single EG terminal in a large group must not force Nexus-BS to retain per-member repeat state for every always-awake terminal.
+
+Component in simple technical terms:
+
+- UMAC/MAC scheduling decides when a GSSI-addressed MAC-RESOURCE or FACCH/STCH block is actually transmitted.
+- Energy Economy members may sleep, so GSSI signalling is repeated until sleeping EG batches have had a listening window. StayAlive members are already listening and should not remain in the repeat snapshot.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.5.2.2.7 requires downlink scheduling to account for MS reception opportunities.
+- EN 300 392-2 clause 23.7.6 defines Energy Economy sleep-cycle behaviour and T.210 activity handling.
+- EN 300 392-2 clause 20.4.1.1.3 remains the reporter/completion context for retained MAC requests.
+- This is local resource-control and scheduling hardening, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - GSSI `GroupDeliveryState` and `GroupStealingState` now retain only targets with a valid `EnergySavingAssignment::is_energy_economy()`.
+  - StayAlive or fail-open members still make the first GSSI transmission ready, but they no longer inflate the retained repeat snapshot.
+  - Invalid/fail-open EG entries, including unsupported frame-18 receive recurrence, no longer trigger GSSI repeat state.
+  - Pruning of retained GSSI repeat state now rechecks current valid EG targets, so stale assignment changes can complete or shrink pending repeats.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_mixed_stayalive_eg_gssi_resource_tracks_only_energy_economy_targets --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_fail_open_energy_assignment_does_not_create_gssi_repeat_snapshot --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_large_mixed_eg7_gssi --locked` -> 2 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 65 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 58 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC mixed EG/StayAlive repeat-state patch.
+2. Continue with UMAC stale GSSI repeat invalidation on floor changes and late-affiliating EG listeners during active group calls.
+3. Then address ingress/global `MessageQueue` and live SDS/WAP admission/observability caps.
