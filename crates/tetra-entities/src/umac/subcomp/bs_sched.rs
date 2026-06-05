@@ -15,6 +15,8 @@ use tetra_pdus::{
         enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
         pdus::d_tx_granted::DTxGranted,
     },
+    llc::pdus::bl_udata::BlUdata,
+    mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator,
     mle::pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
     umac::{
         enums::{
@@ -1409,6 +1411,25 @@ impl BsChannelScheduler {
         }
     }
 
+    fn cmce_dl_payload_from_tma_sdu(sdu: &BitBuffer) -> Option<BitBuffer> {
+        let mut wrapped = BitBuffer::from_bitbuffer(sdu);
+        if BlUdata::from_bitbuf(&mut wrapped).is_ok() {
+            let discriminator = wrapped
+                .read_field(3, "mle_protocol_discriminator")
+                .ok()
+                .and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok());
+            if discriminator == Some(MleProtocolDiscriminator::Cmce) {
+                return Some(wrapped);
+            }
+        }
+
+        let direct = BitBuffer::from_bitbuffer(sdu);
+        direct
+            .peek_bits(5)
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())
+            .map(|_| direct)
+    }
+
     fn stealing_sched_priority(elem: &DlSchedElem) -> StealingSchedPriority {
         let DlSchedElem::Stealing(block, _, _, _) = elem else {
             return StealingSchedPriority::Ordinary;
@@ -1423,7 +1444,14 @@ impl BsChannelScheduler {
             .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both));
         let has_channel_allocation = resource.chan_alloc_element.is_some();
 
-        let mut cmce_type_probe = mac_probe.clone();
+        let mac_payload = BitBuffer::from_bitbuffer_pos(&mac_probe);
+        let Some(mut cmce_type_probe) = Self::cmce_dl_payload_from_tma_sdu(&mac_payload) else {
+            return if has_channel_allocation {
+                StealingSchedPriority::ChannelAllocation
+            } else {
+                StealingSchedPriority::Ordinary
+            };
+        };
         let pdu_type = cmce_type_probe
             .read_field(5, "cmce_pdu_type_dl")
             .ok()
@@ -1436,7 +1464,9 @@ impl BsChannelScheduler {
                 StealingSchedPriority::FloorWithdraw
             }
             Some(CmcePduTypeDl::DTxGranted) => {
-                let mut grant_probe = mac_probe;
+                let Some(mut grant_probe) = Self::cmce_dl_payload_from_tma_sdu(&mac_payload) else {
+                    return StealingSchedPriority::Ordinary;
+                };
                 let positive_grant = DTxGranted::from_bitbuf(&mut grant_probe)
                     .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && uplink_allocated);
                 if positive_grant {
@@ -3318,6 +3348,41 @@ mod tests {
         test_cmce_stch_block(addr, sdu, ul_dl_assigned)
     }
 
+    fn test_llc_wrapped_d_tx_granted_stch_block(
+        addr: TetraAddress,
+        transmission_grant: TransmissionGrant,
+        ul_dl_assigned: UlDlAssignment,
+    ) -> BitBuffer {
+        let mut cmce_sdu = BitBuffer::new_autoexpand(40);
+        DTxGranted {
+            call_identifier: 7,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut cmce_sdu)
+        .expect("serialize compact D-TX GRANTED");
+        cmce_sdu.seek(0);
+
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
+        sdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
+        let cmce_sdu_len = cmce_sdu.get_len();
+        sdu.copy_bits(&mut cmce_sdu, cmce_sdu_len);
+        sdu.seek(0);
+
+        test_cmce_stch_block(addr, sdu, ul_dl_assigned)
+    }
+
     fn test_d_tx_interrupt_stch_block(addr: TetraAddress, ul_dl_assigned: UlDlAssignment) -> BitBuffer {
         let mut sdu = BitBuffer::new_autoexpand(40);
         DTxInterrupt {
@@ -4218,6 +4283,76 @@ mod tests {
                 .iter()
                 .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi)),
             "lower-priority busy responses should remain queued after the requester floor grant is sent"
+        );
+    }
+
+    #[test]
+    fn test_large_group_positive_floor_grant_stch_preempts_llc_wrapped_busy_response_backlog() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let requester = TetraAddress::issi(2_260_082);
+        for offset in 0..MAX_DLSCHED_ELEMS_PER_TIMESLOT {
+            let busy_requester = TetraAddress::issi(2_600_000 + offset as u32);
+            sched.dl_enqueue_stealing(
+                traffic_ts,
+                test_llc_wrapped_d_tx_granted_stch_block(busy_requester, TransmissionGrant::RequestQueued, UlDlAssignment::Dl),
+                busy_requester,
+                None,
+            );
+        }
+
+        let grant_reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_llc_wrapped_d_tx_granted_stch_block(requester, TransmissionGrant::Granted, UlDlAssignment::Both),
+            requester,
+            Some(grant_reporter.clone()),
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let (_tch, stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let stch = stch.expect("assigned traffic channel should send one STCH block");
+
+        let mut parsed = BitBuffer::from_bitbuffer(&stch);
+        let resource = MacResource::from_bitbuf(&mut parsed).expect("selected STCH should carry MAC-RESOURCE");
+        assert_eq!(resource.addr.map(|addr| addr.ssi), Some(requester.ssi));
+        assert_eq!(
+            resource
+                .chan_alloc_element
+                .as_ref()
+                .expect("positive floor grant must carry channel allocation")
+                .ul_dl_assigned,
+            UlDlAssignment::Both
+        );
+        let stch_payload = BitBuffer::from_bitbuffer_pos(&parsed);
+        let mut cmce_payload =
+            BsChannelScheduler::cmce_dl_payload_from_tma_sdu(&stch_payload).expect("STCH should carry BL-UDATA/MLE/CMCE payload");
+        let granted = DTxGranted::from_bitbuf(&mut cmce_payload).expect("selected STCH should carry D-TX GRANTED");
+        assert_eq!(granted.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+        assert_eq!(grant_reporter.get_state(), TxState::Transmitted);
+
+        // Real CMCE->MLE->LLC traffic reaches UMAC wrapped in BL-UDATA with
+        // an MLE CMCE discriminator. The scheduler priority must decode that
+        // shape as the same clause 14.5.2.2.1 positive floor grant, otherwise
+        // the first usable PTT can sit behind thousands of busy responses.
+        assert!(
+            sched.dltx_queues[traffic_ts as usize - 1]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi)),
+            "lower-priority wrapped busy responses should remain queued after the requester floor grant is sent"
         );
     }
 

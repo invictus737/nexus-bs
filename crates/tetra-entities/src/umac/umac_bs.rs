@@ -8,6 +8,8 @@ use tetra_pdus::cmce::{
     enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
     pdus::d_tx_granted::DTxGranted,
 };
+use tetra_pdus::llc::pdus::bl_udata::BlUdata;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
@@ -791,6 +793,25 @@ impl UmacBs {
         queue.push_back(msg);
     }
 
+    fn cmce_dl_payload_from_tma_sdu(sdu: &BitBuffer) -> Option<BitBuffer> {
+        let mut wrapped = BitBuffer::from_bitbuffer(sdu);
+        if BlUdata::from_bitbuf(&mut wrapped).is_ok() {
+            let discriminator = wrapped
+                .read_field(3, "mle_protocol_discriminator")
+                .ok()
+                .and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok());
+            if discriminator == Some(MleProtocolDiscriminator::Cmce) {
+                return Some(wrapped);
+            }
+        }
+
+        let direct = BitBuffer::from_bitbuffer(sdu);
+        direct
+            .peek_bits(5)
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())
+            .map(|_| direct)
+    }
+
     fn classify_tma_admission_priority(prim: &TmaUnitdataReq) -> TmaAdmissionPriority {
         let has_uplink_allocation = prim
             .chan_alloc
@@ -806,7 +827,13 @@ impl UmacBs {
             };
         }
 
-        let mut pdu_type_probe = BitBuffer::from_bitbuffer(&prim.pdu);
+        let Some(mut pdu_type_probe) = Self::cmce_dl_payload_from_tma_sdu(&prim.pdu) else {
+            return if has_channel_allocation {
+                TmaAdmissionPriority::ChannelAllocation
+            } else {
+                TmaAdmissionPriority::Ordinary
+            };
+        };
         let pdu_type = pdu_type_probe
             .read_field(5, "cmce_pdu_type_dl")
             .ok()
@@ -819,7 +846,9 @@ impl UmacBs {
                 TmaAdmissionPriority::FloorWithdraw
             }
             Some(CmcePduTypeDl::DTxGranted) => {
-                let mut grant_probe = BitBuffer::from_bitbuffer(&prim.pdu);
+                let Some(mut grant_probe) = Self::cmce_dl_payload_from_tma_sdu(&prim.pdu) else {
+                    return TmaAdmissionPriority::Ordinary;
+                };
                 let positive_floor_grant = DTxGranted::from_bitbuf(&mut grant_probe)
                     .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && has_uplink_allocation);
                 if positive_floor_grant {

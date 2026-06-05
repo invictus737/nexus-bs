@@ -6237,3 +6237,91 @@ Next non-repeating execution:
 2. Add CMCE->UMAC integrated 4096-member handoff test: real CMCE PTT contenders, `U-TX CEASED`, decoded STCH/FACCH grant, and voice route/source speaker.
 3. Add restart recovery EG7 -> CMCE -> UMAC assigned-channel test with 4096 cached group members.
 4. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
+
+## 2026-06-05 - PM checkpoint: Nexus-BS v0.1.55 clause-scoped hardening at scale
+
+Workstream state:
+
+- Nexus-BS v0.1.55 hardening remains clause-scoped engineering work against ETSI EN 300 392-2. Do not claim whole-stack formal TETRA certification without official conformance-suite/lab evidence.
+- Basic service targets stay unchanged: robust group call, private call simplex and duplex, SDS/status, WAP home-page delivery, MM attach/group affiliation persistence, scan-safe group state, and long-running BS operation without forgetting terminals.
+- Scale requirement is explicit: tests and designs must cover thousands of terminals or bounded large-storm equivalents, not only two or three radios.
+
+Component map in simple terms:
+
+- PM/log: keeps the execution trail and next actions clear so workers do not loop.
+- MM: owns terminal registration, attach state, group affiliation, and energy saving mode such as EG3/EG7.
+- CMCE: owns call control: group call, private call, floor/PTT state, call setup, and release.
+- SDS/status: owns short data and status messages over the TETRA signalling path.
+- WAP: owns the small terminal browser service and Nexus-BS welcome page delivery.
+- LLC/MLE: wraps CMCE/SDS data before UMAC and manages acknowledged/unacknowledged logical link delivery.
+- UMAC/MAC: turns upper-layer requests into downlink MAC resources, grants, random-access ACKs, and assigned-channel signalling.
+
+Current active technical focus:
+
+- UMAC/MAC large-group floor-grant storm work is active. The current patch line protects positive group floor grants and random-access ACKs under 4096-message pressure, then extends the same priority recognition through the real LLC `BL-UDATA` + MLE `Cmce` wrapping path, not only direct synthetic CMCE test payloads.
+- The field symptoms still requiring proof are repeated group PTT static audio on selected terminals, first-PTT/private-call edge cases, and restart recovery where terminals must return attached with coherent group affiliation.
+
+Next concrete execution:
+
+1. Finish the dirty UMAC/MAC wrapped-payload priority patch without touching unrelated files.
+2. Add a CMCE->MLE->LLC->UMAC integrated large-group handoff test that decodes actual STCH/FACCH output and proves the requester receives the positive grant before lower-priority busy/not-granted traffic.
+3. Add restart/EG7 recovery regression for thousands of cached affiliates: after BS restart, MM must restore attach-visible state and group affiliation coherently before group PTT.
+4. Add SDS/WAP accepted-vs-transmitted observability tests so dashboard/logs distinguish queued, transmitted, failed, and terminal-delivered states where the stack can know them.
+5. Keep private-call release fixes in the validation queue: called party must receive correct end-call/release semantics, not `No answer`, and Motorola MXP600 must not be driven into soft reboot by Nexus-BS release signalling.
+
+## 2026-06-05 - Wrapped floor-grant priority closed through UMAC/MAC and CMCE cross-layer tests
+
+Component in simple technical terms:
+
+- CMCE decides who owns the call floor/PTT.
+- MLE marks the payload as CMCE.
+- LLC wraps that payload as `BL-UDATA`.
+- UMAC receives `TMA-UNITDATA.req`, admits it into bounded queues, and builds MAC signalling.
+- MAC scheduler chooses which STCH/FACCH block is sent first on the assigned traffic channel.
+
+Problem fixed:
+
+- The previous UMAC/MAC priority recognition handled direct synthetic CMCE payloads, but real stack traffic reaches UMAC wrapped as LLC `BL-UDATA` plus a 3-bit MLE `Cmce` discriminator.
+- Under a large GSSI storm, that meant the wrapped positive `D-TX GRANTED(Granted)` with uplink allocation could look ordinary and sit behind thousands of lower-value `RequestQueued`/`NotGranted` floor responses.
+- The fix now decodes the wrapped shape before priority classification, while keeping direct CMCE support for existing tests and narrow fixtures.
+- In the scheduler, the CMCE parser now reads the TM-SDU after `MAC-RESOURCE` using the current bit position, not the beginning of the STCH block.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group-call floor request and floor grant/queued/not-granted signalling.
+- EN 300 392-2 clause 20.4.1.1.3: TMA request/report handling.
+- EN 300 392-2 clause 21.4.3.1: random access acknowledgement carried into the grant path.
+- EN 300 392-2 clause 22.3.2.4.1: LLC `BL-UDATA` unacknowledged transfer.
+- EN 300 392-2 clauses 23.5 and 23.5.2.2.1: STCH/FACCH assigned-channel signalling and MAC-RESOURCE delivery.
+- This is clause-scoped regression evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `BL-UDATA`/MLE(CMCE) decoding before TMA admission priority classification.
+  - Positive wrapped `D-TX GRANTED` with UL/Both allocation now receives the same bounded-queue priority as direct CMCE.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added wrapped CMCE detection for STCH/FACCH stealing priority.
+  - Fixed parser position by extracting payload after `MAC-RESOURCE` with `BitBuffer::from_bitbuffer_pos`.
+  - Added wrapped scheduler regression where a positive grant preempts a full backlog of wrapped busy responses.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added wrapped UMAC 4096-message storm regression with preserved requester random-access ACK.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added CMCE->MLE->LLC->UMAC->LMAC cross-layer 4096-member regression that decodes `MAC-RESOURCE -> BL-UDATA -> MLE(CMCE) -> D-TX GRANTED`.
+  - Confirms the requester positive grant reaches STCH before lower-value storm `NotGranted` responses.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/tests/test_cmce_bs.rs crates/tetra-entities/tests/test_umac_bs.rs crates/tetra-entities/src/umac/umac_bs.rs crates/tetra-entities/src/umac/subcomp/bs_sched.rs` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 61 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 69 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 146 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit the wrapped floor-grant priority patch.
+2. Continue restart/EG7 recovery regression for thousands of cached affiliates: after BS restart, MM and CMCE must restore attach-visible state and group affiliation coherently before group PTT.
+3. Add SDS/WAP accepted-vs-transmitted observability tests so dashboard/logs distinguish queued, transmitted, failed, and terminal-delivered states where the stack can know them.
+4. Keep private-call release validation queued: called party should receive correct end-call/release semantics, not `No answer`, and MXP600 must not be driven into soft reboot by release signalling.

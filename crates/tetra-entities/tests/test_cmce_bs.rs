@@ -35,6 +35,8 @@ use tetra_pdus::cmce::pdus::u_release::URelease;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_pdus::cmce::pdus::u_tx_ceased::UTxCeased;
 use tetra_pdus::cmce::pdus::u_tx_demand::UTxDemand;
+use tetra_pdus::llc::pdus::bl_udata::BlUdata;
+use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
@@ -42,6 +44,7 @@ use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
 use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
+use tetra_pdus::umac::pdus::mac_resource::MacResource;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::control::call_control::{CallControl, CircuitDlMediaSource, NetworkCircuitCall};
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
@@ -52,6 +55,7 @@ use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::lcmc::{LcmcMleUnitdataInd, LcmcMleUnitdataReq};
 use tetra_saps::lmm::LmmMleUnitdataInd;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tmv::{TmvUnitdataReq, enums::logical_chans::LogicalChannel};
 
 use crate::common::ComponentTest;
 
@@ -990,6 +994,94 @@ fn parse_d_tx_granted(prim: &LcmcMleUnitdataReq) -> Option<DTxGranted> {
     let mut sdu = prim.sdu.clone();
     sdu.seek(0);
     DTxGranted::from_bitbuf(&mut sdu).ok()
+}
+
+#[derive(Debug)]
+struct WrappedMacDTxGranted {
+    resource_sequence: usize,
+    logical_channel: LogicalChannel,
+    resource: MacResource,
+    bl_udata: BlUdata,
+    grant: DTxGranted,
+}
+
+fn wrapped_d_tx_granted_from_lmac_msgs(msgs: &[SapMsg]) -> Vec<WrappedMacDTxGranted> {
+    let mut decoded = Vec::new();
+    let mut resource_sequence = 0;
+
+    for msg in msgs {
+        let SapMsgInner::TmvUnitdataReq(slot) = &msg.msg else {
+            continue;
+        };
+
+        for block in [&slot.blk1, &slot.blk2].into_iter().flatten() {
+            wrapped_d_tx_granted_from_tmv_block(block, &mut resource_sequence, &mut decoded);
+        }
+    }
+
+    decoded
+}
+
+fn wrapped_d_tx_granted_from_tmv_block(block: &TmvUnitdataReq, resource_sequence: &mut usize, decoded: &mut Vec<WrappedMacDTxGranted>) {
+    if block.logical_channel != LogicalChannel::Stch && block.logical_channel != LogicalChannel::SchF {
+        return;
+    }
+
+    let mut mac_block = block.mac_block.clone();
+    mac_block.seek(0);
+
+    while mac_block.get_len_remaining() >= 2 {
+        let start_pos = mac_block.get_pos();
+        let Some(mac_pdu_type) = mac_block.peek_bits(2) else {
+            break;
+        };
+        if mac_pdu_type != 0b00 {
+            break;
+        }
+
+        let Ok(resource) = MacResource::from_bitbuf(&mut mac_block) else {
+            break;
+        };
+        let sequence = *resource_sequence;
+        *resource_sequence += 1;
+
+        let total_len_bits = resource.length_ind as usize * 8;
+        let next_pos = start_pos + total_len_bits;
+        if total_len_bits == 0 || next_pos <= mac_block.get_pos() || next_pos > mac_block.get_len() {
+            break;
+        }
+
+        let mut payload = BitBuffer::from_bitbuffer_pos(&mac_block);
+        payload.set_raw_end(payload.get_raw_start() + (next_pos - mac_block.get_pos()));
+
+        if let Some((bl_udata, grant)) = parse_wrapped_d_tx_granted_payload(payload) {
+            decoded.push(WrappedMacDTxGranted {
+                resource_sequence: sequence,
+                logical_channel: block.logical_channel,
+                resource,
+                bl_udata,
+                grant,
+            });
+        }
+
+        mac_block.seek(next_pos);
+    }
+}
+
+fn parse_wrapped_d_tx_granted_payload(mut payload: BitBuffer) -> Option<(BlUdata, DTxGranted)> {
+    let bl_udata = BlUdata::from_bitbuf(&mut payload).ok()?;
+    let discriminator = payload
+        .read_field(3, "mle_protocol_discriminator")
+        .ok()
+        .and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok())?;
+    if discriminator != MleProtocolDiscriminator::Cmce {
+        return None;
+    }
+    if payload.peek_bits(5).and_then(|bits| CmcePduTypeDl::try_from(bits).ok()) != Some(CmcePduTypeDl::DTxGranted) {
+        return None;
+    }
+
+    DTxGranted::from_bitbuf(&mut payload).ok().map(|grant| (bl_udata, grant))
 }
 
 fn assert_compact_d_tx_granted_facch(prim: &LcmcMleUnitdataReq, grant: &DTxGranted) {
@@ -5008,6 +5100,101 @@ fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted()
     assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
+}
+
+#[test]
+fn test_cross_layer_large_group_floor_grant_survives_wrapped_ptt_storm_to_lmac() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce, TetraEntity::Mle, TetraEntity::Llc, TetraEntity::Umac],
+        vec![TetraEntity::Lmac, TetraEntity::Brew],
+    );
+
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
+    let first_issi = 820_000_u32;
+    let current_speaker = first_issi;
+    let queued_requester = first_issi + 1;
+    let call_id = 0x1234;
+    force_cmce_next_call_identifier(&mut test, call_id);
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_u_setup_msg(current_speaker, TEST_GSSI));
+    test.run_stack(Some(8));
+    let _ = test.dump_sinks();
+    assert!(
+        cmce_debug_active_call_ids(&mut test).contains(&call_id),
+        "large-group setup should maintain the forced call identifier before the PTT storm"
+    );
+
+    test.submit_message(build_u_tx_demand_msg(queued_requester, call_id));
+    for issi in (first_issi + 2)..(first_issi + member_count) {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+    }
+    test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+    test.run_stack(Some(256));
+    let storm_msgs = test.dump_sinks();
+    let wrapped_grants = wrapped_d_tx_granted_from_lmac_msgs(&storm_msgs);
+
+    // EN 300 392-2 clauses 14.5.2.2.1, 20.4.1.1.3, 22.3.2.4.1 and 23.5:
+    // the requester floor grant must survive the real CMCE->MLE->LLC->UMAC
+    // wrapping path and reach assigned-channel STCH as BL-UDATA/MLE(CMCE).
+    let requester_positive = wrapped_grants
+        .iter()
+        .find(|decoded| {
+            decoded.logical_channel == LogicalChannel::Stch
+                && decoded.resource.addr.is_some_and(|addr| addr.ssi == queued_requester)
+                && decoded
+                    .resource
+                    .chan_alloc_element
+                    .as_ref()
+                    .is_some_and(|alloc| alloc.ul_dl_assigned == UlDlAssignment::Both)
+                && decoded.grant.call_identifier == call_id
+                && decoded.grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+        })
+        .unwrap_or_else(|| panic!("expected wrapped positive requester D-TX GRANTED at LMAC; decoded grants={wrapped_grants:?}"));
+    assert!(
+        !requester_positive.bl_udata.has_fcs,
+        "CMCE floor-control BL-UDATA should use the unacknowledged no-FCS path in this fixture"
+    );
+
+    let busy_grant_count = wrapped_grants
+        .iter()
+        .filter(|decoded| {
+            decoded.resource.addr.is_some_and(|addr| {
+                (first_issi + 2..first_issi + member_count).contains(&addr.ssi)
+                    && decoded.grant.call_identifier == call_id
+                    && decoded.grant.transmission_grant == TransmissionGrant::NotGranted.into_raw() as u8
+            })
+        })
+        .count();
+    assert!(
+        busy_grant_count > 0,
+        "fixture should emit at least one wrapped busy/NotGranted response so the PTT storm is observable at LMAC"
+    );
+
+    if let Some(first_busy) = wrapped_grants.iter().find(|decoded| {
+        decoded.resource.addr.is_some_and(|addr| {
+            (first_issi + 2..first_issi + member_count).contains(&addr.ssi)
+                && decoded.grant.call_identifier == call_id
+                && decoded.grant.transmission_grant == TransmissionGrant::NotGranted.into_raw() as u8
+        })
+    }) {
+        assert!(
+            requester_positive.resource_sequence < first_busy.resource_sequence,
+            "positive requester floor grant must be emitted before lower-value storm NotGranted responses"
+        );
+    }
 }
 
 #[test]
