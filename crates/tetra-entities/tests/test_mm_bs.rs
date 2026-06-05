@@ -5103,6 +5103,80 @@ fn test_restart_recovery_unsolicited_itsi_attach_eg7_refreshes_cached_group_befo
 }
 
 #[test]
+fn test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members() {
+    debug::setup_logging_verbose();
+    let member_count = 2048_u32;
+    let first_issi = 2_264_000_u32;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("large-unsolicited-itsi-eg7-cached-group");
+    let cache: String = (0..member_count)
+        .map(|offset| format!("{} {}:0:4\n", first_issi + offset, gssi))
+        .collect();
+    std::fs::write(&path, cache).expect("failed to seed large recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_location_update_with_type(&mut test, issi, LocationUpdateType::ItsiAttach, None);
+        test.run_stack(Some(1));
+        let attach_msgs = test.dump_sinks();
+        assert!(
+            contains_location_update_accept(&attach_msgs),
+            "restart recovery LU for ISSI {issi} should still get D-LOCATION UPDATE ACCEPT"
+        );
+        if offset == 0 || offset == member_count - 1 {
+            assert_swmi_group_attach_refresh(&attach_msgs, gssi, 4, "large EG7 cached restart restore");
+        }
+        assert!(
+            !test.config.state_read().energy_saving.contains_key(&issi),
+            "EG7 must remain pending until ISSI {issi} explicitly responds"
+        );
+
+        submit_swmi_group_ack(&mut test, issi, 800_000 + offset, false, vec![]);
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+
+        submit_u_mm_status_energy_saving(
+            &mut test,
+            issi,
+            StatusUplink::ChangeOfEnergySavingModeResponse,
+            EnergySavingMode::Eg7,
+        );
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+    }
+
+    let mut members = test.config.state_read().subscribers.group_members(gssi);
+    members.sort_unstable();
+    assert_eq!(members.len(), member_count as usize);
+    assert_eq!(members.first().copied(), Some(first_issi));
+    assert_eq!(members.last().copied(), Some(first_issi + member_count - 1));
+
+    let state = test.config.state_read();
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        let assignment = state
+            .energy_saving
+            .get(&issi)
+            .copied()
+            .expect("large restart-restored member must activate EG7 after matching response");
+        assert_eq!(assignment.mode, EnergySavingMode::Eg7 as u8);
+        assert_eq!(assignment.suspension_count, 0);
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
     debug::setup_logging_verbose();
     let issi = 2260618;

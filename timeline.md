@@ -5382,3 +5382,45 @@ Next non-repeating execution:
 1. Commit this large restart-recovered GSSI evidence patch.
 2. Continue with EG7 restart-derived large-group suspension/resume tests.
 3. Keep the deploy gate as local build only; do not compile on the Pi and do not create binary backups.
+
+## 2026-06-05 17:35:43 EEST - MM large restart-recovered EG7 activation evidence
+
+User goal:
+
+- EG7 must work for large restored groups after BS restart, not only for one terminal.
+- Terminals restored from cache must not remain in a half-attached/no-group state while Energy Economy negotiation is pending.
+
+Component in simple technical terms:
+
+- MM owns registration, group restore, and Energy Economy negotiation.
+- In EG7, the BS requests a long sleep-cycle mode, but the assignment only becomes active after the MS sends `U-MM STATUS` response confirming it.
+- This test proves that 2048 restart-restored group members can all confirm EG7 and remain affiliated to the restored GSSI.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.4.4 and 16.8.1 cover registration/group identity recovery procedures.
+- EN 300 392-2 clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7, and 23.7.6 cover Energy Economy negotiation and scheduling constraints.
+- The restart cache is local implementation state; this remains engineering evidence only, not formal certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members`.
+  - Seeds 2048 cached ISSI -> GSSI affiliations.
+  - Drives ITSI attach without explicit group identities for every ISSI.
+  - Confirms SwMI group refresh handling and then sends matching EG7 responses for every restored member.
+  - Asserts all restored members remain group-affiliated and each has an active EG7 assignment with no assigned-channel suspension leakage.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 135 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this MM EG7 restart-recovery evidence patch.
+2. Run a final focused combined regression across UMAC scheduler, UMAC integration, CMCE, MM, and diff checks.
+3. Next implementation target after that: inspect global `MessageQueue` and LLC queue backpressure policies without dropping protocol-critical messages blindly.
