@@ -3406,3 +3406,36 @@ Next non-repeating execution:
 1. Commit and deploy directly to `/home/chris/nexus-bs-v0.1.55-test` with EG7 config preserved.
 2. Restart the test BS and verify post-restart logs no longer contain `Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY` for `2260082`, `2260616`, or `2260618`.
 3. Confirm terminals show GSSI `226333` rather than `No Group` after restart and before any PTT test.
+
+## 2026-06-05 10:11:04 EEST - Post-deploy restart log confirms group affiliation recovery
+
+Field validation:
+
+- Remote test BS is running `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`.
+- Remote build banner: `Build: v0.1.55-79272974`.
+- Remote config keeps the hard EG test case enabled: `energy_saving_mode = "eg7"` and `call_preemptive = false`.
+- Local inspected log copy: `/private/tmp/nexus-bs-current.log`.
+
+Component explanation:
+
+- MM restart recovery asks already-camped terminals to re-state their registration and group identities after BS restart.
+- CMCE consumes MM `Register` and `Affiliate` updates so group call control and dashboard state know which ISSIs are valid listeners for a GSSI.
+
+Observed result after the latest restart:
+
+- `2260616` sent `U-LOCATION UPDATE DEMAND` with GSSI `226333`; BS sent `D-LOCATION UPDATE ACCEPT` with `GroupIdentityLocationAccept`; CMCE registered and affiliated `2260616` to `[226333]`.
+- `2260082` answered the BS recovery command with `DemandLocationUpdating` and GSSI `226333`; BS accepted and affiliated it to `[226333]`.
+- `2260618` re-registered with GSSI `226333`; BS accepted and affiliated it to `[226333]`.
+- The prior blocker sequence was present for `2260082`: follow-up `U-ATTACH/DETACH GROUP IDENTITY` with `group_report_response len=1 data=0` and GSSI `226333`.
+- The new code accepted that final group-report-complete PDU with `solicited=true`, sent `D-ATTACH/DETACH GROUP IDENTITY ACK` with `group_identity_accept_reject=0`, and left CMCE affiliated to `[226333]`.
+
+Negative checks:
+
+- No `Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY` appeared in the current post-restart log.
+- No `PTT denied`, `RequestedServiceNotAvailable`, `Service unavailable`, `Unit Not Attached`, `No answer`, or `ERROR` appeared in the current post-restart log slice.
+
+Remaining risk / next non-repeating execution:
+
+1. User should confirm the terminal UI now shows group `226333`, not `No Group`, immediately after BS restart.
+2. If any terminal still displays `No Group`, capture a fresh full log from the new restart before patching; check whether dashboard display state diverges from MM/CMCE affiliate state.
+3. If the group display is fixed, continue field validation with EG7 active: group PTT turn-taking, private simplex/duplex, SDS/WAP smoke, and longer soak.
