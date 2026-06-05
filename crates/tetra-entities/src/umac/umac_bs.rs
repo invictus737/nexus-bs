@@ -2451,6 +2451,21 @@ impl UmacBs {
                         );
                         return;
                     }
+                    if !private_participant_scoped {
+                        let group_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
+                        let removed = self
+                            .channel_scheduler
+                            .dl_drop_queued_gssi_repeats(group_addr, "floor granted to a new/current speaker");
+                        if removed > 0 {
+                            tracing::debug!(
+                                "UMAC: dropped {} stale GSSI repeat item(s) for {} after floor grant call_id={} source_issi={}",
+                                removed,
+                                group_addr,
+                                call_id,
+                                source_issi
+                            );
+                        }
+                    }
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                     self.set_current_ul_speaker(ts, source_addr);
                     tracing::info!(

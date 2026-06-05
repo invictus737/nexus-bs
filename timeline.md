@@ -5520,3 +5520,45 @@ Next non-repeating execution:
 1. Commit this UMAC mixed EG/StayAlive repeat-state patch.
 2. Continue with UMAC stale GSSI repeat invalidation on floor changes and late-affiliating EG listeners during active group calls.
 3. Then address ingress/global `MessageQueue` and live SDS/WAP admission/observability caps.
+
+## 2026-06-05 17:57:49 EEST - UMAC drops stale GSSI repeat snapshots on floor grant
+
+User goal:
+
+- Group floor changes must remain correct for large EG groups; late receive batches must not hear stale old-speaker signalling after a new PTT/floor grant.
+
+Component in simple technical terms:
+
+- CMCE decides who owns the group floor and sends the new `D-TX GRANTED`.
+- UMAC may still have old GSSI repeat-state queued for EG listeners that were sleeping during an earlier batch.
+- On a new group `FloorGranted`, UMAC now drops only already-created GSSI repeat snapshots for that group. Fresh unsent signalling for the new floor remains queued.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: SwMI floor control uses `D-TX GRANTED` to move transmission permission.
+- EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6: EG-aware downlink repeats must match the relevant receive opportunities.
+- This patch is local stale-state invalidation around those clauses, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `dl_drop_queued_gssi_repeats`.
+  - It removes only queued `group_state: Some` GSSI Resource/FragBuf/Stealing repeat items matching the group address.
+  - It does not remove fresh `group_state: None` signalling for the same GSSI and does not remove repeat state for other groups.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - `CallControl::FloorGranted` now calls the stale-repeat dropper only for group-scoped bearers.
+  - Private/P2P `FloorGranted` remains strict ISSI-participant scoped and does not invoke GSSI cleanup.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_floor_change_drops_only_requeued_gssi_repeat_state --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 66 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 58 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this stale GSSI repeat invalidation patch.
+2. Continue with late-affiliating EG listeners during active assigned-channel group calls.
+3. Then address global ingress/control `MessageQueue` and live SDS/WAP admission/observability caps.

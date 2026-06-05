@@ -1464,6 +1464,54 @@ impl BsChannelScheduler {
         removed
     }
 
+    fn elem_group_repeat_addr(elem: &DlSchedElem) -> Option<(TetraAddress, Option<TxReporter>, Option<TxReporter>)> {
+        match elem {
+            DlSchedElem::Resource(pdu, _, tx_reporter, Some(group_state)) => {
+                pdu.addr.map(|addr| (addr, tx_reporter.clone(), group_state.tx_reporter.clone()))
+            }
+            DlSchedElem::FragBuf(fragger, Some(group_state)) => fragger.addr().map(|addr| (addr, None, group_state.tx_reporter.clone())),
+            DlSchedElem::Stealing(_, addr, tx_reporter, Some(group_state)) => {
+                Some((*addr, tx_reporter.clone(), group_state.tx_reporter.clone()))
+            }
+            _ => None,
+        }
+    }
+
+    fn dl_drop_queued_gssi_repeats_in_queue(queue: &mut Vec<DlSchedElem>, group_addr: TetraAddress, reason: &str) -> usize {
+        let before = queue.len();
+        queue.retain(|elem| {
+            let Some((addr, tx_reporter, group_reporter)) = Self::elem_group_repeat_addr(elem) else {
+                return true;
+            };
+            if addr != group_addr {
+                return true;
+            }
+
+            // EN 300 392-2 clauses 14.5.2.2.1, 23.5.2.2.7, and 23.7.6:
+            // when the floor changes, retained late EG repeats for the old
+            // GSSI signalling snapshot may advertise stale transmitting-party
+            // state to a later receive batch. Drop only already-created repeat
+            // state; leave fresh group_state=None signalling in the queue.
+            tracing::debug!("UMAC: dropping queued GSSI repeat for {} ({})", group_addr, reason);
+            Self::mark_reporter_discarded_if_pending(tx_reporter);
+            Self::mark_reporter_discarded_if_pending(group_reporter);
+            false
+        });
+        before - queue.len()
+    }
+
+    pub fn dl_drop_queued_gssi_repeats(&mut self, group_addr: TetraAddress, reason: &str) -> usize {
+        if group_addr.ssi_type != SsiType::Gssi {
+            return 0;
+        }
+
+        let mut removed = Self::dl_drop_queued_gssi_repeats_in_queue(&mut self.dltx_next_slot_queue, group_addr, reason);
+        for queue in &mut self.dltx_queues {
+            removed += Self::dl_drop_queued_gssi_repeats_in_queue(queue, group_addr, reason);
+        }
+        removed
+    }
+
     /// Enqueue a TMA PDU to be transmitted on the NEXT frame (ts1, frame N+1).
     /// Use this to deliberately separate two MCCH messages that would overflow the slot
     /// if sent together (e.g. DConnect MCCH + DConnectAck MCCH = 223 bits > 216-bit slot).
@@ -4187,6 +4235,79 @@ mod tests {
                 .iter()
                 .all(|elem| !matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi == gssi)),
             "cancel must remove the requeued GSSI FACCH/STCH final batch"
+        );
+    }
+
+    #[test]
+    fn test_floor_change_drops_only_requeued_gssi_repeat_state() {
+        let mut sched = get_testing_slotter();
+        let gssi = 91;
+        let other_gssi = 92;
+        let old_reporter = TxReporter::new_unacked();
+        let fresh_reporter = TxReporter::new_unacked();
+        let other_reporter = TxReporter::new_unacked();
+        let (old_pdu, old_sdu) = test_resource_for_gssi(gssi, 8);
+        let (fresh_pdu, fresh_sdu) = test_resource_for_gssi(gssi, 8);
+        let (other_pdu, other_sdu) = test_resource_for_gssi(other_gssi, 8);
+
+        sched.dltx_queues[0].push(DlSchedElem::Resource(
+            old_pdu.clone(),
+            old_sdu.clone(),
+            None,
+            Some(GroupDeliveryState::new(
+                old_pdu,
+                old_sdu,
+                vec![1001],
+                Some(old_reporter.clone()),
+                true,
+            )),
+        ));
+        sched.dltx_queues[0].push(DlSchedElem::Resource(fresh_pdu, fresh_sdu, Some(fresh_reporter.clone()), None));
+        sched.dltx_queues[0].push(DlSchedElem::Resource(
+            other_pdu.clone(),
+            other_sdu.clone(),
+            None,
+            Some(GroupDeliveryState::new(
+                other_pdu,
+                other_sdu,
+                vec![2001],
+                Some(other_reporter.clone()),
+                true,
+            )),
+        ));
+
+        // EN 300 392-2 clause 14.5.2.2.1 moves the active group floor with
+        // D-TX GRANTED. Local EG repeats created for old GSSI signalling must
+        // not survive that floor change, but fresh unsent signalling for the
+        // same GSSI has no repeat snapshot yet and must remain eligible.
+        assert_eq!(
+            sched.dl_drop_queued_gssi_repeats(TetraAddress::new(gssi, SsiType::Gssi), "test floor change"),
+            1
+        );
+        assert_eq!(old_reporter.get_state(), TxState::Discarded);
+        assert_eq!(fresh_reporter.get_state(), TxState::Pending);
+        assert_eq!(other_reporter.get_state(), TxState::Pending);
+        assert_eq!(sched.dltx_queues[0].len(), 2);
+        assert!(
+            sched.dltx_queues[0].iter().any(
+                |elem| matches!(elem, DlSchedElem::Resource(_, _, Some(reporter), None) if reporter.shares_state_with(&fresh_reporter))
+            ),
+            "fresh group_state=None signalling for the new floor must stay queued"
+        );
+        assert!(
+            sched.dltx_queues[0].iter().any(|elem| matches!(elem, DlSchedElem::Resource(
+                    MacResource {
+                        addr: Some(TetraAddress {
+                            ssi,
+                            ssi_type: SsiType::Gssi
+                        }),
+                        ..
+                    },
+                    _,
+                    _,
+                    Some(_)
+                ) if *ssi == other_gssi)),
+            "repeat state for a different GSSI must not be dropped"
         );
     }
 
