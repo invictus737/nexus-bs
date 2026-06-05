@@ -2181,6 +2181,7 @@ impl MmBs {
                     }
                 }
                 self.emit_subscriber_update(queue, issi, stored_groups, BrewSubscriberAction::Affiliate);
+                self.emit_current_group_snapshot(issi);
             }
         }
 

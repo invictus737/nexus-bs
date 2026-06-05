@@ -1,5 +1,50 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 13:48:26 EEST - MM coverage-return group snapshot hardening for restart `No Group` visibility
+
+User report:
+
+- After BS restart, radios can appear attached but with `No Group`.
+- Current live cache and latest restart log still show `2260082`, `2260616`, and `2260618` affiliated to GSSI `226333`, so the remaining hardening target is a status/dashboard-visible group gap rather than a reproduced missing CMCE listener in this restart.
+
+Component explanation:
+
+- MM is Mobility Management. It owns ISSI registration, remembered group affiliations, restart recovery, and the `D-LOCATION-UPDATE-COMMAND` / `U-LOCATION UPDATE DEMAND` flow.
+- CMCE is call control. It consumes MM register/affiliate events so group PTT has listeners.
+- Dashboard telemetry is observability. It must receive the final group list, not depend on an incremental event that may be absent when MM reuses an already cached client group.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4: a BS-commanded location update can be answered by `U-LOCATION UPDATE DEMAND` and accepted with the same update type.
+- Clause 16.8.0: previously accepted persistent group identities remain valid until a real detach/replacement.
+- Clause 16.4.4: SwMI may command location update/group reporting after restart.
+- This patch is clause-scoped engineering hardening and dashboard consistency evidence only; it is not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - When a known MS returns after a local `D-LOCATION-UPDATE-COMMAND` without a fresh group report, MM already replays cached groups to CMCE/Brew. It now also emits a full current-group telemetry snapshot.
+  - This prevents a dashboard/status `No Group` state when `client_mgr` still has the group and CMCE listener state was restored, but no new `MsGroupAttach` telemetry was generated.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added a telemetry-enabled MM regression for group-less coverage return after periodic command.
+  - The test proves the final dashboard replay sees `groups=[3002]` instead of an empty group list.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs test_group_less_coverage_return_publishes_dashboard_group_snapshot --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 25 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack --locked` -> 1 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to the Pi test instance; build locally only and do not create binary backups.
+2. Restart test BS and read fresh log plus runtime cache.
+3. Verify dashboard/WebSocket state and radio-side group state after restart for `2260082`, `2260616`, `2260618` on `226333`.
+4. If a terminal screen still says `No Group` while dashboard shows `groups=[226333]`, capture exact ISSI/time and inspect whether that terminal received/ACKed the group accept/refresh on air.
+
 ## 2026-06-05 13:37:22 EEST - Deployed SDS local TSI hardening to Pi test instance
 
 Deployment:

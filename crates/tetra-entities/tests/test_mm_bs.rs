@@ -1,11 +1,16 @@
 mod common;
 
-use tetra_config::bluestation::{CfgBrew, EnergySavingAssignment, StackMode, from_toml_str};
+use tetra_config::bluestation::{CfgBrew, EnergySavingAssignment, StackConfig, StackMode, from_toml_str};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_entities::mm::mm_bs::MmBs;
+use tetra_entities::net_dashboard::server::DashboardServer;
+use tetra_entities::net_telemetry::{
+    TelemetryEvent,
+    channel::{TelemetrySource, telemetry_channel},
+};
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::enums::location_update_accept_type::LocationUpdateAcceptType;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
@@ -1477,6 +1482,57 @@ fn test_demand_location_update_after_periodic_command_without_group_report_reaff
     let state = test.config.state_read();
     assert!(state.subscribers.is_registered(issi));
     assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+}
+
+#[test]
+fn test_group_less_coverage_return_publishes_dashboard_group_snapshot() {
+    debug::setup_logging_verbose();
+    let issi = 2040815;
+    let gssi = 3002;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.periodic_registration_secs = 1;
+
+    let (mut test, telemetry) = mm_test_with_telemetry(config);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    let _ = drain_telemetry(&telemetry);
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    backdate_mm_registration(&mut test, issi, 2);
+    test.run_stack(Some(1));
+    let command_msgs = test.dump_sinks();
+    assert!(contains_location_update_command(&command_msgs));
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+    let _ = drain_telemetry(&telemetry);
+
+    // EN 300 392-2 clauses 16.9.2.8/16.9.3.4 let the MS answer the
+    // BS-commanded location update without repeating its group list. Clause
+    // 16.8.0 keeps the already accepted persistent group identity valid until
+    // a real detach/replacement. When MM restores that local affiliation for
+    // CMCE, dashboard telemetry must also receive the final group list.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    let events = drain_telemetry(&telemetry);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::MsGroupsSnapshot {
+                issi: event_issi,
+                gssis
+            } if *event_issi == issi && gssis == &vec![gssi]
+        )),
+        "group-less coverage return must publish a final dashboard group snapshot, got {events:?}"
+    );
+    assert_eq!(dashboard_groups_after(&events, issi), vec![gssi]);
 }
 
 #[test]
@@ -6872,6 +6928,34 @@ fn unique_restart_recovery_path(label: &str) -> String {
     let mut path = std::env::temp_dir();
     path.push(format!("nexus-bs-mm-restart-recovery-{label}-{}-{nanos}.txt", std::process::id()));
     path.to_string_lossy().into_owned()
+}
+
+fn mm_test_with_telemetry(config: StackConfig) -> (ComponentTest, TelemetrySource) {
+    let (sink, source) = telemetry_channel();
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.register_entity(MmBs::new(test.config.clone(), Some(sink), None));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+    (test, source)
+}
+
+fn drain_telemetry(source: &TelemetrySource) -> Vec<TelemetryEvent> {
+    std::iter::from_fn(|| source.try_recv()).collect()
+}
+
+fn dashboard_groups_after(events: &[TelemetryEvent], issi: u32) -> Vec<u32> {
+    let dashboard = DashboardServer::new("test.toml".to_string());
+    for event in events {
+        dashboard.handle_telemetry(event.clone());
+    }
+    dashboard
+        .state
+        .read()
+        .unwrap()
+        .snapshot_ms()
+        .into_iter()
+        .find(|ms| ms.issi == issi)
+        .map(|ms| ms.groups)
+        .unwrap_or_default()
 }
 
 fn submit_location_update(test: &mut ComponentTest, issi: u32, energy_saving_mode: Option<EnergySavingMode>) {
