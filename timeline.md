@@ -1,5 +1,56 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 13:18:48 EEST - MM restart group refresh survives group-less LU without masking explicit clear
+
+User report:
+
+- After BS restart, terminals reattached but could appear with `No Group`.
+- Current hard live config uses EG7, and lab ISSIs are expected to restore GSSI `226333`.
+
+Component explanation:
+
+- MM is Mobility Management: it registers ISSIs, owns group affiliation state, restart recovery cache, SwMI `D-ATTACH/DETACH GROUP IDENTITY`, ACK/T353, and EG negotiation.
+- CMCE is call control: it consumes MM register/affiliate events so group PTT has listeners.
+- Dashboard renders telemetry cache. The render path cannot show an empty group if the browser state has `groups=[226333]`; an empty row means telemetry/group state was empty or later cleared.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI may command location update and group reporting during restart recovery.
+- Clauses 16.8.0 and 16.8.1: accepted/persistent group identities and SwMI-initiated group attach refresh.
+- Clause 16.8.6: group attach/detach/report collision handling with other MM procedures.
+- Clauses 16.8.5 and 16.11.1.3: acknowledged SwMI group refresh remains bounded by T353.
+- Clause 16.10.27a: explicit group-report-complete is authoritative.
+- EG7 remains covered by clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7, and 23.7.6.
+- This is clause-scoped engineering evidence only, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - A group-less accepted `U-LOCATION UPDATE DEMAND` now preserves a pending restart-recovery SwMI group refresh instead of deleting it before the terminal ACKs.
+  - Preservation is deliberately narrow: only restart refresh transactions with rollback/reprobe semantics, only for already-known clients, and not during hard re-registration cleanup.
+  - Explicit group state in `U-LOCATION UPDATE DEMAND` still abandons the older pending SwMI refresh, so an empty complete group report can clear stale cache.
+  - Rejected LU paths now abandon pending SwMI group transactions before returning: mismatched SSI/MNI, migration reject, disabled MS reject, unsupported feature reject, and whitelist reject.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added restart recovery interleaving tests for group-less LU before SwMI ACK and before T353.
+  - Added explicit complete report, hard roaming re-registration, and rejected LU tests proving stale ACKs cannot re-affiliate cleared groups.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 25 passed.
+- `cargo test -p tetra-entities --test test_mm_bs swmi_group_ack --locked` -> 12 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack --locked` -> 1 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 132 passed.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to the Pi test instance; do not build on the Pi and do not make binary backups.
+2. After restart, capture the fresh BS log from the new process only and the dashboard WebSocket snapshot.
+3. Verify live cache still contains `2260082/2260616/2260618` with `226333:0:4`, the log shows SwMI group refresh/ACK or explicit group report, and dashboard state shows `groups=[226333]`.
+4. Run the first group PTT/private PTT check after all three ISSIs are attached; if a station still displays `No Group`, capture exact ISSI and timestamp immediately.
+
 ## 2026-06-05 13:07:20 EEST - Live restart `No Group` audit under EG7, no protocol patch required
 
 User report:

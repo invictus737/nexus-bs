@@ -5087,6 +5087,291 @@ fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
 }
 
 #[test]
+fn test_restart_recovery_group_less_update_preserves_pending_swmi_refresh_until_ack() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-refresh-survives-group-less-lu");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let command_msgs = test.dump_sinks();
+    assert_eq!(location_update_commands(&command_msgs).len(), 1);
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    // EN 300 392-2 clause 16.8.6 handles collision of group attachment with
+    // other MM procedures. A later U-LOCATION UPDATE DEMAND with no group
+    // state is not an ACK/reject for the already pending SwMI
+    // D-ATTACH/DETACH GROUP IDENTITY, so T353 or the real ACK must remain
+    // authoritative. This avoids a post-restart BS/MS split where local MM has
+    // 226333 but the terminal still shows "No Group".
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::PeriodicLocationUpdating, None);
+    test.run_stack(Some(1));
+    let periodic_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&periodic_msgs);
+    assert_eq!(
+        accept.location_update_accept_type,
+        LocationUpdateAcceptType::PeriodicLocationUpdating
+    );
+    assert!(accept.group_identity_location_accept.is_none());
+    assert!(
+        swmi_group_attach_refresh_details(&periodic_msgs).is_empty(),
+        "group-less follow-up LU must not duplicate the pending SwMI group refresh"
+    );
+    assert!(
+        subscriber_updates(&periodic_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate),
+        "group-less follow-up LU must not deaffiliate the provisionally restored restart group"
+    );
+    assert!(
+        debug_mm_swmi_group_transaction_pending(&mut test, issi),
+        "group-less follow-up LU must preserve the pending SwMI group refresh until ACK/T353"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
+    test.run_stack(Some(1));
+    let ack_msgs = test.dump_sinks();
+    assert!(!contains_attach_detach_ack(&ack_msgs));
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    test.run_stack(Some(721));
+    let after_t353_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&after_t353_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate),
+        "accepted SwMI group refresh must not roll back after T353"
+    );
+    assert!(
+        !contains_location_update_command(&after_t353_msgs),
+        "accepted SwMI group refresh must not re-request group report after T353"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_group_less_update_preserves_pending_swmi_refresh_until_t353() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-refresh-survives-group-less-lu-until-t353");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::PeriodicLocationUpdating, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    test.run_stack(Some(721));
+    let timeout_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&timeout_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![gssi]),
+        "T353 must still roll back the unconfirmed cached group after the group-less LU interleaving"
+    );
+    assert!(
+        contains_location_update_command(&timeout_msgs),
+        "T353 after the group-less LU interleaving should request a fresh group report"
+    );
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_complete_group_report_abandons_pending_swmi_refresh() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("complete-report-abandons-cached-swmi-refresh");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    // EN 300 392-2 clauses 16.4.4 and 16.10.27a make the explicit complete
+    // group report authoritative. Unlike a group-less location update, it
+    // does carry group state and must abandon the older cached SwMI refresh so
+    // a late ACK cannot re-affiliate a group the MS just reported as absent.
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::DemandLocationUpdating, 1, 0);
+    test.run_stack(Some(1));
+    let complete_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&complete_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(accept.group_identity_location_accept.is_none());
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert!(
+        subscriber_updates(&complete_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![gssi]),
+        "explicit empty complete group report must clear the provisionally restored cached group"
+    );
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
+    test.run_stack(Some(1));
+    let stale_ack_msgs = test.dump_sinks();
+    assert!(
+        stale_ack_msgs.is_empty()
+            || subscriber_updates(&stale_ack_msgs)
+                .iter()
+                .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "late ACK for abandoned cached SwMI refresh must not re-affiliate the cleared group"
+    );
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_hard_roaming_location_update_abandons_pending_restart_group_refresh() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("hard-roaming-abandons-cached-swmi-refresh");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    backdate_mm_registration(&mut test, issi, 121);
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::RoamingLocationUpdating, None);
+    test.run_stack(Some(1));
+    let roaming_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&roaming_msgs);
+    assert_eq!(
+        accept.location_update_accept_type,
+        LocationUpdateAcceptType::RoamingLocationUpdating
+    );
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert!(
+        subscriber_updates(&roaming_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![gssi]),
+        "hard group-less roaming re-registration must clear the old restart group"
+    );
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
+    test.run_stack(Some(1));
+    let stale_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&stale_ack_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "late ACK from the abandoned restart refresh must not re-affiliate after hard roaming re-registration"
+    );
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_rejected_location_update_abandons_pending_swmi_group_transaction() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let stale_group = 226333;
+    let handle = 97;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(stale_group)], false);
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DisabledMsUpdating, None);
+    test.run_stack(Some(1));
+    let reject_msgs = test.dump_sinks();
+    let reject = extract_location_update_reject(&reject_msgs);
+    assert_eq!(reject.location_update_type, LocationUpdateType::DisabledMsUpdating);
+    assert_eq!(reject.reject_cause, RejectCause::ServiceNotSubscribed as u8);
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let stale_ack_msgs = test.dump_sinks();
+    assert!(stale_ack_msgs.is_empty(), "stale ACK after rejected LU should be ignored");
+    assert!(!test.config.state_read().subscribers.group_members(stale_group).contains(&issi));
+}
+
+#[test]
 fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
     debug::setup_logging_verbose();
     let issi = 2260618;

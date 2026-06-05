@@ -1029,6 +1029,44 @@ impl MmBs {
         }
     }
 
+    fn pending_swmi_group_transaction_is_restart_refresh(&self, issi: u32) -> bool {
+        self.pending_swmi_group_transactions
+            .get(&issi)
+            .is_some_and(|pending| pending.rollback_unconfirmed_attachments_on_failure && pending.reprobe_group_report_on_failure)
+    }
+
+    fn handle_pending_swmi_group_transaction_for_location_update(
+        &mut self,
+        issi: u32,
+        location_update_carries_group_state: bool,
+        may_preserve_restart_group_refresh: bool,
+    ) {
+        if location_update_carries_group_state {
+            self.abandon_pending_swmi_group_transaction(
+                issi,
+                "accepted U-LOCATION UPDATE DEMAND with explicit group state overrides pending group attach/detach procedure",
+            );
+        } else if self.pending_swmi_group_transactions.contains_key(&issi) {
+            if may_preserve_restart_group_refresh {
+                // EN 300 392-2 clause 16.8.6 collision handling permits the
+                // SwMI to keep the already-started group attach/detach
+                // procedure authoritative when the colliding accepted
+                // location update does not carry group state. Limit this to
+                // restart-recovery refreshes; true registration overrides and
+                // rejected LUs abandon pending SwMI group state elsewhere.
+                tracing::debug!(
+                    "MM: preserving pending restart SwMI group refresh for ISSI {} across group-less U-LOCATION UPDATE DEMAND",
+                    issi
+                );
+            } else {
+                self.abandon_pending_swmi_group_transaction(
+                    issi,
+                    "accepted group-less U-LOCATION UPDATE DEMAND starts or refreshes registration outside restart group refresh context",
+                );
+            }
+        }
+    }
+
     fn push_unique_group(groups: &mut Vec<u32>, gssi: u32) {
         if !groups.contains(&gssi) {
             groups.push(gssi);
@@ -1642,17 +1680,22 @@ impl MmBs {
             }
         };
 
+        let received_issi = prim.received_address.ssi;
         if let Some(pdu_ssi) = pdu.ssi
-            && pdu_ssi != prim.received_address.ssi as u64
+            && pdu_ssi != received_issi as u64
         {
             tracing::warn!(
                 "MM: U-LOCATION UPDATE DEMAND SSI {} does not match received L2 address {}; rejecting",
                 pdu_ssi,
-                prim.received_address.ssi
+                received_issi
+            );
+            self.abandon_pending_swmi_group_transaction(
+                received_issi,
+                "rejected U-LOCATION UPDATE DEMAND with mismatched SSI cannot complete pending SwMI group procedure",
             );
             Self::send_d_location_update_reject_cause(
                 queue,
-                prim.received_address.ssi,
+                received_issi,
                 prim.handle,
                 pdu.location_update_type,
                 pdu.address_extension,
@@ -1669,9 +1712,13 @@ impl MmBs {
                     pdu_mni,
                     expected_mni
                 );
+                self.abandon_pending_swmi_group_transaction(
+                    received_issi,
+                    "rejected U-LOCATION UPDATE DEMAND with mismatched MNI cannot complete pending SwMI group procedure",
+                );
                 Self::send_d_location_update_reject_cause(
                     queue,
-                    prim.received_address.ssi,
+                    received_issi,
                     prim.handle,
                     pdu.location_update_type,
                     pdu.address_extension,
@@ -1680,11 +1727,6 @@ impl MmBs {
                 return;
             }
         }
-
-        self.abandon_pending_swmi_group_transaction(
-            prim.received_address.ssi,
-            "U-LOCATION UPDATE DEMAND overrides pending group attach/detach procedure",
-        );
 
         // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
         // D-LOCATION-UPDATE-PROCEEDING which we don't implement. Reject with cause
@@ -1697,8 +1739,12 @@ impl MmBs {
             // so we can't accept migration formally. But we MUST release the terminal from Brew
             // so the destination network can register it without identity conflict.
             // Send REJECT so terminal knows to try the other network, but first deregister from Brew.
-            let issi = prim.received_address.ssi;
+            let issi = received_issi;
             tracing::info!("MM: ISSI {} migrating to another network — releasing from Brew", issi);
+            self.abandon_pending_swmi_group_transaction(
+                issi,
+                "migration U-LOCATION UPDATE DEMAND starts an unsupported registration path and rejects pending SwMI group procedure",
+            );
             self.clear_solicited_group_report(issi);
             self.clear_critical_downlinks_for_issi(issi);
             self.forget_restart_recovery_issi(issi);
@@ -1728,9 +1774,13 @@ impl MmBs {
             // answered by D-LOCATION UPDATE ACCEPT/REJECT. This SwMI does not
             // support disabled MS updating, so preserve the requested LU type in
             // the reject instead of silently dropping the procedure.
+            self.abandon_pending_swmi_group_transaction(
+                received_issi,
+                "disabled-MS U-LOCATION UPDATE DEMAND is rejected and cannot complete pending SwMI group procedure",
+            );
             Self::send_d_location_update_reject_cause(
                 queue,
-                prim.received_address.ssi,
+                received_issi,
                 prim.handle,
                 pdu.location_update_type,
                 pdu.address_extension,
@@ -1745,9 +1795,13 @@ impl MmBs {
                 "Unsupported critical features in ULocationUpdateDemand; rejecting with {}",
                 reject_cause
             );
+            self.abandon_pending_swmi_group_transaction(
+                received_issi,
+                "unsupported U-LOCATION UPDATE DEMAND is rejected and cannot complete pending SwMI group procedure",
+            );
             Self::send_d_location_update_reject_cause(
                 queue,
-                prim.received_address.ssi,
+                received_issi,
                 prim.handle,
                 pdu.location_update_type,
                 pdu.address_extension,
@@ -1774,8 +1828,10 @@ impl MmBs {
         };
 
         // Try to register the client
-        let issi = prim.received_address.ssi;
+        let issi = received_issi;
         let handle = prim.handle;
+        let location_update_carries_group_state =
+            pdu.group_identity_location_demand.is_some() || Self::group_report_response_is_complete(&pdu);
         let was_solicited_group_report_pending = self.solicited_group_report_pending(issi);
         let was_restart_recovery_candidate = self.restart_recovery.contains_key(&issi);
 
@@ -1792,6 +1848,10 @@ impl MmBs {
         };
         if !issi_allowed {
             tracing::warn!("MM: ISSI {} not in whitelist, rejecting registration", issi);
+            self.abandon_pending_swmi_group_transaction(
+                issi,
+                "whitelist-rejected U-LOCATION UPDATE DEMAND cannot complete pending SwMI group procedure",
+            );
             Self::send_d_location_update_reject_cause(
                 queue,
                 issi,
@@ -1806,6 +1866,7 @@ impl MmBs {
         let was_pending = self.client_mgr.is_pending_command(issi);
         let is_new = !self.client_mgr.client_is_known(issi);
         let mut soft_reattach_cmce_reset = false;
+        let mut hard_reregistration_cleanup = false;
         if !is_new {
             // MS is re-registering while already known. Three cases:
             //
@@ -1858,6 +1919,7 @@ impl MmBs {
             // needs_cleanup: Roaming = MS rebooted, need CMCE reset
             // was_pending: local watchdog expired, we already sent Deregister to Brew — just re-register
             if needs_cleanup {
+                hard_reregistration_cleanup = true;
                 let old_groups: Vec<u32> = self
                     .client_mgr
                     .get_client_by_issi(issi)
@@ -1891,6 +1953,15 @@ impl MmBs {
             // Always reset the registration timer on any re-registration
             self.client_mgr.reset_registration_timer(issi);
         }
+
+        let may_preserve_restart_group_refresh =
+            !is_new && !hard_reregistration_cleanup && self.pending_swmi_group_transaction_is_restart_refresh(issi);
+        self.handle_pending_swmi_group_transaction_for_location_update(
+            issi,
+            location_update_carries_group_state,
+            may_preserve_restart_group_refresh,
+        );
+
         // Determine if we need to emit Register toward Brew.
         // We do this when:
         //   A) Terminal is genuinely new (never seen before).
