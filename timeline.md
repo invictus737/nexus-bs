@@ -3244,3 +3244,62 @@ Next non-repeating execution:
 1. Commit and deploy this MM recovery hardening directly to the test BS.
 2. Confirm the remote build banner and watch for `2260616` recovery without CMCE deregister/deaffiliate churn.
 3. Retest private simplex only after a fresh `U-SETUP -> D-CONNECT -> U-TX/D-TX -> UMAC voice route` sequence appears in the log.
+
+## 2026-06-05 09:23:15 EEST - CMCE private simplex initial floor aligned with ETSI raw request bit
+
+Live diagnostic:
+
+- The recent private simplex log for `2260616 -> 2260618` showed `U-SETUP` with `hook_method_selection=true` and `request_to_transmit_send_data=true`, then `D-SETUP` with `transmission_grant=NotGranted`.
+- The same call then opened the shared P2P traffic bearer and routed voice, but CMCE only set `floor_holder`; it did not emit an internal `CallControl::FloorGranted` to UMAC for the initial setup grant.
+- This left CMCE and UMAC relying on `Open.active_addr` instead of the same floor event model used by group and Brew private paths.
+
+Problem targeted:
+
+- The local `U-SETUP` raw request-to-transmit/send-data bit was being interpreted from the Rust field name rather than ETSI table 14.74.
+- EN 300 392-2 table 14.74 defines raw value `0` as "request to transmit/send data" and raw value `1` as "request that other MS may transmit/send data".
+- For on/off-hook private simplex, clause 14.5.1.2.1 uses that field to decide the setup-phase transmit permission. A raw `1` in the lab trace means the called MS may transmit first, not the caller.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.1.1: `D-CONNECT ACKNOWLEDGE` tells the called MS which party is permitted to transmit and triggers lower-layer configuration at through-connection.
+- EN 300 392-2 clause 14.5.1.1.2: `D-CONNECT` tells the calling MS which party is permitted to transmit and triggers lower-layer configuration at through-connection.
+- EN 300 392-2 clause 14.5.1.2.1 and table 14.74: the SwMI controls private simplex transmit permission; on/off-hook setup interprets raw request-to-transmit/send-data values as setup permission direction.
+- EN 300 392-2 clause 14.5.1.2.1 also says the SwMI shall not send unsolicited `D-TX GRANTED`; this patch does not send an over-air `D-TX GRANTED` at setup. It emits only internal CMCE-to-UMAC floor synchronization after `U-CONNECT`.
+- This is clause-scoped engineering hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-pdus/src/cmce/pdus/u_setup.rs`
+  - Corrected the `USetup::request_to_transmit_send_data` field comment to document the raw table 14.74 values.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - Corrected `IndividualCall::request_to_transmit_send_data` documentation to avoid treating the bool as a semantic "caller requested" flag.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Added `private_simplex_called_ms_transmits_first()` to keep setup and connect semantics in one place.
+  - Local `U-CONNECT` now uses that helper for initial floor-holder selection.
+  - After setting initial simplex `floor_holder`, CMCE now emits internal `CallControl::FloorGranted` to UMAC so hangtime/media queues/current speaker are synchronized with the grant carried by `D-CONNECT` / `D-CONNECT-ACKNOWLEDGE`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Local P2P `D-SETUP` now carries a setup-phase grant only for on/off-hook simplex:
+    - raw bit `0`: called MS sees `GrantedToOtherUser`;
+    - raw bit `1`: called MS sees `Granted`;
+    - direct setup and duplex stay `NotGranted` until `D-CONNECT` / `D-CONNECT-ACKNOWLEDGE`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added assertions that local P2P `U-CONNECT` emits the initial UMAC `FloorGranted`.
+  - Corrected on/off-hook raw bit `0` and raw bit `1` tests against table 14.74.
+  - Added `test_simplex_p2p_current_floor_holder_u_tx_demand_is_granted_not_denied`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities --package tetra-pdus` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 64 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 8 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 128 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Remaining risk / next non-repeating execution:
+
+1. Commit and deploy directly to `/home/chris/nexus-bs-v0.1.55-test` with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+2. Retest private simplex `2260616 -> 2260618` with the same sequence that produced the bad first floor.
+3. Watch live logs for `U-SETUP request_to_transmit_send_data=true`, `D-SETUP transmission_grant=Granted`, `D-CONNECT transmission_grant=GrantedToOtherUser`, `D-CONNECT-ACKNOWLEDGE transmission_grant=Granted`, and `UMAC floor granted source_issi=2260618`.
+4. If static persists after the floor fix, do not change CMCE again first; inspect the remaining LMAC/UMAC raw `NormalTrainSeq2 Block2` path. That path preserves ETSI TCH/S half-slot timing but the current SAP cannot carry a bad-half-slot condition, so a future patch should add an explicit quality/condition field instead of treating unknown raw half-slots as clean speech.

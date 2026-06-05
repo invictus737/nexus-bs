@@ -6250,6 +6250,26 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
             .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
         "simplex P2P shared assigned channel must identify both ISSIs so UMAC suspends EG for both active MSs"
     );
+    assert_eq!(
+        count_umac_floor_granted(&connect_msgs),
+        1,
+        "local private simplex U-CONNECT should synchronize the initial floor into UMAC"
+    );
+    assert!(connect_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == TEST_ISSI
+                && *dest_gssi == TEST_CALLED_ISSI
+                && *ts == simplex_open.ts
+        )
+    }));
+    assert_eq!(count_umac_floor_released(&connect_msgs), 0);
 
     let d_connects: Vec<_> = connect_msgs
         .iter()
@@ -6745,6 +6765,10 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
     // configured call timeout and selected hook method into D-SETUP.
     assert_eq!(setup.call_time_out, CallTimeout::T10m);
     assert!(setup.hook_method_selection);
+    // EN 300 392-2 table 14.74: raw bit 0 means the calling MS requests
+    // transmit/send data. The called MS is therefore told that the other user
+    // has the setup-phase permission.
+    assert_eq!(setup.transmission_grant, TransmissionGrant::GrantedToOtherUser);
 
     test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -6759,16 +6783,30 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
         .collect();
     assert_eq!(open_circuits.len(), 1, "simplex private call should open one shared traffic bearer");
     let open = open_circuits[0];
-    // EN 300 392-2 clause 14.5.1.2.1: with on/off-hook signalling and no
-    // calling-MS request-to-transmit bit, the normal first permission to
-    // transmit is given to the called MS. Keep the CMCE grant state and UMAC
-    // current UL speaker aligned.
+    // EN 300 392-2 clause 14.5.1.2.1 and table 14.74: with on/off-hook
+    // signalling, raw bit 0 asks for caller transmit permission. Keep the CMCE
+    // grant state and UMAC current UL speaker aligned.
     assert_eq!(open.peer_ts, None);
-    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
+    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)));
     assert!(
-        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
-        "shared simplex private bearer must still keep the calling MS active for assigned-channel listening"
+        open.active_secondary_addrs
+            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
+        "shared simplex private bearer must still keep the called MS active for assigned-channel listening"
     );
+    assert!(connect_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == TEST_ISSI
+                && *dest_gssi == TEST_CALLED_ISSI
+                && *ts == open.ts
+        )
+    }));
 
     let d_connects: Vec<_> = connect_msgs
         .iter()
@@ -6785,7 +6823,7 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
         assert!(pdu.hook_method_selection);
         assert!(!pdu.simplex_duplex_selection);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
     }
 
     let d_connect_acks: Vec<_> = connect_msgs
@@ -6799,7 +6837,7 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
     for (_, pdu) in &d_connect_acks {
         assert_eq!(pdu.call_identifier, call_id);
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     }
 }
 
@@ -6988,7 +7026,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
 }
 
 #[test]
-fn test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor() {
+fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -7009,6 +7047,17 @@ fn test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor() {
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
     let call_id = first_d_setup_call_id(&setup_msgs);
+    let d_setups: Vec<_> = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(d_setups.len(), 1, "Expected one D-SETUP to the called MS");
+    assert_eq!(d_setups[0].0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(d_setups[0].1.call_identifier, call_id);
+    assert_eq!(d_setups[0].1.transmission_grant, TransmissionGrant::Granted);
 
     test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -7027,17 +7076,30 @@ fn test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor() {
         "hook private simplex call should open one shared traffic bearer"
     );
     let open = open_circuits[0];
-    // EN 300 392-2 clause 14.5.1.2.1: with on/off-hook signalling, setting
-    // request-to-transmit in U-SETUP is the calling MS asking for initial
-    // transmit permission. Keep the CMCE grant state and UMAC current speaker
-    // aligned so a held PTT sends speech on the first grant.
+    // EN 300 392-2 clause 14.5.1.2.1 and table 14.74: with on/off-hook
+    // signalling, raw bit 1 asks that the other MS may transmit/send data.
+    // Keep the CMCE grant state and UMAC current speaker aligned so the first
+    // speech burst follows the setup grant.
     assert_eq!(open.peer_ts, None);
-    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)));
+    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
     assert!(
-        open.active_secondary_addrs
-            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
-        "shared simplex private bearer must still keep the called MS active for assigned-channel listening"
+        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
+        "shared simplex private bearer must still keep the calling MS active for assigned-channel listening"
     );
+    assert!(connect_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == TEST_CALLED_ISSI
+                && *dest_gssi == TEST_ISSI
+                && *ts == open.ts
+        )
+    }));
 
     let d_connects: Vec<_> = connect_msgs
         .iter()
@@ -7051,7 +7113,7 @@ fn test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor() {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
         assert_eq!(pdu.simplex_duplex_selection, false);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     }
 
     let d_connect_acks: Vec<_> = connect_msgs
@@ -7065,7 +7127,7 @@ fn test_p2p_hook_setup_request_to_transmit_keeps_calling_ms_initial_floor() {
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
-        assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+        assert_eq!(pdu.transmission_grant, TransmissionGrant::Granted);
     }
 }
 
@@ -7265,6 +7327,77 @@ fn test_p2p_u_tx_demand_from_non_participant_is_denied_without_floor_handoff() {
     assert_eq!(count_d_releases(&demand_msgs), 0);
     assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
     assert_eq!(count_umac_floor_released(&demand_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
+}
+
+#[test]
+fn test_simplex_p2p_current_floor_holder_u_tx_demand_is_granted_not_denied() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let (call_id, connect_msgs) = start_active_p2p_call_with_connect_msgs(&mut test);
+    let caller_ts = p2p_open_ts_for(&connect_msgs, TEST_ISSI);
+
+    // EN 300 392-2 clause 14.5.1.2.1 b): the MS already holding the private
+    // simplex floor must not be denied when its user application sends a PTT
+    // demand around through-connection. Confirm or preserve the grant and keep
+    // UMAC on the same active speaker.
+    test.submit_message(build_u_tx_demand_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let grants: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(grants.len(), 2, "current private floor holder PTT should notify both MSs");
+    assert!(
+        grants
+            .iter()
+            .all(|(_, grant)| grant.transmission_grant != TransmissionGrant::NotGranted.into_raw() as u8),
+        "current private floor holder must not receive PTT denied"
+    );
+    let requester_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address.ssi == TEST_ISSI && prim.main_address.ssi_type == SsiType::Issi)
+        .expect("expected grant to current floor holder");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_eq!(
+        requester_grant
+            .0
+            .chan_alloc
+            .as_ref()
+            .expect("current holder grant should carry FACCH allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    assert!(demand_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == TEST_ISSI
+                && *dest_gssi == TEST_CALLED_ISSI
+                && *ts == caller_ts
+        )
+    }));
+    assert_eq!(count_d_tx_ceased(&demand_msgs), 0);
+    assert_eq!(count_d_releases(&demand_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
 }
 

@@ -25,6 +25,22 @@ pub(in crate::cmce::subentities::cc_bs) enum IndividualTransitionError {
 }
 
 impl CcBsSubentity {
+    pub(in crate::cmce::subentities::cc_bs) fn private_simplex_called_ms_transmits_first(
+        simplex_duplex: bool,
+        hook_method_selection: bool,
+        request_to_transmit_send_data: bool,
+    ) -> bool {
+        if simplex_duplex {
+            return false;
+        }
+
+        // EN 300 392-2 table 14.74 encodes this raw bit as:
+        // 0 = request to transmit/send data, 1 = request that other MS may
+        // transmit/send data. Clause 14.5.1.2.1 gives that field
+        // setup-method-specific meaning for the initial private-simplex floor.
+        hook_method_selection && request_to_transmit_send_data
+    }
+
     fn validate_individual_transition(
         call_id: u16,
         state: IndividualCallState,
@@ -476,15 +492,11 @@ impl CcBsSubentity {
             tracing::error!("No cached D-SETUP for call_id={}", call_id);
             return;
         };
-        // EN 300 392-2 clause 14.5.1.2.1 assigns different meaning to the
-        // U-SETUP request-to-transmit/send-data bit depending on setup method.
-        // With on/off-hook signalling the normal first speaker is the called
-        // MS, unless the calling MS sets the bit to ask for initial transmit
-        // permission. With direct setup the normal first speaker is the
-        // calling MS; a set bit only allows the called user application to
-        // request permission first, it is not an automatic grant to the called
-        // MS.
-        let called_ms_transmits_first = !simplex_duplex && cached.pdu.hook_method_selection && !call_snapshot.request_to_transmit_send_data;
+        let called_ms_transmits_first = Self::private_simplex_called_ms_transmits_first(
+            simplex_duplex,
+            cached.pdu.hook_method_selection,
+            call_snapshot.request_to_transmit_send_data,
+        );
 
         let mut calling_timeslots = [false; 4];
         calling_timeslots[calling_ts as usize - 1] = true;
@@ -779,6 +791,23 @@ impl CcBsSubentity {
                     call_id,
                     initial_floor_holder
                 );
+
+                let (source_issi, dest_issi, floor_ts) = if called_ms_transmits_first {
+                    (called_addr.ssi, calling_addr.ssi, called_ts)
+                } else {
+                    (calling_addr.ssi, called_addr.ssi, calling_ts)
+                };
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi,
+                        dest_gssi: dest_issi,
+                        ts: floor_ts,
+                    }),
+                });
             }
         }
     }

@@ -34,10 +34,9 @@ pub struct USetup {
     pub simplex_duplex_selection: bool,
     /// Type1, 8 bits, Basic service information
     pub basic_service_information: BasicServiceInformation,
-    /// Type1, 1 bits, Request to transmit/send data
-    /// The SwMI normally gives the first permission to transmit to the calling MS when a new call has been set-up. However,
-    /// the calling user application may allow the called users to request permission to transmit first. The calling CC shall in
-    /// that case set the "request to transmit" bit accordingly in the U-SETUP PDU.
+    /// Type1, 1 bit, Request to transmit/send data.
+    /// EN 300 392-2 table 14.74: 0 = request to transmit/send data;
+    /// 1 = request that other MS may transmit/send data.
     pub request_to_transmit_send_data: bool,
     /// Type1, 4 bits, See note 2,
     pub call_priority: u8,

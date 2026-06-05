@@ -714,6 +714,20 @@ impl CcBsSubentity {
         // Do not open traffic channel yet. Let called MS respond on MCCH.
         self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
 
+        let setup_grant = if !pdu.simplex_duplex_selection
+            && pdu.hook_method_selection
+            && Self::private_simplex_called_ms_transmits_first(
+                pdu.simplex_duplex_selection,
+                pdu.hook_method_selection,
+                pdu.request_to_transmit_send_data,
+            ) {
+            TransmissionGrant::Granted
+        } else if !pdu.simplex_duplex_selection && pdu.hook_method_selection {
+            TransmissionGrant::GrantedToOtherUser
+        } else {
+            TransmissionGrant::NotGranted
+        };
+
         let d_setup = DSetup {
             call_identifier: call_id,
             call_time_out: if pdu.simplex_duplex_selection {
@@ -724,7 +738,7 @@ impl CcBsSubentity {
             hook_method_selection: pdu.hook_method_selection,
             simplex_duplex_selection: pdu.simplex_duplex_selection,
             basic_service_information: pdu.basic_service_information.clone(),
-            transmission_grant: TransmissionGrant::NotGranted,
+            transmission_grant: setup_grant,
             transmission_request_permission: false,
             call_priority: pdu.call_priority,
             notification_indicator: None,
