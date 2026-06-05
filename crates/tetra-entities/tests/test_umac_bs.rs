@@ -71,6 +71,26 @@ fn group_call_open_msg(gssi: u32, ts: u8) -> SapMsg {
     group_call_open_msg_for_direction(gssi, ts, Direction::Both)
 }
 
+fn group_call_open_msg_with_secondary_speaker(gssi: u32, speaker_issi: u32, ts: u8) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::LocalLoopback,
+            active_addr: Some(TetraAddress::new(gssi, SsiType::Gssi)),
+            active_secondary_addrs: vec![TetraAddress::issi(speaker_issi)],
+        })),
+    }
+}
+
 fn tlmc_configure_req() -> TlmcConfigureReq {
     TlmcConfigureReq {
         threshold_values: None,
@@ -1081,6 +1101,31 @@ fn test_stch_mac_u_signal_tracks_floor_granted_handoff() {
         addresses,
         vec![TetraAddress::issi(called_issi)],
         "UMAC must follow CMCE floor-control state so later U-TX DEMAND/U-TX CEASED signalling is attributed to the granted MS"
+    );
+}
+
+#[test]
+fn test_group_floor_grant_accepts_new_speaker_when_initial_speaker_is_secondary() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x3110;
+    let first_speaker = 0x3111;
+    let second_speaker = 0x3112;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker, traffic_ts));
+    test.submit_message(floor_granted_msg(1, second_speaker, gssi, traffic_ts));
+    submit_stch_mac_u_signal(&mut test);
+    test.run_stack(Some(1));
+
+    let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
+    assert_eq!(
+        addresses,
+        vec![TetraAddress::issi(second_speaker)],
+        "EN 300 392-2 clauses 14.5.2.2.1 and 21.4.5: a group circuit is GSSI-scoped even when the initial speaker ISSI is tracked as secondary, so a later group FloorGranted must not be rejected as a private-call non-participant"
     );
 }
 
@@ -2751,6 +2796,71 @@ fn test_call_control_open_suspends_group_energy_saving_until_close_plus_t210() {
         assert!(
             assignment.awake_until.is_some(),
             "EG resume after assigned-channel close should keep T.210 awake window"
+        );
+    }
+}
+
+#[test]
+fn test_group_secondary_speaker_does_not_double_suspend_energy_saving() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime::default();
+    let gssi = 92;
+    let first_issi = 1101;
+    let second_issi = 1102;
+    let unrelated_issi = 1103;
+    let ts = 2;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    {
+        let mut state = test.config.state_write();
+        for issi in [first_issi, second_issi, unrelated_issi] {
+            state.subscribers.register(issi);
+            state.energy_saving.insert(issi, eg_assignment(start));
+        }
+        state.subscribers.affiliate(first_issi, gssi);
+        state.subscribers.affiliate(second_issi, gssi);
+    }
+    test.populate_entities(vec![TetraEntity::Umac], vec![]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_issi, ts));
+    test.run_stack(Some(1));
+
+    {
+        let state = test.config.state_read();
+        for issi in [first_issi, second_issi] {
+            let assignment = state.energy_saving.get(&issi).expect("affiliated EG MS should remain tracked");
+            assert_eq!(
+                assignment.suspension_count, 1,
+                "EN 300 392-2 clause 23.7.6: a group speaker ISSI already covered by the GSSI assigned channel must not be double-counted as a private/P2P participant"
+            );
+        }
+        assert_eq!(
+            state
+                .energy_saving
+                .get(&unrelated_issi)
+                .expect("unrelated EG MS should remain tracked")
+                .suspension_count,
+            0
+        );
+    }
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Both, ts)),
+    });
+    test.run_stack(Some(1));
+
+    let state = test.config.state_read();
+    for issi in [first_issi, second_issi] {
+        assert_eq!(
+            state
+                .energy_saving
+                .get(&issi)
+                .expect("affiliated EG MS should remain tracked")
+                .suspension_count,
+            0
         );
     }
 }

@@ -1,4 +1,4 @@
-use tetra_core::{Direction, TetraAddress};
+use tetra_core::{Direction, SsiType, TetraAddress};
 
 use crate::control::enums::circuit_mode_type::CircuitModeType;
 
@@ -57,6 +57,10 @@ impl Circuit {
 
     pub fn is_active_for_addr(&self, addr: TetraAddress) -> bool {
         self.active_addresses().any(|active_addr| active_addr == addr)
+    }
+
+    pub fn is_primary_issi_scoped(&self) -> bool {
+        self.active_addr.is_some_and(|active_addr| active_addr.ssi_type == SsiType::Issi)
     }
 }
 

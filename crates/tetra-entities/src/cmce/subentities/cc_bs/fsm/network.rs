@@ -863,12 +863,13 @@ impl CcBsSubentity {
             call_id
         );
 
-        Self::signal_umac_circuit_open(
+        Self::signal_umac_circuit_open_with_secondary(
             queue,
             &circuit,
             None,
             CircuitDlMediaSource::LocalLoopback,
             Some(TetraAddress::new(dest_gssi, SsiType::Gssi)),
+            vec![TetraAddress::issi(source_issi)],
         );
 
         tracing::debug!(

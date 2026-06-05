@@ -1,5 +1,73 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 14:59:46 EEST - UMAC group speaker secondary tracking without P2P regression
+
+User report:
+
+- Patch must take P2P/private calls into account while continuing group-call floor hardening.
+- Recent live group symptoms were static/no voice on first or returning PTT, so the group fix must not break the now-working private simplex/duplex path.
+
+Component explanation:
+
+- CMCE is call control. It creates group/private calls and tells UMAC when a circuit is open and which ISSI has the PTT floor.
+- UMAC is the MAC scheduler. It maps the current floor holder to uplink/downlink TCH/S traffic on the assigned timeslot.
+- P2P/private means ISSI-to-ISSI. The circuit primary active address is an ISSI, and `active_secondary_addrs` contains the peer ISSI for the same private bearer.
+- Group means GSSI-scoped. The circuit primary active address is the GSSI. The current speaker ISSI may be tracked as secondary, but that must not make UMAC treat the group bearer as a private participant list.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: private/individual call floor control and participant-scoped transmit permission.
+- EN 300 392-2 clauses 14.5.2.1 and 14.5.2.2.1: group call setup and SwMI floor grant with `D-TX GRANTED`.
+- EN 300 392-2 clause 21.4.5: STCH `MAC-U-SIGNAL` has no SSI field, so UMAC must inherit the active speaker identity from CMCE floor state.
+- EN 300 392-2 clause 23.5.2.2.7: BS assigns and marks applicable uplink/downlink traffic usage.
+- This is clause-scoped engineering hardening only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-saps/src/control/call_control.rs`
+  - Added `Circuit::is_primary_issi_scoped()` so callers can distinguish private/P2P circuits from group circuits even when a group circuit carries a secondary speaker ISSI.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `ul_circuit_is_private_participant_scoped(ts)`.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - `FloorGranted` now applies the strict ISSI participant guard only when the UL circuit primary active address is ISSI. This preserves P2P non-participant rejection while allowing GSSI group handoff to any CMCE-authorized group speaker.
+  - Energy-economy assigned-channel suspension now de-duplicates ISSI targets per circuit, so a group speaker already covered through the primary GSSI is not suspended a second time as a secondary speaker ISSI.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Local group setup now opens UMAC with primary GSSI plus initial speaker ISSI as secondary.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/network.rs`
+  - Network-origin group setup now uses the same primary GSSI plus speaker ISSI secondary shape.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added a regression where group `active_addr=GSSI` and `active_secondary_addrs=[first_speaker ISSI]`, then `FloorGranted(second_speaker)` must be accepted and STCH attributed to the second speaker.
+  - Added a regression proving a group secondary speaker ISSI does not double-count EG suspension when that ISSI is already an affiliated member of the primary GSSI.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Strengthened local group, numeric-collision group, network-origin group, and private simplex P2P circuit-shape assertions.
+
+Verification:
+
+- `cargo fmt --package tetra-saps --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor_grant_accepts_new_speaker_when_initial_speaker_is_secondary --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_secondary_speaker_does_not_double_suspend_energy_saving --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_stch_mac_u_signal_ignores_floor_granted_for_non_participant_private_speaker --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_setup_sends_proceeding_connect_and_group_setup_with_allocations --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` -> 52 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 65 passed.
+- `cargo test -p tetra-entities --test test_umac_bs group --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 132 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 53 passed.
+- `cargo check -p tetra-saps -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deployment note:
+
+- Committed and deployed direct to the Pi test instance after local release build packaging; no binary backup was created.
+- Startup evidence after deploy showed the Nexus-BS process running and `2260616`, `2260082`, and `2260618` registered plus affiliated to GSSI `226333`.
+- A post-restart error scan found no `PTT denied`, `Service unavailable`, `Unit Not Attached`, or `RequestedServiceNotAvailable` lines in the fresh test log.
+
+Next non-repeating execution:
+
+1. Operator live test: real GSSI `226333` alternating PTT across multiple radios, then private simplex between lab ISSIs.
+2. If static persists, inspect whether the failing burst lacks `UMAC voice route` after `UMAC floor granted`; do not change P2P guard semantics unless a new clause-scoped reason is identified.
+
 ## 2026-06-05 14:08:45 EEST - UMAC rejects invalid traffic timeslots before clean Pi redeploy
 
 User report:

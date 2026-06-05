@@ -1327,6 +1327,16 @@ impl BsChannelScheduler {
             .is_some_and(|circuit| circuit.active_addresses().any(|addr| addr.ssi_type == SsiType::Issi))
     }
 
+    pub fn ul_circuit_is_private_participant_scoped(&self, ts: u8) -> bool {
+        if !(1..=4).contains(&ts) {
+            return false;
+        }
+
+        self.circuits.ul[ts as usize - 1]
+            .as_ref()
+            .is_some_and(|circuit| circuit.is_primary_issi_scoped())
+    }
+
     /// Return the peer timeslot for the UL circuit on `ts`, if any.
     /// Used for full-duplex P2P cross-routing: UL voice on `ts` must be played out
     /// on the peer MS's DL timeslot. Returns `None` for simplex/group calls

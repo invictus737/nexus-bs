@@ -251,13 +251,17 @@ impl CcBsSubentity {
             ts: circuit.ts,
         });
 
-        // Signal UMAC to open DL+UL circuits.
-        Self::signal_umac_circuit_open(
+        // Signal UMAC to open DL+UL circuits. The primary active address
+        // remains the GSSI, so UMAC treats the bearer as group-scoped. The
+        // initial speaker ISSI is also recorded for assigned-channel state,
+        // but must not make this look like a private/P2P participant list.
+        Self::signal_umac_circuit_open_with_secondary(
             queue,
             &circuit,
             None,
             CircuitDlMediaSource::LocalLoopback,
             Some(TetraAddress::new(dest_gssi, SsiType::Gssi)),
+            vec![calling_party],
         );
 
         // Build channel allocation timeslot mask for this call.

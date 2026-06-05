@@ -1502,6 +1502,10 @@ fn start_group_call_with_circuit_for(test: &mut ComponentTest, calling_issi: u32
         Some(TetraAddress::new(dest_gssi, SsiType::Gssi)),
         "group traffic circuit should be scoped to the destination GSSI"
     );
+    assert!(
+        circuit.active_secondary_addrs.contains(&TetraAddress::issi(calling_issi)),
+        "group traffic circuit should carry the first speaker ISSI as secondary without changing the primary GSSI scope"
+    );
     (call_id, circuit.ts, circuit.usage)
 }
 
@@ -1704,6 +1708,21 @@ fn test_network_group_call_start_propagates_priority_to_d_setup() {
     });
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
+
+    let open_circuit = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .expect("network-origin group setup should open a UMAC traffic circuit");
+    assert_eq!(open_circuit.peer_ts, None);
+    assert_eq!(open_circuit.active_addr, Some(TetraAddress::new(TEST_GSSI, SsiType::Gssi)));
+    assert_eq!(
+        open_circuit.active_secondary_addrs,
+        vec![TetraAddress::issi(TEST_CALLED_ISSI)],
+        "network-origin group Open should keep the group GSSI primary and carry the current speaker ISSI only as secondary"
+    );
 
     let setups: Vec<_> = setup_msgs
         .iter()
@@ -3188,6 +3207,11 @@ fn test_group_setup_sends_proceeding_connect_and_group_setup_with_allocations() 
         "group CallControl::Open must identify the GSSI so UMAC can apply EG assigned-channel suspension"
     );
     assert_eq!(
+        open_circuit.active_secondary_addrs,
+        vec![TetraAddress::issi(TEST_ISSI)],
+        "initial group speaker is tracked as a secondary ISSI, while the primary GSSI keeps UMAC group-scoped rather than private/P2P-scoped"
+    );
+    assert_eq!(
         open_circuit.dl_media_source,
         tetra_saps::control::call_control::CircuitDlMediaSource::LocalLoopback
     );
@@ -3307,6 +3331,11 @@ fn test_group_u_setup_numeric_collision_routes_to_gssi_not_registered_issi() {
         })
         .expect("group U-SETUP should open a GSSI traffic circuit");
     assert_eq!(open_circuit.active_addr, Some(TetraAddress::new(collision, SsiType::Gssi)));
+    assert_eq!(
+        open_circuit.active_secondary_addrs,
+        vec![TetraAddress::issi(TEST_ISSI)],
+        "P2MP destination numeric collision must not be added as a private/P2P ISSI participant"
+    );
 
     let setups: Vec<_> = setup_msgs
         .iter()
@@ -6734,10 +6763,9 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     // simplex traffic channel; peer_ts is reserved for duplex cross-routing.
     assert_eq!(simplex_open.peer_ts, None);
     assert_eq!(simplex_open.dl_media_source, CircuitDlMediaSource::LocalLoopback);
-    assert!(
-        simplex_open
-            .active_secondary_addrs
-            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
+    assert_eq!(
+        simplex_open.active_secondary_addrs,
+        vec![TetraAddress::issi(TEST_CALLED_ISSI)],
         "simplex P2P shared assigned channel must identify both ISSIs so UMAC suspends EG for both active MSs"
     );
     assert_eq!(

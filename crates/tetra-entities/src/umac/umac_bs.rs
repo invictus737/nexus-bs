@@ -154,13 +154,15 @@ impl UmacBs {
         }
     }
 
-    fn suspend_energy_saving_for_active_addr(&mut self, ts: u8, addr: TetraAddress) {
+    fn suspend_energy_saving_for_active_addr(&mut self, ts: u8, addr: TetraAddress, covered_issis: &mut HashSet<u32>) {
         let key = EnergySavingSuspensionKey { ts, addr };
-        if self.active_energy_saving_suspensions.contains_key(&key) {
+        if let Some(existing_targets) = self.active_energy_saving_suspensions.get(&key) {
+            covered_issis.extend(existing_targets.iter().copied());
             return;
         }
 
-        let targets = self.active_addr_targets(addr);
+        let mut targets = self.active_addr_targets(addr);
+        targets.retain(|issi| covered_issis.insert(*issi));
         if targets.is_empty() {
             return;
         }
@@ -177,8 +179,9 @@ impl UmacBs {
     }
 
     fn suspend_energy_saving_for_circuit(&mut self, ts: u8, circuit: &Circuit) {
+        let mut covered_issis = HashSet::new();
         for addr in circuit.active_addresses() {
-            self.suspend_energy_saving_for_active_addr(ts, addr);
+            self.suspend_energy_saving_for_active_addr(ts, addr, &mut covered_issis);
         }
     }
 
@@ -2362,8 +2365,8 @@ impl UmacBs {
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     let source_addr = TetraAddress::issi(source_issi);
-                    let has_issi_participants = self.channel_scheduler.ul_circuit_has_issi_participants(ts);
-                    if has_issi_participants && !self.channel_scheduler.circuit_is_active_for_addr(Direction::Ul, ts, source_addr) {
+                    let private_participant_scoped = self.channel_scheduler.ul_circuit_is_private_participant_scoped(ts);
+                    if private_participant_scoped && !self.channel_scheduler.circuit_is_active_for_addr(Direction::Ul, ts, source_addr) {
                         tracing::warn!(
                             "UMAC: ignoring FloorGranted for non-participant ISSI {} on private UL ts {}",
                             source_issi,
@@ -2374,14 +2377,14 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                     self.set_current_ul_speaker(ts, source_addr);
                     tracing::info!(
-                        "UMAC floor granted: call_id={} source_issi={} dest_gssi={} ul_ts={} peer_ts={:?} media_source={:?} has_issi_participants={}",
+                        "UMAC floor granted: call_id={} source_issi={} dest_gssi={} ul_ts={} peer_ts={:?} media_source={:?} private_participant_scoped={}",
                         call_id,
                         source_issi,
                         dest_gssi,
                         ts,
                         self.channel_scheduler.ul_circuit_peer_ts(ts),
                         self.channel_scheduler.ul_circuit_dl_media_source(ts),
-                        has_issi_participants
+                        private_participant_scoped
                     );
                 }
             }
