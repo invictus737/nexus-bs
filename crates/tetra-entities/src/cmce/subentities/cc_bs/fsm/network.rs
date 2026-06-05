@@ -175,14 +175,16 @@ impl CcBsSubentity {
         let communication = CommunicationType::try_from(call.communication as u64).unwrap_or(CommunicationType::P2p);
         let simplex_duplex = call.duplex != 0;
 
+        let occupied_call_ids = self.occupied_call_ids();
         let circuit_called = {
             let mut state = self.config.state_write();
-            match self.circuits.allocate_circuit_with_allocator_duplex(
+            match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 communication,
                 simplex_duplex,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
+                &occupied_call_ids,
             ) {
                 Ok(circuit) => circuit.clone(),
                 Err(e) => {
@@ -827,14 +829,16 @@ impl CcBsSubentity {
         }
 
         // New network call - allocate circuit
+        let occupied_call_ids = self.occupied_call_ids();
         let circuit = match {
             let mut state = self.config.state_write();
-            self.circuits.allocate_circuit_with_allocator_duplex(
+            self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 CommunicationType::P2Mp,
                 false,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
+                &occupied_call_ids,
             )
         } {
             Ok(c) => c.clone(),

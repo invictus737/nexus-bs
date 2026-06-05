@@ -209,14 +209,16 @@ impl CcBsSubentity {
         }
 
         // Allocate circuit (DL+UL for group call)
+        let occupied_call_ids = self.occupied_call_ids();
         let circuit = match {
             let mut state = self.config.state_write();
-            self.circuits.allocate_circuit_with_allocator_duplex(
+            self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,
                 pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
+                &occupied_call_ids,
             )
         } {
             Ok(circuit) => circuit.clone(),
@@ -633,14 +635,16 @@ impl CcBsSubentity {
         }
 
         // Allocate circuit(s). Duplex uses two traffic timeslots, one per MS, with cross-routing.
+        let occupied_call_ids = self.occupied_call_ids();
         let (circuit_calling, circuit_called) = {
             let mut state = self.config.state_write();
-            let circuit_calling = match self.circuits.allocate_circuit_with_allocator_duplex(
+            let circuit_calling = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,
                 pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
+                &occupied_call_ids,
             ) {
                 Ok(circuit) => circuit.clone(),
                 Err(e) => {
@@ -958,14 +962,16 @@ impl CcBsSubentity {
         }
 
         // Allocate one bearer for the local MS.
+        let occupied_call_ids = self.occupied_call_ids();
         let circuit_calling = {
             let mut state = self.config.state_write();
-            match self.circuits.allocate_circuit_with_allocator_duplex(
+            match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,
                 pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
+                &occupied_call_ids,
             ) {
                 Ok(circuit) => circuit.clone(),
                 Err(e) => {
@@ -1093,13 +1099,16 @@ impl CcBsSubentity {
         }
 
         // Allocate a single full-duplex circuit
+        let occupied_call_ids = self.occupied_call_ids();
         let circuit = {
             let mut state = self.config.state_write();
-            match self.circuits.allocate_circuit_with_allocator(
+            match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,
+                false,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
+                &occupied_call_ids,
             ) {
                 Ok(c) => c.clone(),
                 Err(e) => {

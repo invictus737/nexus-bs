@@ -53,6 +53,16 @@ impl CmceBs {
         self.sds.set_wx_cmd_sender(tx);
     }
 
+    #[doc(hidden)]
+    pub fn debug_force_next_call_identifier(&mut self, next_call_identifier: u16) {
+        self.cc.debug_force_next_call_identifier(next_call_identifier);
+    }
+
+    #[doc(hidden)]
+    pub fn debug_active_call_ids(&self) -> Vec<u16> {
+        self.cc.debug_active_call_ids()
+    }
+
     fn do_control_command(
         sds: &mut SdsBsSubentity,
         cc: &mut CcBsSubentity,

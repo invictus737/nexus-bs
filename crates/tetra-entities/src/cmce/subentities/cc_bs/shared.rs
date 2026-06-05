@@ -93,6 +93,48 @@ impl CcBsSubentity {
         self.config = config;
     }
 
+    pub(in crate::cmce) fn debug_force_next_call_identifier(&mut self, next_call_identifier: u16) {
+        self.circuits.next_call_identifier = next_call_identifier;
+    }
+
+    pub(in crate::cmce) fn debug_active_call_ids(&self) -> Vec<u16> {
+        let mut ids: Vec<_> = self.occupied_call_ids().into_iter().collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    pub(super) fn occupied_call_ids(&self) -> HashSet<u16> {
+        let mut ids = HashSet::with_capacity(
+            self.cached_setups.len()
+                + self.active_calls.len()
+                + self.pending_group_releases.len()
+                + self.individual_calls.len()
+                + self.pending_individual_disconnect_tail_drains.len()
+                + self.pending_individual_disconnect_deliveries.len()
+                + self.pending_individual_disconnect_release_acks.len()
+                + self.pending_individual_tx_ceased_tail_drains.len()
+                + self.pending_individual_releases.len()
+                + 4,
+        );
+
+        ids.extend(self.cached_setups.keys().copied());
+        ids.extend(self.active_calls.keys().copied());
+        ids.extend(self.pending_group_releases.keys().copied());
+        ids.extend(self.individual_calls.keys().copied());
+        ids.extend(self.pending_individual_disconnect_tail_drains.keys().copied());
+        ids.extend(self.pending_individual_disconnect_deliveries.keys().copied());
+        ids.extend(self.pending_individual_disconnect_release_acks.keys().copied());
+        ids.extend(self.pending_individual_tx_ceased_tail_drains.keys().copied());
+        ids.extend(self.pending_individual_releases.keys().copied());
+        ids.extend(self.circuits.active_call_ids());
+        if let Some(session) = &self.echo_session {
+            ids.insert(session.call_id);
+        }
+
+        ids.remove(&0);
+        ids
+    }
+
     pub(super) fn build_d_setup_prim(pdu: &DSetup, usage: u8, ts: u8, ul_dl: UlDlAssignment) -> (BitBuffer, CmceChanAllocReq) {
         tracing::debug!("-> {:?}", pdu);
 

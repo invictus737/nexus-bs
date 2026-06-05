@@ -5,6 +5,7 @@ use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
+use tetra_entities::cmce::cmce_bs::CmceBs;
 use tetra_pdus::cmce::enums::call_timeout::CallTimeout;
 use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
 use tetra_pdus::cmce::enums::cmce_pdu_type_ul::CmcePduTypeUl;
@@ -124,6 +125,23 @@ fn submit_subscriber_update(test: &mut ComponentTest, issi: u32, groups: Vec<u32
         dest: TetraEntity::Cmce,
         msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
     });
+}
+
+fn cmce_bs_mut(test: &mut ComponentTest) -> &mut CmceBs {
+    test.router
+        .get_entity(TetraEntity::Cmce)
+        .expect("CMCE entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<CmceBs>()
+        .expect("registered CMCE entity should be CmceBs")
+}
+
+fn force_cmce_next_call_identifier(test: &mut ComponentTest, next_call_identifier: u16) {
+    cmce_bs_mut(test).debug_force_next_call_identifier(next_call_identifier);
+}
+
+fn cmce_debug_active_call_ids(test: &mut ComponentTest) -> Vec<u16> {
+    cmce_bs_mut(test).debug_active_call_ids()
 }
 
 fn drain_private_simplex_tail(test: &mut ComponentTest, dltime: TdmaTime) {
@@ -1595,6 +1613,103 @@ fn test_large_group_setup_uses_one_gssi_d_setup_and_one_umac_open() {
     assert_eq!(opens[0].active_secondary_addrs, vec![TetraAddress::issi(speaker_issi)]);
     assert_eq!(count_umac_open(&setup_msgs), 1);
     assert_eq!(count_d_releases(&setup_msgs), 0);
+}
+
+#[test]
+fn test_group_call_id_wrap_skips_live_group_call_and_preserves_ptt() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let (first_call_id, first_ts, first_usage) = start_group_call_with_circuit(&mut test);
+
+    let second_group_caller = TEST_OTHER_ISSI;
+    let second_group_listener = TEST_OTHER_ISSI + 10;
+    register_subscriber(&mut test, second_group_caller, TEST_CALLED_GSSI);
+    register_subscriber(&mut test, second_group_listener, TEST_CALLED_GSSI);
+
+    force_cmce_next_call_identifier(&mut test, first_call_id);
+    let (second_call_id, _, _) = start_group_call_with_circuit_for(&mut test, second_group_caller, TEST_CALLED_GSSI);
+
+    // EN 300 392-2 clause 14.2.3 uses the SwMI call identifier as the
+    // reference for call handling, and table 14.36 gives only 14 real bits.
+    // After wrap, a fresh group setup must skip a still-live group call id.
+    assert_ne!(
+        second_call_id, first_call_id,
+        "new group call must not overwrite an existing active group call when call-id wraps"
+    );
+    let active_ids = cmce_debug_active_call_ids(&mut test);
+    assert!(active_ids.contains(&first_call_id), "first group call id should remain live");
+    assert!(active_ids.contains(&second_call_id), "second group call id should be live");
+
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, first_call_id));
+    test.run_stack(Some(1));
+    let ptt_msgs = test.dump_sinks();
+    let queued_grant = ptt_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, grant)| prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && grant.call_identifier == first_call_id)
+        .expect("original group call must still queue return PTT after another wrapped allocation");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        first_ts,
+        first_usage,
+        UlDlAssignment::Dl,
+        "group call-id wrap queued PTT",
+    );
+    assert_eq!(count_d_releases(&ptt_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&ptt_msgs), 0);
+}
+
+#[test]
+fn test_group_setup_call_id_wrap_skips_live_private_call() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    submit_subscriber_update(&mut test, TEST_ISSI, Vec::new(), BrewSubscriberAction::Register);
+    submit_subscriber_update(&mut test, TEST_CALLED_ISSI, Vec::new(), BrewSubscriberAction::Register);
+    test.run_stack(Some(4));
+    let _ = test.dump_sinks();
+    let (private_call_id, _private_setup_msgs) = start_p2p_setup(&mut test);
+
+    let group_caller = TEST_OTHER_ISSI;
+    let group_listener = TEST_OTHER_ISSI + 20;
+    register_subscriber(&mut test, group_caller, TEST_GSSI);
+    register_subscriber(&mut test, group_listener, TEST_GSSI);
+
+    force_cmce_next_call_identifier(&mut test, private_call_id);
+    let (group_call_id, _, _) = start_group_call_with_circuit_for(&mut test, group_caller, TEST_GSSI);
+
+    // EN 300 392-2 clauses 14.5.1.1.2/14.5.1.2.1 keep the private-call
+    // identifier as the reference for subsequent individual-call PDUs. A
+    // simultaneous group setup must not reuse it after wrap.
+    assert_ne!(
+        group_call_id, private_call_id,
+        "group setup must skip a live private-call identifier"
+    );
+    let active_ids = cmce_debug_active_call_ids(&mut test);
+    assert!(active_ids.contains(&private_call_id), "private call id should remain live");
+    assert!(active_ids.contains(&group_call_id), "group call id should be live");
 }
 
 fn start_p2p_setup(test: &mut ComponentTest) -> (u16, Vec<SapMsg>) {

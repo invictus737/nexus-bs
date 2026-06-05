@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use tetra_core::{Direction, TdmaTime, TimeslotAllocator, TimeslotOwner, frames, multiframes};
 use tetra_pdus::cmce::structs::cmce_circuit::CmceCircuit;
@@ -9,12 +9,14 @@ use tetra_saps::{
 
 const D_SETUP_REPEATS: i32 = 1;
 const LATE_ENTRY_INTERVAL_TIMESLOTS: i32 = multiframes!(5);
+const MAX_CALL_IDENTIFIER: u16 = 0x3FFF;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CircuitErr {
     NoCircuitFree,
     CircuitAlreadyInUse,
     CircuitNotActive,
+    CallIdentifierExhausted,
 }
 
 pub enum CircuitMgrCmd {
@@ -112,14 +114,32 @@ impl CircuitMgr {
     }
 
     pub fn get_next_call_id(&mut self) -> CallId {
-        let call_id = self.next_call_identifier;
-        self.next_call_identifier += 1;
-        if self.next_call_identifier > 0x3FFF {
-            // EN 300 392-2 table 14.36 defines a 14-bit call identifier:
-            // 0 is the dummy call identifier, 1..=16383 identify calls.
-            self.next_call_identifier = 1;
-        }
+        let call_id = Self::normal_call_identifier(self.next_call_identifier);
+        self.next_call_identifier = Self::call_identifier_after(call_id);
         call_id
+    }
+
+    pub fn get_next_call_id_avoiding(&mut self, occupied: &HashSet<u16>) -> Result<CallId, CircuitErr> {
+        for _ in 0..MAX_CALL_IDENTIFIER {
+            let call_id = self.get_next_call_id();
+            // EN 300 392-2 table 14.36 and clause 14.2.3 require the
+            // SwMI-allocated call identifier to remain the reference for one
+            // specific call. Skip live/pending identifiers when the 14-bit
+            // namespace wraps; value 0 remains the dummy identifier.
+            if !occupied.contains(&call_id) {
+                return Ok(call_id);
+            }
+        }
+
+        Err(CircuitErr::CallIdentifierExhausted)
+    }
+
+    fn normal_call_identifier(call_id: u16) -> u16 {
+        if (1..=MAX_CALL_IDENTIFIER).contains(&call_id) { call_id } else { 1 }
+    }
+
+    fn call_identifier_after(call_id: u16) -> u16 {
+        if call_id >= MAX_CALL_IDENTIFIER { 1 } else { call_id + 1 }
     }
 
     pub fn get_next_usage_number(&mut self) -> u8 {
@@ -206,10 +226,30 @@ impl CircuitMgr {
         timeslot_alloc: &mut TimeslotAllocator,
         owner: TimeslotOwner,
     ) -> Result<&CmceCircuit, CircuitErr> {
+        self.allocate_circuit_with_allocator_duplex_avoiding(dir, comm_type, simplex_duplex, timeslot_alloc, owner, &HashSet::new())
+    }
+
+    /// Allocate circuit using centralized timeslot allocator with explicit duplex flag,
+    /// while avoiding live CMCE call identifiers held by higher-layer state.
+    pub fn allocate_circuit_with_allocator_duplex_avoiding(
+        &mut self,
+        dir: Direction,
+        comm_type: CommunicationType,
+        simplex_duplex: bool,
+        timeslot_alloc: &mut TimeslotAllocator,
+        owner: TimeslotOwner,
+        occupied_call_ids: &HashSet<u16>,
+    ) -> Result<&CmceCircuit, CircuitErr> {
         // Get timeslot from centralized allocator
         let ts = timeslot_alloc.allocate_any(owner).ok_or(CircuitErr::NoCircuitFree)?;
 
-        let call_id = self.get_next_call_id();
+        let call_id = match self.get_next_call_id_avoiding(occupied_call_ids) {
+            Ok(call_id) => call_id,
+            Err(err) => {
+                let _ = timeslot_alloc.release(owner, ts);
+                return Err(err);
+            }
+        };
         let usage = self.get_next_usage_number();
 
         // Create circuit
@@ -227,7 +267,13 @@ impl CircuitMgr {
         };
 
         // Register circuit and return
-        Ok(self.open_circuit(dir, circuit)?)
+        match self.open_circuit(dir, circuit) {
+            Ok(circuit) => Ok(circuit),
+            Err(err) => {
+                let _ = timeslot_alloc.release(owner, ts);
+                Err(err)
+            }
+        }
     }
 
     /// Allocate an additional circuit for an existing call_id using the centralized allocator.
@@ -329,6 +375,16 @@ impl CircuitMgr {
         } else {
             Ok(self.tx_data[ts as usize - 1].pop_front())
         }
+    }
+
+    pub fn active_call_ids(&self) -> Vec<u16> {
+        let mut ids = Vec::new();
+        for circuit in self.dl.iter().chain(self.ul_only.iter()).flatten() {
+            if !ids.contains(&circuit.call_id) {
+                ids.push(circuit.call_id);
+            }
+        }
+        ids
     }
 
     /// Closes any circuits that have expired.
@@ -458,5 +514,27 @@ mod tests {
         assert_eq!(mgr.get_next_call_id(), 0x3FFF);
         assert_eq!(mgr.get_next_call_id(), 1);
         assert_eq!(mgr.next_call_identifier, 2);
+    }
+
+    #[test]
+    fn call_identifier_wrap_skips_occupied_live_ids() {
+        let mut mgr = CircuitMgr::new();
+        mgr.next_call_identifier = 0x3FFE;
+        let occupied = HashSet::from([0x3FFE, 0x3FFF, 1, 2]);
+
+        assert_eq!(
+            mgr.get_next_call_id_avoiding(&occupied),
+            Ok(3),
+            "wrapped allocation must skip live CMCE call identifiers"
+        );
+        assert_eq!(mgr.next_call_identifier, 4);
+    }
+
+    #[test]
+    fn call_identifier_allocator_reports_exhaustion_when_all_real_ids_are_live() {
+        let mut mgr = CircuitMgr::new();
+        let occupied: HashSet<_> = (1..=MAX_CALL_IDENTIFIER).collect();
+
+        assert_eq!(mgr.get_next_call_id_avoiding(&occupied), Err(CircuitErr::CallIdentifierExhausted));
     }
 }

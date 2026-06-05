@@ -5601,3 +5601,61 @@ Next non-repeating execution:
 1. Commit this late EG active-suspension patch.
 2. Continue with global ingress/control `MessageQueue` and live SDS/WAP admission/observability caps.
 3. Continue CMCE large round-robin group PTT tests once the call-control auditor returns or after direct local inspection.
+
+## 2026-06-05 18:14:35 EEST - CMCE call-id wrap skips live group/private calls
+
+User goal:
+
+- Group and private calls must remain robust at thousands of terminals and across long 24x7 runtime, not only with two or three radios.
+- A fresh setup after call-id wrap must not overwrite an active or pending group/private call, because that can route PTT, release, or late-entry signalling to the wrong call.
+
+Component in simple technical terms:
+
+- `CircuitMgr` is the local traffic-channel manager. It chooses timeslot, usage number, and the SwMI call identifier for a new call.
+- `CcBsSubentity` is the CMCE BS call-control state machine. It stores active group calls, private calls, cached `D-SETUP` PDUs, and pending `D-RELEASE`/`D-DISCONNECT` cleanup.
+- The patch makes `CircuitMgr` ask CMCE which call identifiers are still occupied before allocating a new first-leg call identifier. Duplex private calls still intentionally reuse the same call-id for their second bearer leg because that is the same call.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.2.3: the CMCE call identifier is the call-handling reference allocated by the SwMI and then used by subsequent CMCE messages for that call.
+- EN 300 392-2 table 14.36: call identifier is a 14-bit information element; value 0 is dummy and values 1..16383 identify calls.
+- EN 300 392-2 clauses 14.5.1.1.2 and 14.5.1.2.1: individual/private call setup and initial floor state rely on the allocated call identifier.
+- EN 300 392-2 clauses 14.5.2.1 and 14.5.2.2.1: group setup and group floor control use the group call identifier as the maintained call reference.
+- EN 300 392-2 clause 14.5.2.3: group release keeps the call identifier relevant until release cleanup completes.
+- This is clause-scoped hardening and test evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/components/circuit_mgr.rs`
+  - Added `get_next_call_id_avoiding` over the full 14-bit non-zero call-id range.
+  - Added `CircuitErr::CallIdentifierExhausted` for the pathological case where every real call-id is occupied.
+  - Added allocator variant `allocate_circuit_with_allocator_duplex_avoiding`.
+  - Releases a just-reserved timeslot if call-id selection fails or circuit opening rejects, so a failed setup does not leak local timeslot state.
+  - Added `active_call_ids` as a defensive backstop for circuit state that has not yet been reflected into higher CMCE maps.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added `occupied_call_ids`, covering cached setups, active group calls, pending group releases, live individual calls, all pending private release/tail-drain maps, circuit-manager active ids, and echo session id.
+  - Added hidden debug accessors for integration tests.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Local group setup, local private/P2P setup, Brew-originated local private setup, and echo setup now allocate first-leg call identifiers while avoiding occupied CMCE ids.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/network.rs`
+  - Network-origin private and group setup now use the same occupied-id avoiding allocator.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added a group collision regression: keep group call A active, force allocator wrap to A's call-id, start group call B, then verify A still queues return PTT with the original call-id and no release/close side effects.
+  - Added a private collision regression: keep a private setup call-id live, force allocator wrap to that id, start a group call, and verify the group call receives a different id.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib call_identifier --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_call_id_wrap_skips_live_group_call_and_preserves_ptt --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_setup_call_id_wrap_skips_live_private_call --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 139 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE call-id continuity patch.
+2. Extend large-GSSI stress beyond current 2048-member tests toward 4096/5000 members for round-robin PTT, repeated `U-SETUP`, queued handoff, restart recovery, and EG7 listeners.
+3. Continue SDS/WAP admission and truthful observability so live SDS/WAP cannot silently claim delivery when queues are saturated.
+4. Continue MM affiliation persistence and restart recovery scale tests so terminals do not return as `No Group`/`Unit Not Attached` after BS restart.
