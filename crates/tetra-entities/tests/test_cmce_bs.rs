@@ -6372,7 +6372,9 @@ fn test_group_pending_release_large_ptt_flood_is_ignored_without_signalling() {
 
     test.submit_message(build_u_disconnect_msg(speaker_issi, call_id));
     test.run_stack(Some(1));
-    let release_msgs = test.dump_sinks();
+    let mut release_msgs = test.dump_sinks();
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1, "large pending release should track FACCH delivery");
     assert_eq!(count_d_releases(&release_msgs), 2);
     assert_eq!(count_umac_call_ended_or_close(&release_msgs), 0);
 
@@ -6397,6 +6399,18 @@ fn test_group_pending_release_large_ptt_flood_is_ignored_without_signalling() {
     assert!(
         occupied_ids.contains(&call_id),
         "large late-PTT flood must not evict the pending group release call id"
+    );
+
+    reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
+    assert!(
+        count_umac_call_ended_or_close(&closed_msgs) >= 2,
+        "large late-PTT flood must not prevent pending D-RELEASE completion"
+    );
+    assert!(
+        !cmce_debug_active_call_ids(&mut test).contains(&call_id),
+        "pending group release call id should be freed after reporter completion"
     );
 }
 

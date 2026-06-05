@@ -6056,3 +6056,45 @@ Next non-repeating execution:
 2. Extend the large pending-release flood test to prove release still completes after reporter transmission.
 3. Add the analogous P2P pending-release flood regression so private simplex teardown remains bounded.
 4. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
+
+## 2026-06-05 19:05:05 EEST - CMCE large pending group flood now proves release completion
+
+User goal:
+
+- Large GSSI PTT storms must not leave stale calls or call identifiers stuck forever.
+- A 4096-member late PTT flood during group release must be harmless and the original release must still finish when `D-RELEASE` transmission is reported.
+
+Component in simple technical terms:
+
+- `TxReporter` is the local delivery state for a downlink PDU.
+- CMCE keeps the group bearer and call id alive while the `D-RELEASE` reporter is pending.
+- The strengthened test now proves that after the flood, marking the release reporter transmitted closes the UMAC call and frees the old call id.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.3: group calls are cleared by SwMI `D-RELEASE`.
+- EN 300 392-2 clause 14.2.3/table 14.36: the call identifier remains the call reference and must not be reused or leaked while release is pending.
+- This is clause-scoped release-completion evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Extended `test_group_pending_release_large_ptt_flood_is_ignored_without_signalling`.
+  - Extracts the FACCH `D-RELEASE` reporter from the initial release.
+  - After the 4095-message late `U-TX DEMAND` flood, marks the reporter transmitted.
+  - Asserts UMAC close/call-ended signalling occurs and the old pending call id is no longer active.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_pending_release_large_ptt_flood_is_ignored_without_signalling --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 144 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE large pending-release flood completion regression.
+2. Add the analogous P2P pending-release flood regression so private simplex teardown remains bounded.
+3. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
+4. Re-run targeted UMAC large EG7/group tests before the next field deploy.
