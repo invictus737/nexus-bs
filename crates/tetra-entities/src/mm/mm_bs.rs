@@ -1286,6 +1286,72 @@ impl MmBs {
         true
     }
 
+    fn emit_current_group_snapshot(&mut self, issi: u32) {
+        let Some(sink) = self.client_mgr.telemetry_sink().cloned() else {
+            return;
+        };
+        let all_groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|c| c.groups.iter().copied().collect())
+            .unwrap_or_default();
+        sink.send(crate::net_telemetry::TelemetryEvent::MsGroupsSnapshot { issi, gssis: all_groups });
+    }
+
+    fn retainable_mode_one_attach_groups(&self, issi: u32, giu_for_mode: &[GroupIdentityUplink]) -> BTreeSet<u32> {
+        giu_for_mode
+            .iter()
+            .filter_map(|giu| {
+                if giu.group_identity_detachment_uplink.is_some() || giu.vgssi.is_some() || giu.address_extension.is_some() {
+                    return None;
+                }
+                let gssi = giu.gssi?;
+                if gssi > 0x00FF_FFFF {
+                    return None;
+                }
+                if self
+                    .config
+                    .config()
+                    .cell
+                    .allowed_gssi_ranges
+                    .as_ref()
+                    .is_some_and(|ranges| !ranges.contains(gssi))
+                {
+                    tracing::warn!("Rejecting group attach from ISSI {} to unprovisioned GSSI {}", issi, gssi);
+                    return None;
+                }
+                Some(gssi)
+            })
+            .collect()
+    }
+
+    fn prepare_detach_all_then_attach(&mut self, queue: &mut MessageQueue, issi: u32, giu_for_mode: &[GroupIdentityUplink]) -> bool {
+        let prior_groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| client.groups.iter().copied().collect())
+            .unwrap_or_default();
+        let retained_groups = self.retainable_mode_one_attach_groups(issi, giu_for_mode);
+
+        if let Err(e) = self.client_mgr.client_detach_all_groups_silent(issi) {
+            tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
+            return false;
+        }
+
+        let deaff_groups: Vec<u32> = prior_groups.into_iter().filter(|gssi| !retained_groups.contains(gssi)).collect();
+        if !deaff_groups.is_empty() {
+            {
+                let mut state = self.config.state_write();
+                for &gssi in &deaff_groups {
+                    state.subscribers.deaffiliate(issi, gssi);
+                }
+            }
+            self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
+        }
+
+        true
+    }
+
     fn restore_cached_restart_recovery_groups(&mut self, queue: &mut MessageQueue, issi: u32) -> CachedRestartGroupRefresh {
         let cached_groups: Vec<(u32, GroupAttachmentInfo)> = self.cached_restart_recovery_groups_for_issi(issi).into_iter().collect();
         if cached_groups.is_empty() {
@@ -1346,6 +1412,7 @@ impl MmBs {
                 restored_gssis
             );
             self.emit_subscriber_update(queue, issi, restored_gssis, BrewSubscriberAction::Affiliate);
+            self.emit_current_group_snapshot(issi);
         }
 
         restored_groups
@@ -1962,25 +2029,28 @@ impl MmBs {
                 // request has passed local ACK-capacity validation, otherwise Annex G
                 // cannot be represented coherently and the procedure remains unchanged.
                 if gild.group_identity_attach_detach_mode == 1 {
-                    let prior_groups: Vec<u32> = self
-                        .client_mgr
-                        .get_client_by_issi(issi)
-                        .map(|client| client.groups.iter().copied().collect())
-                        .unwrap_or_default();
-                    if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
-                        tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
-                    } else if !prior_groups.is_empty() {
-                        {
-                            let mut state = self.config.state_write();
-                            for &gssi in &prior_groups {
-                                state.subscribers.deaffiliate(issi, gssi);
-                            }
+                    // EN 300 392-2 clause 16.10.17 mode=1 is one logical
+                    // replace operation: detach all current groups, then attach
+                    // the listed groups. Keep retained GSSIs affiliated in the
+                    // shared routing/dashboard state so a restart refresh for
+                    // the same scan group cannot create a transient No Group.
+                    if !self.prepare_detach_all_then_attach(queue, issi, giu_for_mode.as_deref().unwrap_or(&[])) {
+                        Some(GroupIdentityProcessResult {
+                            group_identity_downlink: giu_for_mode
+                                .as_ref()
+                                .map(|giu| Self::rejected_group_identity_downlinks(giu))
+                                .unwrap_or_default(),
+                            all_accepted: false,
+                        })
+                    } else {
+                        if giu_for_mode.is_none() {
+                            self.emit_current_group_snapshot(issi);
                         }
-                        self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                        giu_for_mode.as_ref().map(|giu| self.try_attach_detach_groups(queue, issi, giu))
                     }
+                } else {
+                    giu_for_mode.as_ref().map(|giu| self.try_attach_detach_groups(queue, issi, giu))
                 }
-
-                giu_for_mode.as_ref().map(|giu| self.try_attach_detach_groups(queue, issi, giu))
             };
 
             let group_identity_accept_reject = group_result
@@ -2943,17 +3013,10 @@ impl MmBs {
             self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
         }
 
-        // Emit a single snapshot of all current groups so the dashboard always has
-        // the full list (not just incremental add/remove events).
-        let _sink = self.client_mgr.telemetry_sink().cloned();
-        let all_groups: Vec<u32> = self
-            .client_mgr
-            .get_client_by_issi(issi)
-            .map(|c| c.groups.iter().copied().collect())
-            .unwrap_or_default();
-        if let Some(sink) = _sink {
-            sink.send(crate::net_telemetry::TelemetryEvent::MsGroupsSnapshot { issi, gssis: all_groups });
-        }
+        // Emit a single snapshot of all current groups so the dashboard always
+        // has the final ETSI mode=1 replace result, not an intermediate empty
+        // list from the local detach-all step.
+        self.emit_current_group_snapshot(issi);
         self.remember_restart_recovery_issi(issi);
 
         GroupIdentityProcessResult {
@@ -3122,29 +3185,8 @@ impl MmBs {
                 all_accepted: false,
             }
         } else {
-            if detach_all_then_attach {
-                let prior_groups: Vec<u32> = self
-                    .client_mgr
-                    .get_client_by_issi(issi)
-                    .map(|client| client.groups.iter().copied().collect())
-                    .unwrap_or_default();
-                match self.client_mgr.client_detach_all_groups(issi) {
-                    Ok(_) => {
-                        if !prior_groups.is_empty() {
-                            {
-                                let mut state = self.config.state_write();
-                                for &gssi in &prior_groups {
-                                    state.subscribers.deaffiliate(issi, gssi);
-                                }
-                            }
-                            self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
-                        return false;
-                    }
-                }
+            if detach_all_then_attach && !self.prepare_detach_all_then_attach(queue, issi, &giu_for_mode) {
+                return false;
             }
 
             self.try_attach_detach_groups(queue, issi, &giu_for_mode)

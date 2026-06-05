@@ -335,15 +335,15 @@ impl MmClientMgr {
         }
     }
 
-    /// Detaches all groups from a client
-    pub fn client_detach_all_groups(&mut self, issi: u32) -> Result<bool, ClientMgrErr> {
+    fn client_detach_all_groups_inner(&mut self, issi: u32, emit_telemetry: bool) -> Result<bool, ClientMgrErr> {
         if let Some(client) = self.clients.get_mut(&issi) {
-            // Send telemetry event
-            if let Some(sink) = &self.telemetry_sink {
-                sink.send(TelemetryEvent::MsGroupDetach {
-                    issi: client.issi,
-                    gssis: client.groups.iter().cloned().collect(),
-                });
+            if emit_telemetry {
+                if let Some(sink) = &self.telemetry_sink {
+                    sink.send(TelemetryEvent::MsGroupDetach {
+                        issi: client.issi,
+                        gssis: client.groups.iter().cloned().collect(),
+                    });
+                }
             }
             client.groups.clear();
             client.group_attachments.clear();
@@ -351,6 +351,18 @@ impl MmClientMgr {
         } else {
             Err(ClientMgrErr::ClientNotFound { issi })
         }
+    }
+
+    /// Detaches all groups from a client.
+    pub fn client_detach_all_groups(&mut self, issi: u32) -> Result<bool, ClientMgrErr> {
+        self.client_detach_all_groups_inner(issi, true)
+    }
+
+    /// Detaches all groups without emitting an intermediate telemetry event.
+    /// Used when MM applies ETSI mode=1 as one logical replace operation and
+    /// will publish the final group list after accepted attachments are known.
+    pub fn client_detach_all_groups_silent(&mut self, issi: u32) -> Result<bool, ClientMgrErr> {
+        self.client_detach_all_groups_inner(issi, false)
     }
 
     /// Attaches or detaches a client from a group

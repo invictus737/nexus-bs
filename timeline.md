@@ -3865,3 +3865,48 @@ Next non-repeating execution:
 1. User should visually confirm terminals no longer show `No Group` after this restart.
 2. If any terminal still displays `No Group`, capture the fresh log interval after that visual state and compare dashboard state vs MM/CMCE affiliation lines.
 3. Run a live group PTT test on `226333`; if failure occurs, inspect from the current build log around `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, and UMAC floor events.
+
+## 2026-06-05 12:44:11 EEST - Hardened restart group retention against transient No Group
+
+Component scope:
+
+- MM: Mobility Management owns terminal registration and group affiliation after attach/restart.
+- CMCE: call control consumes MM subscriber updates; a short false deaffiliate can make group PTT look unavailable.
+- Dashboard telemetry: observability only; it must show the final MM group list, not a local intermediate state.
+
+Patch:
+
+- `client_detach_all_groups_silent()` now lets MM apply ETSI mode=1 as one logical replace operation without first emitting an intermediate empty group telemetry event.
+- MM mode=1 handling now keeps retained GSSIs affiliated in shared subscriber/CMCE state when the replacement list contains the same accepted group.
+- MM still deaffiliates groups that are actually absent from the replacement list, so explicit empty reports/detach-all remain authoritative.
+- Cached restart group restoration now emits a full current group snapshot after replaying cached affiliations, so dashboard clients do not depend only on incremental attach ordering.
+- Added tests for standalone and location-update mode=1 refreshes retaining `226333` without CMCE `Deaffiliate -> Affiliate` churn.
+- Updated the restart-recovery follow-up test to assert no transient CMCE `No Group` window when the final complete report retains the same GSSI.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.10.17/table 16.49: group identity attach/detach mode=1 means detach all current groups and attach the listed identities as one requested operation.
+- Clauses 16.8.0/16.8.4: accepted group identities remain valid attached identities and are represented in the downlink acknowledgement/accept.
+- This is a clause-scoped engineering hardening for restart/group-affiliation behavior, not formal certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs mode_one_retains_same_group --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 22 passed.
+- `cargo test -p tetra-entities --test test_mm_bs swmi_group_ack --locked` -> 12 passed.
+- `cargo test -p tetra-entities --test test_mm_bs group_identity --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 127 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --lib dashboard --locked` -> 49 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs 226333 --locked` -> 2 passed.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this MM restart/no-transient-group patch.
+2. Deploy directly to testing with local build only.
+3. After restart, read the full fresh log from process start and confirm:
+   - `2260082`, `2260616`, `2260618` end with `groups=[226333]`;
+   - no `CMCE: subscriber deaffiliate issi=... groups=[226333]` followed immediately by re-affiliate for retained `226333`;
+   - no steady dashboard/WebSocket snapshot with `groups:[]` for the three lab ISSIs;
+   - no `PTT denied`, `No Group`, `Unit Not Attached`, or `T353 expired` in the restart interval.

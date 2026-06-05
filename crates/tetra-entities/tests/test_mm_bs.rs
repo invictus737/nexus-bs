@@ -2612,11 +2612,10 @@ fn test_restart_recovery_keeps_group_report_pending_until_attach_detach_complete
     );
 
     let updates = subscriber_updates(&sink_msgs);
-    assert_eq!(updates.len(), 2);
-    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
-    assert_eq!(updates[0].groups, vec![gssi]);
-    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
-    assert_eq!(updates[1].groups, vec![gssi]);
+    assert!(
+        updates.is_empty(),
+        "final complete report retaining the same GSSI must not create a transient CMCE No Group window: {updates:?}"
+    );
     assert!(!debug_mm_solicited_group_report_pending(&mut test, issi));
     assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 
@@ -3182,6 +3181,90 @@ fn test_standalone_mode_one_ignores_explicit_detachment_entries() {
     assert!(state.subscribers.group_members(3000).is_empty());
     assert!(state.subscribers.group_members(3001).is_empty());
     assert_eq!(state.subscribers.group_members(3002), vec![issi]);
+}
+
+#[test]
+fn test_standalone_mode_one_retains_same_group_without_cmce_deaffiliate() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 clause 16.10.17 mode=1 replaces the current group list.
+    // If the replacement list retains the same accepted GSSI, local CMCE
+    // routing must not see a transient Deaffiliate/No Group window.
+    submit_attach_detach_group_identity(&mut test, issi, true, Some(vec![gssi]));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let ack = extract_attach_detach_ack(&sink_msgs);
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    let downlink = ack.group_identity_downlink.expect("retained group should be acknowledged");
+    assert_eq!(downlink.len(), 1);
+    assert_eq!(downlink[0].gssi, Some(gssi));
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert!(
+        updates.is_empty(),
+        "retaining the same GSSI must not churn CMCE affiliation updates: {updates:?}"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+}
+
+#[test]
+fn test_location_update_mode_one_retains_same_group_without_cmce_deaffiliate() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Cmce, TetraEntity::Mle]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_groups_and_group_report_response(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        vec![gssi],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    let gila = accept
+        .group_identity_location_accept
+        .expect("retained group should be acknowledged in location update accept");
+    assert_eq!(gila.group_identity_accept_reject, 0);
+    let downlink = gila.group_identity_downlink.expect("accepted group should be listed");
+    assert_eq!(downlink.len(), 1);
+    assert_eq!(downlink[0].gssi, Some(gssi));
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert!(
+        updates.is_empty(),
+        "mode=1 restart refresh retaining the same GSSI must not churn CMCE affiliation updates: {updates:?}"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 }
 
 #[test]
