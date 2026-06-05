@@ -1,6 +1,11 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use tetra_core::{TdmaTime, TimeslotAllocator};
 
+/// Bounded live SDS admission. These entries are operator-injected dashboard
+/// broadcasts; without a cap, a disconnected or scripted dashboard could grow
+/// process memory unbounded while RF can only drain one item per interval.
+pub const LIVE_SDS_QUEUE_MAX_LEN: usize = 256;
+
 /// A one-shot or repeating SDS broadcast message injected at runtime via the dashboard.
 ///
 /// Each message is broadcast to all MSs on the cell (GSSI 0xFFFFFF) using the same

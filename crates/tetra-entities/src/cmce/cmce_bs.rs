@@ -1,7 +1,7 @@
 use crate::net_control::{ControlCommand, ControlEndpoint, ControlResponse};
 use crate::net_telemetry::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait};
-use tetra_config::bluestation::{SharedConfig, is_supported_periodic_sds_protocol_id};
+use tetra_config::bluestation::{LIVE_SDS_QUEUE_MAX_LEN, SharedConfig, is_supported_periodic_sds_protocol_id};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{Sap, TdmaTime, unimplemented_log};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -148,6 +148,15 @@ impl CmceBs {
                     return;
                 }
                 let mut state = sds.shared_config().state_write();
+                if state.live_sds_queue.len() >= LIVE_SDS_QUEUE_MAX_LEN {
+                    tracing::warn!(
+                        "CMCE: AddLiveSds rejected full live SDS queue len={} max={} text={:?}",
+                        state.live_sds_queue.len(),
+                        LIVE_SDS_QUEUE_MAX_LEN,
+                        text
+                    );
+                    return;
+                }
                 let id = state.next_live_sds_id;
                 state.next_live_sds_id = state.next_live_sds_id.wrapping_add(1).max(1);
                 state.live_sds_queue.push_back(tetra_config::bluestation::LiveSdsMessage {

@@ -5702,3 +5702,52 @@ Next non-repeating execution:
 2. Continue SDS/WAP admission and truthful delivery/queue observability.
 3. Continue MM affiliation persistence tests at EG7 and restart scale.
 4. Add UMAC/MAC large EG batch pressure tests so 4096-member GSSI scheduling remains bounded below CMCE.
+
+## 2026-06-05 18:24:48 EEST - Live SDS admission bounded for dashboard/WAP robustness
+
+User goal:
+
+- SDS/WAP features must stay robust during long-running BS operation and must not silently grow unbounded control state.
+- The WAP MVP delivery path must keep working while live text-style SDS broadcast remains fail-closed for WAP PIDs that require their own raw payload encoder.
+
+Component in simple technical terms:
+
+- Live SDS is the dashboard/control queue for operator-injected broadcast messages, transmitted later by the Home Mode Display/SDS-TL sender.
+- WAP MVP uses raw SDS Type4/WAP payload helpers, not the text-style live SDS queue.
+- This patch caps only the live SDS broadcast queue. It does not limit normal SDS, raw SDS WAP delivery, or status delivery.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 13.2: SDS includes individual and group short data/status services.
+- EN 300 392-2 clause 29.3.3.8.2: SDS-TL system broadcast may use the all-ones broadcast address.
+- EN 300 392-2 clause 29.4.1 and table 29.21: SDS-TL transport PIDs are distinct from WAP/WCMP application PIDs; WAP raw Type4 remains on the raw SDS path.
+- This is bounded local admission/observability hardening around SDS/WAP, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-config/src/bluestation/state.rs`
+  - Added `LIVE_SDS_QUEUE_MAX_LEN = 256` for runtime live SDS broadcast entries.
+- `crates/tetra-entities/src/cmce/cmce_bs.rs`
+  - `AddLiveSds` now rejects new live SDS entries when the queue is full before allocating an ID or mutating state.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Dashboard live SDS POST now checks the shared queue and returns HTTP 429 when full.
+  - Dashboard live SDS POST now returns HTTP 503 if the CMCE control channel is unavailable, rather than reporting OK after a failed send.
+- `crates/tetra-entities/tests/test_sds_bs.rs`
+  - Added `test_live_sds_control_queue_is_bounded`, proving overflow is rejected without evicting accepted broadcasts, consuming an ID, or emitting an RF message.
+
+Verification:
+
+- `cargo fmt --package tetra-config --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_sds_bs live_sds --locked` -> 5 passed.
+- `cargo test -p tetra-entities --test test_sds_bs wap --locked` -> 12 passed.
+- `cargo test -p tetra-entities net_dashboard::server::tests::live_sds --locked` -> 6 relevant dashboard tests passed.
+- `cargo test -p tetra-entities --test test_sds_bs --locked` -> 117 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this bounded live SDS admission patch.
+2. Continue MM restart/affiliation persistence with EG7-scale tests.
+3. Continue UMAC/MAC EG batch pressure below CMCE for 4096-member GSSI scheduling.
+4. Add dashboard/API observability for accepted-vs-transmitted WAP/SDS where a synchronous response path exists.

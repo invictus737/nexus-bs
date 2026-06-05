@@ -9,7 +9,7 @@ use tungstenite::{
     handshake::server::{Request, Response},
 };
 
-use tetra_config::bluestation::{DEFAULT_SDS_TEXT_PROTOCOL_ID, is_supported_periodic_sds_protocol_id};
+use tetra_config::bluestation::{DEFAULT_SDS_TEXT_PROTOCOL_ID, LIVE_SDS_QUEUE_MAX_LEN, is_supported_periodic_sds_protocol_id};
 
 use crate::net_control::commands::{
     ControlCommand, WAP_MVP_COLOR_PAGE_TEXT, WAP_MVP_PAGE_TEXT, WAP_SDS_TYPE4_MAX_BYTE_ALIGNED_PAYLOAD_BYTES, wap_sds_type4_payload,
@@ -1070,13 +1070,19 @@ fn http_response_401(mut stream: TcpStream) {
     let _ = stream.write_all(resp.as_bytes());
 }
 
-/// Send a ControlCommand through the dashboard → CMCE channel, best-effort.
-fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand) {
+/// Send a ControlCommand through the dashboard -> CMCE channel, best-effort.
+fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand) -> bool {
     if let Ok(guard) = cmd_tx.lock() {
         if let Some(ref tx) = *guard {
-            let _ = tx.send(cmd);
+            return tx.send(cmd).is_ok();
         }
     }
+    false
+}
+
+fn live_sds_queue_full(cfg: &Option<tetra_config::bluestation::SharedConfig>) -> bool {
+    cfg.as_ref()
+        .is_some_and(|c| c.state_read().live_sds_queue.len() >= LIVE_SDS_QUEUE_MAX_LEN)
 }
 
 /// Serialize the current live SDS queue to JSON and serve it.
@@ -1625,8 +1631,16 @@ fn handle_connection(
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => match parse_live_sds_post(&v) {
                 Ok(post) => {
+                    if live_sds_queue_full(&shared_config) {
+                        http_response(
+                            buf.into_inner(),
+                            429,
+                            &format!("live SDS queue full (max {LIVE_SDS_QUEUE_MAX_LEN})"),
+                        );
+                        return;
+                    }
                     tracing::info!("Dashboard: AddLiveSds text={:?} repeat={}", post.text, post.repeat_count);
-                    send_control_cmd(
+                    let accepted = send_control_cmd(
                         &cmd_tx,
                         ControlCommand::AddLiveSds {
                             text: post.text,
@@ -1635,7 +1649,11 @@ fn handle_connection(
                             repeat_count: post.repeat_count,
                         },
                     );
-                    http_response(buf.into_inner(), 200, "OK");
+                    if accepted {
+                        http_response(buf.into_inner(), 200, "OK");
+                    } else {
+                        http_response(buf.into_inner(), 503, "control channel unavailable");
+                    }
                 }
                 Err(e) => http_response(buf.into_inner(), 400, &e),
             },

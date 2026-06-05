@@ -3,7 +3,8 @@ mod common;
 use std::time::Duration;
 
 use tetra_config::bluestation::{
-    CfgBrew, CfgHomeModeDisplay, CfgSdsCommandControl, CfgSdsCommandEntry, HomeModeDisplaySdsTextCodingScheme, SharedConfig, StackMode,
+    CfgBrew, CfgHomeModeDisplay, CfgSdsCommandControl, CfgSdsCommandEntry, HomeModeDisplaySdsTextCodingScheme, LIVE_SDS_QUEUE_MAX_LEN,
+    SharedConfig, StackMode,
 };
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TxReporter, TxState, debug};
@@ -867,6 +868,46 @@ fn test_live_sds_control_rejects_wap_sds_tl_protocol_id_0x84() {
     // non-text application PID through the text path.
     assert!(queue.pop_front().is_none());
     assert!(shared_config.state_read().live_sds_queue.is_empty());
+}
+
+#[test]
+fn test_live_sds_control_queue_is_bounded() {
+    debug::setup_logging_verbose();
+
+    let config = ComponentTest::get_default_test_config(StackMode::Bs);
+    let shared_config = SharedConfig::from_parts(config, None);
+    let (dispatcher, endpoint) = make_control_link();
+    let mut cmce = CmceBs::new(shared_config.clone(), None, Some(endpoint));
+    let mut queue = MessageQueue::new();
+
+    for idx in 0..=LIVE_SDS_QUEUE_MAX_LEN {
+        dispatcher.send(ControlCommand::AddLiveSds {
+            text: format!("LIVE-{idx}"),
+            protocol_id: 0x82,
+            source_issi: 0x00FF_FFFF,
+            repeat_count: 1,
+        });
+    }
+    cmce.tick_start(&mut queue, TdmaTime::default());
+
+    let state = shared_config.state_read();
+    assert_eq!(
+        state.live_sds_queue.len(),
+        LIVE_SDS_QUEUE_MAX_LEN,
+        "live SDS admission must be bounded before RF scheduling"
+    );
+    let expected_last = format!("LIVE-{}", LIVE_SDS_QUEUE_MAX_LEN - 1);
+    assert_eq!(
+        state.live_sds_queue.back().map(|m| m.text.as_str()),
+        Some(expected_last.as_str()),
+        "overflow item must be rejected, not evict an accepted broadcast silently"
+    );
+    assert_eq!(
+        state.next_live_sds_id,
+        LIVE_SDS_QUEUE_MAX_LEN as u32 + 1,
+        "rejected overflow must not consume a live SDS id"
+    );
+    assert!(queue.pop_front().is_none());
 }
 
 #[test]
