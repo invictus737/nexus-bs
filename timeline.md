@@ -6963,3 +6963,43 @@ Next non-repeating execution:
 1. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
 2. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
 3. Continue dashboard/telemetry scaling work: bounded client queues and coalesced station rendering for 10k MS snapshots.
+
+## 2026-06-05 21:43 EEST - CMCE large-group storm aftercare for simple private call
+
+Component in simple technical terms:
+
+- CMCE owns both group floor control and private call control.
+- A large GSSI PTT storm must not leave CMCE in a state that breaks later simple private call setup.
+
+Problem covered:
+
+- The 10k GSSI overflow test proved explicit `RequestQueued`/`NotGranted` behaviour and preserved group handoff.
+- The remaining aftercare question was whether the same runtime can still start a simple private call after that storm.
+- The test now registers a private caller/callee after the 10k group overflow and handoff, then starts a normal simplex private call.
+- It verifies that CMCE allocates a distinct call identifier, opens one shared traffic bearer, sends `D-CONNECT`, and sends `D-CONNECT-ACKNOWLEDGE`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group floor-control outcomes under contention.
+- EN 300 392-2 clauses 14.5.1.1.2 and 14.7.2.3: simple individual call setup and connect acknowledgement.
+- This is clause-scoped regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Renamed and extended the 10k overflow test to `test_ten_thousand_member_group_floor_overflow_is_explicit_and_private_call_still_works`.
+  - Added private-call aftercare assertions in the same CMCE runtime.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_ten_thousand_member_group_floor_overflow_is_explicit_and_private_call_still_works --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 152 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+2. Continue dashboard/telemetry scaling work: bounded client queues and coalesced station rendering for 10k MS snapshots.
+3. Add SDS/status aftercare under large registered MS set.

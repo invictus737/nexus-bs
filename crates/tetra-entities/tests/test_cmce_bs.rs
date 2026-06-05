@@ -5615,7 +5615,7 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
 }
 
 #[test]
-fn test_ten_thousand_member_group_floor_overflow_is_explicit_and_preserves_handoff() {
+fn test_ten_thousand_member_group_floor_overflow_is_explicit_and_private_call_still_works() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -5718,6 +5718,31 @@ fn test_ten_thousand_member_group_floor_overflow_is_explicit_and_preserves_hando
     assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let (private_call_id, private_connect_msgs) = start_active_p2p_call_with_connect_msgs(&mut test);
+    assert_ne!(
+        private_call_id, call_id,
+        "private call aftercare must allocate a distinct live call identifier after the 10k group storm"
+    );
+    assert_eq!(
+        count_umac_open(&private_connect_msgs),
+        1,
+        "simple private call should still open its shared traffic circuit after the 10k group storm"
+    );
+    assert!(
+        private_connect_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
+        "simple private call should still send D-CONNECT after the 10k group storm"
+    );
+    assert!(
+        private_connect_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some())),
+        "simple private call should still send D-CONNECT-ACKNOWLEDGE after the 10k group storm"
+    );
 }
 
 #[test]
