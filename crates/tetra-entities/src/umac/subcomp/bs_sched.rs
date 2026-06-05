@@ -215,6 +215,13 @@ impl GroupDeliveryState {
             .collect()
     }
 
+    fn has_uncovered_listener(&self, ts: TdmaTime, energy_saving: &HashMap<u32, EnergySavingAssignment>) -> bool {
+        self.targets
+            .iter()
+            .copied()
+            .any(|issi| !self.covered.contains(&issi) && Self::ms_listens_at(energy_saving, issi, ts))
+    }
+
     fn active_batch_listens(&self, ts: TdmaTime, energy_saving: &HashMap<u32, EnergySavingAssignment>) -> bool {
         self.active_batch
             .iter()
@@ -287,6 +294,13 @@ impl GroupStealingState {
             .collect()
     }
 
+    fn has_uncovered_listener(&self, ts: TdmaTime, energy_saving: &HashMap<u32, EnergySavingAssignment>) -> bool {
+        self.targets
+            .iter()
+            .copied()
+            .any(|issi| !self.covered.contains(&issi) && GroupDeliveryState::ms_listens_at(energy_saving, issi, ts))
+    }
+
     fn active_batch_listens(&self, ts: TdmaTime, energy_saving: &HashMap<u32, EnergySavingAssignment>) -> bool {
         self.active_batch
             .iter()
@@ -310,6 +324,44 @@ impl GroupStealingState {
         for issi in self.active_batch.drain() {
             self.covered.insert(issi);
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct GroupReadinessCache {
+    targets_by_addr: HashMap<TetraAddress, Vec<u32>>,
+    any_listens_by_addr: HashMap<TetraAddress, bool>,
+}
+
+impl GroupReadinessCache {
+    fn targets_for(&mut self, addr: TetraAddress, subscribers: &SubscriberRegistry) -> &[u32] {
+        self.targets_by_addr
+            .entry(addr)
+            .or_insert_with(|| BsChannelScheduler::group_targets(addr, subscribers))
+            .as_slice()
+    }
+
+    fn any_target_listens(
+        &mut self,
+        addr: TetraAddress,
+        ts: TdmaTime,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
+        subscribers: &SubscriberRegistry,
+    ) -> bool {
+        if let Some(listens) = self.any_listens_by_addr.get(&addr) {
+            return *listens;
+        }
+
+        let listens = {
+            let targets = self.targets_for(addr, subscribers);
+            targets.is_empty()
+                || targets
+                    .iter()
+                    .copied()
+                    .any(|issi| BsChannelScheduler::ms_listens_at(energy_saving, issi, ts))
+        };
+        self.any_listens_by_addr.insert(addr, listens);
+        listens
     }
 }
 
@@ -337,6 +389,15 @@ impl BsChannelScheduler {
             mcch_chan_alloc_sent_this_frame: false,
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
+        }
+    }
+
+    fn dl_slot_index(ts: u8, context: &str) -> Option<usize> {
+        if (1..=NUM_TIMESLOTS as u8).contains(&ts) {
+            Some(ts as usize - 1)
+        } else {
+            tracing::warn!("{}: invalid downlink timeslot {}", context, ts);
+            None
         }
     }
 
@@ -751,6 +812,9 @@ impl BsChannelScheduler {
     /// `usage_marker` is set when the grant covers >1 slot — the MS uses it to identify the reservation
     /// when continuing the burst on the second slot (per ETSI §21.4.3.2). Single-slot grants pass None.
     pub fn dl_enqueue_grant(&mut self, ts: u8, addr: TetraAddress, grant: BasicSlotgrant, usage_marker: Option<u8>) {
+        let Some(slot) = Self::dl_slot_index(ts, "dl_enqueue_grant") else {
+            return;
+        };
         tracing::debug!(
             "dl_enqueue_grant: ts {} enqueueing PDU {:?} for addr {} marker {:?}",
             ts,
@@ -759,10 +823,13 @@ impl BsChannelScheduler {
             usage_marker
         );
         let elem = DlSchedElem::Grant(addr, grant, usage_marker);
-        self.dltx_queues[ts as usize - 1].push(elem);
+        self.dltx_queues[slot].push(elem);
     }
 
     pub fn dl_enqueue_reservation_grant(&mut self, ts: u8, addr: TetraAddress, res_req: ReservationRequirement) {
+        let Some(slot) = Self::dl_slot_index(ts, "dl_enqueue_reservation_grant") else {
+            return;
+        };
         tracing::debug!(
             "dl_enqueue_reservation_grant: ts {} enqueueing reservation {:?} for addr {}",
             ts,
@@ -770,17 +837,20 @@ impl BsChannelScheduler {
             addr
         );
         let elem = DlSchedElem::PendingGrant(addr, res_req);
-        self.dltx_queues[ts as usize - 1].push(elem);
+        self.dltx_queues[slot].push(elem);
     }
 
     pub fn dl_enqueue_random_access_ack(&mut self, ts: u8, addr: TetraAddress) {
+        let Some(slot) = Self::dl_slot_index(ts, "dl_enqueue_random_access_ack") else {
+            return;
+        };
         tracing::debug!(
             "dl_enqueue_random_access_ack: ts {} enqueueing random access acknowledgementfor addr {}",
             ts,
             addr
         );
         let elem = DlSchedElem::RandomAccessAck(addr);
-        self.dltx_queues[ts as usize - 1].push(elem);
+        self.dltx_queues[slot].push(elem);
     }
 
     fn common_control_downlink_timeslots() -> [u8; NUM_TIMESLOTS] {
@@ -848,7 +918,10 @@ impl BsChannelScheduler {
     /// this timeslot. Used when building STCH blocks so the MAC-RESOURCE can carry
     /// random_access_flag=true per ETSI 21.4.3.1.
     pub fn take_pending_ra_ack(&mut self, ts: u8, addr: TetraAddress) -> bool {
-        let pending = &mut self.pending_ra_acks[ts as usize - 1];
+        let Some(slot) = Self::dl_slot_index(ts, "take_pending_ra_ack") else {
+            return false;
+        };
+        let pending = &mut self.pending_ra_acks[slot];
         if let Some(pos) = pending
             .iter()
             .position(|pending_addr| pending_addr.ssi == addr.ssi && pending_addr.ssi_type == addr.ssi_type)
@@ -872,7 +945,10 @@ impl BsChannelScheduler {
     /// enter the assigned-channel U-plane; keep the acknowledgement pending for
     /// that PDU as well.
     pub fn take_pending_ra_ack_for_stch(&mut self, ts: u8, addr: TetraAddress, carries_channel_allocation: bool) -> bool {
-        let has_pending = self.pending_ra_acks[ts as usize - 1]
+        let Some(slot) = Self::dl_slot_index(ts, "take_pending_ra_ack_for_stch") else {
+            return false;
+        };
+        let has_pending = self.pending_ra_acks[slot]
             .iter()
             .any(|pending_addr| pending_addr.ssi == addr.ssi && pending_addr.ssi_type == addr.ssi_type);
         if !has_pending {
@@ -894,11 +970,19 @@ impl BsChannelScheduler {
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
     /// The block must be 124 type1 bits containing MAC-U-SIGNAL header + TM-SDU.
     pub fn dl_enqueue_stealing(&mut self, ts: u8, block: BitBuffer, addr: TetraAddress, tx_reporter: Option<TxReporter>) {
+        let Some(slot) = Self::dl_slot_index(ts, "dl_enqueue_stealing") else {
+            Self::mark_reporter_discarded_if_pending(tx_reporter);
+            return;
+        };
         tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits)", ts, block.get_len());
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(block, addr, tx_reporter, None));
+        self.dltx_queues[slot].push(DlSchedElem::Stealing(block, addr, tx_reporter, None));
     }
 
     fn dl_requeue_group_stealing(&mut self, ts: u8, block: BitBuffer, addr: TetraAddress, group_state: GroupStealingState) {
+        let Some(slot) = Self::dl_slot_index(ts, "dl_requeue_group_stealing") else {
+            Self::mark_reporter_discarded_if_pending(group_state.tx_reporter);
+            return;
+        };
         tracing::debug!(
             "dl_requeue_group_stealing: GSSI {} covered {}/{} on ts {}",
             addr.ssi,
@@ -906,7 +990,7 @@ impl BsChannelScheduler {
             group_state.targets.len(),
             ts
         );
-        self.dltx_queues[ts as usize - 1].push(DlSchedElem::Stealing(
+        self.dltx_queues[slot].push(DlSchedElem::Stealing(
             block,
             addr,
             group_state.tx_reporter.clone(),
@@ -970,48 +1054,38 @@ impl BsChannelScheduler {
         targets
     }
 
-    fn any_group_target_listens(
+    fn retain_current_group_delivery_targets(
+        state: &mut GroupDeliveryState,
         addr: TetraAddress,
-        ts: TdmaTime,
-        energy_saving: &HashMap<u32, EnergySavingAssignment>,
         subscribers: &SubscriberRegistry,
-    ) -> bool {
-        let mut has_targets = false;
-        if addr.ssi == PREDEFINED_BROADCAST_GSSI {
-            for issi in subscribers.all_registered_issis() {
-                has_targets = true;
-                if Self::ms_listens_at(energy_saving, issi, ts) {
-                    return true;
-                }
-            }
-        } else {
-            for issi in subscribers.group_member_issis(addr.ssi) {
-                has_targets = true;
-                if Self::ms_listens_at(energy_saving, issi, ts) {
-                    return true;
-                }
-            }
-        }
-        !has_targets
-    }
-
-    fn retain_current_group_delivery_targets(state: &mut GroupDeliveryState, addr: TetraAddress, subscribers: &SubscriberRegistry) {
+        readiness_cache: &mut GroupReadinessCache,
+    ) {
         // EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require delivery to match
         // current EG listening opportunities. If MM removes a registration or
         // group affiliation while a repeated GSSI transfer is pending, stale
         // snapshot targets are no longer valid local addresses.
-        let current_targets = Self::group_targets(addr, subscribers);
-        state.retain_targets(&current_targets);
+        let current_targets = readiness_cache.targets_for(addr, subscribers);
+        state.retain_targets(current_targets);
     }
 
-    fn retain_current_group_stealing_targets(state: &mut GroupStealingState, addr: TetraAddress, subscribers: &SubscriberRegistry) {
+    fn retain_current_group_stealing_targets(
+        state: &mut GroupStealingState,
+        addr: TetraAddress,
+        subscribers: &SubscriberRegistry,
+        readiness_cache: &mut GroupReadinessCache,
+    ) {
         // Same current-address pruning as MAC-RESOURCE delivery, applied to
         // FACCH/STCH repeats whose block is already encoded.
-        let current_targets = Self::group_targets(addr, subscribers);
-        state.retain_targets(&current_targets);
+        let current_targets = readiness_cache.targets_for(addr, subscribers);
+        state.retain_targets(current_targets);
     }
 
-    fn prune_completed_stale_group_states_for_slot(&mut self, slot: usize, subscribers: &SubscriberRegistry) {
+    fn prune_completed_stale_group_states_for_slot(
+        &mut self,
+        slot: usize,
+        subscribers: &SubscriberRegistry,
+        readiness_cache: &mut GroupReadinessCache,
+    ) {
         let Some(queue) = self.dltx_queues.get_mut(slot) else {
             return;
         };
@@ -1019,15 +1093,15 @@ impl BsChannelScheduler {
         queue.retain_mut(|elem| {
             let completed_reporter = match elem {
                 DlSchedElem::Resource(pdu, _, _, Some(state)) => pdu.addr.and_then(|addr| {
-                    Self::retain_current_group_delivery_targets(state, addr, subscribers);
+                    Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache);
                     state.is_complete().then(|| state.tx_reporter.clone()).flatten()
                 }),
                 DlSchedElem::FragBuf(fragger, Some(state)) => fragger.addr().and_then(|addr| {
-                    Self::retain_current_group_delivery_targets(state, addr, subscribers);
+                    Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache);
                     state.is_complete().then(|| state.tx_reporter.clone()).flatten()
                 }),
                 DlSchedElem::Stealing(_, addr, _, Some(state)) => {
-                    Self::retain_current_group_stealing_targets(state, *addr, subscribers);
+                    Self::retain_current_group_stealing_targets(state, *addr, subscribers, readiness_cache);
                     state.is_complete().then(|| state.tx_reporter.clone()).flatten()
                 }
                 _ => None,
@@ -1052,12 +1126,13 @@ impl BsChannelScheduler {
         sdu: &BitBuffer,
         tx_reporter: Option<TxReporter>,
         subscribers: &SubscriberRegistry,
+        readiness_cache: &mut GroupReadinessCache,
     ) -> Option<GroupDeliveryState> {
         if addr.ssi_type != SsiType::Gssi {
             return None;
         }
 
-        let targets = Self::group_targets(addr, subscribers);
+        let targets = readiness_cache.targets_for(addr, subscribers);
         if targets.is_empty() {
             return None;
         }
@@ -1065,7 +1140,7 @@ impl BsChannelScheduler {
         Some(GroupDeliveryState::new(
             pdu.clone(),
             sdu.clone(),
-            targets,
+            targets.to_vec(),
             tx_reporter,
             addr.ssi != PREDEFINED_BROADCAST_GSSI,
         ))
@@ -1077,15 +1152,16 @@ impl BsChannelScheduler {
         ts: TdmaTime,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
         subscribers: &SubscriberRegistry,
+        readiness_cache: &mut GroupReadinessCache,
     ) -> bool {
         if let Some(state) = state {
             if !state.active_batch.is_empty() {
                 return state.active_batch_listens(ts, energy_saving);
             }
-            return !state.uncovered_listeners(ts, energy_saving).is_empty();
+            return state.has_uncovered_listener(ts, energy_saving);
         }
 
-        Self::any_group_target_listens(addr, ts, energy_saving, subscribers)
+        readiness_cache.any_target_listens(addr, ts, energy_saving, subscribers)
     }
 
     fn group_stealing_state_ready_for_tx(
@@ -1094,15 +1170,16 @@ impl BsChannelScheduler {
         ts: TdmaTime,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
         subscribers: &SubscriberRegistry,
+        readiness_cache: &mut GroupReadinessCache,
     ) -> bool {
         if let Some(state) = state {
             if !state.active_batch.is_empty() {
                 return state.active_batch_listens(ts, energy_saving);
             }
-            return !state.uncovered_listeners(ts, energy_saving).is_empty();
+            return state.has_uncovered_listener(ts, energy_saving);
         }
 
-        Self::any_group_target_listens(addr, ts, energy_saving, subscribers)
+        readiness_cache.any_target_listens(addr, ts, energy_saving, subscribers)
     }
 
     fn elem_is_ready_for_tx(
@@ -1110,6 +1187,7 @@ impl BsChannelScheduler {
         ts: TdmaTime,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
         subscribers: &SubscriberRegistry,
+        readiness_cache: &mut GroupReadinessCache,
     ) -> bool {
         let Some(addr) = Self::elem_addr(elem) else {
             return true;
@@ -1119,12 +1197,12 @@ impl BsChannelScheduler {
             SsiType::Issi => Self::ms_listens_at(energy_saving, addr.ssi, ts),
             SsiType::Gssi => match elem {
                 DlSchedElem::Resource(_, _, _, group_state) | DlSchedElem::FragBuf(_, group_state) => {
-                    Self::group_state_ready_for_tx(group_state.as_ref(), addr, ts, energy_saving, subscribers)
+                    Self::group_state_ready_for_tx(group_state.as_ref(), addr, ts, energy_saving, subscribers, readiness_cache)
                 }
                 DlSchedElem::Stealing(_, _, _, group_state) => {
-                    Self::group_stealing_state_ready_for_tx(group_state.as_ref(), addr, ts, energy_saving, subscribers)
+                    Self::group_stealing_state_ready_for_tx(group_state.as_ref(), addr, ts, energy_saving, subscribers, readiness_cache)
                 }
-                _ => Self::group_state_ready_for_tx(None, addr, ts, energy_saving, subscribers),
+                _ => Self::group_state_ready_for_tx(None, addr, ts, energy_saving, subscribers, readiness_cache),
             },
             _ => true,
         }
@@ -1454,7 +1532,8 @@ impl BsChannelScheduler {
 
     /// Returns a mutable reference to the first scheduled resource for the given timeslot and address.
     pub fn dl_get_scheduled_resource_for_addr(&mut self, ts: TdmaTime, addr: &TetraAddress) -> Option<&mut DlSchedElem> {
-        let queue = &mut self.dltx_queues[ts.t as usize - 1];
+        let slot = Self::dl_slot_index(ts.t, "dl_get_scheduled_resource_for_addr")?;
+        let queue = &mut self.dltx_queues[slot];
 
         for index in 0..queue.len() {
             let elem = &mut queue[index];
@@ -1498,15 +1577,19 @@ impl BsChannelScheduler {
         subscribers: &SubscriberRegistry,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) -> Vec<DlSchedElem> {
-        let queue = &mut self.dltx_queues[ts.t as usize - 1];
+        let Some(slot) = Self::dl_slot_index(ts.t, "dl_take_all_ready_grants_and_acks") else {
+            return Vec::new();
+        };
+        let queue = &mut self.dltx_queues[slot];
         let mut taken = Vec::new();
         let mut retained = Vec::with_capacity(queue.len());
+        let mut readiness_cache = GroupReadinessCache::default();
 
         for elem in std::mem::take(queue) {
             if matches!(
                 elem,
                 DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_)
-            ) && Self::elem_is_ready_for_tx(&elem, ts, energy_saving, subscribers)
+            ) && Self::elem_is_ready_for_tx(&elem, ts, energy_saving, subscribers, &mut readiness_cache)
             {
                 taken.push(elem);
             } else {
@@ -1523,7 +1606,10 @@ impl BsChannelScheduler {
     /// while keeping stealing blocks that may still need to be transmitted via FACCH.
     /// Discarded elements are reported as such via tx_reporter if available. Returns true if elements were discarded.
     pub fn dl_drop_all_except_stolen(&mut self, timeslot: u8) -> bool {
-        let queue = &mut self.dltx_queues[timeslot as usize - 1];
+        let Some(slot) = Self::dl_slot_index(timeslot, "dl_drop_all_except_stolen") else {
+            return false;
+        };
+        let queue = &mut self.dltx_queues[slot];
         let dropped_grant_addrs: Vec<TetraAddress> = queue
             .iter()
             .filter_map(|elem| match elem {
@@ -1574,7 +1660,7 @@ impl BsChannelScheduler {
                         } else {
                             // Save the SSI so the next STCH for this address can carry
                             // random_access_flag=true (ETSI 21.4.3.1)
-                            self.pending_ra_acks[timeslot as usize - 1].push(addr);
+                            self.pending_ra_acks[slot].push(addr);
                         }
                     }
 
@@ -1595,6 +1681,9 @@ impl BsChannelScheduler {
         subscribers: &SubscriberRegistry,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) {
+        let Some(slot) = Self::dl_slot_index(ts.t, "dl_integrate_sched_elems_for_timeslot") else {
+            return;
+        };
         if !Self::can_carry_scheduled_schf(ts) {
             // EN 300 392-2 clauses 9.5.2 and 9.5.3 reserve fixed frame-18
             // BSCH/BNCH positions. Keep pending MAC-RESOURCE grants queued
@@ -1604,7 +1693,6 @@ impl BsChannelScheduler {
 
         // Remove all grants and acks from queue and collect them into a vec
         let grants_and_acks = self.dl_take_all_ready_grants_and_acks(ts, subscribers, energy_saving);
-        let slot = ts.t as usize - 1;
         let mut resource_indexes: HashMap<TetraAddress, usize> = self.dltx_queues[slot]
             .iter()
             .enumerate()
@@ -1728,9 +1816,10 @@ impl BsChannelScheduler {
         energy_saving: &mut HashMap<u32, EnergySavingAssignment>,
     ) -> Option<BitBuffer> {
         let mut buf_opt = None;
+        let mut readiness_cache = GroupReadinessCache::default();
 
         while !self.dltx_queues[ts.t as usize - 1].is_empty() {
-            let opt = self.dl_take_prioritized_sched_item(ts, subscribers, energy_saving);
+            let opt = self.dl_take_prioritized_sched_item_with_cache(ts, subscribers, energy_saving, &mut readiness_cache);
 
             match opt {
                 Some(sched_elem) => {
@@ -1742,11 +1831,13 @@ impl BsChannelScheduler {
                         DlSchedElem::Resource(pdu, sdu, tx_reporter, group_state) => {
                             let addr = pdu.addr;
                             let mut group_state = group_state.or_else(|| {
-                                addr.and_then(|addr| Self::group_state_for_resource(addr, &pdu, &sdu, tx_reporter.clone(), subscribers))
+                                addr.and_then(|addr| {
+                                    Self::group_state_for_resource(addr, &pdu, &sdu, tx_reporter.clone(), subscribers, &mut readiness_cache)
+                                })
                             });
                             if let Some(state) = group_state.as_mut() {
                                 if let Some(addr) = addr {
-                                    Self::retain_current_group_delivery_targets(state, addr, subscribers);
+                                    Self::retain_current_group_delivery_targets(state, addr, subscribers, &mut readiness_cache);
                                 }
                                 state.begin_batch_if_needed(ts, energy_saving);
                             }
@@ -1786,7 +1877,7 @@ impl BsChannelScheduler {
                             let addr = fragger.addr();
                             if let Some(state) = group_state.as_mut() {
                                 if let Some(addr) = addr {
-                                    Self::retain_current_group_delivery_targets(state, addr, subscribers);
+                                    Self::retain_current_group_delivery_targets(state, addr, subscribers, &mut readiness_cache);
                                 }
                                 state.begin_batch_if_needed(ts, energy_saving);
                             }
@@ -1896,16 +1987,18 @@ impl BsChannelScheduler {
             }
         });
 
+        let mut readiness_cache = GroupReadinessCache::default();
+
         // Check for FACCH/stealing: take a queued Stealing item (highest priority signaling)
         let (stch_opt, stealing_addr_opt, tx_reporter_opt, group_state_opt) = {
             if ts.t >= 1 && (ts.t as usize) <= self.dltx_queues.len() {
-                self.prune_completed_stale_group_states_for_slot(ts.t as usize - 1, subscribers);
+                self.prune_completed_stale_group_states_for_slot(ts.t as usize - 1, subscribers, &mut readiness_cache);
             }
             let q = &mut self.dltx_queues[ts.t as usize - 1];
-            if let Some(i) = q
-                .iter()
-                .position(|e| matches!(e, DlSchedElem::Stealing(..)) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers))
-            {
+            if let Some(i) = q.iter().position(|e| {
+                matches!(e, DlSchedElem::Stealing(..))
+                    && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, &mut readiness_cache)
+            }) {
                 match q.remove(i) {
                     DlSchedElem::Stealing(buf, addr, tx_reporter, group_state) => (Some(buf), Some(addr), tx_reporter, group_state),
                     _ => unreachable!(),
@@ -1926,13 +2019,13 @@ impl BsChannelScheduler {
         {
             let mut group_state = group_state_opt.unwrap_or_else(|| {
                 GroupStealingState::new(
-                    Self::group_targets(addr, subscribers),
+                    readiness_cache.targets_for(addr, subscribers).to_vec(),
                     tx_reporter_opt.clone(),
                     addr.ssi != PREDEFINED_BROADCAST_GSSI,
                 )
             });
             if !group_state.targets.is_empty() {
-                Self::retain_current_group_stealing_targets(&mut group_state, addr, subscribers);
+                Self::retain_current_group_stealing_targets(&mut group_state, addr, subscribers, &mut readiness_cache);
             }
             if !group_state.targets.is_empty() {
                 group_state.begin_batch_if_needed(ts, energy_saving);
@@ -1972,6 +2065,17 @@ impl BsChannelScheduler {
         subscribers: &SubscriberRegistry,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) -> Option<DlSchedElem> {
+        let mut readiness_cache = GroupReadinessCache::default();
+        self.dl_take_prioritized_sched_item_with_cache(ts, subscribers, energy_saving, &mut readiness_cache)
+    }
+
+    fn dl_take_prioritized_sched_item_with_cache(
+        &mut self,
+        ts: TdmaTime,
+        subscribers: &SubscriberRegistry,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
+        readiness_cache: &mut GroupReadinessCache,
+    ) -> Option<DlSchedElem> {
         if !Self::can_carry_scheduled_schf(ts) {
             return None;
         }
@@ -1984,7 +2088,7 @@ impl BsChannelScheduler {
             return None;
         }
         let slot = ts.t as usize - 1;
-        self.prune_completed_stale_group_states_for_slot(slot, subscribers);
+        self.prune_completed_stale_group_states_for_slot(slot, subscribers, readiness_cache);
         let Some(q) = self.dltx_queues.get_mut(slot) else {
             return None;
         };
@@ -1992,7 +2096,7 @@ impl BsChannelScheduler {
         // Return grants first, but only when the addressed MS should be listening.
         if let Some(i) = q.iter().position(|e| {
             matches!(e, DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..))
-                && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers)
+                && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
         }) {
             return Some(q.remove(i));
         }
@@ -2001,36 +2105,32 @@ impl BsChannelScheduler {
         // them ahead of ready EG grant traffic so a private-call setup is not
         // held behind ordinary reservation churn once the addressed MS can
         // receive it (EN 300 392-2 clauses 14, 21.5.2 and 23.5.2.2.7).
-        if let Some(i) = q
-            .iter()
-            .position(|e| Self::elem_has_channel_allocation(e) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers))
-        {
+        if let Some(i) = q.iter().position(|e| {
+            Self::elem_has_channel_allocation(e) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
+        }) {
             return Some(q.remove(i));
         }
 
         // Grants and random-access ACKs are integrated into MAC-RESOURCE before
         // SCH/F building. Keep those resources ahead of fragmentation backlog so
         // EN 300 392-2 21.4.3.1 ACK/grant timing is not delayed by ordinary data.
-        if let Some(i) = q
-            .iter()
-            .position(|e| Self::elem_has_integrated_grant_or_ack(e) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers))
-        {
+        if let Some(i) = q.iter().position(|e| {
+            Self::elem_has_integrated_grant_or_ack(e) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
+        }) {
             return Some(q.remove(i));
         }
 
         // Return FragBufs next, but only when the addressed MS should be listening.
-        if let Some(i) = q
-            .iter()
-            .position(|e| matches!(e, DlSchedElem::FragBuf(_, _)) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers))
-        {
+        if let Some(i) = q.iter().position(|e| {
+            matches!(e, DlSchedElem::FragBuf(_, _)) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
+        }) {
             return Some(q.remove(i));
         }
 
         // Return Resources last, but only when the addressed MS should be listening.
-        if let Some(i) = q
-            .iter()
-            .position(|e| matches!(e, DlSchedElem::Resource(_, _, _, _)) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers))
-        {
+        if let Some(i) = q.iter().position(|e| {
+            matches!(e, DlSchedElem::Resource(_, _, _, _)) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
+        }) {
             return Some(q.remove(i));
         }
 
@@ -2845,6 +2945,80 @@ mod tests {
         assert!(sched.dltx_queues[1].is_empty());
         assert!(sched.dltx_queues[2].is_empty());
         assert!(sched.dltx_queues[3].is_empty());
+    }
+
+    #[test]
+    fn test_invalid_downlink_timeslot_enqueue_and_drop_apis_do_not_panic_or_mutate() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress::issi(1234);
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+
+        for invalid_ts in [0, 5] {
+            let steal_reporter = TxReporter::new_unacked();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                sched.dl_enqueue_grant(invalid_ts, addr, grant.clone(), None);
+                sched.dl_enqueue_reservation_grant(invalid_ts, addr, ReservationRequirement::Req1Slot);
+                sched.dl_enqueue_random_access_ack(invalid_ts, addr);
+                assert!(!sched.take_pending_ra_ack(invalid_ts, addr));
+                assert!(!sched.take_pending_ra_ack_for_stch(invalid_ts, addr, true));
+                sched.dl_enqueue_stealing(invalid_ts, BitBuffer::new(SCH_HD_CAP), addr, Some(steal_reporter.clone()));
+                assert!(!sched.dl_drop_all_except_stolen(invalid_ts));
+                assert!(
+                    sched
+                        .dl_take_all_ready_grants_and_acks(
+                            TdmaTime {
+                                t: invalid_ts,
+                                f: 1,
+                                m: 1,
+                                h: 0
+                            },
+                            &SubscriberRegistry::new(),
+                            &HashMap::new(),
+                        )
+                        .is_empty()
+                );
+                assert!(
+                    sched
+                        .dl_get_scheduled_resource_for_addr(
+                            TdmaTime {
+                                t: invalid_ts,
+                                f: 1,
+                                m: 1,
+                                h: 0
+                            },
+                            &addr
+                        )
+                        .is_none()
+                );
+                sched.dl_integrate_sched_elems_for_timeslot(
+                    TdmaTime {
+                        t: invalid_ts,
+                        f: 1,
+                        m: 1,
+                        h: 0,
+                    },
+                    &SubscriberRegistry::new(),
+                    &HashMap::new(),
+                );
+            }));
+
+            // Internal robustness guard: invalid local scheduling state must
+            // not crash the BS process or leave an impossible TMA request
+            // pending. This does not alter any valid over-air ETSI PDU.
+            assert!(result.is_ok(), "invalid downlink timeslot {invalid_ts} must not panic");
+            assert_eq!(steal_reporter.get_state(), TxState::Discarded);
+            assert!(
+                sched.dltx_queues.iter().all(Vec::is_empty),
+                "invalid downlink timeslot {invalid_ts} must not mutate DL queues"
+            );
+            assert!(
+                sched.pending_ra_acks.iter().all(Vec::is_empty),
+                "invalid downlink timeslot {invalid_ts} must not leave pending RA ACK state"
+            );
+        }
     }
 
     #[test]
@@ -4155,6 +4329,155 @@ mod tests {
                 .values()
                 .all(|assignment| assignment.awake_until == Some(TdmaTime { t: 1, f: 3, m: 2, h: 0 })),
             "EG7 receive batch should get T.210 only after its own downlink transmit"
+        );
+    }
+
+    #[test]
+    fn test_large_mixed_eg7_gssi_facch_stealing_repeats_by_receive_batch_not_member() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let gssi = 91;
+        let stayalive_count = 1024;
+        let eg7_count = 1024;
+        let reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            2,
+            BitBuffer::new(SCH_HD_CAP),
+            TetraAddress::new(gssi, SsiType::Gssi),
+            Some(reporter.clone()),
+        );
+
+        let mut subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        for offset in 0..stayalive_count {
+            let issi = 110_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+        }
+        for offset in 0..eg7_count {
+            let issi = 120_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+            energy_saving.insert(
+                issi,
+                EnergySavingAssignment {
+                    mode: 7,
+                    frame: Some(2),
+                    multiframe: Some(1),
+                    awake_until: None,
+                    suspension_count: 0,
+                },
+            );
+        }
+
+        let first = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(first.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        assert_eq!(reporter.get_state(), TxState::Pending);
+        assert_eq!(
+            sched.dltx_queues[1]
+                .iter()
+                .filter(|elem| matches!(elem, DlSchedElem::Stealing(_, _, _, Some(_))))
+                .count(),
+            1,
+            "GSSI FACCH repeat must remain one queued STCH block for the EG7 receive batch, not one per member"
+        );
+        assert!(
+            energy_saving.values().all(|assignment| assignment.awake_until.is_none()),
+            "sleeping EG7 members must not get T.210 from the StayAlive FACCH batch"
+        );
+
+        sched.tick_start(TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        sched.tick_start(TdmaTime { t: 3, f: 1, m: 1, h: 0 });
+        sched.tick_start(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+        sched.tick_start(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        let second = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(second.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+
+        // EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require assigned-channel
+        // signalling to respect EG receive windows. The scalable behaviour is
+        // one GSSI-addressed FACCH repeat per receive batch, not per affiliate.
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
+        assert!(
+            sched.dltx_queues[1].is_empty(),
+            "GSSI FACCH delivery should leave the queue after all large receive batches are covered"
+        );
+        assert!(
+            energy_saving
+                .values()
+                .all(|assignment| assignment.awake_until == Some(TdmaTime { t: 2, f: 2, m: 2, h: 0 })),
+            "EG7 FACCH receive batch should get T.210 only after its own downlink transmit"
+        );
+    }
+
+    #[test]
+    fn test_large_gssi_readiness_cache_is_slot_scoped_across_queued_resources() {
+        let mut sched = get_testing_slotter();
+        let ts_sleeping = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        let ts_awake = TdmaTime { t: 1, f: 3, m: 1, h: 0 };
+        let gssi = 91;
+        let group_addr = TetraAddress::new(gssi, SsiType::Gssi);
+        let member_count = 4096;
+        let resource_count = 64;
+
+        for _ in 0..resource_count {
+            let (pdu, sdu) = test_resource_for_gssi(gssi, 8);
+            sched.dl_enqueue_tma(pdu, sdu, None);
+        }
+
+        let mut subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        for offset in 0..member_count {
+            let issi = 130_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+            energy_saving.insert(
+                issi,
+                EnergySavingAssignment {
+                    mode: 7,
+                    frame: Some(ts_awake.f),
+                    multiframe: Some(ts_awake.m),
+                    awake_until: None,
+                    suspension_count: 0,
+                },
+            );
+        }
+
+        let mut sleeping_cache = GroupReadinessCache::default();
+        assert!(
+            sched
+                .dl_take_prioritized_sched_item_with_cache(ts_sleeping, &subscribers, &energy_saving, &mut sleeping_cache)
+                .is_none(),
+            "no EG7 affiliate listens on the sleeping frame"
+        );
+        assert_eq!(
+            sleeping_cache.targets_by_addr.get(&group_addr).map(Vec::len),
+            Some(member_count as usize),
+            "large GSSI target list should be built once for the scheduling opportunity"
+        );
+        assert_eq!(
+            sleeping_cache.any_listens_by_addr.get(&group_addr),
+            Some(&false),
+            "the sleeping-frame GSSI readiness result should be cached across all queued resources"
+        );
+        assert_eq!(sched.dltx_queues[0].len(), resource_count as usize);
+
+        let mut awake_cache = GroupReadinessCache::default();
+        assert!(
+            sched
+                .dl_take_prioritized_sched_item_with_cache(ts_awake, &subscribers, &energy_saving, &mut awake_cache)
+                .is_some(),
+            "the same queued GSSI resources should become ready on the EG7 receive frame"
+        );
+        assert_eq!(
+            awake_cache.targets_by_addr.get(&group_addr).map(Vec::len),
+            Some(member_count as usize)
+        );
+        assert_eq!(
+            awake_cache.any_listens_by_addr.get(&group_addr),
+            Some(&true),
+            "the awake-frame readiness result should be cached for the current slot"
         );
     }
 

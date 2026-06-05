@@ -4883,3 +4883,57 @@ Next non-repeating execution:
    - GSSI `D-TX GRANTED/GrantedToOtherUser` carrying transmitting party `2260082`;
    - `NormalTrainSeq*` and `UMAC voice route` before inactivity timeout.
 3. If static persists with those logs present, next investigation should be PHY/RSSI/vocoder path for 2260082, not CMCE floor denial.
+
+## 2026-06-05 16:42:53 EEST - UMAC large-GSSI scheduler hardening
+
+User goal:
+
+- Make group operation robust for thousands of affiliated terminals, not only two or three radios.
+- Continue clause-scoped ETSI EN 300 392-2 hardening without claiming formal certification.
+
+Component in simple technical terms:
+
+- UMAC scheduler is the layer that decides which downlink MAC PDU is sent on each radio slot.
+- CMCE decides who may talk; UMAC makes the floor-control/status/SDS/grant messages actually fit onto MCCH/SCH-F or assigned-channel FACCH/STCH.
+- For a large GSSI, the scheduler must keep one group-addressed message and repeat it only by real Energy Economy receive batches, not create one message per affiliated ISSI.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 21.4.3.1 and 23.5.2.2.2: random-access ACK and slot-grant scheduling remain addressed to the exact requesting MS.
+- EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6/T.210: downlink signalling to EG terminals is sent when the target MS or group batch is listening; T.210 is marked only for the batch that actually received the downlink.
+- EN 300 392-2 clause 14.5.2.2.1: group floor listener notification remains one GSSI-addressed FACCH/STCH transfer for the group, not per-member signalling.
+- Invalid local timeslot guard is internal robustness only; it does not alter valid over-air PDU semantics.
+- This is engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added slot-scoped `GroupReadinessCache` so repeated readiness checks for the same GSSI in one scheduling opportunity reuse the current target list and awake/asleep result.
+  - Avoided allocating a temporary uncovered-listener `Vec` just to answer "is any member listening?" for existing GSSI delivery/stealing state.
+  - Reused the same FACCH/STCH readiness cache when building the selected group stealing state.
+  - Added defensive downlink timeslot validation on enqueue/drop/ACK helper APIs so invalid `ts=0` or `ts=5` logs and returns instead of panicking.
+  - Invalid reported STCH enqueue now marks its `TxReporter` discarded rather than leaving a permanent pending request.
+
+Tests added:
+
+- `test_large_mixed_eg7_gssi_facch_stealing_repeats_by_receive_batch_not_member`
+- `test_large_gssi_readiness_cache_is_slot_scoped_across_queued_resources`
+- `test_invalid_downlink_timeslot_enqueue_and_drop_apis_do_not_panic_or_mutate`
+
+Verification:
+
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 56 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 56 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_floor --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 134 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC large-GSSI scheduler hardening patch.
+2. Continue with QA findings that remain open:
+   - MM restart-recovery cache I/O amplification for thousands of ISSIs.
+   - UMAC/TMA pending report bounds when downlink completion stalls.
+   - DL media queue backpressure under sustained group-call overfeed.
+3. Keep private simplex/duplex and group floor tests in the regression set before any deploy.
