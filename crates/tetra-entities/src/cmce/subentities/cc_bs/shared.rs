@@ -605,6 +605,32 @@ impl CcBsSubentity {
                     }
                 }
             }
+            BrewSubscriberAction::ReleaseIndividualCalls => {
+                let calls_to_release: Vec<u16> = self
+                    .individual_calls
+                    .iter()
+                    .filter(|(_, call)| call.calling_addr.ssi == issi || call.called_addr.ssi == issi)
+                    .map(|(&id, _)| id)
+                    .collect();
+                for call_id in calls_to_release {
+                    tracing::info!(
+                        "CMCE: releasing individual call_id={} for ISSI {} soft re-attach while preserving group affiliation",
+                        call_id,
+                        issi
+                    );
+                    self.release_individual_call(queue, call_id, DisconnectCause::UserRequestedDisconnection);
+                }
+
+                if self.subscriber_groups.contains_key(&issi) {
+                    tracing::info!(
+                        "CMCE: individual-call cleanup issi={} preserved groups={:?}",
+                        issi,
+                        self.subscriber_groups_for(issi)
+                    );
+                } else {
+                    tracing::debug!("CMCE: individual-call cleanup issi={} with no subscriber-group state", issi);
+                }
+            }
         }
     }
 

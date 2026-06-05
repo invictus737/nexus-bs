@@ -3910,3 +3910,53 @@ Next non-repeating execution:
    - no `CMCE: subscriber deaffiliate issi=... groups=[226333]` followed immediately by re-affiliate for retained `226333`;
    - no steady dashboard/WebSocket snapshot with `groups:[]` for the three lab ISSIs;
    - no `PTT denied`, `No Group`, `Unit Not Attached`, or `T353 expired` in the restart interval.
+
+## 2026-06-05 12:54:07 EEST - Split soft re-attach private-call cleanup from group affiliation
+
+Live trigger:
+
+- Deployed `4317457e` and read the full fresh log from Pi start.
+- The three lab terminals ended correctly affiliated to `226333` in the WebSocket snapshot.
+- Remaining risk found in the fresh log: a soft `RoamingLocationUpdating` from `2260082` emitted an internal CMCE `Deregister -> Register -> Affiliate` sequence in the same millisecond. That can create a tiny dashboard/CMCE `No Group` window even though the final group state is correct.
+
+Component scope:
+
+- MM: registration and group affiliation owner. On soft re-attach, it may need to clear stale private-call state but must not withdraw accepted groups.
+- CMCE: call/PTT controller. It now has a separate internal action to release stale individual calls without touching `subscriber_groups` or GSSI listener counts.
+- Brew/backhaul: ignores this internal cleanup action; it is not a subscriber deregistration or group-affiliation procedure.
+
+Patch:
+
+- Added internal `ReleaseIndividualCalls` subscriber action.
+- MM soft re-attach now emits `ReleaseIndividualCalls` to CMCE instead of simulating `Deregister -> Register -> Affiliate`.
+- CMCE handles `ReleaseIndividualCalls` by releasing active individual calls involving the ISSI, while preserving group memberships and listener counts.
+- Brew ignores the internal action defensively.
+- Updated the MM soft re-attach test so the expected behavior is one private-call cleanup action and no group churn.
+- Added a CMCE test proving a group-affiliated MS still receives a queued return PTT grant after private-call cleanup.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.9.3.4 and 16.10.35a: the soft location update is accepted as the same location-registration update type.
+- Clauses 16.8.0/16.8.4: accepted group identities remain valid attached group identities until an explicit detach/replacement procedure changes them.
+- The private-call cleanup is a local robustness guard for stale CMCE individual-call state; it is not an over-air ETSI group detach operation and must not be represented as one.
+- This is clause-scoped engineering validation only, not formal certification.
+
+Verification:
+
+- `cargo fmt -p tetra-saps -p tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs soft_roaming_reattach --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs private_call_cleanup_preserves_group_floor_membership --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 127 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 131 passed.
+- `cargo check -p tetra-saps -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this soft re-attach/no-group-churn patch.
+2. Deploy directly to testing with local build only.
+3. After restart, read the fresh full Pi log and confirm:
+   - build id matches the new commit;
+   - `2260082`, `2260616`, `2260618` end with `groups=[226333]`;
+   - soft re-attach logs `ReleaseIndividualCalls`/private cleanup and no CMCE `Deregister -> Register -> Affiliate` group churn for retained `226333`;
+   - no `No Group`, `Unit Not Attached`, `PTT denied`, `RequestedServiceNotAvailable`, or `T353 expired` during restart recovery.

@@ -3387,7 +3387,7 @@ fn test_hard_roaming_reregistration_resets_shared_groups_and_energy_saving() {
 }
 
 #[test]
-fn test_soft_roaming_reattach_resets_cmce_without_brew_affiliate_replay() {
+fn test_soft_roaming_reattach_releases_private_calls_without_group_churn() {
     debug::setup_logging_verbose();
     let issi = 2040814;
     let gssi = 3000;
@@ -3417,10 +3417,11 @@ fn test_soft_roaming_reattach_resets_cmce_without_brew_affiliate_replay() {
     test.run_stack(Some(1));
     let sink_msgs = test.dump_sinks();
 
-    // EN 300 392-2 clauses 16.9.3.4 and 16.10.35a keep this as a location
-    // registration update accepted as RoamingLocationUpdating. The local CMCE
-    // reset is a bounded call-state cleanup, not a new group-affiliation
-    // procedure toward Brew.
+    // EN 300 392-2 clauses 16.9.3.4 and 16.10.35a keep this as a
+    // location-registration update accepted as RoamingLocationUpdating. The
+    // local CMCE cleanup is private-call state repair only; accepted group
+    // affiliations from clauses 16.8.0/16.8.4 must not be withdrawn and
+    // replayed as a transient "No Group" window.
     let accept = extract_location_update_accept(&sink_msgs);
     assert_eq!(
         accept.location_update_accept_type,
@@ -3435,13 +3436,11 @@ fn test_soft_roaming_reattach_resets_cmce_without_brew_affiliate_replay() {
             _ => None,
         })
         .collect();
-    assert_eq!(cmce_updates.len(), 3);
-    assert_eq!(cmce_updates[0].action, BrewSubscriberAction::Deregister);
+    assert_eq!(cmce_updates.len(), 1);
+    assert_eq!(cmce_updates[0].action, BrewSubscriberAction::ReleaseIndividualCalls);
     assert_eq!(cmce_updates[0].groups, Vec::<u32>::new());
-    assert_eq!(cmce_updates[1].action, BrewSubscriberAction::Register);
-    assert_eq!(cmce_updates[1].groups, Vec::<u32>::new());
-    assert_eq!(cmce_updates[2].action, BrewSubscriberAction::Affiliate);
-    assert_eq!(cmce_updates[2].groups, vec![gssi]);
+
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 
     assert!(
         sink_msgs

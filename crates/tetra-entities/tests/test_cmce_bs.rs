@@ -252,6 +252,19 @@ fn build_mm_deregister_msg(issi: u32) -> SapMsg {
     }
 }
 
+fn build_mm_release_individual_calls_msg(issi: u32) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Mm,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+            issi,
+            groups: vec![],
+            action: BrewSubscriberAction::ReleaseIndividualCalls,
+        }),
+    }
+}
+
 fn build_mm_deaffiliate_msg(issi: u32, gssi: u32) -> SapMsg {
     SapMsg {
         sap: Sap::Control,
@@ -4145,6 +4158,52 @@ fn test_group_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_g
             )
         }));
     }
+}
+
+#[test]
+fn test_private_call_cleanup_preserves_group_floor_membership() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
+
+    test.submit_message(build_mm_release_individual_calls_msg(TEST_CALLED_ISSI));
+    test.run_stack(Some(1));
+    let cleanup_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&cleanup_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&cleanup_msgs), 0);
+
+    // EN 300 392-2 clauses 16.8.0/16.8.4 keep accepted group identities
+    // valid until an explicit group detach/replacement. A local private-call
+    // cleanup must therefore not remove the MS from CMCE's GSSI listener set.
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let queued_grant = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI))
+        .expect("group-affiliated MS should still receive a queued return PTT grant after private cleanup");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "private cleanup preserved group listener",
+    );
 }
 
 #[test]

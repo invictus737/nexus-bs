@@ -553,6 +553,12 @@ impl BrewEntity {
                     );
                 }
             }
+            BrewSubscriberAction::ReleaseIndividualCalls => {
+                tracing::debug!(
+                    "BrewEntity: ignoring internal individual-call cleanup for issi={} (MM/CMCE local state only)",
+                    issi
+                );
+            }
         }
     }
 

@@ -4,6 +4,9 @@ pub enum BrewSubscriberAction {
     Deregister,
     Affiliate,
     Deaffiliate,
+    /// Internal MM -> CMCE request: clear stale individual-call state for an
+    /// ISSI while preserving registration and group affiliations.
+    ReleaseIndividualCalls,
 }
 
 #[derive(Debug, Clone)]

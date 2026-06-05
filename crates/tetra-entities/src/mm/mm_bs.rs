@@ -1511,61 +1511,26 @@ impl MmBs {
     }
 
     /// Force CMCE to release any individual P2P calls involving the given ISSI,
-    /// without touching Brew affiliations. Used on soft re-attach (e.g. MTP3550
-    /// 2s RF dropout) to prevent "PTT denied" caused by stale call state in CMCE.
-    ///
-    /// Implementation: sends Deregister to CMCE only (not Brew), then re-sends
-    /// Register + Affiliate so subscriber_groups and group_listener counts are
-    /// restored. Brew is not informed because the MS is still considered registered.
-    fn emit_individual_call_release_for_issi(&mut self, queue: &mut MessageQueue, issi: u32) {
-        let groups: Vec<u32> = self
-            .client_mgr
-            .get_client_by_issi(issi)
-            .map(|c| c.groups.iter().copied().collect())
-            .unwrap_or_default();
-
-        // CMCE Deregister: releases individual_calls + drops group_listener counts
-        let dereg = MmSubscriberUpdate {
+    /// without touching MM/Brew registration or accepted GSSI affiliations.
+    /// Used on soft re-attach to prevent stale call state from causing PTT
+    /// denial on the next private call.
+    fn emit_individual_call_release_for_issi(&self, queue: &mut MessageQueue, issi: u32) {
+        let release = MmSubscriberUpdate {
             issi,
             groups: Vec::new(),
-            action: BrewSubscriberAction::Deregister,
+            action: BrewSubscriberAction::ReleaseIndividualCalls,
         };
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Mm,
             dest: TetraEntity::Cmce,
-            msg: SapMsgInner::MmSubscriberUpdate(dereg),
+            msg: SapMsgInner::MmSubscriberUpdate(release),
         });
 
-        // CMCE Register: re-introduces the ISSI as known
-        let reg = MmSubscriberUpdate {
-            issi,
-            groups: Vec::new(),
-            action: BrewSubscriberAction::Register,
-        };
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Mm,
-            dest: TetraEntity::Cmce,
-            msg: SapMsgInner::MmSubscriberUpdate(reg),
-        });
-
-        // CMCE Affiliate: restores group_listener counts so group calls still route
-        if !groups.is_empty() {
-            let aff = MmSubscriberUpdate {
-                issi,
-                groups,
-                action: BrewSubscriberAction::Affiliate,
-            };
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Mm,
-                dest: TetraEntity::Cmce,
-                msg: SapMsgInner::MmSubscriberUpdate(aff),
-            });
-        }
-
-        tracing::info!("MM: forced individual call release for ISSI {} (soft re-attach)", issi);
+        tracing::info!(
+            "MM: requested CMCE individual-call cleanup for ISSI {} while preserving group affiliation (soft re-attach)",
+            issi
+        );
     }
 
     fn emit_subscriber_update(&self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
@@ -1583,6 +1548,7 @@ impl MmBs {
             let should_send = match action {
                 BrewSubscriberAction::Register | BrewSubscriberAction::Deregister => net_brew::is_brew_issi_routable(&self.config, issi),
                 BrewSubscriberAction::Affiliate | BrewSubscriberAction::Deaffiliate => !brew_groups.is_empty(),
+                BrewSubscriberAction::ReleaseIndividualCalls => false,
             };
             if should_send {
                 let brew_update = MmSubscriberUpdate {
