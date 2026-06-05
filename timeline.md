@@ -6772,3 +6772,50 @@ Next non-repeating execution:
 1. Extend restart/EG7 large-group recovery to dashboard/telemetry observable state.
 2. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
 3. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+
+## 2026-06-05 21:21 EEST - Dashboard/MM restart observability for cached GSSI + EG7
+
+Component in simple technical terms:
+
+- MM is mobility management: registration, attach, group affiliation, restart recovery, and Energy Economy negotiation.
+- Dashboard/telemetry is operator visibility. It is not the TETRA air interface, but it must faithfully show the MM state so a recovered terminal does not appear as "No Group" or missing EG mode.
+
+Problem covered:
+
+- `MsGroupAttach` and `MsGroupsSnapshot` already created a dashboard MS entry if group telemetry arrived before registration.
+- `MsEnergySaving` only updated an existing entry. During restart recovery at scale, an EG7 response can race registration/group events, so the dashboard could drop the EG state even though MM negotiated it correctly.
+- The patch makes `MsEnergySaving` create the dashboard entry and update `last_seen`, matching the order-tolerant behaviour of group telemetry.
+- A new MM integration test seeds restart recovery with cached `ISSI -> GSSI`, lets the MS return without a group list, accepts the SwMI group refresh ACK, then activates EG7 and feeds all telemetry through the dashboard.
+- The resulting dashboard state must show both the recovered GSSI and the EG7 receive opportunity.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: restart/registration recovery context.
+- EN 300 392-2 clauses 16.8.0, 16.9.3.4, 16.10.23, and 16.10.35a: group identity state, group attach/detach signalling, and location update accept semantics.
+- EN 300 392-2 clauses 16.7.1, 16.10.9, 16.10.10, 23.7.6, and timer T.210: Energy Economy negotiation and receive opportunity state.
+- Dashboard state is operational evidence over the clause-scoped MM/EG behaviour, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - `TelemetryEvent::MsEnergySaving` now uses `entry(...).or_insert_with(empty_ms_entry)` and updates `last_seen`.
+  - Added `dashboard_preserves_energy_saving_if_energy_event_precedes_registration`.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `dashboard_ms_after` helper for complete dashboard MS state assertions.
+  - Added `test_restart_recovery_eg7_cached_group_is_visible_in_dashboard_after_refresh`.
+  - Added a telemetry MM helper that sets the subscriber recovery cache path before constructing `MmBs`, so restart cache loading is exercised correctly.
+
+Verification:
+
+- `cargo test -p tetra-entities dashboard_preserves_energy_saving_if_energy_event_precedes_registration --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_eg7_cached_group_is_visible_in_dashboard_after_refresh --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 30 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/src/net_dashboard/server.rs crates/tetra-entities/tests/test_mm_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+2. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+3. Continue CMCE/UMAC audit for any fixed-size or O(n)-while-locked behaviour that can break GSSI calls with thousands of terminals.

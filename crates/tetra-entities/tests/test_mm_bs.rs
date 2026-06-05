@@ -9,6 +9,7 @@ use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_entities::mm::mm_bs::MmBs;
 use tetra_entities::net_dashboard::server::DashboardServer;
+use tetra_entities::net_dashboard::state::MsState;
 use tetra_entities::net_telemetry::{
     TelemetryEvent,
     channel::{TelemetrySource, telemetry_channel},
@@ -5261,6 +5262,81 @@ fn test_restart_recovery_unsolicited_itsi_attach_eg7_refreshes_cached_group_befo
 }
 
 #[test]
+fn test_restart_recovery_eg7_cached_group_is_visible_in_dashboard_after_refresh() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("eg7-dashboard-cached-group");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let (mut test, telemetry) = mm_test_with_telemetry_and_recovery_path(config, path.clone());
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::ItsiAttach, None);
+    test.run_stack(Some(1));
+    let attach_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&attach_msgs, gssi, 4, "EG7 cached restart dashboard restore");
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "EG7 must remain pending until the MS explicitly responds"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg7,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let events = drain_telemetry(&telemetry);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::MsGroupsSnapshot {
+                issi: event_issi,
+                gssis
+            } if *event_issi == issi && gssis == &vec![gssi]
+        )),
+        "restart refresh must publish a dashboard group snapshot, got {events:?}"
+    );
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::MsEnergySaving {
+                issi: event_issi,
+                mode: 7,
+                frame: Some(_),
+                multiframe: Some(_),
+            } if *event_issi == issi
+        )),
+        "EG7 response must publish dashboard energy-saving telemetry, got {events:?}"
+    );
+
+    let ms = dashboard_ms_after(&events, issi).expect("radio should be visible in dashboard");
+    assert_eq!(ms.groups, vec![gssi]);
+    assert_eq!(ms.energy_saving_mode, EnergySavingMode::Eg7 as u8);
+    assert!(
+        ms.energy_saving_frame.is_some() && ms.energy_saving_multiframe.is_some(),
+        "EG7 dashboard state must include the assigned receive opportunity, got {ms:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members() {
     debug::setup_logging_verbose();
     let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT;
@@ -7248,24 +7324,29 @@ fn mm_test_with_telemetry(config: StackConfig) -> (ComponentTest, TelemetrySourc
     (test, source)
 }
 
+fn mm_test_with_telemetry_and_recovery_path(config: StackConfig, path: String) -> (ComponentTest, TelemetrySource) {
+    let (sink, source) = telemetry_channel();
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path);
+    test.register_entity(MmBs::new(test.config.clone(), Some(sink), None));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+    (test, source)
+}
+
 fn drain_telemetry(source: &TelemetrySource) -> Vec<TelemetryEvent> {
     std::iter::from_fn(|| source.try_recv()).collect()
 }
 
-fn dashboard_groups_after(events: &[TelemetryEvent], issi: u32) -> Vec<u32> {
+fn dashboard_ms_after(events: &[TelemetryEvent], issi: u32) -> Option<MsState> {
     let dashboard = DashboardServer::new("test.toml".to_string());
     for event in events {
         dashboard.handle_telemetry(event.clone());
     }
-    dashboard
-        .state
-        .read()
-        .unwrap()
-        .snapshot_ms()
-        .into_iter()
-        .find(|ms| ms.issi == issi)
-        .map(|ms| ms.groups)
-        .unwrap_or_default()
+    dashboard.state.read().unwrap().snapshot_ms().into_iter().find(|ms| ms.issi == issi)
+}
+
+fn dashboard_groups_after(events: &[TelemetryEvent], issi: u32) -> Vec<u32> {
+    dashboard_ms_after(events, issi).map(|ms| ms.groups).unwrap_or_default()
 }
 
 fn submit_location_update(test: &mut ComponentTest, issi: u32, energy_saving_mode: Option<EnergySavingMode>) {

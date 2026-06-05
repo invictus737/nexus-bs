@@ -710,11 +710,11 @@ impl DashboardServer {
                     frame,
                     multiframe,
                 } => {
-                    if let Some(e) = s.ms_map.get_mut(issi) {
-                        e.energy_saving_mode = *mode;
-                        e.energy_saving_frame = *frame;
-                        e.energy_saving_multiframe = *multiframe;
-                    }
+                    let e = s.ms_map.entry(*issi).or_insert_with(|| empty_ms_entry(*issi));
+                    e.energy_saving_mode = *mode;
+                    e.energy_saving_frame = *frame;
+                    e.energy_saving_multiframe = *multiframe;
+                    e.last_seen = Instant::now();
                 }
                 TelemetryEvent::GroupCallStarted {
                     call_id,
@@ -3146,6 +3146,26 @@ mod tests {
         let snapshot = dashboard.state.read().unwrap().snapshot_ms();
         let ms = snapshot.iter().find(|ms| ms.issi == issi).expect("radio should be visible");
         assert_eq!(ms.groups, vec![gssi]);
+    }
+
+    #[test]
+    fn dashboard_preserves_energy_saving_if_energy_event_precedes_registration() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        let issi = 2260618;
+
+        dashboard.handle_telemetry(TelemetryEvent::MsEnergySaving {
+            issi,
+            mode: 7,
+            frame: Some(11),
+            multiframe: Some(42),
+        });
+        dashboard.handle_telemetry(TelemetryEvent::MsRegistration { issi });
+
+        let snapshot = dashboard.state.read().unwrap().snapshot_ms();
+        let ms = snapshot.iter().find(|ms| ms.issi == issi).expect("radio should be visible");
+        assert_eq!(ms.energy_saving_mode, 7);
+        assert_eq!(ms.energy_saving_frame, Some(11));
+        assert_eq!(ms.energy_saving_multiframe, Some(42));
     }
 
     #[test]
