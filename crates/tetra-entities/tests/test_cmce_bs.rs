@@ -64,6 +64,7 @@ const LAB_GROUP_GSSI: u32 = 226333;
 const LAB_ISSI_A: u32 = 2260616;
 const LAB_ISSI_B: u32 = 2260082;
 const LAB_ISSI_MXP600: u32 = 2260618;
+const LARGE_GSSI_MEMBER_COUNT: u32 = 4096;
 const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
 const PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
@@ -1574,7 +1575,7 @@ fn test_large_group_setup_uses_one_gssi_d_setup_and_one_umac_open() {
         vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
     );
 
-    let member_count = 2048_u32;
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
     let first_issi = 420_000_u32;
     let speaker_issi = first_issi;
     for offset in 0..member_count {
@@ -4659,7 +4660,7 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
         vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
     );
 
-    let member_count = 2048_u32;
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
     let first_issi = 500_000_u32;
     for offset in 0..member_count {
         let issi = first_issi + offset;
@@ -4783,7 +4784,7 @@ fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted()
         vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
     );
 
-    let member_count = 2048_u32;
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
     let first_issi = 700_000_u32;
     let current_speaker = first_issi;
     let queued_requester = first_issi + 1;
@@ -5347,7 +5348,7 @@ fn test_restart_recovery_large_cached_gssi_restores_cmce_listeners_and_turn_taki
     debug::setup_logging_verbose();
 
     let path = unique_restart_recovery_path("cmce-large-cached-gssi-unrouted-ack");
-    let member_count = 2048_u32;
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
     let first_issi = 2_264_000_u32;
     let gssi = LAB_GROUP_GSSI;
     let cache: String = (0..member_count)

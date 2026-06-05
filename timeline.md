@@ -5659,3 +5659,46 @@ Next non-repeating execution:
 2. Extend large-GSSI stress beyond current 2048-member tests toward 4096/5000 members for round-robin PTT, repeated `U-SETUP`, queued handoff, restart recovery, and EG7 listeners.
 3. Continue SDS/WAP admission and truthful observability so live SDS/WAP cannot silently claim delivery when queues are saturated.
 4. Continue MM affiliation persistence and restart recovery scale tests so terminals do not return as `No Group`/`Unit Not Attached` after BS restart.
+
+## 2026-06-05 18:17:27 EEST - CMCE large GSSI tests raised to 4096 members
+
+User goal:
+
+- Group call handling must be robust for thousands of terminals, not just two or three lab radios.
+
+Component in simple technical terms:
+
+- CMCE group-call setup and floor control should remain group-scoped: one GSSI `D-SETUP`, one GSSI listener grant on handoff, and one bounded queued floor owner.
+- MM restart-recovery must restore enough affiliation state that CMCE can still accept and queue return PTT after a BS restart.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1: normal group call setup is addressed to the group identity.
+- EN 300 392-2 clause 14.5.2.2.1: SwMI floor control grants, queues, or denies transmission permission without creating per-member group setup fanout.
+- EN 300 392-2 clause 16.8.1: group attach/detach acknowledgement is the confirmation point used by the restart-recovery tests.
+- This is scale regression evidence for the existing clause-scoped behavior, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `LARGE_GSSI_MEMBER_COUNT = 4096`.
+  - Raised these CMCE regressions from 2048 to 4096 affiliated ISSIs:
+    - large group setup emits one GSSI `D-SETUP` and one UMAC open.
+    - large group PTT handoff emits one requester grant plus one GSSI listener grant.
+    - large group floor queue remains bounded and later contenders do not replace the first queued requester.
+    - restart-recovered cached GSSI restores CMCE listeners and return PTT works after attach/ACK refresh.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs large --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 139 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this 4096-member CMCE test-scale patch.
+2. Continue SDS/WAP admission and truthful delivery/queue observability.
+3. Continue MM affiliation persistence tests at EG7 and restart scale.
+4. Add UMAC/MAC large EG batch pressure tests so 4096-member GSSI scheduling remains bounded below CMCE.
