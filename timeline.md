@@ -6186,3 +6186,54 @@ Next non-repeating execution:
 2. Continue cross-layer UMAC test for large group PTT storm prioritizing requester grant with preserved RA ACK.
 3. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
 4. Continue network-origin call-id wrap regressions for group/private starts.
+
+## 2026-06-05 19:34:20 EEST - UMAC TMA admission preserves critical group floor grant under 4096-message storm
+
+User goal:
+
+- Group calls must remain robust with thousands of terminals, not only two or three radios.
+- A valid requester must receive the first positive floor grant and assigned-channel allocation even when thousands of lower-value busy/not-granted responses are already queued.
+- The BS must remain bounded; the fix must not solve the problem by growing unbounded queues.
+
+Component in simple technical terms:
+
+- UMAC receives `TMA-UNITDATA.req` from LLC/CMCE and turns it into MAC downlink signalling.
+- `pending_tma_reports` is the local UMAC list that remembers which TMA requests still need a final MAC report back to LLC.
+- The bug was before the radio scheduler: 4096 ordinary busy/not-granted TMA reports filled this local report list, so the 4097th TMA request, the positive `D-TX GRANTED` for the next speaker, was discarded before it could reach STCH/FACCH.
+- UMAC now assigns admission priority to TMA requests. Critical assigned-channel floor-control PDUs (`D-TX GRANTED` with UL/Both allocation, `D-TX CEASED`, `D-TX INTERRUPT`) can evict one lower-priority pending ordinary report under the local cap. Ordinary overload remains fail-closed with `TMA-REPORT.ind FragmentationFailure`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group-call transmission request/floor signalling, including positive grants and queued/not-granted responses.
+- EN 300 392-2 clause 20.4.1.1.3: MAC reports TMA request progress/failure using `TMA-REPORT.ind`.
+- EN 300 392-2 clause 21.4.3.1: `random_access_flag` acknowledges the requester's random access.
+- EN 300 392-2 clauses 23.5 and 23.5.2.2.1: STCH/FACCH assigned-channel signalling carries the floor-control MAC-RESOURCE.
+- This is clause-scoped engineering hardening and regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `TmaAdmissionPriority` and CMCE PDU inspection for TMA admission.
+  - Retained the 4096 pending-report cap.
+  - On critical incoming TMA under cap pressure, evicts one lower-priority pending ordinary TMA report, cancels its queued scheduler element by `TxReporter`, and emits `TMA-REPORT.ind FragmentationFailure` for that lower-priority request.
+  - Keeps equal/higher-priority cap pressure fail-closed.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_large_group_ptt_storm_prioritizes_requester_grant_with_preserved_ra_ack`.
+  - Builds an active GSSI call, preserves the requester's RA ACK through hangtime cleanup, queues 4096 lower-value `D-TX GRANTED(NotGranted)` STCH requests, then submits the positive requester `D-TX GRANTED(Granted)` with `UlDlAssignment::Both`.
+  - Asserts the requester grant is transmitted before busy responses, carries channel allocation `Both`, and repeats `random_access_flag=true`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_large_group_ptt_storm_prioritizes_requester_grant_with_preserved_ra_ack --locked` -> 1 passed.
+- `rustfmt --edition 2024 crates/tetra-entities/src/umac/umac_bs.rs crates/tetra-entities/tests/test_umac_bs.rs` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 60 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 68 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 145 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Run `git diff --check`, then commit this UMAC TMA admission/floor-grant storm patch.
+2. Add CMCE->UMAC integrated 4096-member handoff test: real CMCE PTT contenders, `U-TX CEASED`, decoded STCH/FACCH grant, and voice route/source speaker.
+3. Add restart recovery EG7 -> CMCE -> UMAC assigned-channel test with 4096 cached group members.
+4. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.

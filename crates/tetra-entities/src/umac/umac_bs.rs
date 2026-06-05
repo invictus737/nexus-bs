@@ -4,6 +4,10 @@ use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, TxState, unimplemented_log};
+use tetra_pdus::cmce::{
+    enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
+    pdus::d_tx_granted::DTxGranted,
+};
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
 use tetra_pdus::mle::pdus::d_mle_sync::DMleSync;
 use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
@@ -28,7 +32,7 @@ use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
-use tetra_saps::tma::{TmaReport, TmaReportInd, TmaUnitdataInd};
+use tetra_saps::tma::{TmaReport, TmaReportInd, TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::tmv::TmvConfigureReq;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -88,6 +92,15 @@ struct PendingTmaReport {
     req_handle: Todo,
     tx_reporter: TxReporter,
     created_at: TdmaTime,
+    priority: TmaAdmissionPriority,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TmaAdmissionPriority {
+    Ordinary,
+    ChannelAllocation,
+    PositiveFloorGrant,
+    FloorWithdraw,
 }
 
 struct PendingRawTchSHalfSlot {
@@ -778,13 +791,93 @@ impl UmacBs {
         queue.push_back(msg);
     }
 
-    fn track_tma_request(&mut self, queue: &mut MessageQueue, handle: Todo, tx_reporter: Option<TxReporter>) -> Option<TxReporter> {
+    fn classify_tma_admission_priority(prim: &TmaUnitdataReq) -> TmaAdmissionPriority {
+        let has_uplink_allocation = prim
+            .chan_alloc
+            .as_ref()
+            .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both));
+        let has_channel_allocation = prim.chan_alloc.is_some();
+
+        if !prim.stealing_permission {
+            return if has_channel_allocation {
+                TmaAdmissionPriority::ChannelAllocation
+            } else {
+                TmaAdmissionPriority::Ordinary
+            };
+        }
+
+        let mut pdu_type_probe = BitBuffer::from_bitbuffer(&prim.pdu);
+        let pdu_type = pdu_type_probe
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok());
+
+        match pdu_type {
+            Some(CmcePduTypeDl::DTxInterrupt) | Some(CmcePduTypeDl::DTxCeased) => {
+                // EN 300 392-2 clause 14.5.2.2.1 floor withdrawal/interrupt
+                // is time-critical assigned-channel signalling.
+                TmaAdmissionPriority::FloorWithdraw
+            }
+            Some(CmcePduTypeDl::DTxGranted) => {
+                let mut grant_probe = BitBuffer::from_bitbuffer(&prim.pdu);
+                let positive_floor_grant = DTxGranted::from_bitbuf(&mut grant_probe)
+                    .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && has_uplink_allocation);
+                if positive_floor_grant {
+                    // This D-TX GRANTED is the response that lets an MS enter
+                    // the assigned-channel U-plane; it must not be admitted
+                    // behind thousands of lower-value busy responses.
+                    TmaAdmissionPriority::PositiveFloorGrant
+                } else if has_channel_allocation {
+                    TmaAdmissionPriority::ChannelAllocation
+                } else {
+                    TmaAdmissionPriority::Ordinary
+                }
+            }
+            _ if has_channel_allocation => TmaAdmissionPriority::ChannelAllocation,
+            _ => TmaAdmissionPriority::Ordinary,
+        }
+    }
+
+    fn evict_lower_priority_tma_report(&mut self, queue: &mut MessageQueue, incoming_priority: TmaAdmissionPriority) -> bool {
+        let Some((pos, _)) = self
+            .pending_tma_reports
+            .iter()
+            .enumerate()
+            .filter(|(_, pending)| pending.priority < incoming_priority && pending.tx_reporter.get_state() == TxState::Pending)
+            .min_by_key(|(_, pending)| pending.priority)
+        else {
+            return false;
+        };
+
+        let pending = self.pending_tma_reports.remove(pos);
+        let removed = self.channel_scheduler.dl_cancel_by_reporter(&pending.tx_reporter);
+        if removed == 0 {
+            pending.tx_reporter.mark_discarded();
+        }
+        tracing::warn!(
+            "UMAC: evicting queued TMA req_handle={} priority {:?} for incoming priority {:?} under pending-report cap",
+            pending.req_handle,
+            pending.priority,
+            incoming_priority
+        );
+        Self::send_tma_report_ind(queue, pending.req_handle, TmaReport::FragmentationFailure);
+        true
+    }
+
+    fn track_tma_request(
+        &mut self,
+        queue: &mut MessageQueue,
+        handle: Todo,
+        tx_reporter: Option<TxReporter>,
+        priority: TmaAdmissionPriority,
+    ) -> Option<TxReporter> {
         self.emit_completed_tma_reports(queue);
         let tx_reporter = tx_reporter.unwrap_or_else(TxReporter::new_unacked);
-        if self.pending_tma_reports.len() >= Self::MAX_PENDING_TMA_REPORTS {
+        if self.pending_tma_reports.len() >= Self::MAX_PENDING_TMA_REPORTS && !self.evict_lower_priority_tma_report(queue, priority) {
             tracing::warn!(
-                "UMAC: dropping TMA-UNITDATA req_handle={} because {} pending TMA reports are already retained",
+                "UMAC: dropping TMA-UNITDATA req_handle={} priority {:?} because {} pending TMA reports are already retained",
                 handle,
+                priority,
                 self.pending_tma_reports.len()
             );
             tx_reporter.mark_discarded();
@@ -795,6 +888,7 @@ impl UmacBs {
             req_handle: handle,
             tx_reporter: tx_reporter.clone(),
             created_at: self.dltime,
+            priority,
         });
         Some(tx_reporter)
     }
@@ -1835,7 +1929,8 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
-        let Some(tx_reporter) = self.track_tma_request(queue, prim.req_handle, prim.tx_reporter.take()) else {
+        let admission_priority = Self::classify_tma_admission_priority(&prim);
+        let Some(tx_reporter) = self.track_tma_request(queue, prim.req_handle, prim.tx_reporter.take(), admission_priority) else {
             return;
         };
         let mut sdu = prim.pdu;

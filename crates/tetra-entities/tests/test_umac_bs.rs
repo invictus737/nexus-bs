@@ -2994,6 +2994,179 @@ fn test_group_floor_grant_stch_repeats_preserved_random_access_ack_for_requester
 }
 
 #[test]
+fn test_large_group_ptt_storm_prioritizes_requester_grant_with_preserved_ra_ack() {
+    debug::setup_logging_verbose();
+
+    let first_speaker_issi = 2_260_618;
+    let requester_issi = 2_260_082;
+    let gssi = 226_333;
+    let traffic_ts = 2;
+    let call_id = 6;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker_issi, traffic_ts));
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.channel_scheduler
+            .dl_enqueue_random_access_ack(traffic_ts, TetraAddress::issi(requester_issi));
+        assert!(
+            umac.channel_scheduler.dl_drop_all_except_stolen(traffic_ts),
+            "test setup should preserve the requester's random-access ACK through hangtime cleanup"
+        );
+    }
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let make_d_tx_granted_sdu = |transmission_grant: TransmissionGrant| {
+        let mut sdu = BitBuffer::new_autoexpand(40);
+        DTxGranted {
+            call_identifier: call_id,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("serialize D-TX GRANTED");
+        sdu.seek(0);
+        sdu
+    };
+
+    // EN 300 392-2 clause 14.5.2.2.1 allows queued/not-granted floor
+    // responses while another MS owns the floor. Under a large GSSI storm,
+    // those lower-value responses must not delay the positive grant that lets
+    // the requester enter the assigned-channel U-plane.
+    let busy_count = 4096;
+    for offset in 0..busy_count {
+        let busy_issi = 3_100_000 + offset;
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 10_000 + offset as i32,
+                pdu: make_d_tx_granted_sdu(TransmissionGrant::NotGranted),
+                main_address: TetraAddress::issi(busy_issi),
+                endpoint_id: 0,
+                pdu_prio: 0,
+                stealing_permission: true,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    let grant_reporter = TxReporter::new_unacked();
+    test.submit_message(floor_granted_msg(call_id, requester_issi, gssi, traffic_ts));
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 20_000,
+            pdu: make_d_tx_granted_sdu(TransmissionGrant::Granted),
+            main_address: TetraAddress::issi(requester_issi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: Some(grant_reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(48));
+    let sink_msgs = test.dump_sinks();
+    let all_pdus = downlink_mac_pdus(&sink_msgs);
+
+    let requester_grant_index = all_pdus
+        .iter()
+        .position(|pdu| match pdu {
+            DownlinkMacPdu::Resource(LogicalChannel::Stch, resource)
+                if resource
+                    .addr
+                    .is_some_and(|addr| mac_resource_matches_addr(addr, TetraAddress::issi(requester_issi)))
+                    && resource.chan_alloc_element.is_some() =>
+            {
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected requester positive D-TX GRANTED STCH with channel allocation; reporter={:?}; pdus={all_pdus:?}",
+                grant_reporter.get_state()
+            )
+        });
+    let first_busy_index = all_pdus.iter().position(|pdu| match pdu {
+        DownlinkMacPdu::Resource(LogicalChannel::Stch, resource)
+            if resource.addr.is_some_and(|addr| {
+                matches!(addr.ssi_type, SsiType::Issi | SsiType::Ssi) && (3_100_000..3_100_000 + busy_count).contains(&addr.ssi)
+            }) =>
+        {
+            true
+        }
+        _ => false,
+    });
+
+    if let Some(first_busy_index) = first_busy_index {
+        assert!(
+            requester_grant_index < first_busy_index,
+            "positive requester floor grant must transmit before lower-value busy floor responses"
+        );
+    }
+
+    let DownlinkMacPdu::Resource(_, requester_grant) = &all_pdus[requester_grant_index] else {
+        unreachable!("requester_grant_index was selected from Resource variants");
+    };
+    assert!(
+        requester_grant.random_access_flag,
+        "EN 300 392-2 clause 21.4.3.1: positive group floor grant must preserve the requester's random-access ACK"
+    );
+    assert_eq!(
+        requester_grant
+            .chan_alloc_element
+            .as_ref()
+            .expect("requester grant should carry assigned-channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+}
+
+#[test]
 fn test_oversized_facch_stealing_falls_back_to_schf_instead_of_overflowing_stch() {
     debug::setup_logging_verbose();
 
