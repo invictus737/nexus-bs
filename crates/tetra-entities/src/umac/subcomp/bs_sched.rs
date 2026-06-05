@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tetra_config::bluestation::{EnergySavingAssignment, SubscriberRegistry};
 use tetra_core::{
@@ -171,8 +171,8 @@ pub struct GroupDeliveryState {
     original_pdu: MacResource,
     original_sdu: BitBuffer,
     targets: Vec<u32>,
-    covered: Vec<u32>,
-    active_batch: Vec<u32>,
+    covered: HashSet<u32>,
+    active_batch: HashSet<u32>,
     tx_reporter: Option<TxReporter>,
     suspend_t210: bool,
 }
@@ -189,8 +189,8 @@ impl GroupDeliveryState {
             original_pdu,
             original_sdu,
             targets,
-            covered: Vec::new(),
-            active_batch: Vec::new(),
+            covered: HashSet::new(),
+            active_batch: HashSet::new(),
             tx_reporter,
             suspend_t210,
         }
@@ -234,15 +234,13 @@ impl GroupDeliveryState {
 
     fn begin_batch_if_needed(&mut self, ts: TdmaTime, energy_saving: &HashMap<u32, EnergySavingAssignment>) {
         if self.active_batch.is_empty() {
-            self.active_batch = self.uncovered_listeners(ts, energy_saving);
+            self.active_batch = self.uncovered_listeners(ts, energy_saving).into_iter().collect();
         }
     }
 
     fn mark_batch_covered(&mut self) {
-        for issi in self.active_batch.drain(..) {
-            if !self.covered.contains(&issi) {
-                self.covered.push(issi);
-            }
+        for issi in self.active_batch.drain() {
+            self.covered.insert(issi);
         }
     }
 }
@@ -259,8 +257,8 @@ impl GroupDeliveryState {
 #[derive(Debug, Clone)]
 pub struct GroupStealingState {
     targets: Vec<u32>,
-    covered: Vec<u32>,
-    active_batch: Vec<u32>,
+    covered: HashSet<u32>,
+    active_batch: HashSet<u32>,
     tx_reporter: Option<TxReporter>,
     suspend_t210: bool,
 }
@@ -269,8 +267,8 @@ impl GroupStealingState {
     fn new(targets: Vec<u32>, tx_reporter: Option<TxReporter>, suspend_t210: bool) -> Self {
         Self {
             targets,
-            covered: Vec::new(),
-            active_batch: Vec::new(),
+            covered: HashSet::new(),
+            active_batch: HashSet::new(),
             tx_reporter,
             suspend_t210,
         }
@@ -304,15 +302,13 @@ impl GroupStealingState {
 
     fn begin_batch_if_needed(&mut self, ts: TdmaTime, energy_saving: &HashMap<u32, EnergySavingAssignment>) {
         if self.active_batch.is_empty() {
-            self.active_batch = self.uncovered_listeners(ts, energy_saving);
+            self.active_batch = self.uncovered_listeners(ts, energy_saving).into_iter().collect();
         }
     }
 
     fn mark_batch_covered(&mut self) {
-        for issi in self.active_batch.drain(..) {
-            if !self.covered.contains(&issi) {
-                self.covered.push(issi);
-            }
+        for issi in self.active_batch.drain() {
+            self.covered.insert(issi);
         }
     }
 }
@@ -967,11 +963,36 @@ impl BsChannelScheduler {
         let mut targets: Vec<u32> = if addr.ssi == PREDEFINED_BROADCAST_GSSI {
             subscribers.all_registered_issis().collect()
         } else {
-            subscribers.group_members(addr.ssi)
+            subscribers.group_member_issis(addr.ssi).collect()
         };
         targets.sort_unstable();
         targets.dedup();
         targets
+    }
+
+    fn any_group_target_listens(
+        addr: TetraAddress,
+        ts: TdmaTime,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
+        subscribers: &SubscriberRegistry,
+    ) -> bool {
+        let mut has_targets = false;
+        if addr.ssi == PREDEFINED_BROADCAST_GSSI {
+            for issi in subscribers.all_registered_issis() {
+                has_targets = true;
+                if Self::ms_listens_at(energy_saving, issi, ts) {
+                    return true;
+                }
+            }
+        } else {
+            for issi in subscribers.group_member_issis(addr.ssi) {
+                has_targets = true;
+                if Self::ms_listens_at(energy_saving, issi, ts) {
+                    return true;
+                }
+            }
+        }
+        !has_targets
     }
 
     fn retain_current_group_delivery_targets(state: &mut GroupDeliveryState, addr: TetraAddress, subscribers: &SubscriberRegistry) {
@@ -1064,12 +1085,7 @@ impl BsChannelScheduler {
             return !state.uncovered_listeners(ts, energy_saving).is_empty();
         }
 
-        let targets = Self::group_targets(addr, subscribers);
-        if targets.is_empty() {
-            return true;
-        }
-
-        targets.iter().copied().any(|issi| Self::ms_listens_at(energy_saving, issi, ts))
+        Self::any_group_target_listens(addr, ts, energy_saving, subscribers)
     }
 
     fn group_stealing_state_ready_for_tx(
@@ -1086,12 +1102,7 @@ impl BsChannelScheduler {
             return !state.uncovered_listeners(ts, energy_saving).is_empty();
         }
 
-        let targets = Self::group_targets(addr, subscribers);
-        if targets.is_empty() {
-            return true;
-        }
-
-        targets.iter().copied().any(|issi| Self::ms_listens_at(energy_saving, issi, ts))
+        Self::any_group_target_listens(addr, ts, energy_saving, subscribers)
     }
 
     fn elem_is_ready_for_tx(
@@ -1191,7 +1202,7 @@ impl BsChannelScheduler {
                 // stealing, extend T.210 only for affiliates that were
                 // actually listening at this TDMA instant; one awake group
                 // member must not manufacture activity for sleeping EG peers.
-                for issi in Self::group_targets(addr, subscribers) {
+                for issi in subscribers.group_member_issis(addr.ssi) {
                     let listens_at_tx = energy_saving.get(&issi).map(|assignment| assignment.listens_at(ts)).unwrap_or(true);
                     if !listens_at_tx {
                         continue;
@@ -1489,20 +1500,21 @@ impl BsChannelScheduler {
     ) -> Vec<DlSchedElem> {
         let queue = &mut self.dltx_queues[ts.t as usize - 1];
         let mut taken = Vec::new();
+        let mut retained = Vec::with_capacity(queue.len());
 
-        let mut i = 0;
-        while i < queue.len() {
+        for elem in std::mem::take(queue) {
             if matches!(
-                queue[i],
+                elem,
                 DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_)
-            ) && Self::elem_is_ready_for_tx(&queue[i], ts, energy_saving, subscribers)
+            ) && Self::elem_is_ready_for_tx(&elem, ts, energy_saving, subscribers)
             {
-                let elem = queue.remove(i);
                 taken.push(elem);
             } else {
-                i += 1;
+                retained.push(elem);
             }
         }
+
+        *queue = retained;
         taken
     }
 
@@ -1592,6 +1604,15 @@ impl BsChannelScheduler {
 
         // Remove all grants and acks from queue and collect them into a vec
         let grants_and_acks = self.dl_take_all_ready_grants_and_acks(ts, subscribers, energy_saving);
+        let slot = ts.t as usize - 1;
+        let mut resource_indexes: HashMap<TetraAddress, usize> = self.dltx_queues[slot]
+            .iter()
+            .enumerate()
+            .filter_map(|(index, elem)| match elem {
+                DlSchedElem::Resource(pdu, _, _, _) => pdu.addr.map(|addr| (addr, index)),
+                _ => None,
+            })
+            .collect();
 
         // Process grants and acks
         for elem in grants_and_acks {
@@ -1627,13 +1648,15 @@ impl BsChannelScheduler {
 
             // Try to find existing resource for this address
             let addr = match &elem {
-                DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _) => addr,
-                DlSchedElem::RandomAccessAck(addr) => addr,
+                DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _) => *addr,
+                DlSchedElem::RandomAccessAck(addr) => *addr,
                 _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
             };
-            let mac_resource = self.dl_get_scheduled_resource_for_addr(ts, addr);
-            match mac_resource {
-                Some(DlSchedElem::Resource(pdu, _sdu, _repeat, _)) => {
+            match resource_indexes.get(&addr).copied() {
+                Some(index) => {
+                    let DlSchedElem::Resource(pdu, _sdu, _repeat, _) = &mut self.dltx_queues[slot][index] else {
+                        unreachable!("BUG: resource index no longer points to a MAC-RESOURCE");
+                    };
                     // Integrate grant into the resource
                     match &elem {
                         DlSchedElem::Grant(_, grant, usage_marker) => {
@@ -1674,7 +1697,7 @@ impl BsChannelScheduler {
                                 grant,
                                 usage_marker,
                             );
-                            let mut pdu = Self::dl_make_minimal_resource(addr, Some(grant.clone()), false);
+                            let mut pdu = Self::dl_make_minimal_resource(&addr, Some(grant.clone()), false);
                             pdu.usage_marker = *usage_marker;
                             pdu
                         }
@@ -1683,16 +1706,17 @@ impl BsChannelScheduler {
                                 "dl_integrate_sched_elems_for_timeslot: Creating new resource for addr {} with ack",
                                 addr
                             );
-                            Self::dl_make_minimal_resource(addr, None, true)
+                            Self::dl_make_minimal_resource(&addr, None, true)
                         }
                         _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
                     };
 
                     // Push new resource into the queue. These do not need a tx_reporter
                     let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, None);
-                    self.dltx_queues[ts.t as usize - 1].push(dlsched_res);
+                    let index = self.dltx_queues[slot].len();
+                    self.dltx_queues[slot].push(dlsched_res);
+                    resource_indexes.insert(addr, index);
                 }
-                _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
             }
         }
     }
@@ -3684,7 +3708,8 @@ mod tests {
                     DlSchedElem::Stealing(_, addr, _, Some(state))
                         if addr.ssi == gssi
                             && addr.ssi_type == SsiType::Gssi
-                            && state.covered == vec![first_issi]
+                            && state.covered.len() == 1
+                            && state.covered.contains(&first_issi)
                 )
             }),
             "GSSI FACCH/STCH must remain queued after only the first EG batch is covered"
@@ -4027,6 +4052,109 @@ mod tests {
         assert_eq!(
             energy_saving.get(&second_issi).and_then(|a| a.awake_until),
             Some(TdmaTime { t: 1, f: 3, m: 2, h: 0 })
+        );
+    }
+
+    #[test]
+    fn test_large_stayalive_gssi_resource_transmits_once_without_per_member_repeat() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+
+        let gssi = 91;
+        let member_count = 2048;
+        let reporter = TxReporter::new_unacked();
+        let (pdu, sdu) = test_resource_for_gssi(gssi, 8);
+        sched.dl_enqueue_tma(pdu, sdu, Some(reporter.clone()));
+
+        let mut subscribers = SubscriberRegistry::new();
+        for offset in 0..member_count {
+            let issi = 50_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+        }
+
+        let mut energy_saving = HashMap::new();
+        let delivered = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        // EN 300 392-2 clauses 14.5.2.1, 23.5.2.2.7, and 23.7.6 keep the
+        // downlink address GSSI-scoped. When every affiliate is awake, one
+        // group-addressed resource covers the whole local listener set.
+        assert_eq!(delivered.ts, TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
+        assert!(
+            sched.dltx_queues[0].is_empty(),
+            "StayAlive GSSI delivery must not create one queued repeat per affiliated ISSI"
+        );
+        assert_eq!(subscribers.group_members(gssi).len(), member_count as usize);
+    }
+
+    #[test]
+    fn test_large_mixed_eg7_gssi_resource_repeats_by_receive_batch_not_member() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+
+        let gssi = 91;
+        let stayalive_count = 1024;
+        let eg7_count = 1024;
+        let reporter = TxReporter::new_unacked();
+        let (pdu, sdu) = test_resource_for_gssi(gssi, 8);
+        sched.dl_enqueue_tma(pdu, sdu, Some(reporter.clone()));
+
+        let mut subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        for offset in 0..stayalive_count {
+            let issi = 80_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+        }
+        for offset in 0..eg7_count {
+            let issi = 90_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+            energy_saving.insert(
+                issi,
+                EnergySavingAssignment {
+                    mode: 7,
+                    frame: Some(3),
+                    multiframe: Some(1),
+                    awake_until: None,
+                    suspension_count: 0,
+                },
+            );
+        }
+
+        let first = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(first.ts, TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        assert_eq!(reporter.get_state(), TxState::Pending);
+        assert_eq!(
+            sched.dltx_queues[0]
+                .iter()
+                .filter(|elem| matches!(elem, DlSchedElem::Resource(_, _, _, Some(_))))
+                .count(),
+            1,
+            "GSSI repeat must stay one queued resource for the EG7 receive batch, not one per member"
+        );
+        assert!(
+            energy_saving.values().all(|assignment| assignment.awake_until.is_none()),
+            "sleeping EG7 members must not get T.210 from the StayAlive batch"
+        );
+
+        sched.tick_start(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        sched.tick_start(TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+        sched.tick_start(TdmaTime { t: 3, f: 2, m: 1, h: 0 });
+        sched.tick_start(TdmaTime { t: 4, f: 2, m: 1, h: 0 });
+        let second = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(second.ts, TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
+        assert!(
+            sched.dltx_queues[0].is_empty(),
+            "GSSI resource should leave the queue after all large receive batches are covered"
+        );
+        assert!(
+            energy_saving
+                .values()
+                .all(|assignment| assignment.awake_until == Some(TdmaTime { t: 1, f: 3, m: 2, h: 0 })),
+            "EG7 receive batch should get T.210 only after its own downlink transmit"
         );
     }
 
@@ -4703,6 +4831,49 @@ mod tests {
             panic!("expected grant resource");
         };
         assert!(!pdu.random_access_flag, "slot grants alone must not acknowledge random access");
+    }
+
+    #[test]
+    fn test_mass_random_access_grant_ack_integration_uses_one_resource_per_issi() {
+        let mut sched = get_testing_slotter();
+        let ts = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        let member_count = 2048;
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+
+        for offset in 0..member_count {
+            let addr = TetraAddress::issi(70_000 + offset);
+            sched.dl_enqueue_grant(ts.t, addr, grant.clone(), None);
+            sched.dl_enqueue_random_access_ack(ts.t, addr);
+        }
+        assert_eq!(sched.dltx_queues[ts.t as usize - 1].len(), member_count as usize * 2);
+
+        let subscribers = SubscriberRegistry::new();
+        let energy_saving = HashMap::new();
+        sched.dl_integrate_sched_elems_for_timeslot(ts, &subscribers, &energy_saving);
+
+        // EN 300 392-2 clauses 21.4.3.1 and 23.5.2.2.2 bind the MAC
+        // random-access acknowledgement and slot grant to the addressed MS.
+        // A mass access burst should collapse to one MAC-RESOURCE per ISSI,
+        // not leave independent ACK/grant queue entries behind.
+        let queue = &sched.dltx_queues[ts.t as usize - 1];
+        assert_eq!(queue.len(), member_count as usize);
+        assert!(
+            queue
+                .iter()
+                .all(|elem| !matches!(elem, DlSchedElem::Grant(..) | DlSchedElem::RandomAccessAck(_))),
+            "ready grant/ACK elements should be integrated into MAC-RESOURCEs"
+        );
+        for elem in queue {
+            let DlSchedElem::Resource(pdu, _sdu, _reporter, _group_state) = elem else {
+                panic!("mass grant/ACK integration should produce only MAC-RESOURCE elements");
+            };
+            assert_eq!(pdu.addr.expect("resource should stay addressed").ssi_type, SsiType::Issi);
+            assert!(pdu.random_access_flag);
+            assert!(pdu.slot_granting_element.is_some());
+        }
     }
 
     #[test]

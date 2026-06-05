@@ -182,6 +182,8 @@ impl EnergySavingAssignment {
 pub struct SubscriberRegistry {
     /// Registered ISSIs → Subscriber information
     subscribers: HashMap<u32, Subscriber>,
+    /// GSSI → registered ISSIs currently affiliated to that group.
+    group_members_by_gssi: HashMap<u32, HashSet<u32>>,
     /// Set of all GSSIs with at least one local affiliate
     all_attached_groups: HashSet<u32>,
 }
@@ -190,6 +192,7 @@ impl SubscriberRegistry {
     pub fn new() -> Self {
         Self {
             subscribers: HashMap::new(),
+            group_members_by_gssi: HashMap::new(),
             all_attached_groups: HashSet::new(),
         }
     }
@@ -218,11 +221,17 @@ impl SubscriberRegistry {
     /// Deregister an ISSI, removing it from the registry and cleaning up any group affiliations
     pub fn deregister(&mut self, issi: u32) {
         if let Some(subscriber) = self.subscribers.remove(&issi) {
-            // Clean up global group affiliations for this subscriber
             for gssi in &subscriber.attached_groups {
-                // Check if any other subscriber is still affiliated with this group
-                let still_has_members = self.subscribers.values().any(|s| s.attached_groups.contains(gssi));
-                if !still_has_members {
+                let remove_group = if let Some(members) = self.group_members_by_gssi.get_mut(gssi) {
+                    members.remove(&issi);
+                    members.is_empty()
+                } else {
+                    false
+                };
+                if remove_group {
+                    self.group_members_by_gssi.remove(gssi);
+                }
+                if !self.group_members_by_gssi.contains_key(gssi) {
                     self.all_attached_groups.remove(gssi);
                 }
             }
@@ -235,6 +244,7 @@ impl SubscriberRegistry {
             return false;
         };
         subscriber.attached_groups.insert(gssi);
+        self.group_members_by_gssi.entry(gssi).or_default().insert(issi);
         self.all_attached_groups.insert(gssi);
         true
     }
@@ -245,9 +255,16 @@ impl SubscriberRegistry {
             return false;
         };
         if subscriber.attached_groups.remove(&gssi) {
-            // Check if any other subscriber is still affiliated with this group
-            let still_has_members = self.subscribers.values().any(|s| s.attached_groups.contains(&gssi));
-            if !still_has_members {
+            let remove_group = if let Some(members) = self.group_members_by_gssi.get_mut(&gssi) {
+                members.remove(&issi);
+                members.is_empty()
+            } else {
+                false
+            };
+            if remove_group {
+                self.group_members_by_gssi.remove(&gssi);
+            }
+            if !self.group_members_by_gssi.contains_key(&gssi) {
                 self.all_attached_groups.remove(&gssi);
             }
             return true;
@@ -260,13 +277,23 @@ impl SubscriberRegistry {
         self.all_attached_groups.contains(&gssi)
     }
 
+    /// Check if a registered ISSI is affiliated with the given GSSI.
+    pub fn contains_group_member(&self, gssi: u32, issi: u32) -> bool {
+        self.group_members_by_gssi.get(&gssi).is_some_and(|members| members.contains(&issi))
+    }
+
+    /// Iterate all currently registered ISSIs affiliated with the given GSSI
+    /// without allocating a temporary Vec.
+    pub fn group_member_issis(&self, gssi: u32) -> impl Iterator<Item = u32> + '_ {
+        self.group_members_by_gssi
+            .get(&gssi)
+            .into_iter()
+            .flat_map(|members| members.iter().copied())
+    }
+
     /// Returns all currently registered ISSIs affiliated with the given GSSI.
     pub fn group_members(&self, gssi: u32) -> Vec<u32> {
-        self.subscribers
-            .values()
-            .filter(|subscriber| subscriber.attached_groups.contains(&gssi))
-            .map(|subscriber| subscriber.issi)
-            .collect()
+        self.group_member_issis(gssi).collect()
     }
 
     /// Returns all currently registered ISSIs.
@@ -394,10 +421,52 @@ mod energy_saving_tests {
         reg.affiliate(1003, 91);
         reg.affiliate(1002, 92);
 
+        assert!(reg.contains_group_member(91, 1001));
+        assert!(reg.contains_group_member(91, 1003));
+        assert!(!reg.contains_group_member(91, 1002));
+        let mut iter_members: Vec<u32> = reg.group_member_issis(91).collect();
+        iter_members.sort_unstable();
+        assert_eq!(iter_members, vec![1001, 1003]);
         let mut members = reg.group_members(91);
         members.sort_unstable();
         assert_eq!(members, vec![1001, 1003]);
         assert!(reg.group_members(999).is_empty());
+    }
+
+    #[test]
+    fn test_group_members_index_survives_large_group_churn() {
+        let mut reg = SubscriberRegistry::new();
+        let gssi = 91;
+        let first_issi = 10_000;
+        let members = 4096;
+
+        for offset in 0..members {
+            let issi = first_issi + offset;
+            reg.register(issi);
+            assert!(reg.affiliate(issi, gssi));
+        }
+
+        assert!(reg.has_group_members(gssi));
+        assert_eq!(reg.group_members(gssi).len(), members as usize);
+
+        assert!(reg.deaffiliate(first_issi, gssi));
+        reg.deregister(first_issi + 1);
+        assert!(
+            !reg.is_registered(first_issi + 1),
+            "deregister should remove indexed group membership"
+        );
+
+        let mut remaining = reg.group_members(gssi);
+        remaining.sort_unstable();
+        assert_eq!(remaining.len(), members as usize - 2);
+        assert!(!remaining.contains(&first_issi));
+        assert!(!remaining.contains(&(first_issi + 1)));
+
+        for offset in 2..members {
+            assert!(reg.deaffiliate(first_issi + offset, gssi));
+        }
+        assert!(!reg.has_group_members(gssi));
+        assert!(reg.group_members(gssi).is_empty());
     }
 
     #[test]

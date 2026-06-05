@@ -1,5 +1,68 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 16:22:09 EEST - Large GSSI group-call and UMAC scheduling scalability hardening
+
+User report:
+
+- Group call must be robust for thousands of terminals on one GSSI, not only two or three radios.
+- Continue clause-scoped ETSI EN 300 392-2 hardening without claiming formal certification.
+
+Component explanation:
+
+- `SubscriberRegistry` is the shared ISSI/GSSI affiliation table. It answers "which ISSIs are attached to this GSSI?" for MM, CMCE, UMAC, SDS, dashboard, and restart recovery.
+- MM is Mobility Management. It restores registration/group affiliation after restart/roaming and must not scan a full group list just to check one ISSI.
+- UMAC is the MAC scheduler. It turns group signalling into real downlink MAC-RESOURCE/FACCH blocks and must repeat GSSI downlinks by actual EG receive batch, not by one PDU per terminal.
+- CMCE is call control. It arbitrates PTT floor changes and must keep group floor signalling GSSI-scoped for listeners even when thousands of terminals are affiliated.
+- RA ACK is the MAC acknowledgement of random access; a grant tells an MS where it may continue. Under mass access these must integrate into MAC-RESOURCEs without quadratic queue churn.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.2.1 and 14.5.2.2.1: group call setup/floor control and group-addressed `D-TX GRANTED` listener notification.
+- EN 300 392-2 clause 21.4.3.1: MAC random-access acknowledgement.
+- EN 300 392-2 clause 23.5.2.2.2: slot-grant response handling.
+- EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6/T.210: BS downlink scheduling must account for energy-economy receive windows.
+- This is clause-scoped engineering hardening and test evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-config/src/bluestation/state.rs`
+  - Added reverse GSSI membership index `group_members_by_gssi`.
+  - Added `contains_group_member(gssi, issi)` and `group_member_issis(gssi)` so callers can avoid allocating/scanning a full member list for one membership check.
+  - Preserved tolerant duplicate affiliation semantics while preventing unknown ISSI phantom registration.
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Replaced runtime `group_members(...).contains(...)` checks with indexed `contains_group_member(...)` in restart recovery and attach/detach paths.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Changed GSSI delivery `covered` and `active_batch` tracking from `Vec` to `HashSet`, removing quadratic coverage checks for large groups.
+  - Added no-allocation readiness iteration for GSSI listeners where only "any target listens now?" is needed.
+  - Reworked ready grant/RA-ACK extraction to partition the queue in one pass instead of repeated middle `Vec::remove`.
+  - Reworked grant/ACK integration to index MAC-RESOURCEs by address, so mass ACK/grant bursts collapse to one resource per ISSI without repeated linear searches.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Uses the no-allocation GSSI member iterator when suspending EG for active group circuits.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added a 2048-member GSSI floor-handoff regression with 16 back-and-forth PTT cycles: requester receives `RequestQueued`, handoff emits one ISSI `Granted` plus one GSSI `GrantedToOtherUser`, and no release/close occurs.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs` tests
+  - Added 2048-member StayAlive GSSI delivery test: one group resource, no per-member repeat.
+  - Added 2048-member mixed StayAlive/EG7 GSSI delivery test: repeat by receive batch, not by member; sleeping EG7 members do not get T.210 from another batch.
+  - Added 2048-ISSI mass RA ACK/grant integration test: one MAC-RESOURCE per ISSI with both ACK and grant integrated.
+
+Verification:
+
+- `cargo fmt --package tetra-config`
+- `cargo fmt --package tetra-entities`
+- `cargo test -p tetra-config --lib bluestation::state --locked` -> 18 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 53 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 133 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 56 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 133 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add a bounded test for CMCE one-deep floor queue under hundreds/thousands of simultaneous requesters: first waiter queued, later contenders explicitly `NotGranted`, no unbounded state growth.
+2. Continue UMAC optimization with a per-slot GSSI readiness cache if profiling or stress tests show repeated `Q * N` scans with many queued GSSI elements.
+3. Deploy only after a release build if live RF validation is requested; no formal certification claim without official conformance evidence.
+
 ## 2026-06-05 14:59:46 EEST - UMAC group speaker secondary tracking without P2P regression
 
 User report:

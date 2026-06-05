@@ -1118,7 +1118,7 @@ impl MmBs {
     }
 
     fn rollback_swmi_group_attachment(&mut self, issi: u32, gssi: u32, deaff_groups: &mut Vec<u32>, reason: &str) {
-        let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+        let shared_affiliated_before = self.config.state_read().subscribers.contains_group_member(gssi, issi);
         match self.client_mgr.client_group_attach(issi, gssi, false) {
             Ok(changed) => {
                 if changed || shared_affiliated_before {
@@ -1274,7 +1274,7 @@ impl MmBs {
             let missing_groups = groups
                 .iter()
                 .copied()
-                .filter(|gssi| !state.subscribers.group_members(*gssi).contains(&issi))
+                .filter(|gssi| !state.subscribers.contains_group_member(*gssi, issi))
                 .collect::<Vec<u32>>();
             (needs_register, missing_groups)
         };
@@ -1426,7 +1426,7 @@ impl MmBs {
     ) -> Vec<(u32, GroupAttachmentInfo)> {
         let mut restored_groups = Vec::new();
         for &(gssi, attachment_info) in cached_groups {
-            let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+            let shared_affiliated_before = self.config.state_read().subscribers.contains_group_member(gssi, issi);
             match self.client_mgr.client_group_attach_with_info(issi, gssi, true, attachment_info) {
                 Ok(changed) => {
                     if changed || !shared_affiliated_before {
@@ -2948,7 +2948,7 @@ impl MmBs {
             }
 
             if is_detach {
-                let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+                let shared_affiliated_before = self.config.state_read().subscribers.contains_group_member(gssi, issi);
                 match self.client_mgr.client_group_attach(issi, gssi, false) {
                     Ok(changed) => {
                         if changed {
@@ -2979,7 +2979,7 @@ impl MmBs {
                     }
                 }
             } else {
-                let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+                let shared_affiliated_before = self.config.state_read().subscribers.contains_group_member(gssi, issi);
                 let attachment_info = GroupAttachmentInfo {
                     group_identity_attachment_lifetime: 0,
                     class_of_usage: giu.class_of_usage.unwrap_or(0),

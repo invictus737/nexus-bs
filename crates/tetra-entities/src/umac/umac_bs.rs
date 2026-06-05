@@ -149,7 +149,7 @@ impl UmacBs {
         match addr.ssi_type {
             SsiType::Issi => vec![addr.ssi],
             SsiType::Gssi if addr.ssi == PREDEFINED_BROADCAST_GSSI => self.config.state_read().subscribers.all_registered_issis().collect(),
-            SsiType::Gssi => self.config.state_read().subscribers.group_members(addr.ssi),
+            SsiType::Gssi => self.config.state_read().subscribers.group_member_issis(addr.ssi).collect(),
             _ => Vec::new(),
         }
     }

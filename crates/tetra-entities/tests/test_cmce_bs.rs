@@ -117,6 +117,15 @@ fn register_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
     test.dump_sinks();
 }
 
+fn submit_subscriber_update(test: &mut ComponentTest, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Mm,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
+    });
+}
+
 fn drain_private_simplex_tail(test: &mut ComponentTest, dltime: TdmaTime) {
     test.router
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
@@ -4468,6 +4477,131 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
             }) if *got_call_id == call_id && *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_GSSI
         )
     }));
+}
+
+#[test]
+fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = 2048_u32;
+    let first_issi = 500_000_u32;
+    let speaker_a = first_issi;
+    let speaker_b = first_issi + 1;
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, speaker_a, TEST_GSSI);
+
+    let mut current_speaker = speaker_a;
+    let mut next_speaker = speaker_b;
+    for cycle in 0..16 {
+        test.submit_message(build_u_tx_demand_msg(next_speaker, call_id));
+        test.run_stack(Some(1));
+        let queued_msgs = test.dump_sinks();
+        let queued_grants: Vec<_> = queued_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            queued_grants.len(),
+            1,
+            "large-group queued PTT should answer only requester on cycle {cycle}"
+        );
+        assert_eq!(queued_grants[0].0.main_address, TetraAddress::issi(next_speaker), "cycle {cycle}");
+        assert_eq!(
+            queued_grants[0].1.transmission_grant,
+            TransmissionGrant::RequestQueued.into_raw() as u8,
+            "cycle {cycle}"
+        );
+        assert_ne!(
+            queued_grants[0].1.transmission_grant,
+            TransmissionGrant::NotGranted.into_raw() as u8,
+            "large-group queued PTT must not degrade to PTT denied on cycle {cycle}"
+        );
+        assert_eq!(count_umac_floor_granted(&queued_msgs), 0, "cycle {cycle}");
+
+        test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+        test.run_stack(Some(1));
+        let handoff_msgs = test.dump_sinks();
+
+        // EN 300 392-2 clause 14.5.2.2.1 uses group-addressed D-TX GRANTED
+        // for listeners. A large GSSI must not create one listener grant per
+        // affiliate, even across repeated back-and-forth PTT handoffs.
+        let grants: Vec<_> = handoff_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants.len(),
+            2,
+            "large-group handoff should produce one requester grant plus one GSSI listener grant on cycle {cycle}"
+        );
+
+        let requester_grant = grants
+            .iter()
+            .find(|(prim, _)| prim.main_address == TetraAddress::issi(next_speaker))
+            .expect("queued requester should get one individual grant");
+        assert_eq!(
+            requester_grant.1.transmission_grant,
+            TransmissionGrant::Granted.into_raw() as u8,
+            "cycle {cycle}"
+        );
+        assert_d_tx_granted_facch_allocation(
+            requester_grant.0,
+            &requester_grant.1,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Both,
+            "large group requester handoff",
+        );
+
+        let listener_grants: Vec<_> = grants
+            .iter()
+            .filter(|(prim, _)| prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi))
+            .collect();
+        assert_eq!(
+            listener_grants.len(),
+            1,
+            "listeners must be notified once via GSSI on cycle {cycle}"
+        );
+        assert_eq!(
+            listener_grants[0].1.transmission_grant,
+            TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            "cycle {cycle}"
+        );
+        assert_d_tx_granted_facch_allocation(
+            listener_grants[0].0,
+            &listener_grants[0].1,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Dl,
+            "large group listener grant",
+        );
+        assert_eq!(count_umac_floor_granted(&handoff_msgs), 1, "cycle {cycle}");
+        assert_eq!(count_d_releases(&handoff_msgs), 0, "cycle {cycle}");
+        assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0, "cycle {cycle}");
+
+        std::mem::swap(&mut current_speaker, &mut next_speaker);
+    }
 }
 
 #[test]
