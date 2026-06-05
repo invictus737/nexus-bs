@@ -3545,3 +3545,22 @@ Next non-repeating execution:
 1. Commit this second MM hardening patch.
 2. Redeploy to test BS and confirm build id changes from `7d72c06b`.
 3. Verify cache stays `ISSI 226333:0:4` for `2260082`, `2260616`, and `2260618` after restart.
+
+## 2026-06-05 10:58:30 EEST - Final deploy blocked by SSH timeout
+
+Execution status:
+
+- Code commit `f02371a` (`fix: recover restart candidate groups before eg`) was created after local verification.
+- Local `scripts/nexus-bs-test-deploy.sh` cross-build completed successfully for `nexus-bs v0.1.55`.
+- The remote deploy phase failed before copying the new binary because `ssh chris@192.168.1.179` timed out on port 22.
+- Two short-timeout SSH retries also timed out.
+- Last confirmed remote running build remains `v0.1.55-7d72c06b`; that build already includes the dashboard/cache GSSI persistence patch and had rewritten the cache to:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+
+Next non-repeating execution:
+
+1. When `chris@192.168.1.179` is reachable again, rerun `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+2. Confirm remote build id changes from `v0.1.55-7d72c06b` to the current HEAD.
+3. Re-read `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` and verify all three ISSIs still persist `226333:0:4`.
