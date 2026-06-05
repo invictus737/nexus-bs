@@ -4660,6 +4660,206 @@ fn test_successful_location_update_persists_restart_recovery_cache() {
 }
 
 #[test]
+fn test_successful_location_update_persists_restart_recovery_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2260082;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("persist-groups");
+    let _ = std::fs::remove_file(&path);
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(contains_location_update_accept(&sink_msgs));
+    let cache = std::fs::read_to_string(&path).expect("registration should persist restart recovery cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:0")),
+        "cache should contain ISSI {issi} and GSSI {gssi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-restore");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let command_msgs = test.dump_sinks();
+    let command_details = location_update_command_details(&command_msgs);
+    assert_eq!(command_details.len(), 1);
+    assert_eq!(command_details[0].0, issi);
+    assert!(command_details[0].3.group_identity_report);
+
+    // EN 300 392-2 clause 16.4.4 permits BS-commanded registration.
+    // Clause 16.8.0 keeps previously accepted group identities valid while
+    // their lifetime remains valid. If the MS answers the recovery command
+    // without a fresh group report, restore only the cached accepted groups for
+    // local routing; the D-LOCATION UPDATE ACCEPT itself must not pretend the
+    // group was reported in this PDU.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(
+        accept.group_identity_location_accept.is_none(),
+        "cached group restoration must not fabricate a GroupIdentityLocationAccept entry"
+    );
+    assert!(
+        !contains_location_update_command(&demand_msgs),
+        "cached group restoration must not trigger an immediate duplicate recovery command"
+    );
+    assert!(
+        debug_mm_solicited_group_report_pending(&mut test, issi),
+        "the solicited group-report window remains pending until an explicit complete report or expiry"
+    );
+
+    let updates = subscriber_updates(&demand_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![gssi]);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+    drop(state);
+
+    let cache = std::fs::read_to_string(&path).expect("restored affiliation should keep cached group");
+    assert!(
+        cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:4")),
+        "cache should preserve restored GSSI/class, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_empty_complete_report_clears_cached_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-empty");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    assert_eq!(location_update_commands(&test.dump_sinks()).len(), 1);
+
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::DemandLocationUpdating, 1, 0);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(accept.group_identity_location_accept.is_none());
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    let cache = std::fs::read_to_string(&path).expect("empty report should keep ISSI cache without group");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "cache should keep ISSI for future recovery, got {cache:?}"
+    );
+    assert!(
+        !cache.lines().any(|line| line.contains(&gssi.to_string())),
+        "explicit empty complete report must clear cached GSSI {gssi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_explicit_group_report_replaces_cached_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let old_gssi = 226333;
+    let new_gssi = 226444;
+    let path = unique_restart_recovery_path("cached-group-replace");
+    std::fs::write(&path, format!("{issi} {old_gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    assert_eq!(location_update_commands(&test.dump_sinks()).len(), 1);
+
+    submit_location_update_with_groups_and_group_report_response(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        vec![new_gssi],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&demand_msgs);
+    let gila = accept
+        .group_identity_location_accept
+        .as_ref()
+        .expect("explicit group report should be acknowledged");
+    let accepted_groups = gila.group_identity_downlink.as_ref().expect("reported group should be listed");
+    assert!(accepted_groups.iter().any(|group| group.gssi == Some(new_gssi)));
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.group_members(old_gssi).is_empty());
+    assert_eq!(state.subscribers.group_members(new_gssi), vec![issi]);
+    drop(state);
+
+    let cache = std::fs::read_to_string(&path).expect("explicit report should replace cached group");
+    assert!(cache.lines().any(|line| line.contains(&format!("{new_gssi}:0:0"))));
+    assert!(
+        !cache.lines().any(|line| line.contains(&format!("{old_gssi}:"))),
+        "explicit report must replace old cached GSSI {old_gssi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
     debug::setup_logging_verbose();
     let issi = 2260618;
@@ -4774,7 +4974,12 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
     );
 
     let cache = std::fs::read_to_string(&path).expect("registration should keep recovery cache");
-    assert!(cache.lines().any(|line| line.trim() == issi.to_string()));
+    assert!(
+        cache
+            .lines()
+            .any(|line| line.trim().starts_with(&issi.to_string()) && line.contains(&format!("{gssi}:0:0"))),
+        "cache should keep recovered ISSI/GSSI, got {cache:?}"
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));

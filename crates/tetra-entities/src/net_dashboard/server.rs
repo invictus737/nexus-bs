@@ -672,19 +672,9 @@ impl DashboardServer {
             let mut s = self.state.write().unwrap();
             match &event {
                 TelemetryEvent::MsRegistration { issi } => {
-                    s.ms_map.insert(
-                        *issi,
-                        MsEntry {
-                            issi: *issi,
-                            groups: Vec::new(),
-                            rssi_dbfs: None,
-                            registered_at: Instant::now(),
-                            last_seen: Instant::now(),
-                            energy_saving_mode: 0,
-                            energy_saving_frame: None,
-                            energy_saving_multiframe: None,
-                        },
-                    );
+                    let entry = s.ms_map.entry(*issi).or_insert_with(|| empty_ms_entry(*issi));
+                    entry.registered_at = Instant::now();
+                    entry.last_seen = Instant::now();
                     s.push_log("INFO", format!("MS {} registered", issi));
                 }
                 TelemetryEvent::MsDeregistration { issi } => {
@@ -692,18 +682,16 @@ impl DashboardServer {
                     s.push_log("INFO", format!("MS {} deregistered", issi));
                 }
                 TelemetryEvent::MsGroupAttach { issi, gssis } => {
-                    if let Some(e) = s.ms_map.get_mut(issi) {
-                        for g in gssis {
-                            if !e.groups.contains(g) {
-                                e.groups.push(*g);
-                            }
+                    let e = s.ms_map.entry(*issi).or_insert_with(|| empty_ms_entry(*issi));
+                    for g in gssis {
+                        if !e.groups.contains(g) {
+                            e.groups.push(*g);
                         }
                     }
                 }
                 TelemetryEvent::MsGroupsSnapshot { issi, gssis } => {
-                    if let Some(e) = s.ms_map.get_mut(issi) {
-                        e.groups = gssis.clone();
-                    }
+                    let e = s.ms_map.entry(*issi).or_insert_with(|| empty_ms_entry(*issi));
+                    e.groups = gssis.clone();
                 }
                 TelemetryEvent::MsGroupDetach { issi, gssis } => {
                     if let Some(e) = s.ms_map.get_mut(issi) {
@@ -903,6 +891,19 @@ impl DashboardServer {
     fn broadcast(&self, msg: &str) {
         let mut clients = self.clients.lock().unwrap();
         clients.retain(|tx| tx.send(msg.to_owned()).is_ok());
+    }
+}
+
+fn empty_ms_entry(issi: u32) -> MsEntry {
+    MsEntry {
+        issi,
+        groups: Vec::new(),
+        rssi_dbfs: None,
+        registered_at: Instant::now(),
+        last_seen: Instant::now(),
+        energy_saving_mode: 0,
+        energy_saving_frame: None,
+        energy_saving_multiframe: None,
     }
 }
 
@@ -3095,6 +3096,48 @@ mod tests {
         assert_eq!(product.version, "0.1.55");
         assert_eq!(product.version_tag, "v0.1.55");
         assert_eq!(product.user_agent, "Nexus-BS/v0.1.55");
+    }
+
+    #[test]
+    fn dashboard_preserves_group_if_group_event_precedes_registration() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        let issi = 2260618;
+        let gssi = 226333;
+
+        // Dashboard telemetry is observability, not an air-interface rule. The
+        // field bug after restart was that MM/CMCE had already rebuilt the GSSI
+        // affiliation, but the UI could still show "No Group" if the group
+        // event raced the registration event.
+        dashboard.handle_telemetry(TelemetryEvent::MsGroupAttach { issi, gssis: vec![gssi] });
+        dashboard.handle_telemetry(TelemetryEvent::MsRegistration { issi });
+
+        let snapshot = dashboard.state.read().unwrap().snapshot_ms();
+        let ms = snapshot.iter().find(|ms| ms.issi == issi).expect("radio should be visible");
+        assert_eq!(ms.groups, vec![gssi]);
+    }
+
+    #[test]
+    fn dashboard_preserves_group_snapshot_if_snapshot_precedes_registration() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        let issi = 2260616;
+        let gssi = 226333;
+
+        dashboard.handle_telemetry(TelemetryEvent::MsGroupsSnapshot { issi, gssis: vec![gssi] });
+        dashboard.handle_telemetry(TelemetryEvent::MsRegistration { issi });
+
+        let snapshot = dashboard.state.read().unwrap().snapshot_ms();
+        let ms = snapshot.iter().find(|ms| ms.issi == issi).expect("radio should be visible");
+        assert_eq!(ms.groups, vec![gssi]);
+    }
+
+    #[test]
+    fn dashboard_browser_creates_ms_entry_for_group_events_before_registration() {
+        let dashboard = render_product_template(crate::net_dashboard::html::DASHBOARD_HTML);
+
+        assert!(dashboard.contains("function ensureMsEntry(issi)"));
+        assert!(dashboard.contains("if((msg.groups||[]).length){const e=ensureMsEntry(msg.issi);"));
+        assert!(dashboard.contains("if(state.ms[msg.issi]||(msg.groups||[]).length)ensureMsEntry(msg.issi).groups=msg.groups||[];"));
+        assert!(dashboard.contains("ensureMsEntry(msg.issi)._last_seen_ts=Date.now();"));
     }
 
     #[test]

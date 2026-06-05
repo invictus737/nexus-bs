@@ -1,7 +1,7 @@
 use crate::net_control::ControlEndpoint;
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
@@ -74,6 +74,8 @@ struct PendingSwmiGroupTransaction {
     group_identity_downlink: Vec<GroupIdentityDownlink>,
     detach_all_then_attach: bool,
 }
+
+type RestartRecoveryCache = BTreeMap<u32, BTreeMap<u32, GroupAttachmentInfo>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CriticalMmDownlinkKind {
@@ -211,30 +213,100 @@ impl MmBs {
         cfg.security.is_issi_allowed(issi)
     }
 
-    fn read_restart_recovery_cache(path: &str) -> BTreeSet<u32> {
-        let mut issis = BTreeSet::new();
+    fn parse_restart_recovery_group_spec(spec: &str) -> Result<(u32, GroupAttachmentInfo), String> {
+        let clean = spec.trim().trim_matches(',').trim_matches('[').trim_matches(']');
+        if clean.is_empty() {
+            return Err("empty group token".to_string());
+        }
+
+        let mut fields = clean.split(':');
+        let gssi = fields
+            .next()
+            .ok_or_else(|| "missing GSSI".to_string())?
+            .parse::<u32>()
+            .map_err(|err| format!("invalid GSSI: {err}"))?;
+        let group_identity_attachment_lifetime = match fields.next() {
+            Some(value) if !value.is_empty() => value
+                .parse::<u8>()
+                .map_err(|err| format!("invalid group attachment lifetime: {err}"))?,
+            _ => 0,
+        };
+        let class_of_usage = match fields.next() {
+            Some(value) if !value.is_empty() => value.parse::<u8>().map_err(|err| format!("invalid group class of usage: {err}"))?,
+            _ => 0,
+        };
+        if fields.next().is_some() {
+            return Err("too many ':' fields in group token".to_string());
+        }
+
+        Ok((
+            gssi,
+            GroupAttachmentInfo {
+                group_identity_attachment_lifetime,
+                class_of_usage,
+            },
+        ))
+    }
+
+    fn read_restart_recovery_cache(path: &str) -> RestartRecoveryCache {
+        let mut cache = RestartRecoveryCache::new();
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return issis,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return cache,
             Err(err) => {
                 tracing::warn!("MM: failed reading restart recovery cache '{}': {}", path, err);
-                return issis;
+                return cache;
             }
         };
 
         for (line_no, line) in contents.lines().enumerate() {
-            let token = line.split('#').next().unwrap_or("").trim().trim_end_matches(',');
-            if token.is_empty() {
+            let body = line.split('#').next().unwrap_or("").trim();
+            if body.is_empty() {
                 continue;
             }
-            match token.parse::<u32>() {
+            let mut tokens = body.split_whitespace();
+            let Some(issi_token) = tokens.next() else {
+                continue;
+            };
+            match issi_token.trim_end_matches(',').parse::<u32>() {
                 Ok(issi) => {
-                    issis.insert(issi);
+                    let groups = cache.entry(issi).or_default();
+                    for token in tokens {
+                        let token = token.trim();
+                        let token = token.strip_prefix("groups=").unwrap_or(token);
+                        for spec in token.split(',') {
+                            if spec.trim().is_empty() {
+                                continue;
+                            }
+                            match Self::parse_restart_recovery_group_spec(spec) {
+                                Ok((gssi, info)) if gssi <= Self::MAX_AIR_INTERFACE_SSI => {
+                                    groups.insert(gssi, info);
+                                }
+                                Ok((gssi, _)) => {
+                                    tracing::warn!(
+                                        "MM: ignored invalid cached GSSI {} in restart recovery cache '{}' line {}",
+                                        gssi,
+                                        path,
+                                        line_no + 1
+                                    );
+                                }
+                                Err(err) => {
+                                    tracing::warn!(
+                                        "MM: ignored invalid cached group token '{}' in restart recovery cache '{}' line {}: {}",
+                                        spec,
+                                        path,
+                                        line_no + 1,
+                                        err
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
                 Err(err) => {
                     tracing::warn!(
                         "MM: ignored invalid ISSI '{}' in restart recovery cache '{}' line {}: {}",
-                        token,
+                        issi_token,
                         path,
                         line_no + 1,
                         err
@@ -243,19 +315,29 @@ impl MmBs {
             }
         }
 
-        issis
+        cache
     }
 
-    fn write_restart_recovery_cache(path: &str, issis: &BTreeSet<u32>) -> std::io::Result<()> {
+    fn write_restart_recovery_cache(path: &str, cache: &RestartRecoveryCache) -> std::io::Result<()> {
         if let Some(parent) = Path::new(path).parent()
             && !parent.as_os_str().is_empty()
         {
             std::fs::create_dir_all(parent)?;
         }
 
-        let mut body = String::from("# Nexus-BS local subscriber restart recovery cache\n# Auto-managed by MM. One ISSI per line.\n");
-        for issi in issis {
-            body.push_str(&format!("{issi}\n"));
+        let mut body = String::from(
+            "# Nexus-BS local subscriber restart recovery cache\n\
+             # Auto-managed by MM. Format: ISSI [GSSI:lifetime:class_of_usage ...]\n",
+        );
+        for (issi, groups) in cache {
+            body.push_str(&issi.to_string());
+            for (gssi, info) in groups {
+                body.push_str(&format!(
+                    " {gssi}:{}:{}",
+                    info.group_identity_attachment_lifetime, info.class_of_usage
+                ));
+            }
+            body.push('\n');
         }
 
         let tmp = format!("{path}.tmp");
@@ -276,7 +358,7 @@ impl MmBs {
         }
 
         if let Some(path) = Self::subscriber_recovery_path(config) {
-            for issi in Self::read_restart_recovery_cache(&path) {
+            for issi in Self::read_restart_recovery_cache(&path).keys().copied() {
                 if Self::restart_recovery_eligible(config, issi) {
                     issis.insert(issi);
                 } else {
@@ -295,6 +377,60 @@ impl MmBs {
         issis
     }
 
+    fn cached_restart_recovery_groups_for_issi(&self, issi: u32) -> Vec<(u32, GroupAttachmentInfo)> {
+        let Some(path) = Self::subscriber_recovery_path(&self.config) else {
+            return Vec::new();
+        };
+        let cache = Self::read_restart_recovery_cache(&path);
+        let Some(groups) = cache.get(&issi) else {
+            return Vec::new();
+        };
+        groups
+            .iter()
+            .filter_map(|(&gssi, &info)| {
+                if self.restart_recovery_group_allowed(gssi) {
+                    Some((gssi, info))
+                } else {
+                    tracing::warn!(
+                        "MM: cached GSSI {} for ISSI {} ignored because it is outside local group policy",
+                        gssi,
+                        issi
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn restart_recovery_group_allowed(&self, gssi: u32) -> bool {
+        if gssi > Self::MAX_AIR_INTERFACE_SSI {
+            return false;
+        }
+        !self
+            .config
+            .config()
+            .cell
+            .allowed_gssi_ranges
+            .as_ref()
+            .is_some_and(|ranges| !ranges.contains(gssi))
+    }
+
+    fn current_restart_recovery_groups_for_client(&mut self, issi: u32) -> BTreeMap<u32, GroupAttachmentInfo> {
+        let groups: Vec<u32> = self
+            .client_mgr
+            .get_client_by_issi(issi)
+            .map(|client| client.groups.iter().copied().collect())
+            .unwrap_or_default();
+        let mut cached_groups = BTreeMap::new();
+        for gssi in groups {
+            if self.restart_recovery_group_allowed(gssi) {
+                let info = self.client_mgr.client_group_attachment_info(issi, gssi).unwrap_or_default();
+                cached_groups.insert(gssi, info);
+            }
+        }
+        cached_groups
+    }
+
     fn remember_restart_recovery_issi(&mut self, issi: u32) {
         self.restart_recovery.remove(&issi);
         if !Self::restart_recovery_eligible(&self.config, issi) {
@@ -304,9 +440,12 @@ impl MmBs {
             return;
         };
 
-        let mut issis = Self::read_restart_recovery_cache(&path);
-        if issis.insert(issi) {
-            if let Err(err) = Self::write_restart_recovery_cache(&path, &issis) {
+        let groups = self.current_restart_recovery_groups_for_client(issi);
+        let mut cache = Self::read_restart_recovery_cache(&path);
+        let changed = cache.get(&issi) != Some(&groups);
+        cache.insert(issi, groups);
+        if changed {
+            if let Err(err) = Self::write_restart_recovery_cache(&path, &cache) {
                 tracing::warn!("MM: failed persisting ISSI {} to restart recovery cache '{}': {}", issi, path, err);
             }
         }
@@ -318,9 +457,9 @@ impl MmBs {
             return;
         };
 
-        let mut issis = Self::read_restart_recovery_cache(&path);
-        if issis.remove(&issi) {
-            if let Err(err) = Self::write_restart_recovery_cache(&path, &issis) {
+        let mut cache = Self::read_restart_recovery_cache(&path);
+        if cache.remove(&issi).is_some() {
+            if let Err(err) = Self::write_restart_recovery_cache(&path, &cache) {
                 tracing::warn!("MM: failed removing ISSI {} from restart recovery cache '{}': {}", issi, path, err);
             }
         }
@@ -953,6 +1092,7 @@ impl MmBs {
         if !aff_groups.is_empty() {
             self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
         }
+        self.remember_restart_recovery_issi(issi);
     }
 
     fn restore_shared_subscriber_state_for_reported_groups(&mut self, queue: &mut MessageQueue, issi: u32, groups: &[u32]) {
@@ -1010,6 +1150,42 @@ impl MmBs {
         // accepted group affiliation is advertised.
         self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Register);
         true
+    }
+
+    fn restore_cached_restart_recovery_groups(&mut self, queue: &mut MessageQueue, issi: u32) -> Vec<u32> {
+        let cached_groups = self.cached_restart_recovery_groups_for_issi(issi);
+        if cached_groups.is_empty() {
+            return Vec::new();
+        }
+
+        let mut restored_groups = Vec::new();
+        for (gssi, attachment_info) in cached_groups {
+            let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+            match self.client_mgr.client_group_attach_with_info(issi, gssi, true, attachment_info) {
+                Ok(changed) => {
+                    if changed || !shared_affiliated_before {
+                        self.restore_shared_subscriber_registration_for_known_client(queue, issi);
+                    }
+                    if !shared_affiliated_before && self.config.state_write().subscribers.affiliate(issi, gssi) {
+                        restored_groups.push(gssi);
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("MM: failed restoring cached restart group ISSI {} GSSI {}: {:?}", issi, gssi, err);
+                }
+            }
+        }
+
+        if !restored_groups.is_empty() {
+            tracing::info!(
+                "MM: restored cached restart group affiliation for ISSI {} groups={:?}",
+                issi,
+                restored_groups
+            );
+            self.emit_subscriber_update(queue, issi, restored_groups.clone(), BrewSubscriberAction::Affiliate);
+        }
+
+        restored_groups
     }
 
     fn parse_u_mm_status_energy_saving_mode(pdu: &UMmStatus, issi: u32) -> Option<EnergySavingMode> {
@@ -1733,6 +1909,22 @@ impl MmBs {
             }
         }
 
+        if is_new
+            && was_solicited_group_report_pending
+            && pdu.location_update_type != LocationUpdateType::ItsiAttach
+            && !_has_groups
+            && !group_report_complete
+        {
+            // EN 300 392-2 clause 16.8.0 keeps previously accepted group
+            // identities valid while their lifetime remains valid. When a
+            // restarted BS has just recovered the registration but the MS did
+            // not include a fresh group report yet, restore only the locally
+            // cached, previously accepted persistent groups for routing. A
+            // later explicit empty or replacement group report remains
+            // authoritative and clears/replaces these cached groups.
+            self.restore_cached_restart_recovery_groups(queue, issi);
+        }
+
         // Store and log class_of_ms
         if let Some(ref class) = pdu.class_of_ms {
             tracing::info!("MS {} class_of_ms: {}", issi, class);
@@ -2097,6 +2289,7 @@ impl MmBs {
                             }
                             self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
                             self.clear_solicited_group_report(issi);
+                            self.remember_restart_recovery_issi(issi);
                         }
                         Err(e) => {
                             tracing::warn!("Failed clearing groups for standalone group-report-complete MS {}: {:?}", issi, e);
@@ -2138,6 +2331,7 @@ impl MmBs {
                         self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
                     }
                     self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
+                    self.remember_restart_recovery_issi(issi);
                 }
                 Err(e) => {
                     tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
@@ -2572,6 +2766,7 @@ impl MmBs {
         if let Some(sink) = _sink {
             sink.send(crate::net_telemetry::TelemetryEvent::MsGroupsSnapshot { issi, gssis: all_groups });
         }
+        self.remember_restart_recovery_issi(issi);
 
         GroupIdentityProcessResult {
             group_identity_downlink,

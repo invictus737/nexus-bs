@@ -3439,3 +3439,62 @@ Remaining risk / next non-repeating execution:
 1. User should confirm the terminal UI now shows group `226333`, not `No Group`, immediately after BS restart.
 2. If any terminal still displays `No Group`, capture a fresh full log from the new restart before patching; check whether dashboard display state diverges from MM/CMCE affiliate state.
 3. If the group display is fixed, continue field validation with EG7 active: group PTT turn-taking, private simplex/duplex, SDS/WAP smoke, and longer soak.
+
+## 2026-06-05 10:45:39 EEST - Dashboard and MM restart cache hardened for `No Group` after restart
+
+Field symptom:
+
+- User reported that after BS restart the stations appeared attached but with `No Group`.
+- Fresh remote log `/home/chris/nexus-bs-v0.1.55-test/nexus-bs.log`, copied to `/private/tmp/nexus-bs-current.log`, started at `10:07:57` with build `v0.1.55-79272974` and `energy_saving_mode = "eg7"`.
+- The active remote restart cache `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` was still old format: only `2260082`, `2260616`, `2260618`, no cached GSSI.
+
+Log finding:
+
+- MM/CMCE did not lose the group in this restart slice.
+- `2260616`, `2260082`, and `2260618` each sent location update with GSSI `226333`; MM sent `D-LOCATION UPDATE ACCEPT` with `GroupIdentityLocationAccept` for `226333`; CMCE logged `subscriber affiliate ... groups=[226333]`.
+- Therefore the observed `No Group` was either dashboard/browser event-order display loss, or a restart-cache risk for cases where an MS answers the restart recovery command without a fresh group report.
+
+Component explanation:
+
+- MM is Mobile Management: it owns terminal registration, group affiliation state, and the local restart-recovery cache used after BS restart.
+- CMCE is call control: it consumes MM register/affiliate updates so group/private calls know which terminals are valid participants.
+- Dashboard telemetry is observability only: it must accurately show MM/CMCE state, but it is not the ETSI air-interface procedure.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: BS-commanded registration can request a group identity report after restart.
+- Clauses 16.8.0, 16.8.2, 16.8.3, 16.8.4 and 16.10.27a: group identities reported/accepted during MM attach/group-report procedures remain the authority for affiliation state.
+- Clauses 16.10.19 and 16.10.20: accepted group attachment information and reject reasons must be coherent; this patch preserves accepted `GroupAttachmentInfo` in the restart cache and does not fabricate an over-air GSSI accept when the MS did not report one.
+- This is clause-scoped hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Restart recovery cache now supports `ISSI GSSI:lifetime:class_of_usage`.
+  - Successful group affiliation persists the current GSSI/class/lifetime in the local cache.
+  - Legacy `ISSI`-only cache entries remain valid.
+  - If a restarted BS has a cached accepted GSSI and a solicited `DemandLocationUpdating` response arrives without a fresh group report, MM restores only local routing/CMCE affiliation from the cache; it does not add a fake `GroupIdentityLocationAccept` to that over-air response.
+  - Explicit empty complete reports clear cached groups; explicit group reports replace cached groups.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Dashboard state now creates/preserves an MS entry when `MsGroupAttach` or `MsGroupsSnapshot` arrives before `MsRegistration`, instead of later showing `No Group`.
+- `crates/tetra-entities/src/net_dashboard/html.rs`
+  - Browser-side WS handling now uses `ensureMsEntry()` for `ms_groups` and non-empty `ms_groups_all`, so a live browser does not drop group events that race ahead of `ms_registered`.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added restart-cache GSSI persistence/restoration/empty-clear/replacement coverage.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added server-state and shipped-HTML regression tests for group-before-registration ordering.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 14 passed.
+- `cargo test -p tetra-entities --lib dashboard_ --locked` -> 8 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Deploy this local patch directly to `/home/chris/nexus-bs-v0.1.55-test` without compiling on the Pi.
+2. Restart the test BS with EG7 still active and confirm the cache rewrites to `2260616 226333:0:4`, `2260082 226333:0:4`, `2260618 226333:0:4` or equivalent class values after the terminals report.
+3. Re-open the dashboard after restart and verify all three stations show `226333`, not `No Group`.
+4. If a terminal itself, not the dashboard, still displays `No Group`, inspect whether it received/ACKed `D-LOCATION UPDATE ACCEPT` and whether it later sends an explicit empty group-report-complete.

@@ -2871,7 +2871,7 @@ function handleMsg(msg){
     case 'brew_status':
       setBrewStatus(!!msg.connected,msg.brew_version||0);break;
     case 'ms_registered':
-      state.ms[msg.issi]=Object.assign({issi:msg.issi,groups:[],rssi_dbfs:null,energy_saving_mode:0,energy_saving_frame:null,energy_saving_multiframe:null},state.ms[msg.issi]||{},{issi:msg.issi,_last_seen_ts:Date.now()});
+      ensureMsEntry(msg.issi)._last_seen_ts=Date.now();
       renderStations();break;
     case 'ms_deregistered':
       delete state.ms[msg.issi];renderStations();break;
@@ -2879,13 +2879,13 @@ function handleMsg(msg){
       if(state.ms[msg.issi]){state.ms[msg.issi].rssi_dbfs=msg.rssi_dbfs;state.ms[msg.issi]._last_seen_ts=Date.now();}
       renderStations();break;
     case 'ms_groups':
-      if(state.ms[msg.issi]){const cur=new Set(state.ms[msg.issi].groups||[]);(msg.groups||[]).forEach(g=>cur.add(g));state.ms[msg.issi].groups=[...cur];}
+      if((msg.groups||[]).length){const e=ensureMsEntry(msg.issi);const cur=new Set(e.groups||[]);(msg.groups||[]).forEach(g=>cur.add(g));e.groups=[...cur];}
       renderStations();break;
     case 'ms_groups_detach':
       if(state.ms[msg.issi]){const rem=new Set(msg.groups||[]);state.ms[msg.issi].groups=(state.ms[msg.issi].groups||[]).filter(g=>!rem.has(g));}
       renderStations();break;
     case 'ms_groups_all':
-      if(state.ms[msg.issi])state.ms[msg.issi].groups=msg.groups||[];
+      if(state.ms[msg.issi]||(msg.groups||[]).length)ensureMsEntry(msg.issi).groups=msg.groups||[];
       renderStations();break;
     case 'call_started':
       state.calls[msg.call_id]={...msg,started_at:Date.now()};
@@ -2922,6 +2922,11 @@ function handleMsg(msg){
     case 'sdr_health':handleSdrHealth(msg);break;
     case 'sys_health':handleSysHealth(msg);break;
   }
+}
+
+function ensureMsEntry(issi){
+  state.ms[issi]=Object.assign({issi,groups:[],rssi_dbfs:null,energy_saving_mode:0,energy_saving_frame:null,energy_saving_multiframe:null},state.ms[issi]||{},{issi});
+  return state.ms[issi];
 }
 
 // ── Render helpers ────────────────────────────────────────────────────────
