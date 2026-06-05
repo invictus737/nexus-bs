@@ -5024,3 +5024,42 @@ Next non-repeating execution:
 1. Commit this UMAC TMA pending report bounds patch.
 2. Continue with DL media queue backpressure under sustained group-call overfeed.
 3. Before deploy, rerun UMAC scheduler, MM, CMCE group/private, and diff checks.
+
+## 2026-06-05 16:57:19 EEST - DL media queue backpressure
+
+User goal:
+
+- Keep group/private call audio paths stable under sustained overfeed and long-running operation.
+- Prevent stale queued speech frames from accumulating when producer rate exceeds the radio drain rate.
+
+Component in simple technical terms:
+
+- `CircuitMgr` owns active UL/DL traffic circuits and the per-timeslot downlink media queues.
+- These queues hold ACELP or raw TCH/S blocks that are waiting to be transmitted on an assigned traffic channel.
+- If the queue grows without bound, old speech can add latency, stale audio, or memory pressure; for live PTT voice, keeping the latest bounded window is safer.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.5 traffic-channel scheduling: this is local queue/backpressure behavior before selecting the next TCH/S block for a valid assigned channel.
+- Floor release/grant still purges stale media at UMAC/CMCE boundaries; this patch only bounds ordinary per-timeslot media buildup.
+- This is engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/circuit_mgr.rs`
+  - Added `MAX_TX_DATA_BLOCKS_PER_TIMESLOT`.
+  - `put_block` and `put_raw_tch_s_half_slot` now push through a bounded helper.
+  - When full, the oldest queued DL media block is dropped and the newest block is retained.
+  - Added unit tests for bounded ACELP and raw TCH/S overfeed.
+
+Verification:
+
+- `cargo test -p tetra-entities --lib umac::subcomp::circuit_mgr --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 57 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this DL media queue backpressure patch.
+2. Run a final combined verification set across scheduler, MM, UMAC, CMCE, and diff checks.
+3. If deploy is requested, build locally and deploy direct to testing only; do not compile on the Pi and do not create binary backups.
