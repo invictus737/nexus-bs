@@ -155,9 +155,6 @@ impl CcBsSubentity {
         };
         let dest_addr = cached.dest_addr;
 
-        if let Some(call) = self.active_calls.get_mut(&call_id) {
-            call.reset_timeout(self.dltime);
-        }
         self.refresh_group_cached_d_setup_speaker(call_id, speaker.ssi);
 
         // EN 300 392-2 clause 14.5.2.2.1 b) defines D-TX GRANTED as the
@@ -167,6 +164,7 @@ impl CcBsSubentity {
         // transmit permission and refreshes the local traffic scheduler.
         self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, usage, TransmissionGrant::Granted, Some(speaker.ssi));
         self.send_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts, usage);
+        self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -258,7 +256,6 @@ impl CcBsSubentity {
                     return Err(GroupTransitionError::UnknownCall(call_id));
                 };
                 call.grant_floor(requesting_party.ssi, Some(requesting_party));
-                call.reset_timeout(self.dltime);
             }
 
             // EN 300 392-2 clause 14.5.2.2.1 f) and table 14.85: pre-emptive
@@ -293,6 +290,7 @@ impl CcBsSubentity {
                 Some(requesting_party.ssi),
             );
             self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
             self.send_group_d_setup_refresh(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
@@ -394,6 +392,7 @@ impl CcBsSubentity {
             Some(requesting_party.ssi),
         );
         self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
+        self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
         self.send_group_d_setup_refresh(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
 
         // Notify dashboard that the speaker changed (hangtime -> new speaker).
@@ -503,6 +502,7 @@ impl CcBsSubentity {
                 Some(requester.ssi),
             );
             self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
             self.send_group_d_setup_refresh(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
 
             // Notify dashboard that the queued speaker got the floor.
@@ -658,7 +658,6 @@ impl CcBsSubentity {
             };
 
             call.grant_floor(source_issi, None);
-            call.reset_timeout(self.dltime);
             call.priority = priority;
             call.brew_uuid = Some(brew_uuid);
             if matches!(&call.origin, CallOrigin::Network { brew_uuid: old_uuid } if *old_uuid != brew_uuid) {
@@ -695,6 +694,7 @@ impl CcBsSubentity {
         }
 
         self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
+        self.send_group_d_info_reset_t310_facch(queue, call_id, dest_gssi, ts, usage);
         self.send_group_d_setup_refresh(queue, call_id, source_issi, dest_gssi, ts, usage);
 
         queue.push_back(SapMsg {

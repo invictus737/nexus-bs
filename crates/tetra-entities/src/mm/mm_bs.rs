@@ -73,6 +73,9 @@ struct PendingSwmiGroupTransaction {
     expires_at: TdmaTime,
     group_identity_downlink: Vec<GroupIdentityDownlink>,
     detach_all_then_attach: bool,
+    accepts_unrouted_ack_handle_zero: bool,
+    rollback_unconfirmed_attachments_on_failure: bool,
+    reprobe_group_report_on_failure: bool,
 }
 
 type RestartRecoveryCache = BTreeMap<u32, BTreeMap<u32, GroupAttachmentInfo>>;
@@ -137,7 +140,7 @@ impl MmBs {
     // time is 30 s. One TETRA multiframe is 18 TDMA frames (72 slots), so this
     // deterministic TDMA approximation is just over 30 s.
     const T352_ENERGY_RESPONSE_TIMESLOTS: i32 = 30 * 18 * 4;
-    // EN 300 392-2 clause 16.11.1.4: T353 is 10 s for attach/detach group
+    // EN 300 392-2 clause 16.11.1.3: T353 is 10 s for attach/detach group
     // identity response. One TETRA second is 18 frames * 4 timeslots.
     const T353_GROUP_RESPONSE_TIMESLOTS: i32 = 10 * 18 * 4;
     // Local restart recovery retry cadence. This is an operator-side SwMI
@@ -153,6 +156,7 @@ impl MmBs {
     const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 2 * 18 * 4;
     const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 150;
+    const UNROUTED_UPLINK_HANDLE: MleHandle = 0;
     // Local acceptance window for the group-report phase requested by
     // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
     // clause 16.4.4. This is not an ETSI timer value; it matches the local
@@ -465,14 +469,18 @@ impl MmBs {
         }
     }
 
-    fn allocate_critical_downlink_handle(&mut self) -> MleHandle {
+    fn allocate_mm_downlink_handle(&mut self) -> MleHandle {
         loop {
             let handle = self.next_critical_downlink_handle;
             self.next_critical_downlink_handle = self.next_critical_downlink_handle.wrapping_add(1);
             if self.next_critical_downlink_handle < 0x8000_0000 {
                 self.next_critical_downlink_handle = 0x8000_0000;
             }
-            if handle != 0 && !self.pending_critical_downlinks.contains_key(&handle) {
+            let swmi_group_handle_in_use = self
+                .pending_swmi_group_transactions
+                .values()
+                .any(|pending| pending.handle == handle);
+            if handle != 0 && !self.pending_critical_downlinks.contains_key(&handle) && !swmi_group_handle_in_use {
                 return handle;
             }
         }
@@ -481,7 +489,7 @@ impl MmBs {
     fn track_location_update_accept_downlink(&mut self, issi: u32, retry_handle: u32) -> MleHandle {
         self.pending_critical_downlinks
             .retain(|_, pending| !(pending.issi == issi && pending.kind == CriticalMmDownlinkKind::LocationUpdateAccept));
-        let handle = self.allocate_critical_downlink_handle();
+        let handle = self.allocate_mm_downlink_handle();
         self.pending_critical_downlinks.insert(
             handle,
             PendingCriticalMmDownlink {
@@ -673,9 +681,18 @@ impl MmBs {
                 expires_at: self.dltime.add_timeslots(Self::T353_GROUP_RESPONSE_TIMESLOTS),
                 group_identity_downlink,
                 detach_all_then_attach,
+                accepts_unrouted_ack_handle_zero: false,
+                rollback_unconfirmed_attachments_on_failure: false,
+                reprobe_group_report_on_failure: false,
             },
         );
         true
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_swmi_group_transaction_pending_for_test(&self, issi: u32) -> bool {
+        self.pending_swmi_group_transactions.contains_key(&issi)
     }
 
     fn stay_alive_energy_saving_information() -> EnergySavingInformation {
@@ -896,7 +913,7 @@ impl MmBs {
         }
     }
 
-    fn expire_pending_swmi_group_transactions(&mut self, now: TdmaTime) {
+    fn expire_pending_swmi_group_transactions(&mut self, queue: &mut MessageQueue, now: TdmaTime) {
         let expired: Vec<u32> = self
             .pending_swmi_group_transactions
             .iter()
@@ -904,11 +921,22 @@ impl MmBs {
             .collect();
 
         for issi in expired {
-            if self.pending_swmi_group_transactions.remove(&issi).is_some() {
+            if let Some(pending) = self.pending_swmi_group_transactions.remove(&issi) {
                 tracing::warn!(
                     "MM: T353 expired for SwMI-initiated group attach/detach transaction to ISSI {}; discarding pending transaction",
                     issi
                 );
+                if pending.rollback_unconfirmed_attachments_on_failure {
+                    let mut deaff_groups = Vec::new();
+                    for gid in &pending.group_identity_downlink {
+                        if gid.group_identity_attachment.is_some() {
+                            if let Some(gssi) = GroupIdentityAddress::from_downlink(gid).plain_gssi() {
+                                self.rollback_swmi_group_attachment(issi, gssi, &mut deaff_groups, "T353 expired");
+                            }
+                        }
+                    }
+                    self.finish_swmi_group_failure_recovery(queue, issi, &pending, deaff_groups, "T353 expired");
+                }
             }
         }
     }
@@ -1021,6 +1049,55 @@ impl MmBs {
         }
     }
 
+    fn rollback_swmi_group_attachment(&mut self, issi: u32, gssi: u32, deaff_groups: &mut Vec<u32>, reason: &str) {
+        let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
+        match self.client_mgr.client_group_attach(issi, gssi, false) {
+            Ok(changed) => {
+                if changed || shared_affiliated_before {
+                    if shared_affiliated_before {
+                        self.config.state_write().subscribers.deaffiliate(issi, gssi);
+                    }
+                    Self::push_unique_group(deaff_groups, gssi);
+                    tracing::warn!(
+                        "MM: rolled back unconfirmed SwMI group attachment ISSI {} GSSI {} after {}",
+                        issi,
+                        gssi,
+                        reason
+                    );
+                }
+            }
+            Err(e) => tracing::warn!(
+                "MM: failed rolling back unconfirmed SwMI group attachment ISSI {} GSSI {} after {}: {:?}",
+                issi,
+                gssi,
+                reason,
+                e
+            ),
+        }
+    }
+
+    fn finish_swmi_group_failure_recovery(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        pending: &PendingSwmiGroupTransaction,
+        deaff_groups: Vec<u32>,
+        reason: &str,
+    ) {
+        if !deaff_groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
+            self.remember_restart_recovery_issi(issi);
+        }
+        if pending.reprobe_group_report_on_failure {
+            tracing::info!(
+                "MM: requesting fresh group report from ISSI {} after failed restart group refresh ({})",
+                issi,
+                reason
+            );
+            self.send_d_location_update_command(queue, issi, 0);
+        }
+    }
+
     fn apply_swmi_group_ack(
         &mut self,
         queue: &mut MessageQueue,
@@ -1068,6 +1145,14 @@ impl MmBs {
                         issi,
                         gssi
                     );
+                    if pending.rollback_unconfirmed_attachments_on_failure {
+                        self.rollback_swmi_group_attachment(
+                            issi,
+                            gssi,
+                            &mut deaff_groups,
+                            "U-ATTACH/DETACH GROUP IDENTITY ACK rejected attachment",
+                        );
+                    }
                     continue;
                 }
                 let attachment_info = GroupAttachmentInfo {
@@ -1086,13 +1171,23 @@ impl MmBs {
             }
         }
 
-        if !deaff_groups.is_empty() {
+        let had_deaff_groups = !deaff_groups.is_empty();
+        if had_deaff_groups {
             self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
         }
         if !aff_groups.is_empty() {
             self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
         }
         self.remember_restart_recovery_issi(issi);
+        if pending.rollback_unconfirmed_attachments_on_failure && had_deaff_groups {
+            self.finish_swmi_group_failure_recovery(
+                queue,
+                issi,
+                &pending,
+                Vec::new(),
+                "U-ATTACH/DETACH GROUP IDENTITY ACK rejected attachment",
+            );
+        }
     }
 
     fn restore_shared_subscriber_state_for_reported_groups(&mut self, queue: &mut MessageQueue, issi: u32, groups: &[u32]) {
@@ -1771,6 +1866,7 @@ impl MmBs {
 
         // Process optional GroupIdentityLocationDemand field
         let _has_groups = pdu.group_identity_location_demand.is_some();
+        let mut cached_restart_group_refresh = Vec::new();
         let gila = if let Some(gild) = pdu.group_identity_location_demand {
             let giu_for_mode = gild
                 .group_identity_uplink
@@ -1918,7 +2014,7 @@ impl MmBs {
             // cached, previously accepted persistent groups for routing. A
             // later explicit empty or replacement group report remains
             // authoritative and clears/replaces these cached groups.
-            self.restore_cached_restart_recovery_groups(queue, issi);
+            cached_restart_group_refresh = self.restore_cached_restart_recovery_groups(queue, issi);
         }
 
         // Store and log class_of_ms
@@ -1997,6 +2093,15 @@ impl MmBs {
         };
         queue.push_back(msg);
 
+        if !cached_restart_group_refresh.is_empty() {
+            // EN 300 392-2 clause 16.8.1 gives the SwMI a separate
+            // infrastructure-initiated group attach path. Use it after the
+            // location update accept so a restarted terminal that came back
+            // group-less receives an over-air GSSI refresh instead of only a
+            // local CMCE/dashboard affiliation replay.
+            self.send_swmi_group_attach_refresh(queue, issi, &cached_restart_group_refresh);
+        }
+
         // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI +
         // group identity report) for a genuinely new radio that did not already
         // include a group report.
@@ -2020,6 +2125,7 @@ impl MmBs {
         let has_groups = _has_groups || group_report_complete;
         let request_restart_group_report = is_new
             && !has_groups
+            && cached_restart_group_refresh.is_empty()
             && !was_solicited_group_report_pending
             && (pdu.location_update_type != LocationUpdateType::ItsiAttach || was_restart_recovery_candidate);
 
@@ -2492,7 +2598,8 @@ impl MmBs {
             return;
         };
 
-        if pending.handle != prim.handle {
+        let unrouted_zero_ack = pending.accepts_unrouted_ack_handle_zero && prim.handle == Self::UNROUTED_UPLINK_HANDLE;
+        if pending.handle != prim.handle && !unrouted_zero_ack {
             tracing::debug!(
                 "MM: U-ATTACH/DETACH GROUP IDENTITY ACK handle mismatch for ISSI {}: pending={} received={}; ignoring",
                 issi,
@@ -2825,6 +2932,97 @@ impl MmBs {
                 tx_reporter: None,
             }),
         });
+    }
+
+    fn send_swmi_group_attach_refresh(&mut self, queue: &mut MessageQueue, issi: u32, groups: &[u32]) {
+        if groups.is_empty() {
+            return;
+        }
+
+        let groups_to_send = if groups.len() > Self::MAX_GROUPS_PER_ATTACH {
+            tracing::warn!(
+                "MM: cached restart group refresh for ISSI {} has {} groups; limiting one D-ATTACH/DETACH GROUP IDENTITY PDU to {} groups",
+                issi,
+                groups.len(),
+                Self::MAX_GROUPS_PER_ATTACH
+            );
+            &groups[..Self::MAX_GROUPS_PER_ATTACH]
+        } else {
+            groups
+        };
+
+        let group_identity_downlink = self.group_identity_downlink_for_reported_groups(issi, groups_to_send);
+        if group_identity_downlink.is_empty() {
+            return;
+        }
+        let handle = self.allocate_mm_downlink_handle();
+
+        let pdu = DAttachDetachGroupIdentity {
+            group_identity_report: false,
+            group_identity_acknowledgement_request: true,
+            // EN 300 392-2 clause 16.8.1/table 16.49: use amendment for a
+            // restart refresh so cached groups are attached without detaching
+            // any additional scan-list groups the MS may still hold. A later
+            // explicit group report or empty report remains authoritative and
+            // abandons this pending SwMI transaction before mutating state.
+            group_identity_attach_detach_mode: false,
+            proprietary: None,
+            group_report_response: None,
+            group_identity_downlink: Some(group_identity_downlink.clone()),
+            group_identity_security_related_information: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        match pdu.to_bitbuf(&mut sdu) {
+            Ok(()) => {
+                sdu.seek(0);
+                tracing::info!(
+                    "MM: sending SwMI group attach refresh to ISSI {} for cached restart group(s) {:?}",
+                    issi,
+                    groups_to_send
+                );
+                self.pending_swmi_group_transactions.insert(
+                    issi,
+                    PendingSwmiGroupTransaction {
+                        handle,
+                        expires_at: self.dltime.add_timeslots(Self::T353_GROUP_RESPONSE_TIMESLOTS),
+                        group_identity_downlink,
+                        detach_all_then_attach: false,
+                        // LLC/MLE uplink indications generated for a standalone
+                        // MS ACK may not preserve the downlink request handle.
+                        // Accept handle 0 for this restart-refresh transaction,
+                        // but keep non-zero wrong handles rejected.
+                        accepts_unrouted_ack_handle_zero: true,
+                        rollback_unconfirmed_attachments_on_failure: true,
+                        reprobe_group_report_on_failure: true,
+                    },
+                );
+                queue.push_back(SapMsg {
+                    sap: Sap::LmmSap,
+                    src: TetraEntity::Mm,
+                    dest: TetraEntity::Mle,
+                    msg: SapMsgInner::LmmMleUnitdataReq(LmmMleUnitdataReq {
+                        sdu,
+                        handle,
+                        address: TetraAddress::issi(issi),
+                        layer2service: Layer2Service::Acknowledged,
+                        stealing_permission: false,
+                        stealing_repeats_flag: false,
+                        encryption_flag: false,
+                        is_null_pdu: false,
+                        tx_reporter: None,
+                    }),
+                });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "MM: failed serializing SwMI group attach refresh for ISSI {} groups={:?}: {:?}",
+                    issi,
+                    groups_to_send,
+                    err
+                );
+            }
+        }
     }
 
     fn process_attach_detach_group_identity_uplink(
@@ -3444,7 +3642,7 @@ impl TetraEntityTrait for MmBs {
         }
 
         self.expire_pending_energy_saving(ts);
-        self.expire_pending_swmi_group_transactions(ts);
+        self.expire_pending_swmi_group_transactions(queue, ts);
         self.expire_pending_solicited_group_reports(queue, ts);
         self.tick_restart_recovery(queue, ts);
 

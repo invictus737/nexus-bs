@@ -18,6 +18,7 @@ use tetra_pdus::cmce::pdus::d_call_proceeding::DCallProceeding;
 use tetra_pdus::cmce::pdus::d_connect::DConnect;
 use tetra_pdus::cmce::pdus::d_connect_acknowledge::DConnectAcknowledge;
 use tetra_pdus::cmce::pdus::d_disconnect::DDisconnect;
+use tetra_pdus::cmce::pdus::d_info::DInfo;
 use tetra_pdus::cmce::pdus::d_release::DRelease;
 use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
@@ -941,6 +942,15 @@ fn parse_d_disconnect(prim: &LcmcMleUnitdataReq) -> Option<DDisconnect> {
     DDisconnect::from_bitbuf(&mut sdu).ok()
 }
 
+fn parse_d_info(prim: &LcmcMleUnitdataReq) -> Option<DInfo> {
+    if !is_dl_pdu(prim, CmcePduTypeDl::DInfo) {
+        return None;
+    }
+    let mut sdu = prim.sdu.clone();
+    sdu.seek(0);
+    DInfo::from_bitbuf(&mut sdu).ok()
+}
+
 fn parse_d_release(prim: &LcmcMleUnitdataReq) -> Option<DRelease> {
     if !is_dl_pdu(prim, CmcePduTypeDl::DRelease) {
         return None;
@@ -1117,6 +1127,58 @@ fn count_d_tx_ceased(msgs: &[SapMsg]) -> usize {
     msgs.iter()
         .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_tx_ceased(prim).is_some()))
         .count()
+}
+
+fn d_info_reset_t310_prims(msgs: &[SapMsg]) -> Vec<(&LcmcMleUnitdataReq, DInfo)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_info(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .filter(|(_, pdu)| pdu.reset_call_time_out_timer_t310_)
+        .collect()
+}
+
+fn assert_one_group_d_info_reset_t310(msgs: &[SapMsg], call_id: u16, gssi: u32, ts: u8, usage: u8, context: &str) {
+    let resets = d_info_reset_t310_prims(msgs);
+    assert_eq!(resets.len(), 1, "{context}: expected one group D-INFO reset T310");
+    let (prim, d_info) = &resets[0];
+    assert_eq!(d_info.call_identifier, call_id, "{context}: D-INFO call id");
+    assert!(d_info.reset_call_time_out_timer_t310_, "{context}: reset T310 bit");
+    assert!(!d_info.poll_request, "{context}: no acknowledged-group poll request");
+    assert!(
+        d_info.call_time_out.is_none(),
+        "{context}: reset uses existing T310 value instead of changing timeout"
+    );
+    assert_eq!(
+        prim.main_address,
+        TetraAddress::new(gssi, SsiType::Gssi),
+        "{context}: group address"
+    );
+    assert!(
+        prim.stealing_permission,
+        "{context}: D-INFO reset should use assigned-channel FACCH/STCH"
+    );
+    assert_eq!(
+        prim.layer2service,
+        Layer2Service::Unacknowledged,
+        "{context}: group reset is unacknowledged"
+    );
+    assert_eq!(
+        prim.unacked_bl_repetitions,
+        Some(0),
+        "{context}: reset T310 floor-control signalling must not repeat stale BL-UDATA"
+    );
+    let chan_alloc = prim
+        .chan_alloc
+        .as_ref()
+        .unwrap_or_else(|| panic!("{context}: D-INFO reset should carry channel allocation"));
+    assert_chan_alloc_matches_circuit(chan_alloc, ts, usage, context);
+    assert_eq!(
+        chan_alloc.ul_dl_assigned,
+        UlDlAssignment::Both,
+        "{context}: D-INFO reset preserves active bidirectional traffic allocation"
+    );
 }
 
 fn count_d_releases(msgs: &[SapMsg]) -> usize {
@@ -3867,6 +3929,10 @@ fn test_group_tx_demand_from_non_speaker_is_queued_without_floor_handoff() {
         0,
         "queued floor request must not notify UMAC of a floor handoff"
     );
+    assert!(
+        d_info_reset_t310_prims(&demand_msgs).is_empty(),
+        "queued-only U-TX DEMAND must not reset T310"
+    );
 }
 
 #[test]
@@ -4138,6 +4204,14 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         .expect("group D-SETUP refresh should carry channel allocation");
     assert_chan_alloc_matches_circuit(setup_refresh_alloc, active_ts, active_usage, "queued handoff D-SETUP refresh");
     assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert_one_group_d_info_reset_t310(
+        &ceased_msgs,
+        call_id,
+        TEST_GSSI,
+        active_ts,
+        active_usage,
+        "queued U-TX-CEASED handoff",
+    );
 
     assert!(
         ceased_msgs
@@ -4266,6 +4340,14 @@ fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
         .expect("group timeout D-SETUP refresh should carry channel allocation");
     assert_chan_alloc_matches_circuit(setup_alloc, active_ts, active_usage, "group timeout D-SETUP refresh");
     assert_eq!(setup_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert_one_group_d_info_reset_t310(
+        &timeout_msgs,
+        call_id,
+        LAB_GROUP_GSSI,
+        active_ts,
+        active_usage,
+        "UL inactivity queued handoff",
+    );
 
     assert!(timeout_msgs.iter().any(|msg| {
         matches!(
@@ -4611,6 +4693,10 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
 
     assert_eq!(count_umac_floor_granted(&ceased_msgs), 0);
     assert_eq!(count_umac_floor_released(&ceased_msgs), 1);
+    assert!(
+        d_info_reset_t310_prims(&ceased_msgs).is_empty(),
+        "no-handoff U-TX-CEASED must not reset T310"
+    );
     assert!(ceased_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
@@ -4689,6 +4775,7 @@ fn test_group_hangtime_tx_demand_refreshes_late_entry_speaker() {
         prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
+    assert_one_group_d_info_reset_t310(&demand_msgs, call_id, TEST_GSSI, active_ts, active_usage, "hangtime floor retake");
     assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
 }
 

@@ -1,5 +1,56 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 11:52:03 EEST - MM cached restart group refresh over air, EG7 ordering, and failure rollback
+
+User report:
+
+- After BS restart, terminals attach but display `No Group`.
+- Current hard test shape includes cached group `226333`, terminals such as `2260616`/`2260618`, and BS energy saving configured as EG7.
+
+Component explanation:
+
+- MM is Mobility Management: it owns ISSI registration, cached restart recovery, group affiliation, SwMI group attach/detach, and energy economy negotiation.
+- CMCE is call control: it depends on MM `Register`/`Affiliate` events to decide whether group/private PTT is valid.
+- EG7 is an energy-saving mode: the terminal may sleep for long cycles, so group refresh must be queued before BS-initiated EG7 sleep assignment is activated.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI may initiate registration and request group identity reporting.
+- Clause 16.8.0: previously accepted group identities remain valid while their lifetime remains valid.
+- Clause 16.8.1: SwMI-initiated `D-ATTACH/DETACH GROUP IDENTITY` must use `group identity report = not report request`, no group-report-response IE, and may use amendment mode.
+- Clause 16.8.5 and 16.11.1.3: T353 bounds attach/detach response waiting; expiry is treated as failed refresh in this implementation.
+- Clauses 16.8.6, 16.10.13, 16.10.14, 16.10.17, 16.10.19, and Annex G: ACK request/type, amendment mode, attachment lifetime/class, rejected attachment handling, and procedure collision handling.
+- Clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7, and 23.7.6 remain the EG scheduling scope. This is clause-scoped engineering hardening, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Cached restart group restore now returns the restored GSSIs and sends a separate acknowledged SwMI `D-ATTACH/DETACH GROUP IDENTITY` refresh after `D-LOCATION UPDATE ACCEPT`.
+  - The refresh uses amendment mode and a non-zero local downlink handle; handle `0` is accepted only as an unrouted uplink ACK fallback for this restart-refresh transaction.
+  - Cached refresh no longer immediately collides with a fresh `D-LOCATION UPDATE COMMAND(group_identity_report=1)` in the same unsolicited ITSI attach cycle.
+  - If the MS rejects the refreshed group or T353 expires, MM rolls back the provisional cached affiliation, persists the bare ISSI cache, and requests a fresh group report.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs` and group FSM/timers
+  - Real group floor grants send group-addressed FACCH/STCH `D-INFO` with reset T310 while preserving `UlDlAssignment::Both`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 19 passed.
+- `cargo test -p tetra-entities --test test_mm_bs swmi_group_ack --locked` -> 12 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 122 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_ --locked` -> 50 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 129 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this MM/CMCE patch.
+2. Deploy direct when `chris@192.168.1.179` is reachable: `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. After restart, verify terminals `2260082`, `2260616`, and `2260618` show group `226333`, not `No Group`.
+4. In fresh logs, confirm cached restart restore is followed by `D-ATTACH/DETACH GROUP IDENTITY`, ACK handling, and no duplicate affiliate event.
+5. Retest group PTT under EG7: first PTT after restart should not be denied because CMCE should already have the restored MM affiliate.
+
 ## 2026-06-05 11:18:02 EEST - Restart `No Group` remains deploy/log blocked; LMAC fail-closed verified locally
 
 User report:
@@ -47,7 +98,7 @@ Verification run:
 Deploy/log status:
 
 - Commit created after verification:
-  - `da6fa25 fix: fail closed unsupported lmac channels`
+  - `e7afd48 fix: fail closed unsupported lmac channels`
 - `ssh chris@192.168.1.179 ...` timed out on port 22 while trying to read `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` and the full `/home/chris/nexus-bs-v0.1.55-test/nexus-bs.log` from the latest restart.
 - Live restart validation and direct deploy are still blocked by SSH reachability, not by local code/test failures.
 

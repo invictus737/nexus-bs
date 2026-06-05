@@ -3539,7 +3539,7 @@ fn test_wrong_handle_swmi_group_ack_keeps_pending_transaction_until_valid_ack() 
     test.run_stack(Some(1));
     let wrong_handle_msgs = test.dump_sinks();
 
-    // EN 300 392-2 clause 16.11.1.4 binds the SwMI-initiated group
+    // EN 300 392-2 clause 16.11.1.3 binds the SwMI-initiated group
     // attach/detach transaction to T353. A mismatched ACK handle is not the
     // solicited response and must not consume the pending transaction.
     assert!(
@@ -4709,7 +4709,8 @@ fn test_restart_recovery_unsolicited_itsi_attach_without_groups_restores_cached_
     // EN 300 392-2 clause 16.4.4 gives the SwMI a group-report command path,
     // but a still-camped MS may also self-attach before the startup command is
     // sent. If it omits group identities, restore only the cached, previously
-    // accepted group locally; do not fabricate an over-air group accept.
+    // accepted group locally and send a separate SwMI group refresh instead of
+    // colliding with an immediate group-report command.
     submit_location_update_with_type(&mut test, issi, LocationUpdateType::ItsiAttach, None);
     test.run_stack(Some(1));
     let attach_msgs = test.dump_sinks();
@@ -4721,11 +4722,11 @@ fn test_restart_recovery_unsolicited_itsi_attach_without_groups_restores_cached_
         "cached restart restoration must not fabricate a GroupIdentityLocationAccept for a group-less ITSI attach"
     );
 
-    let commands = location_update_command_details(&attach_msgs);
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0, issi);
-    assert!(commands[0].3.group_identity_report);
-    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+    assert!(
+        !contains_location_update_command(&attach_msgs),
+        "cached restart group refresh must not immediately collide with a group-report command"
+    );
+    assert!(!debug_mm_solicited_group_report_pending(&mut test, issi));
 
     let updates = subscriber_updates(&attach_msgs);
     assert_eq!(updates.len(), 2);
@@ -4735,6 +4736,8 @@ fn test_restart_recovery_unsolicited_itsi_attach_without_groups_restores_cached_
     assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
     assert_eq!(updates[1].issi, issi);
     assert_eq!(updates[1].groups, vec![gssi]);
+    assert_swmi_group_attach_refresh(&attach_msgs, gssi, 4, "unsolicited restart ITSI attach");
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
 
     let state = test.config.state_read();
     assert!(state.subscribers.is_registered(issi));
@@ -4809,6 +4812,104 @@ fn test_restart_recovery_unsolicited_itsi_attach_eg7_requests_group_report_befor
 }
 
 #[test]
+fn test_restart_recovery_unsolicited_itsi_attach_eg7_refreshes_cached_group_before_bs_eg() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("unsolicited-itsi-eg7-cached-group");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::ItsiAttach, None);
+    test.run_stack(Some(1));
+    let attach_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&attach_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    assert!(
+        accept.group_identity_location_accept.is_none(),
+        "cached EG7 restart restore must not fake a group report inside D-LOCATION UPDATE ACCEPT"
+    );
+    assert!(
+        !contains_location_update_command(&attach_msgs),
+        "cached EG7 restart restore uses SwMI group refresh instead of an immediate group-report command"
+    );
+    assert_swmi_group_attach_refresh(&attach_msgs, gssi, 4, "EG7 cached restart restore");
+
+    let downlink_types = mm_downlink_pdu_types(&attach_msgs);
+    let refresh_idx = downlink_types
+        .iter()
+        .position(|pdu| *pdu == MmPduTypeDl::DAttachDetachGroupIdentity)
+        .expect("cached group refresh should be queued");
+    let status_idx = downlink_types
+        .iter()
+        .position(|pdu| *pdu == MmPduTypeDl::DMmStatus)
+        .expect("configured EG7 should still be requested");
+    assert!(
+        refresh_idx < status_idx,
+        "cached group refresh must be queued before BS-initiated EG7 request, got {downlink_types:?}"
+    );
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "EG7 must remain pending until the MS explicitly responds"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
+    test.run_stack(Some(1));
+    let wrong_ack_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&wrong_ack_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "wrong non-zero ACK handle must not consume restart refresh"
+    );
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
+    test.run_stack(Some(1));
+    let ack_msgs = test.dump_sinks();
+    assert!(!contains_attach_detach_ack(&ack_msgs));
+    assert!(
+        subscriber_updates(&ack_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "ACK for already-restored cached EG7 group must not duplicate affiliation"
+    );
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_u_mm_status_energy_saving(
+        &mut test,
+        issi,
+        StatusUplink::ChangeOfEnergySavingModeResponse,
+        EnergySavingMode::Eg7,
+    );
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    let assignment = test
+        .config
+        .state_read()
+        .energy_saving
+        .get(&issi)
+        .copied()
+        .expect("matching EG7 response must activate pending assignment");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg7 as u8);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
     debug::setup_logging_verbose();
     let issi = 2260618;
@@ -4864,6 +4965,7 @@ fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
     assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
     assert_eq!(updates[1].issi, issi);
     assert_eq!(updates[1].groups, vec![gssi]);
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
 
     let state = test.config.state_read();
     assert!(state.subscribers.is_registered(issi));
@@ -4874,6 +4976,136 @@ fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
     assert!(
         cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:4")),
         "cache should preserve restored GSSI/class, got {cache:?}"
+    );
+
+    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
+    test.run_stack(Some(1));
+    let ack_msgs = test.dump_sinks();
+    assert!(
+        !contains_attach_detach_ack(&ack_msgs),
+        "U-ATTACH/DETACH GROUP IDENTITY ACK must not get a downlink MM response"
+    );
+    assert!(
+        subscriber_updates(&ack_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Affiliate),
+        "ACK for already-restored cached group refresh must not duplicate CMCE/Brew affiliation"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_group_refresh_reject_rolls_back_cached_affiliation_and_reprobes() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-refresh-reject");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_swmi_group_ack(&mut test, issi, 0, true, vec![gssi]);
+    test.run_stack(Some(1));
+    let reject_msgs = test.dump_sinks();
+
+    assert!(!contains_attach_detach_ack(&reject_msgs));
+    assert!(
+        subscriber_updates(&reject_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![gssi]),
+        "rejected restart refresh must roll back the provisional cached affiliation"
+    );
+    assert!(
+        contains_location_update_command(&reject_msgs),
+        "rejected restart refresh should request a fresh group report"
+    );
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    let cache = std::fs::read_to_string(&path).expect("reject rollback should persist cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "reject rollback should keep bare ISSI recovery entry, got {cache:?}"
+    );
+    assert!(
+        !cache.lines().any(|line| line.contains(&gssi.to_string())),
+        "reject rollback must remove unconfirmed cached GSSI {gssi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_group_refresh_t353_expiry_rolls_back_cached_affiliation_and_reprobes() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-refresh-t353");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    test.run_stack(Some(721));
+    let timeout_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&timeout_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![gssi]),
+        "T353 expiry must roll back the provisional cached affiliation"
+    );
+    assert!(
+        contains_location_update_command(&timeout_msgs),
+        "T353 expiry should request a fresh group report"
+    );
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+
+    let cache = std::fs::read_to_string(&path).expect("T353 rollback should persist cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "T353 rollback should keep bare ISSI recovery entry, got {cache:?}"
+    );
+    assert!(
+        !cache.lines().any(|line| line.contains(&gssi.to_string())),
+        "T353 rollback must remove unconfirmed cached GSSI {gssi}, got {cache:?}"
     );
 
     let _ = std::fs::remove_file(&path);
@@ -5747,6 +5979,58 @@ fn extract_d_attach_detach_group_identities(msgs: &[SapMsg]) -> Vec<(DAttachDeta
         .collect()
 }
 
+fn assert_swmi_group_attach_refresh(msgs: &[SapMsg], gssi: u32, class_of_usage: u8, context: &str) {
+    let refreshes: Vec<(DAttachDetachGroupIdentity, Layer2Service, u32)> = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                DAttachDetachGroupIdentity::from_bitbuf(&mut sdu)
+                    .ok()
+                    .map(|pdu| (pdu, prim.layer2service, prim.handle))
+            }
+            _ => None,
+        })
+        .filter(|(pdu, _, _)| {
+            !pdu.group_identity_report
+                && pdu.group_identity_acknowledgement_request
+                && !pdu.group_identity_attach_detach_mode
+                && pdu.group_report_response.is_none()
+        })
+        .collect();
+    assert_eq!(refreshes.len(), 1, "{context}: expected one SwMI group attach refresh");
+
+    let (refresh, layer2service, handle) = &refreshes[0];
+    assert_ne!(
+        *handle, 0,
+        "{context}: SwMI group attach refresh should use a non-zero local downlink handle"
+    );
+    assert_eq!(
+        *layer2service,
+        Layer2Service::Acknowledged,
+        "{context}: SwMI group attach refresh should use acknowledged service"
+    );
+    let groups = refresh
+        .group_identity_downlink
+        .as_ref()
+        .expect("SwMI group attach refresh should carry group identities");
+    assert_eq!(groups.len(), 1, "{context}: expected one refreshed cached group");
+    assert_eq!(groups[0].gssi, Some(gssi), "{context}: refreshed GSSI");
+    assert!(groups[0].group_identity_detachment_uplink.is_none());
+    let attachment = groups[0]
+        .group_identity_attachment
+        .as_ref()
+        .expect("refreshed group should carry attachment information");
+    assert_eq!(
+        attachment.group_identity_attachment_lifetime, 0,
+        "{context}: cached restart group refresh should keep persistent attachment lifetime"
+    );
+    assert_eq!(
+        attachment.class_of_usage, class_of_usage,
+        "{context}: cached restart group refresh should preserve class of usage"
+    );
+}
+
 fn extract_d_mm_status(msgs: &[SapMsg]) -> DMmStatus {
     msgs.iter()
         .find_map(|msg| match &msg.msg {
@@ -5858,6 +6142,16 @@ fn debug_mm_solicited_group_report_pending(test: &mut ComponentTest, issi: u32) 
         .downcast_mut::<MmBs>()
         .expect("registered MM entity should be MmBs")
         .debug_solicited_group_report_pending_for_test(issi)
+}
+
+fn debug_mm_swmi_group_transaction_pending(test: &mut ComponentTest, issi: u32) -> bool {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_swmi_group_transaction_pending_for_test(issi)
 }
 
 fn begin_swmi_group_transaction_for_test(

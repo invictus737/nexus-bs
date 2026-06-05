@@ -1726,6 +1726,58 @@ impl CcBsSubentity {
         }
     }
 
+    /// Reset the group-call T310 timer for MSs following an active group call.
+    pub(super) fn send_group_d_info_reset_t310_facch(&mut self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, ts: u8, usage: u8) {
+        let call_timeout = self
+            .active_calls
+            .get_mut(&call_id)
+            .map(|call| {
+                call.reset_timeout(self.dltime);
+                call.call_timeout
+            })
+            .unwrap_or(CallTimeout::Infinite);
+
+        if call_timeout == CallTimeout::Infinite {
+            return;
+        }
+
+        // EN 300 392-2 clauses 14.5.2.2.2(c), 14.7.1.8 and 14.8.37:
+        // D-INFO with Reset call time-out timer = 1 restarts T310 using the
+        // current call-timeout value. Keep the PDU compact and group-addressed
+        // on assigned-channel FACCH/STCH so listeners reset the same timer the
+        // SwMI just reset locally after a real floor grant. Preserve the active
+        // bidirectional traffic allocation: this timer refresh is not a floor
+        // withdrawal or a DL-only channel reassignment.
+        let pdu = DInfo {
+            call_identifier: call_id,
+            reset_call_time_out_timer_t310_: true,
+            poll_request: false,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_time_out_set_up_phase_t301_t302_: None,
+            call_ownership: None,
+            modify: None,
+            call_status: None,
+            temporary_address: None,
+            notification_indicator: None,
+            poll_response_percentage: None,
+            poll_response_number: None,
+            dtmf: None,
+            facility: None,
+            poll_response_addresses: None,
+            proprietary: None,
+        };
+
+        tracing::debug!("-> D-INFO reset T310 (FACCH) {:?}", pdu);
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DInfo reset T310");
+        sdu.seek(0);
+
+        let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
+        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Both, Some(0));
+        queue.push_back(msg);
+    }
+
     /// Send D-TX GRANTED via FACCH stealing on the group traffic channel.
     pub(super) fn send_d_tx_granted_facch(
         &mut self,
