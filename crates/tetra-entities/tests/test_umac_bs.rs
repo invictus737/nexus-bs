@@ -3135,6 +3135,78 @@ fn test_call_control_open_suspends_group_energy_saving_until_close_plus_t210() {
 }
 
 #[test]
+fn test_late_group_eg_activation_joins_active_assigned_channel_suspension() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime::default();
+    let gssi = 91;
+    let initial_issi = 1001;
+    let late_issi = 1002;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    {
+        let mut state = test.config.state_write();
+        state.subscribers.register(initial_issi);
+        state.subscribers.affiliate(initial_issi, gssi);
+        state.energy_saving.insert(initial_issi, eg_assignment(start));
+    }
+    test.populate_entities(vec![TetraEntity::Umac], vec![]);
+
+    test.submit_message(group_call_open_msg(gssi, 2));
+    test.run_stack(Some(1));
+
+    {
+        let mut state = test.config.state_write();
+        state.subscribers.register(late_issi);
+        state.subscribers.affiliate(late_issi, gssi);
+    }
+    submit_tlmc_configure_req(
+        &mut test,
+        TlmcConfigureReq {
+            energy_economy_issi: Some(late_issi),
+            energy_economy_group: Some(7),
+            energy_economy_startpoint: Some(TlmcEnergyEconomyStartpoint { frame: 3, multiframe: 1 }),
+            ..tlmc_configure_req()
+        },
+    );
+    test.run_stack(Some(1));
+
+    {
+        let state = test.config.state_read();
+        let assignment = state
+            .energy_saving
+            .get(&late_issi)
+            .expect("late affiliated EG MS should be tracked");
+        assert_eq!(
+            assignment.suspension_count, 1,
+            "late EG activation in an active GSSI call must inherit assigned-channel suspension"
+        );
+        assert!(
+            assignment.listens_at(start.add_timeslots(4)),
+            "late EG member must stay awake while the assigned group channel is active"
+        );
+    }
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Both, 2)),
+    });
+    test.run_stack(Some(1));
+
+    let state = test.config.state_read();
+    let assignment = state
+        .energy_saving
+        .get(&late_issi)
+        .expect("late affiliated EG MS should remain tracked after group close");
+    assert_eq!(assignment.suspension_count, 0);
+    assert!(
+        assignment.awake_until.is_some(),
+        "late EG resume after assigned-channel close should keep T.210 awake window"
+    );
+}
+
+#[test]
 fn test_large_eg7_group_call_open_suspends_all_members_once_and_resumes_after_close() {
     debug::setup_logging_verbose();
 

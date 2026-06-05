@@ -235,6 +235,40 @@ impl UmacBs {
             .unwrap_or(u16::MAX)
     }
 
+    fn active_suspension_key_covers_issi(&self, key: EnergySavingSuspensionKey, issi: u32) -> bool {
+        match key.addr.ssi_type {
+            SsiType::Issi => key.addr.ssi == issi,
+            SsiType::Gssi if key.addr.ssi == PREDEFINED_BROADCAST_GSSI => self
+                .config
+                .state_read()
+                .subscribers
+                .all_registered_issis()
+                .any(|registered_issi| registered_issi == issi),
+            SsiType::Gssi => self.config.state_read().subscribers.contains_group_member(key.addr.ssi, issi),
+            _ => false,
+        }
+    }
+
+    fn sync_active_suspensions_for_issi(&mut self, issi: u32) -> u16 {
+        let keys: Vec<EnergySavingSuspensionKey> = self.active_energy_saving_suspensions.keys().copied().collect();
+        let mut active_count: u16 = 0;
+
+        for key in keys {
+            if !self.active_suspension_key_covers_issi(key, issi) {
+                continue;
+            }
+            let Some(targets) = self.active_energy_saving_suspensions.get_mut(&key) else {
+                continue;
+            };
+            if !targets.contains(&issi) {
+                targets.push(issi);
+            }
+            active_count = active_count.saturating_add(1);
+        }
+
+        active_count
+    }
+
     fn set_current_ul_speaker(&mut self, ts: u8, addr: TetraAddress) {
         if !(1..=4).contains(&ts) {
             tracing::warn!("UMAC: ignoring current UL speaker for invalid ts {}", ts);
@@ -513,6 +547,7 @@ impl UmacBs {
             .map(|assignment| assignment.suspension_count)
             .unwrap_or(0);
         let active_suspension_count = self.active_suspension_count_for_issi(issi);
+        let current_active_suspension_count = self.sync_active_suspensions_for_issi(issi);
 
         // EN 300 392-2 clauses 20.3.5.4.1c, 20.4.3 and 23.7.6 route the
         // negotiated energy economy group/startpoint to MAC through
@@ -527,7 +562,9 @@ impl UmacBs {
                 frame: Some(startpoint.frame),
                 multiframe: Some(startpoint.multiframe),
                 awake_until: Some(awake_until),
-                suspension_count: existing_suspension_count.max(active_suspension_count),
+                suspension_count: existing_suspension_count
+                    .max(active_suspension_count)
+                    .max(current_active_suspension_count),
             },
         );
     }

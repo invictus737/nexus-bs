@@ -5562,3 +5562,42 @@ Next non-repeating execution:
 1. Commit this stale GSSI repeat invalidation patch.
 2. Continue with late-affiliating EG listeners during active assigned-channel group calls.
 3. Then address global ingress/control `MessageQueue` and live SDS/WAP admission/observability caps.
+
+## 2026-06-05 18:02:08 EEST - UMAC late EG activation joins active group suspension
+
+User goal:
+
+- Terminals that join/activate Energy Economy while a group call is already active must not fall asleep and miss assigned-channel group traffic.
+
+Component in simple technical terms:
+
+- UMAC tracks active assigned-channel suspensions so EG radios stay awake during calls.
+- Previously the suspension target list was a snapshot taken when the circuit opened. A later EG activation for an ISSI newly affiliated to the same GSSI could miss that active suspension.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.7.6: Energy Economy sleep cycle is suspended while the MS has an assigned channel/call active.
+- EN 300 392-2 clauses 20.3.5.4.1c and 20.4.3: TLMC configuration carries energy-economy parameters from upper layers to MAC.
+- This is local suspension-state robustness, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `sync_active_suspensions_for_issi`.
+  - When TLMC configures EG for an ISSI, UMAC now checks all active suspension keys and adds the ISSI if the current subscriber/group state is covered by an active GSSI/broadcast/ISSI suspension.
+  - The new assignment starts with the correct `suspension_count`, and later close/resume decrements it normally.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_late_group_eg_activation_joins_active_assigned_channel_suspension`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_late_group_eg_activation_joins_active_assigned_channel_suspension --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 59 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this late EG active-suspension patch.
+2. Continue with global ingress/control `MessageQueue` and live SDS/WAP admission/observability caps.
+3. Continue CMCE large round-robin group PTT tests once the call-control auditor returns or after direct local inspection.
