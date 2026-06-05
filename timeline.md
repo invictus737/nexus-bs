@@ -6684,3 +6684,46 @@ Next non-repeating execution:
 2. Add UMAC mixed EG7/StayAlive group floor-control stress test: requester positive grant and listener GSSI grant must survive queue pressure without unbounded growth.
 3. Extend restart/EG7 large-group recovery to dashboard/telemetry observable state.
 4. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+
+## 2026-06-05 21:08 EEST - CMCE large-group duplicate PTT idempotency evidence
+
+Component in simple technical terms:
+
+- CMCE is the call-control and floor-control layer. For group calls it decides which terminal currently has PTT/floor, which terminals are waiting, and what `D-TX GRANTED` response is sent.
+- A duplicate `U-TX DEMAND` is the same waiting terminal pressing/retrying PTT while another terminal still has the floor.
+- In a large GSSI, duplicate PTT pressure must not add duplicate FIFO entries; otherwise the same terminal can be granted again and delay the next unique speaker.
+
+Problem covered:
+
+- The implementation already deduplicates queued floor waiters by ISSI in `ActiveCall`.
+- The missing evidence was a component-level 4096-member GSSI test proving that repeated same-ISSI `U-TX DEMAND` stays idempotent across real CMCE messages and UMAC floor events.
+- New test queues eight duplicate PTT demands from one requester, then one PTT demand from the next requester.
+- When the current speaker ceases, the duplicate requester receives exactly one granted handoff.
+- When that requester ceases, the next unique requester receives the next handoff; the duplicate requester is not still in FIFO.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group call floor-control responses, including queued request-to-transmit and granted transmission.
+- EN 300 392-2 clause 23.5: assigned-channel FACCH/STCH transport of floor-control signalling.
+- The 4096-member stress shape and duplicate FIFO idempotency are Nexus-BS robustness evidence over standard CMCE PDUs, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_large_group_duplicate_queued_u_tx_demand_is_idempotent_before_handoff`.
+  - The test registers 4096 group members, starts a group call, applies duplicate same-ISSI PTT pressure, and verifies FIFO handoff order remains unique.
+  - It also checks no `D-RELEASE`, no UMAC close/end event, and exactly one UMAC floor grant per real handoff.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_duplicate_queued_u_tx_demand_is_idempotent_before_handoff --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 151 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add UMAC mixed EG7/StayAlive group floor-control stress test: requester positive grant and listener GSSI grant must survive queue pressure without unbounded growth.
+2. Extend restart/EG7 large-group recovery to dashboard/telemetry observable state.
+3. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.

@@ -5129,6 +5129,152 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
 }
 
 #[test]
+fn test_large_group_duplicate_queued_u_tx_demand_is_idempotent_before_handoff() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
+    let first_issi = 540_000_u32;
+    let current_speaker = first_issi;
+    let duplicate_requester = first_issi + 1;
+    let next_requester = first_issi + 2;
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+
+    let duplicate_count = 8;
+    for _ in 0..duplicate_count {
+        test.submit_message(build_u_tx_demand_msg(duplicate_requester, call_id));
+    }
+    test.submit_message(build_u_tx_demand_msg(next_requester, call_id));
+    test.run_stack(Some(duplicate_count + 4));
+    let demand_msgs = test.dump_sinks();
+    let demand_grants: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        demand_grants
+            .iter()
+            .filter(|(prim, grant)| {
+                prim.main_address == TetraAddress::issi(duplicate_requester)
+                    && grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8
+            })
+            .count(),
+        duplicate_count,
+        "duplicate queued requester should receive explicit queued responses without adding duplicate FIFO entries"
+    );
+    assert_eq!(
+        demand_grants
+            .iter()
+            .filter(|(prim, grant)| {
+                prim.main_address == TetraAddress::issi(next_requester)
+                    && grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8
+            })
+            .count(),
+        1,
+        "next unique requester should still enter the FIFO after duplicate pressure"
+    );
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+    assert_eq!(count_d_releases(&demand_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
+
+    // EN 300 392-2 clause 14.5.2.2.1 allows a queued request-to-transmit
+    // response while another group member has the floor. Nexus-BS must treat
+    // repeated same-ISSI U-TX DEMAND as idempotent queue pressure: the repeated
+    // radio gets queued responses, but only one FIFO entry is retained.
+    test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+    test.run_stack(Some(1));
+    let first_handoff_msgs = test.dump_sinks();
+    let first_handoff_grants: Vec<_> = first_handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_handoff_grants.len(), 2);
+    let duplicate_handoff = first_handoff_grants
+        .iter()
+        .find(|(prim, grant)| {
+            prim.main_address == TetraAddress::issi(duplicate_requester)
+                && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+        })
+        .expect("duplicate requester should receive exactly one granted handoff");
+    assert_d_tx_granted_facch_allocation(
+        duplicate_handoff.0,
+        &duplicate_handoff.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "large group duplicate requester handoff",
+    );
+    assert!(
+        first_handoff_grants.iter().any(|(prim, grant)| {
+            prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+                && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        }),
+        "duplicate requester handoff should notify listeners once via GSSI"
+    );
+    assert_eq!(count_umac_floor_granted(&first_handoff_msgs), 1);
+    assert_eq!(count_d_releases(&first_handoff_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&first_handoff_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(duplicate_requester, call_id));
+    test.run_stack(Some(1));
+    let second_handoff_msgs = test.dump_sinks();
+    let second_handoff_grants: Vec<_> = second_handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(second_handoff_grants.len(), 2);
+    let next_handoff = second_handoff_grants
+        .iter()
+        .find(|(prim, grant)| {
+            prim.main_address == TetraAddress::issi(next_requester)
+                && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+        })
+        .expect("next unique requester should receive the second handoff");
+    assert_d_tx_granted_facch_allocation(
+        next_handoff.0,
+        &next_handoff.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "large group next unique requester handoff after duplicate pressure",
+    );
+    assert!(
+        second_handoff_grants
+            .iter()
+            .all(|(prim, grant)| !(prim.main_address == TetraAddress::issi(duplicate_requester)
+                && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)),
+        "duplicate requester must not remain in the FIFO for a second self-handoff"
+    );
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+    assert_eq!(count_d_releases(&second_handoff_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&second_handoff_msgs), 0);
+}
+
+#[test]
 fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
     debug::setup_logging_verbose();
 
