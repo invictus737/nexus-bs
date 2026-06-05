@@ -4649,3 +4649,36 @@ Next non-repeating execution:
 1. Commit this guard/seed patch.
 2. Continue group-call live validation on GSSI `226333`; if static/no-voice persists, inspect the next live log for actual `UMAC voice route` vs FACCH/STCH-only frames rather than changing P2P release paths.
 3. Keep P2P regressions in the verification set for every group-call patch.
+
+## 2026-06-05 15:32:30 EEST - P2P/group speaker scope build deployed
+
+Commit deployed:
+
+- `8a53b919` (`fix: preserve p2p scope with group speaker metadata`)
+
+Build/deploy:
+
+- Command:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Local build only; no compile on `chris@192.168.1.179`.
+- Remote binary copied directly to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; no binary backup created.
+- Remote deployed binary SHA-256:
+  - `b88bc154e727f1fe8c3f21b00e93c1e956773b213cd506ee11e9f231da3ca774`
+
+Live evidence after deploy:
+
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+- Startup build line:
+  - `Build: v0.1.55-8a53b919`
+- Startup registration/affiliation:
+  - `2260618` registered and affiliated to `226333`.
+  - `2260616` registered and affiliated to `226333`.
+  - `2260082` registered and affiliated to `226333`.
+- The post-start filtered log sample showed no `RequestedServiceNotAvailable`, `Service unavailable`, `PTT denied`, or `Unit Not Attached`.
+
+Next non-repeating execution:
+
+1. RF retest GSSI `226333`: first PTT after group setup, then alternating PTT between stations.
+2. RF retest private simplex P2P `2260616` <-> `2260618`, including reverse PTT and red-key close.
+3. If group static/no-voice persists, inspect post-deploy log for `UMAC voice route`, `rx_blk_traffic`, early STCH/FACCH stealing, and `UL inactivity timeout` around the exact PTT window.
