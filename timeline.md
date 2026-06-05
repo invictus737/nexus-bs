@@ -5969,3 +5969,46 @@ Next non-repeating execution:
 2. Add the analogous P2P pending-release flood regression so private simplex teardown also stays bounded under repeated stale floor attempts.
 3. Continue restart-recovered EG7 affiliation through real UMAC scheduling.
 4. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.
+
+## 2026-06-05 19:00:03 EEST - CMCE large repeated GSSI U-SETUP floor alias regression added
+
+User goal:
+
+- Group PTT must stay robust with thousands of affiliated terminals, including terminals that signal a same-GSSI PTT as a repeated `U-SETUP` rather than a plain `U-TX DEMAND`.
+- A PTT storm from a maintained group call must not fan out new setup transactions, new traffic circuits, or release/error signalling.
+
+Component in simple technical terms:
+
+- CMCE maps a repeated `U-SETUP` for the already-active GSSI to floor control.
+- The first non-speaker requester may be queued for the next turn; later contenders are explicitly told `NotGranted` and are not retained as extra waiters.
+- This keeps the group floor queue bounded at one waiter even when 4096 group members contend.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1: group setup applies when establishing the call.
+- EN 300 392-2 clause 14.5.2.2.1: once the group call is maintained, transmit permission is controlled through floor-control responses such as queued/granted/not-granted.
+- This is clause-scoped regression evidence and queue/state hardening, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout`.
+  - Registers and affiliates 4096 members to one GSSI, starts a real group call, queues the first repeated same-GSSI `U-SETUP`, then floods repeated `U-SETUP` from every other member.
+  - Asserts no `D-CALL PROCEEDING`, no `D-CONNECT`, no `D-SETUP`, no `D-RELEASE`, no UMAC open/close, and no premature UMAC floor grant during the storm.
+  - Asserts later contenders receive `NotGranted` without replacing the first queued requester.
+  - Asserts `U-TX CEASED` from the current speaker hands the floor only to the first queued requester plus one GSSI listener notification.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 143 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE large repeated same-GSSI `U-SETUP` floor-alias regression.
+2. Add the analogous P2P pending-release flood regression so private simplex teardown also stays bounded under repeated stale floor attempts.
+3. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.
+4. Continue global ingress queue pressure tests for attach + SDS + PTT bursts.
