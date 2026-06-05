@@ -1,5 +1,46 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 16:26:47 EEST - CMCE bounded group floor queue stress coverage
+
+User report:
+
+- Continue toward robust TETRA group call behavior for thousands of terminals, not just a few radios.
+- Keep changes clause-scoped to ETSI EN 300 392-2 and do not claim formal certification.
+
+Component explanation:
+
+- CMCE is call control. For group calls it decides which affiliated ISSI currently owns the PTT floor.
+- A queued floor requester is an MS that pressed PTT while another MS is still speaking. This stack intentionally keeps one waiter for direct handoff; additional contenders receive an explicit busy/not-granted response instead of being stored in an unbounded queue.
+- UMAC should only be notified when the actual floor owner changes. Busy contenders must not receive `FloorGranted` and must not replace the queued requester.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: SwMI group floor control uses `D-TX GRANTED` with `Granted`, `RequestQueued`, or `NotGranted` state for request-to-transmit handling.
+- EN 300 392-2 clause 14.5.2.1: group call remains GSSI-scoped for listener signalling while individual floor responses go back to the requesting ISSI.
+- This is an engineering stress/regression test for the local one-waiter policy, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted`.
+  - Fixture registers 2048 affiliated ISSIs on one GSSI.
+  - First non-speaker PTT receives `RequestQueued`.
+  - The remaining 2046 affiliated contenders receive individual `NotGranted` responses with no UMAC `FloorGranted`, no release, and no call close.
+  - When the current speaker sends `U-TX CEASED`, only the first queued requester receives the `Granted` handoff; busy contenders do not replace it.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 134 passed.
+- `git diff --check` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Continue UMAC large-GSSI hardening with a per-slot readiness cache only if stress/profiling shows repeated queued GSSI elements causing `Q * N` scans.
+2. Continue SDS/status and LLC remaining audit gaps with clause-scoped field-level tests.
+
 ## 2026-06-05 16:22:09 EEST - Large GSSI group-call and UMAC scheduling scalability hardening
 
 User report:

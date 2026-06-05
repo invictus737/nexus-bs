@@ -4605,6 +4605,119 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
 }
 
 #[test]
+fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = 2048_u32;
+    let first_issi = 700_000_u32;
+    let current_speaker = first_issi;
+    let queued_requester = first_issi + 1;
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+
+    test.submit_message(build_u_tx_demand_msg(queued_requester, call_id));
+    test.run_stack(Some(1));
+    let first_waiter_msgs = test.dump_sinks();
+    let first_waiter_grants: Vec<_> = first_waiter_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_waiter_grants.len(), 1);
+    assert_eq!(first_waiter_grants[0].0.main_address, TetraAddress::issi(queued_requester));
+    assert_eq!(
+        first_waiter_grants[0].1.transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8
+    );
+    assert_eq!(count_umac_floor_granted(&first_waiter_msgs), 0);
+
+    for issi in (first_issi + 2)..(first_issi + member_count) {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+    }
+    test.run_stack(Some(member_count as usize + 16));
+    let busy_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 14.5.2.2.1 lets the SwMI answer a floor request
+    // with queued/granted/not-granted state. This implementation deliberately
+    // keeps one bounded waiter for group floor handoff: later affiliated
+    // contenders are explicitly rejected and must not replace the queued MS.
+    let busy_grants: Vec<_> = busy_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(busy_grants.len(), member_count as usize - 2);
+    for (prim, grant) in &busy_grants {
+        assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+        assert!(
+            prim.main_address.ssi >= first_issi + 2 && prim.main_address.ssi < first_issi + member_count,
+            "only busy requesters should receive busy queue responses"
+        );
+        assert_eq!(
+            grant.transmission_grant,
+            TransmissionGrant::NotGranted.into_raw() as u8,
+            "second and later waiters must not be retained as queued group floor owners"
+        );
+        assert_d_tx_granted_facch_allocation(
+            prim,
+            grant,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Dl,
+            "large group busy floor requester",
+        );
+    }
+    assert_eq!(count_umac_floor_granted(&busy_msgs), 0);
+    assert_eq!(count_d_releases(&busy_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&busy_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_grants.len(), 2);
+    let queued_handoff = handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(queued_requester))
+        .expect("only the first queued requester should receive the handoff floor");
+    assert_eq!(queued_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert!(
+        handoff_grants.iter().all(|(prim, _)| {
+            prim.main_address.ssi == queued_requester || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+        }),
+        "busy requesters must not replace the first queued floor requester"
+    );
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_d_releases(&handoff_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
+}
+
+#[test]
 fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
     debug::setup_logging_verbose();
 
