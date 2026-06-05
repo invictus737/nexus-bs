@@ -178,6 +178,7 @@ impl ActiveCall {
     }
 
     pub(super) fn grant_floor(&mut self, source_issi: u32, _speaker_addr: Option<TetraAddress>) {
+        self.clear_queued_tx_demand_from(source_issi);
         self.source_issi = source_issi;
         self.tx_active = true;
         self.hangtime_start = None;
@@ -535,5 +536,30 @@ mod tests {
         assert_eq!(call.take_queued_tx_demand().map(|requester| requester.ssi), Some(103));
         assert_eq!(call.queue_tx_demand(TetraAddress::issi(101)), TxDemandQueueResult::Queued);
         assert_eq!(call.queue_tx_demand(TetraAddress::issi(102)), TxDemandQueueResult::Queued);
+    }
+
+    #[test]
+    fn group_floor_grant_removes_new_speaker_from_waiter_fifo() {
+        let mut call = test_group_call();
+
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(101)), TxDemandQueueResult::Queued);
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(102)), TxDemandQueueResult::Queued);
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(103)), TxDemandQueueResult::Queued);
+
+        call.grant_floor(102, Some(TetraAddress::issi(102)));
+
+        assert_eq!(call.take_queued_tx_demand().map(|requester| requester.ssi), Some(101));
+        assert_eq!(call.take_queued_tx_demand().map(|requester| requester.ssi), Some(103));
+        assert_eq!(
+            call.queue_tx_demand(TetraAddress::issi(102)),
+            TxDemandQueueResult::FromCurrentSpeaker,
+            "current speaker reassertion must not create a duplicate FIFO waiter"
+        );
+        call.enter_hangtime(TdmaTime::default());
+        assert_eq!(
+            call.queue_tx_demand(TetraAddress::issi(102)),
+            TxDemandQueueResult::Queued,
+            "a speaker removed by grant may request the floor again after it ceases"
+        );
     }
 }

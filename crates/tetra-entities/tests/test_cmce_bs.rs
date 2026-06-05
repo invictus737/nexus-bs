@@ -4704,6 +4704,118 @@ fn test_group_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_g
 }
 
 #[test]
+fn test_large_group_preemptive_grant_removes_requester_from_fifo_before_next_handoff() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.transmission_interruption_enabled = true;
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
+    let first_issi = 880_000_u32;
+    let current_speaker = first_issi;
+    let preemptive_requester = first_issi + 1;
+    let next_fifo_requester = first_issi + 2;
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+
+    for issi in (first_issi + 1)..(first_issi + member_count) {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+    }
+    test.run_stack(Some(member_count as usize + 16));
+    let queued_msgs = test.dump_sinks();
+    assert_eq!(
+        queued_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim),
+                _ => None,
+            })
+            .filter(|grant| grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+            .count(),
+        member_count as usize - 1,
+        "large group should queue every in-cap floor contender before preemption"
+    );
+
+    // EN 300 392-2 clause 14.5.2.2.1 f) permits an explicitly configured
+    // SwMI to interrupt the current speaker for a pre-emptive U-TX DEMAND.
+    // The pre-empting ISSI must also be removed from the local FIFO, otherwise
+    // its later U-TX CEASED grants the floor back to itself instead of the
+    // next large-group waiter.
+    test.submit_message(build_u_tx_demand_msg_with_priority(preemptive_requester, call_id, 3));
+    test.run_stack(Some(1));
+    let preempt_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_interrupt(&preempt_msgs), 2);
+    assert_eq!(count_umac_floor_granted(&preempt_msgs), 1);
+    assert!(preempt_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *got_call_id == call_id && *source_issi == preemptive_requester && *dest_gssi == TEST_GSSI
+        )
+    }));
+
+    test.submit_message(build_u_tx_ceased_msg(preemptive_requester, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    let next_handoff = handoff_grants
+        .iter()
+        .find(|(prim, grant)| {
+            prim.main_address == TetraAddress::issi(next_fifo_requester)
+                && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+        })
+        .expect("next FIFO requester should receive the post-preemption floor handoff");
+    assert_d_tx_granted_facch_allocation(
+        next_handoff.0,
+        &next_handoff.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "large group post-preemption FIFO handoff",
+    );
+    assert!(
+        handoff_grants.iter().all(|(prim, grant)| {
+            prim.main_address != TetraAddress::issi(preemptive_requester)
+                || grant.transmission_grant != TransmissionGrant::Granted.into_raw() as u8
+        }),
+        "pre-empting requester must not remain queued and be granted to itself again"
+    );
+    assert!(handoff_grants.iter().any(|(prim, grant)| {
+        prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+            && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    }));
+    assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
+    assert_eq!(count_umac_floor_released(&handoff_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+}
+
+#[test]
 fn test_private_call_cleanup_preserves_group_floor_membership() {
     debug::setup_logging_verbose();
 

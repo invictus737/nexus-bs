@@ -6449,3 +6449,51 @@ Next non-repeating execution:
 2. Continue restart/EG7 recovery regression for thousands of cached affiliates: after BS restart, MM and CMCE must restore attach-visible state and GSSI affiliation before group PTT.
 3. Continue live-lab validation for Motorola MTP3550 static-audio-on-repeated-PTT, using logs from last restart and without changing ETSI baseline.
 4. Continue SDS/WAP accepted-vs-transmitted observability and private-call release validation.
+
+## 2026-06-05 - Large-group preemption FIFO stale-entry hardening
+
+Component in simple technical terms:
+
+- CMCE is the call-control layer that decides group PTT/floor ownership.
+- The FIFO floor queue is the SwMI-side waiting list of ISSIs that pressed PTT while another MS owns the group floor.
+- Pre-emption is optional/default-off Nexus-BS behavior where an explicitly configured high-priority `U-TX DEMAND` can interrupt the current speaker.
+
+Problem fixed:
+
+- A group floor grant changed the active speaker but did not defensively remove that ISSI from the waiting FIFO.
+- In normal FIFO handoff this was usually hidden because handoff already popped the selected waiter first.
+- Under optional pre-emption, or any future direct grant path, a requester could already be queued and then become the new speaker while still present in the FIFO.
+- When that speaker later sent `U-TX CEASED`, CMCE could grant the floor back to the same ISSI instead of the next queued group member.
+- This is especially risky in thousands-terminal GSSI groups, where stale FIFO entries are hard to see manually and can look like first-PTT loss, false turn-taking, or static/no-voice symptoms.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: SwMI controls group transmission permission and may respond to `U-TX DEMAND` with `Granted`, `RequestQueued`, or `NotGranted`.
+- EN 300 392-2 clause 14.5.2.2.1 f) and table 14.85: pre-emptive/emergency TX demand may withdraw current transmit permission when SwMI interruption support is explicitly enabled.
+- This patch preserves the same over-the-air PDUs and only hardens Nexus-BS internal queue ownership; it is clause-scoped engineering evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - `ActiveCall::grant_floor` now removes the granted speaker from the group floor FIFO before setting it as active speaker.
+  - Added a unit test proving a granted speaker is removed from the FIFO, current-speaker reassertion does not duplicate the waiter, and the ISSI can request again after hangtime.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added a 4096-member GSSI regression where all in-cap contenders queue, an explicitly enabled pre-emptive requester takes the floor, and its later `U-TX CEASED` grants the next FIFO requester rather than itself.
+  - The test also verifies one GSSI listener notification, no false `D-TX CEASED`, no floor release, and one UMAC floor grant.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --lib group_floor_grant_removes_new_speaker_from_waiter_fifo --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_preemptive_grant_removes_requester_from_fifo_before_next_handoff --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 150 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 62 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add full FIFO drain regression for a 4096-member GSSI: every queued waiter gets exactly one ordered floor handoff, no `NotGranted`, no duplicated self-grant, no per-member listener fanout.
+2. Add overflow retry regression: 4097th waiter receives `NotGranted`, then after one FIFO slot frees the same ISSI can retry and enters the tail without corrupting order.
+3. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state so "attached but No Group" is covered beyond internal registry state.
+4. Add stress-aftercare regression: large group storm then simple private simplex and duplex still setup, grant floor, and release cleanly.
