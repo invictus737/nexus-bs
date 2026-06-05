@@ -3088,6 +3088,23 @@ mod tests {
     }
 
     #[test]
+    fn test_downlink_scheduler_discards_reported_deferred_resource_when_next_slot_cap_is_reached() {
+        let mut sched = get_testing_slotter();
+        let first_reporter = TxReporter::new_unacked();
+
+        for offset in 0..=MAX_DLSCHED_NEXT_SLOT_ELEMS {
+            let (pdu, sdu) = test_ordinary_resource_for_issi(320_000 + offset as u32, 8);
+            let reporter = (offset == 0).then(|| first_reporter.clone());
+            sched.dl_enqueue_tma_next_frame(pdu, sdu, reporter);
+        }
+
+        // Same local robustness guard as the live downlink queue, applied to
+        // deferred next-frame signalling before it can be merged back into TS1.
+        assert_eq!(sched.dltx_next_slot_queue.len(), MAX_DLSCHED_NEXT_SLOT_ELEMS);
+        assert_eq!(first_reporter.get_state(), TxState::Discarded);
+    }
+
+    #[test]
     fn test_downlink_scheduler_backpressure_preserves_grants_over_ordinary_resources() {
         let mut sched = get_testing_slotter();
         for offset in 0..MAX_DLSCHED_ELEMS_PER_TIMESLOT {

@@ -5264,3 +5264,37 @@ Next non-repeating execution:
 1. Commit this UMAC StayAlive large-GSSI fast path.
 2. Continue with large-group restart/affiliation persistence tests at multi-thousand scale.
 3. Review global `MessageQueue`/LLC queue behavior separately; do not add arbitrary drops without clause-scoped handling/reporting.
+
+## 2026-06-05 17:26:21 EEST - UMAC deferred downlink queue cap test
+
+User goal:
+
+- Keep Nexus-BS robust under large group/restart signalling bursts, including traffic deferred into the next TDMA frame.
+
+Component in simple technical terms:
+
+- `dltx_next_slot_queue` is the scheduler holding area for downlink signalling that cannot fit in the current frame and must be tried again on the next frame.
+- It is separate from the live per-timeslot queue, so it needs its own regression evidence.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 20.4.1.1.3: MAC reports local transfer completion/failure through TMA reporting.
+- EN 300 392-2 clauses 21.4.3.1 and 23.5.2.2.2 remain protected by the production cap logic; this test covers ordinary deferred signalling only.
+- This is local robustness evidence, not formal certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added a unit test proving `dltx_next_slot_queue` is capped and reports the discarded ordinary deferred request through `TxReporter`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 63 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this test-only deferred queue cap evidence patch.
+2. Continue with CMCE large initial group setup fanout or MM restart recovery large-GSSI persistence tests.
