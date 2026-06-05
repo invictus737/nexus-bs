@@ -6727,3 +6727,48 @@ Next non-repeating execution:
 1. Add UMAC mixed EG7/StayAlive group floor-control stress test: requester positive grant and listener GSSI grant must survive queue pressure without unbounded growth.
 2. Extend restart/EG7 large-group recovery to dashboard/telemetry observable state.
 3. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+
+## 2026-06-05 21:12 EEST - UMAC mixed EG7/StayAlive large-group floor-control stress
+
+Component in simple technical terms:
+
+- UMAC/MAC is the radio scheduler. It turns CMCE/MM decisions into MAC-RESOURCE, STCH/FACCH, random-access ACKs, and channel allocations on the real downlink timeslot.
+- Energy Economy EG7 means some terminals sleep most of the time and only listen in scheduled windows unless an assigned-channel group call suspends that sleep cycle.
+- Group floor-control needs two critical downlinks during handoff: the requester ISSI must receive a positive `D-TX GRANTED` with uplink allocation, and the GSSI listeners must receive `GrantedToOtherUser`.
+
+Problem covered:
+
+- Existing tests covered large PTT storm requester grants, listener grants, and EG7 group suspension separately.
+- The missing combined evidence was a 4096-member GSSI with mixed StayAlive/EG7 members under thousands of lower-value busy floor responses.
+- The new test opens a group call, verifies the EG7 requester is suspended awake while a StayAlive member has no EG scheduler entry, preserves the requester random-access ACK, then queues 4096 lower-value busy responses plus both critical handoff grants.
+- The requester positive grant and GSSI listener grant both transmit before lower-value busy responses.
+- The requester grant carries the preserved random-access ACK; the GSSI listener grant does not incorrectly ACK one requester's random access for the whole group.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group floor-control `D-TX GRANTED` semantics for requester and listeners.
+- EN 300 392-2 clause 21.4.3.1: random-access acknowledgement must apply to the requesting MS.
+- EN 300 392-2 clause 23.5: assigned-channel STCH/FACCH delivery of floor-control signalling.
+- EN 300 392-2 clause 23.7.6: Energy Economy receive/suspend behaviour for assigned-channel activity.
+- This is scheduler-level robustness evidence over standard PDUs, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_large_group_ptt_storm_mixed_eg7_stayalive_keeps_requester_and_listener_floor_grants`.
+  - The test registers 4096 GSSI members, half with EG7 assignments and half StayAlive/no EG state.
+  - It verifies both critical floor-control grants survive a 4096-item busy-response backlog and retain correct random-access ACK semantics.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_large_group_ptt_storm_mixed_eg7_stayalive_keeps_requester_and_listener_floor_grants --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 63 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_umac_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Extend restart/EG7 large-group recovery to dashboard/telemetry observable state.
+2. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+3. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.

@@ -3466,6 +3466,258 @@ fn test_large_group_ptt_storm_admits_llc_wrapped_listener_floor_grant() {
 }
 
 #[test]
+fn test_large_group_ptt_storm_mixed_eg7_stayalive_keeps_requester_and_listener_floor_grants() {
+    debug::setup_logging_verbose();
+
+    let gssi = 226_333;
+    let first_issi = 3_400_000;
+    let first_speaker_issi = first_issi;
+    let requester_issi = first_issi + 2;
+    let stayalive_listener_issi = first_issi + 1;
+    let traffic_ts = 2;
+    let call_id = 6;
+    let member_count = 4096;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    {
+        let mut state = test.config.state_write();
+        for offset in 0..member_count {
+            let issi = first_issi + offset;
+            state.subscribers.register(issi);
+            assert!(state.subscribers.affiliate(issi, gssi));
+            if offset % 2 == 0 {
+                state.energy_saving.insert(issi, eg_assignment(start));
+            }
+        }
+    }
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker_issi, traffic_ts));
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.subscribers.group_members(gssi).len(), member_count as usize);
+        assert_eq!(
+            state
+                .energy_saving
+                .get(&requester_issi)
+                .expect("requester should be an EG7 member in this mixed group")
+                .suspension_count,
+            1,
+            "assigned-channel group call should suspend the EG7 requester before floor-control STCH"
+        );
+        assert!(
+            !state.energy_saving.contains_key(&stayalive_listener_issi),
+            "odd-offset member intentionally represents StayAlive/no EG scheduler state"
+        );
+    }
+
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.channel_scheduler
+            .dl_enqueue_random_access_ack(traffic_ts, TetraAddress::issi(requester_issi));
+        assert!(
+            umac.channel_scheduler.dl_drop_all_except_stolen(traffic_ts),
+            "test setup should preserve the requester's random-access ACK through hangtime cleanup"
+        );
+    }
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let make_wrapped_d_tx_granted_sdu =
+        |transmission_grant: TransmissionGrant| llc_wrapped_cmce_sdu(d_tx_granted_sdu(call_id, transmission_grant));
+
+    // EN 300 392-2 clauses 14.5.2.2.1, 21.4.3.1, 23.5, and 23.7.6:
+    // group floor-control must keep the requester grant and the GSSI listener
+    // notification deliverable even when thousands of lower-value busy
+    // responses are queued and half the GSSI is in EG7.
+    let busy_count = 4096;
+    for offset in 0..busy_count {
+        let busy_issi = 3_500_000 + offset;
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 70_000 + offset as i32,
+                pdu: make_wrapped_d_tx_granted_sdu(TransmissionGrant::NotGranted),
+                main_address: TetraAddress::issi(busy_issi),
+                endpoint_id: 0,
+                pdu_prio: 0,
+                stealing_permission: true,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    let requester_reporter = TxReporter::new_unacked();
+    let listener_reporter = TxReporter::new_unacked();
+    test.submit_message(floor_granted_msg(call_id, requester_issi, gssi, traffic_ts));
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 80_000,
+            pdu: make_wrapped_d_tx_granted_sdu(TransmissionGrant::Granted),
+            main_address: TetraAddress::issi(requester_issi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: Some(requester_reporter.clone()),
+        }),
+    });
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 80_001,
+            pdu: make_wrapped_d_tx_granted_sdu(TransmissionGrant::GrantedToOtherUser),
+            main_address: TetraAddress::new(gssi, SsiType::Gssi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Dl,
+                carrier: None,
+            }),
+            tx_reporter: Some(listener_reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(64));
+    let sink_msgs = test.dump_sinks();
+    let all_pdus = downlink_mac_pdus(&sink_msgs);
+
+    let requester_grant_index = all_pdus
+        .iter()
+        .position(|pdu| match pdu {
+            DownlinkMacPdu::Resource(LogicalChannel::Stch, resource)
+                if resource
+                    .addr
+                    .is_some_and(|addr| mac_resource_matches_addr(addr, TetraAddress::issi(requester_issi)))
+                    && resource.chan_alloc_element.is_some() =>
+            {
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected mixed-EG requester D-TX GRANTED STCH with channel allocation; reporter={:?}; pdus={all_pdus:?}",
+                requester_reporter.get_state()
+            )
+        });
+    let listener_grant_index = all_pdus
+        .iter()
+        .position(|pdu| match pdu {
+            DownlinkMacPdu::Resource(LogicalChannel::Stch, resource)
+                if resource
+                    .addr
+                    .is_some_and(|addr| mac_resource_matches_addr(addr, TetraAddress::new(gssi, SsiType::Gssi)))
+                    && resource.chan_alloc_element.is_some() =>
+            {
+                true
+            }
+            _ => false,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected mixed-EG GSSI D-TX GRANTED/GrantedToOtherUser STCH; reporter={:?}; pdus={all_pdus:?}",
+                listener_reporter.get_state()
+            )
+        });
+
+    let first_busy_index = all_pdus.iter().position(|pdu| match pdu {
+        DownlinkMacPdu::Resource(LogicalChannel::Stch, resource)
+            if resource.addr.is_some_and(|addr| {
+                matches!(addr.ssi_type, SsiType::Issi | SsiType::Ssi) && (3_500_000..3_500_000 + busy_count).contains(&addr.ssi)
+            }) =>
+        {
+            true
+        }
+        _ => false,
+    });
+    if let Some(first_busy_index) = first_busy_index {
+        assert!(
+            requester_grant_index < first_busy_index && listener_grant_index < first_busy_index,
+            "requester and listener floor grants must transmit before lower-value busy responses"
+        );
+    }
+    assert!(
+        requester_grant_index < listener_grant_index,
+        "positive requester grant should stay ahead of the listener notification"
+    );
+
+    let DownlinkMacPdu::Resource(_, requester_grant) = &all_pdus[requester_grant_index] else {
+        unreachable!("requester_grant_index was selected from Resource variants");
+    };
+    assert!(
+        requester_grant.random_access_flag,
+        "requester floor grant should repeat the preserved random-access ACK"
+    );
+    assert_eq!(
+        requester_grant
+            .chan_alloc_element
+            .as_ref()
+            .expect("requester grant should carry channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+
+    let DownlinkMacPdu::Resource(_, listener_grant) = &all_pdus[listener_grant_index] else {
+        unreachable!("listener_grant_index was selected from Resource variants");
+    };
+    assert!(
+        !listener_grant.random_access_flag,
+        "GSSI listener grant must not acknowledge one requester's random access for the whole group"
+    );
+    assert_eq!(
+        listener_grant
+            .chan_alloc_element
+            .as_ref()
+            .expect("listener grant should carry channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Dl
+    );
+    assert_eq!(requester_reporter.get_state(), TxState::Transmitted);
+    assert_eq!(listener_reporter.get_state(), TxState::Transmitted);
+}
+
+#[test]
 fn test_oversized_facch_stealing_falls_back_to_schf_instead_of_overflowing_stch() {
     debug::setup_logging_verbose();
 
