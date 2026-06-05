@@ -2907,11 +2907,7 @@ function handleMsg(msg){
       if(msg.last_heard){pushLastHeard(msg.last_heard);renderLastHeard();}
       renderCalls();break;
     case 'ms_energy_saving':
-      if(state.ms[msg.issi]){
-        state.ms[msg.issi].energy_saving_mode=msg.mode;
-        state.ms[msg.issi].energy_saving_frame=msg.frame??null;
-        state.ms[msg.issi].energy_saving_multiframe=msg.multiframe??null;
-      }
+      {const e=ensureMsEntry(msg.issi);e.energy_saving_mode=msg.mode;e.energy_saving_frame=msg.frame??null;e.energy_saving_multiframe=msg.multiframe??null;e._last_seen_ts=Date.now();}
       renderStations();break;
     case 'last_heard':
       pushLastHeard({issi:msg.issi,activity:msg.activity,dest:msg.dest,ts:new Date().toTimeString().slice(0,8)});

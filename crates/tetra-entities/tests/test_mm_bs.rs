@@ -4044,6 +4044,79 @@ fn test_swmi_group_ack_accepts_pending_detach_without_downlink_response() {
 }
 
 #[test]
+fn test_swmi_group_ack_detach_publishes_dashboard_group_snapshot() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let group = 103;
+    let handle = 89;
+
+    let config = ComponentTest::get_default_test_config(StackMode::Bs);
+    let (mut test, telemetry) = mm_test_with_telemetry(config);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![group]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    let _ = drain_telemetry(&telemetry);
+    assert!(test.config.state_read().subscribers.group_members(group).contains(&issi));
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_detach_group(group)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let events = drain_telemetry(&telemetry);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::MsGroupsSnapshot {
+                issi: event_issi,
+                gssis
+            } if *event_issi == issi && gssis.is_empty()
+        )),
+        "SwMI-requested detach must publish a final empty dashboard group snapshot, got {events:?}"
+    );
+    assert_eq!(dashboard_groups_after(&events, issi), Vec::<u32>::new());
+}
+
+#[test]
+fn test_swmi_group_ack_detach_all_then_attach_publishes_final_dashboard_group_snapshot() {
+    debug::setup_logging_verbose();
+    let issi = 2040814;
+    let old_groups = vec![104, 105];
+    let new_group = 106;
+    let handle = 90;
+
+    let config = ComponentTest::get_default_test_config(StackMode::Bs);
+    let (mut test, telemetry) = mm_test_with_telemetry(config);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, old_groups.clone());
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    let _ = drain_telemetry(&telemetry);
+    for group in &old_groups {
+        assert!(test.config.state_read().subscribers.group_members(*group).contains(&issi));
+    }
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_attach_group(new_group)], true);
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let events = drain_telemetry(&telemetry);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::MsGroupsSnapshot {
+                issi: event_issi,
+                gssis
+            } if *event_issi == issi && gssis == &vec![new_group]
+        )),
+        "SwMI detach-all-then-attach must publish the final dashboard group snapshot, got {events:?}"
+    );
+    assert_eq!(dashboard_groups_after(&events, issi), vec![new_group]);
+}
+
+#[test]
 fn test_itsi_detach_clears_pending_swmi_group_transaction_before_issi_reuse() {
     debug::setup_logging_verbose();
     let issi = 2040814;
@@ -4981,6 +5054,102 @@ fn test_successful_location_update_persists_restart_recovery_groups() {
     assert!(
         cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:0")),
         "cache should contain ISSI {issi} and GSSI {gssi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_group_affiliation_update_forces_restart_recovery_cache_flush() {
+    debug::setup_logging_verbose();
+    let issi = 2260082;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("group-affiliation-flush");
+    let _ = std::fs::remove_file(&path);
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    let cache = std::fs::read_to_string(&path).expect("initial registration should persist bare ISSI");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "initial cache should contain bare ISSI {issi}, got {cache:?}"
+    );
+
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(vec![gssi]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 group affiliation state is persistent until a real detach
+    // or replacement. Locally, the restart-recovery file must be durable as
+    // soon as that affiliation changes, not only at the next periodic cache
+    // flush, otherwise an immediate BS restart can recover "No Group".
+    let cache = std::fs::read_to_string(&path).expect("group affiliation should flush restart recovery cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:0")),
+        "cache should immediately contain ISSI {issi} and GSSI {gssi}, got {cache:?}"
+    );
+    assert!(
+        !debug_mm_restart_recovery_cache_dirty(&mut test),
+        "group affiliation update should force the dirty cache to disk"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_swmi_group_detach_forces_restart_recovery_cache_flush() {
+    debug::setup_logging_verbose();
+    let issi = 2260082;
+    let gssi = 226333;
+    let handle = 91;
+    let path = unique_restart_recovery_path("swmi-detach-flush");
+    let _ = std::fs::remove_file(&path);
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    let cache = std::fs::read_to_string(&path).expect("initial group registration should persist");
+    assert!(
+        cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:0")),
+        "initial cache should contain ISSI {issi} and GSSI {gssi}, got {cache:?}"
+    );
+
+    begin_swmi_group_transaction_for_test(&mut test, issi, handle, vec![swmi_detach_group(gssi)], false);
+    submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let cache = std::fs::read_to_string(&path).expect("SwMI detach should flush restart recovery cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "cache should keep bare ISSI after SwMI detach, got {cache:?}"
+    );
+    assert!(
+        !cache.lines().any(|line| line.contains(&gssi.to_string())),
+        "cache should immediately remove detached GSSI {gssi}, got {cache:?}"
+    );
+    assert!(
+        !debug_mm_restart_recovery_cache_dirty(&mut test),
+        "SwMI detach should force the dirty cache to disk"
     );
 
     let _ = std::fs::remove_file(&path);

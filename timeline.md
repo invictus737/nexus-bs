@@ -6819,3 +6819,59 @@ Next non-repeating execution:
 1. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
 2. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
 3. Continue CMCE/UMAC audit for any fixed-size or O(n)-while-locked behaviour that can break GSSI calls with thousands of terminals.
+
+## 2026-06-05 21:31 EEST - MM group-state durability and browser EG ordering
+
+Component in simple technical terms:
+
+- MM owns the durable subscriber/group recovery state used after a BS restart.
+- SwMI group ACK is the confirmation path for BS-initiated group attach/detach changes.
+- Dashboard browser state is the client-side view; it must handle telemetry in any order, because thousands of returning terminals can interleave registration, group, and EG events.
+
+Problem covered:
+
+- The server now preserved `MsEnergySaving` before registration, but the browser reducer still ignored `ms_energy_saving` unless the MS row already existed.
+- SwMI-requested detach changed MM/CMCE state but did not publish a final dashboard group snapshot, so the UI could retain stale groups.
+- Restart recovery cache writes were still coalesced for normal registration updates. That is correct for scale, but group affiliation changes need stronger durability: if a BS restarts immediately after a group attach/detach, the cache file must already reflect the final GSSI set.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.4.3 and 16.4.4: SwMI/MM registration and group-report recovery procedures.
+- EN 300 392-2 clauses 16.8.0, 16.8.1, 16.8.2, 16.9.3.4, 16.10.17, and Annex G: group identity attach/detach semantics, including SwMI-requested detach and mode=1 replace/detach-all.
+- EN 300 392-2 clauses 16.7.1, 16.10.9, 16.10.10, 23.7.6, and T.210: Energy Economy state represented in dashboard telemetry.
+- Cache durability and dashboard rendering are Nexus-BS operational hardening around clause-scoped behaviour, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/net_dashboard/html.rs`
+  - Browser `ms_energy_saving` now calls `ensureMsEntry(msg.issi)` and updates `_last_seen_ts`.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added browser reducer test for EG-before-registration ordering.
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Added `remember_restart_recovery_issi_with_remaining_persist` and `remember_restart_recovery_issi_after_group_change`.
+  - Group affiliation/deaffiliation paths now force a restart-cache flush after real group-state mutation while preserving coalescing for simple registration updates.
+  - SwMI ACK detach/replace now emits the final `MsGroupsSnapshot`.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added SwMI detach dashboard snapshot tests.
+  - Added immediate cache-flush tests for standalone group affiliation and SwMI group detach.
+
+Verification:
+
+- `cargo test -p tetra-entities dashboard_browser_creates_ms_entry_for_energy_saving_before_registration --locked` -> 1 passed.
+- `cargo test -p tetra-entities dashboard_preserves_energy_saving_if_energy_event_precedes_registration --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_swmi_group_ack_detach_publishes_dashboard_group_snapshot --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_swmi_group_ack_detach_all_then_attach_publishes_final_dashboard_group_snapshot --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_group_affiliation_update_forces_restart_recovery_cache_flush --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_swmi_group_detach_forces_restart_recovery_cache_flush --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_cache_coalesces_multiple_updates_until_flush --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs swmi_group_ack --locked` -> 14 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 32 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/src/mm/mm_bs.rs crates/tetra-entities/src/net_dashboard/server.rs crates/tetra-entities/tests/test_mm_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+2. Add deterministic over-cap tests/telemetry for CMCE/UMAC fixed queue ceilings so thousands-scale contention fails explicitly, not silently.
+3. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.

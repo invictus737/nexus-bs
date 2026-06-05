@@ -576,6 +576,19 @@ impl MmBs {
     }
 
     fn remember_restart_recovery_issi_with_remaining(&mut self, issi: u32, remaining_restart_group_refresh: &[(u32, GroupAttachmentInfo)]) {
+        self.remember_restart_recovery_issi_with_remaining_persist(issi, remaining_restart_group_refresh, false);
+    }
+
+    fn remember_restart_recovery_issi_after_group_change(&mut self, issi: u32) {
+        self.remember_restart_recovery_issi_with_remaining_persist(issi, &[], true);
+    }
+
+    fn remember_restart_recovery_issi_with_remaining_persist(
+        &mut self,
+        issi: u32,
+        remaining_restart_group_refresh: &[(u32, GroupAttachmentInfo)],
+        force_persist: bool,
+    ) {
         self.remove_restart_recovery_probe(issi);
         if !Self::restart_recovery_eligible(&self.config, issi) {
             return;
@@ -589,7 +602,7 @@ impl MmBs {
         if changed {
             self.restart_recovery_cache.insert(issi, groups);
             self.restart_recovery_cache_dirty = true;
-            self.flush_restart_recovery_cache_if_due(false);
+            self.flush_restart_recovery_cache_if_due(force_persist);
         }
     }
 
@@ -1279,10 +1292,15 @@ impl MmBs {
         deaff_groups: Vec<u32>,
         reason: &str,
     ) {
+        let changed_group_affiliation = !deaff_groups.is_empty();
         if !deaff_groups.is_empty() {
             self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
         }
-        self.remember_restart_recovery_issi_with_remaining(issi, &pending.remaining_restart_group_refresh);
+        self.remember_restart_recovery_issi_with_remaining_persist(
+            issi,
+            &pending.remaining_restart_group_refresh,
+            changed_group_affiliation,
+        );
         if pending.reprobe_group_report_on_failure {
             tracing::info!(
                 "MM: requesting fresh group report from ISSI {} after failed restart group refresh ({})",
@@ -1367,12 +1385,17 @@ impl MmBs {
         }
 
         let had_deaff_groups = !deaff_groups.is_empty();
+        let had_aff_groups = !aff_groups.is_empty();
         if had_deaff_groups {
             self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
         }
-        if !aff_groups.is_empty() {
+        if had_aff_groups {
             self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
         }
+        if had_deaff_groups || had_aff_groups {
+            self.emit_current_group_snapshot(issi);
+        }
+        let changed_group_affiliation = had_deaff_groups || had_aff_groups;
         if pending.rollback_unconfirmed_attachments_on_failure && had_deaff_groups {
             self.finish_swmi_group_failure_recovery(
                 queue,
@@ -1388,9 +1411,17 @@ impl MmBs {
             if !next_refresh.is_empty() {
                 self.send_swmi_group_attach_refresh(queue, issi, &next_refresh, remaining.to_vec());
             }
-            self.remember_restart_recovery_issi(issi);
+            if changed_group_affiliation {
+                self.remember_restart_recovery_issi_after_group_change(issi);
+            } else {
+                self.remember_restart_recovery_issi(issi);
+            }
         } else {
-            self.remember_restart_recovery_issi(issi);
+            if changed_group_affiliation {
+                self.remember_restart_recovery_issi_after_group_change(issi);
+            } else {
+                self.remember_restart_recovery_issi(issi);
+            }
         }
     }
 
@@ -2247,14 +2278,18 @@ impl MmBs {
                 .unwrap_or_default();
             if let Err(e) = self.client_mgr.client_detach_all_groups(issi) {
                 tracing::warn!("Failed clearing groups for group-report-complete MS {}: {:?}", issi, e);
-            } else if !prior_groups.is_empty() {
-                {
-                    let mut state = self.config.state_write();
-                    for &gssi in &prior_groups {
-                        state.subscribers.deaffiliate(issi, gssi);
+            } else {
+                let had_prior_groups = !prior_groups.is_empty();
+                if had_prior_groups {
+                    {
+                        let mut state = self.config.state_write();
+                        for &gssi in &prior_groups {
+                            state.subscribers.deaffiliate(issi, gssi);
+                        }
                     }
+                    self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
+                    self.remember_restart_recovery_issi_after_group_change(issi);
                 }
-                self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
             }
             None
         } else {
@@ -2701,7 +2736,8 @@ impl MmBs {
                         .unwrap_or_default();
                     match self.client_mgr.client_detach_all_groups(issi) {
                         Ok(_) => {
-                            if !prior_groups.is_empty() {
+                            let had_prior_groups = !prior_groups.is_empty();
+                            if had_prior_groups {
                                 {
                                     let mut state = self.config.state_write();
                                     for &gssi in &prior_groups {
@@ -2712,7 +2748,11 @@ impl MmBs {
                             }
                             self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
                             self.clear_solicited_group_report(issi);
-                            self.remember_restart_recovery_issi(issi);
+                            if had_prior_groups {
+                                self.remember_restart_recovery_issi_after_group_change(issi);
+                            } else {
+                                self.remember_restart_recovery_issi(issi);
+                            }
                         }
                         Err(e) => {
                             tracing::warn!("Failed clearing groups for standalone group-report-complete MS {}: {:?}", issi, e);
@@ -2744,7 +2784,8 @@ impl MmBs {
                 .unwrap_or_default();
             match self.client_mgr.client_detach_all_groups(issi) {
                 Ok(_) => {
-                    if !prior_groups.is_empty() {
+                    let had_prior_groups = !prior_groups.is_empty();
+                    if had_prior_groups {
                         {
                             let mut state = self.config.state_write();
                             for &gssi in &prior_groups {
@@ -2754,7 +2795,11 @@ impl MmBs {
                         self.emit_subscriber_update(queue, issi, prior_groups, BrewSubscriberAction::Deaffiliate);
                     }
                     self.send_d_attach_detach_ack(queue, issi, prim.handle, &[]);
-                    self.remember_restart_recovery_issi(issi);
+                    if had_prior_groups {
+                        self.remember_restart_recovery_issi_after_group_change(issi);
+                    } else {
+                        self.remember_restart_recovery_issi(issi);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed detaching all groups for MS {}: {:?}", issi, e);
@@ -3171,6 +3216,7 @@ impl MmBs {
             }
         }
 
+        let changed_group_affiliation = !aff_groups.is_empty() || !deaff_groups.is_empty();
         if !aff_groups.is_empty() {
             self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
         }
@@ -3182,7 +3228,11 @@ impl MmBs {
         // has the final ETSI mode=1 replace result, not an intermediate empty
         // list from the local detach-all step.
         self.emit_current_group_snapshot(issi);
-        self.remember_restart_recovery_issi(issi);
+        if changed_group_affiliation {
+            self.remember_restart_recovery_issi_after_group_change(issi);
+        } else {
+            self.remember_restart_recovery_issi(issi);
+        }
 
         GroupIdentityProcessResult {
             group_identity_downlink,

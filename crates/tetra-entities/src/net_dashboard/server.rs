@@ -3179,6 +3179,17 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_browser_creates_ms_entry_for_energy_saving_before_registration() {
+        let dashboard = render_product_template(crate::net_dashboard::html::DASHBOARD_HTML);
+
+        assert!(dashboard.contains("case 'ms_energy_saving':"));
+        assert!(dashboard.contains("const e=ensureMsEntry(msg.issi);e.energy_saving_mode=msg.mode;"));
+        assert!(dashboard.contains("e.energy_saving_frame=msg.frame??null;"));
+        assert!(dashboard.contains("e.energy_saving_multiframe=msg.multiframe??null;"));
+        assert!(dashboard.contains("e._last_seen_ts=Date.now();"));
+    }
+
+    #[test]
     fn cpu_descriptor_detects_raspberry_pi_zero_2_w_cortex_a53() {
         let cpuinfo = r#"processor	: 0
 BogoMIPS	: 38.40
