@@ -4937,3 +4937,49 @@ Next non-repeating execution:
    - UMAC/TMA pending report bounds when downlink completion stalls.
    - DL media queue backpressure under sustained group-call overfeed.
 3. Keep private simplex/duplex and group floor tests in the regression set before any deploy.
+
+## 2026-06-05 16:49:28 EEST - MM restart recovery cache scaling
+
+User goal:
+
+- After BS restart, thousands of terminals must remain recoverable without "Unit Not Attached" drift or slow full-file cache churn.
+- Keep group affiliation and scan-list recovery robust for lab GSSI `226333` and larger deployments.
+
+Component in simple technical terms:
+
+- MM is Mobility Management: it handles registration/attach, group affiliation state, energy economy negotiation, and BS-initiated `D-LOCATION UPDATE COMMAND` recovery.
+- The restart recovery cache is a local Nexus-BS persistence file. It remembers local ISSIs and cached GSSI affiliation hints so the BS can reprobe camped terminals after process restart.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI may initiate registration with `D-LOCATION UPDATE COMMAND`.
+- EN 300 392-2 clause 16.8.1/table 16.49: group identity attach/detach state is refreshed through MM group identity procedures.
+- File caching is local implementation robustness only; it is not an over-air ETSI PDU change.
+- This is engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - MM now keeps the restart recovery cache in memory for the current configured path.
+  - Startup reads the cache once and arms restart recovery from the in-memory view.
+  - `remember_restart_recovery_issi*` and `forget_restart_recovery_issi` no longer read the whole file per ISSI update.
+  - Multiple same-window updates are coalesced and flushed from memory instead of forcing full-file write churn for every ISSI.
+  - Path changes flush the old dirty cache and load the new path cleanly.
+  - Added debug-only test helpers for cache dirty state, cache size, and forced flush.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `test_restart_recovery_cache_coalesces_multiple_updates_until_flush`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_cache_coalesces_multiple_updates_until_flush --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 134 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack --locked` -> 1 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this MM restart recovery cache scaling patch.
+2. Continue with remaining QA findings:
+   - UMAC/TMA pending report bounds when downlink completion stalls.
+   - DL media queue backpressure under sustained group-call overfeed.
+3. Before deploy, rerun UMAC scheduler, MM, CMCE group/private, and diff checks.

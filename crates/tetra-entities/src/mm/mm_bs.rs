@@ -51,6 +51,10 @@ pub struct MmBs {
     pending_swmi_group_transactions: HashMap<u32, PendingSwmiGroupTransaction>,
     pending_solicited_group_reports: HashMap<u32, TdmaTime>,
     restart_recovery: HashMap<u32, RestartRecoveryProbe>,
+    restart_recovery_cache_path: Option<String>,
+    restart_recovery_cache: RestartRecoveryCache,
+    restart_recovery_cache_dirty: bool,
+    restart_recovery_cache_last_flush: Option<TdmaTime>,
     pending_critical_downlinks: HashMap<MleHandle, PendingCriticalMmDownlink>,
     next_critical_downlink_handle: MleHandle,
 }
@@ -162,6 +166,7 @@ impl MmBs {
     const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 2 * 18 * 4;
     const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 150;
+    const RESTART_RECOVERY_CACHE_FLUSH_TIMESLOTS: i32 = 18 * 4;
     // Local acceptance window for the group-report phase requested by
     // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
     // clause 16.4.4. This is not an ETSI timer value; it matches the local
@@ -171,7 +176,12 @@ impl MmBs {
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         let client_mgr = MmClientMgr::new(telemetry.clone());
         let restart_recovery_start = TdmaTime::default().add_timeslots(Self::RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS);
-        let restart_recovery = Self::load_restart_recovery_candidates(&config)
+        let restart_recovery_cache_path = Self::subscriber_recovery_path(&config);
+        let restart_recovery_cache = restart_recovery_cache_path
+            .as_deref()
+            .map(Self::read_restart_recovery_cache)
+            .unwrap_or_default();
+        let restart_recovery = Self::load_restart_recovery_candidates(&config, &restart_recovery_cache)
             .into_iter()
             .enumerate()
             .map(|(index, issi)| {
@@ -194,6 +204,10 @@ impl MmBs {
             pending_swmi_group_transactions: HashMap::new(),
             pending_solicited_group_reports: HashMap::new(),
             restart_recovery,
+            restart_recovery_cache_path,
+            restart_recovery_cache,
+            restart_recovery_cache_dirty: false,
+            restart_recovery_cache_last_flush: None,
             pending_critical_downlinks: HashMap::new(),
             next_critical_downlink_handle: 0x8000_0000,
         }
@@ -354,7 +368,7 @@ impl MmBs {
         std::fs::rename(&tmp, path)
     }
 
-    fn load_restart_recovery_candidates(config: &SharedConfig) -> BTreeSet<u32> {
+    fn load_restart_recovery_candidates(config: &SharedConfig, cache: &RestartRecoveryCache) -> BTreeSet<u32> {
         if !config.config().cell.registration {
             return BTreeSet::new();
         }
@@ -366,16 +380,14 @@ impl MmBs {
             }
         }
 
-        if let Some(path) = Self::subscriber_recovery_path(config) {
-            for issi in Self::read_restart_recovery_cache(&path).keys().copied() {
-                if Self::restart_recovery_eligible(config, issi) {
-                    issis.insert(issi);
-                } else {
-                    tracing::warn!(
-                        "MM: restart recovery cache ISSI {} ignored because it is outside local policy/whitelist",
-                        issi
-                    );
-                }
+        for issi in cache.keys().copied() {
+            if Self::restart_recovery_eligible(config, issi) {
+                issis.insert(issi);
+            } else {
+                tracing::warn!(
+                    "MM: restart recovery cache ISSI {} ignored because it is outside local policy/whitelist",
+                    issi
+                );
             }
         }
 
@@ -386,14 +398,58 @@ impl MmBs {
         issis
     }
 
-    fn cached_restart_recovery_groups_for_issi(&self, issi: u32) -> Vec<(u32, GroupAttachmentInfo)> {
-        let Some(path) = Self::subscriber_recovery_path(&self.config) else {
+    fn persist_restart_recovery_cache_now(&mut self) {
+        if !self.restart_recovery_cache_dirty {
+            return;
+        }
+        let Some(path) = self.restart_recovery_cache_path.clone() else {
+            self.restart_recovery_cache_dirty = false;
+            return;
+        };
+
+        match Self::write_restart_recovery_cache(&path, &self.restart_recovery_cache) {
+            Ok(()) => {
+                self.restart_recovery_cache_dirty = false;
+                self.restart_recovery_cache_last_flush = Some(self.dltime);
+            }
+            Err(err) => {
+                tracing::warn!("MM: failed writing restart recovery cache '{}': {}", path, err);
+            }
+        }
+    }
+
+    fn flush_restart_recovery_cache_if_due(&mut self, force: bool) {
+        if !self.restart_recovery_cache_dirty {
+            return;
+        }
+        let due = force
+            || self.restart_recovery_cache_last_flush.is_none_or(|last_flush| {
+                self.dltime
+                    .diff(last_flush.add_timeslots(Self::RESTART_RECOVERY_CACHE_FLUSH_TIMESLOTS))
+                    >= 0
+            });
+        if due {
+            self.persist_restart_recovery_cache_now();
+        }
+    }
+
+    fn sync_restart_recovery_cache_path(&mut self) -> Option<String> {
+        let current_path = Self::subscriber_recovery_path(&self.config);
+        if self.restart_recovery_cache_path != current_path {
+            self.flush_restart_recovery_cache_if_due(true);
+            self.restart_recovery_cache = current_path.as_deref().map(Self::read_restart_recovery_cache).unwrap_or_default();
+            self.restart_recovery_cache_path = current_path.clone();
+            self.restart_recovery_cache_dirty = false;
+            self.restart_recovery_cache_last_flush = None;
+        }
+        current_path
+    }
+
+    fn cached_restart_recovery_groups_for_issi(&mut self, issi: u32) -> Vec<(u32, GroupAttachmentInfo)> {
+        let Some(_path) = self.sync_restart_recovery_cache_path() else {
             return Vec::new();
         };
-        let cache = Self::read_restart_recovery_cache(&path);
-        let Some(groups) = cache.get(&issi) else {
-            return Vec::new();
-        };
+        let groups = self.restart_recovery_cache.get(&issi).cloned().unwrap_or_default();
         groups
             .iter()
             .filter_map(|(&gssi, &info)| {
@@ -469,32 +525,28 @@ impl MmBs {
         if !Self::restart_recovery_eligible(&self.config, issi) {
             return;
         }
-        let Some(path) = Self::subscriber_recovery_path(&self.config) else {
+        if self.sync_restart_recovery_cache_path().is_none() {
             return;
-        };
+        }
 
         let groups = self.current_restart_recovery_groups_for_client_with_remaining(issi, remaining_restart_group_refresh);
-        let mut cache = Self::read_restart_recovery_cache(&path);
-        let changed = cache.get(&issi) != Some(&groups);
-        cache.insert(issi, groups);
+        let changed = self.restart_recovery_cache.get(&issi) != Some(&groups);
         if changed {
-            if let Err(err) = Self::write_restart_recovery_cache(&path, &cache) {
-                tracing::warn!("MM: failed persisting ISSI {} to restart recovery cache '{}': {}", issi, path, err);
-            }
+            self.restart_recovery_cache.insert(issi, groups);
+            self.restart_recovery_cache_dirty = true;
+            self.flush_restart_recovery_cache_if_due(false);
         }
     }
 
     fn forget_restart_recovery_issi(&mut self, issi: u32) {
         self.restart_recovery.remove(&issi);
-        let Some(path) = Self::subscriber_recovery_path(&self.config) else {
+        if self.sync_restart_recovery_cache_path().is_none() {
             return;
-        };
+        }
 
-        let mut cache = Self::read_restart_recovery_cache(&path);
-        if cache.remove(&issi).is_some() {
-            if let Err(err) = Self::write_restart_recovery_cache(&path, &cache) {
-                tracing::warn!("MM: failed removing ISSI {} from restart recovery cache '{}': {}", issi, path, err);
-            }
+        if self.restart_recovery_cache.remove(&issi).is_some() {
+            self.restart_recovery_cache_dirty = true;
+            self.flush_restart_recovery_cache_if_due(false);
         }
     }
 
@@ -689,6 +741,24 @@ impl MmBs {
     #[doc(hidden)]
     pub fn debug_solicited_group_report_pending_for_test(&self, issi: u32) -> bool {
         self.solicited_group_report_pending(issi)
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_restart_recovery_cache_dirty_for_test(&self) -> bool {
+        self.restart_recovery_cache_dirty
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_restart_recovery_cache_len_for_test(&self) -> usize {
+        self.restart_recovery_cache.len()
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_flush_restart_recovery_cache_for_test(&mut self) {
+        self.flush_restart_recovery_cache_if_due(true);
     }
 
     #[cfg(debug_assertions)]
@@ -3791,11 +3861,15 @@ impl TetraEntityTrait for MmBs {
     }
 
     fn set_config(&mut self, config: SharedConfig) {
+        self.flush_restart_recovery_cache_if_due(true);
         self.config = config;
+        self.sync_restart_recovery_cache_path();
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
+        self.sync_restart_recovery_cache_path();
+        self.flush_restart_recovery_cache_if_due(false);
 
         if let Some(cep) = &self.control {
             while let Some(cmd) = cep.try_recv() {

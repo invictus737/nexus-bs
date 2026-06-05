@@ -4829,6 +4829,54 @@ fn test_successful_location_update_persists_restart_recovery_groups() {
 }
 
 #[test]
+fn test_restart_recovery_cache_coalesces_multiple_updates_until_flush() {
+    debug::setup_logging_verbose();
+    let issis = [2260082, 2260616, 2260618];
+    let path = unique_restart_recovery_path("coalesce-updates");
+    let _ = std::fs::remove_file(&path);
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    for issi in issis {
+        submit_location_update(&mut test, issi, None);
+    }
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    assert_eq!(
+        debug_mm_restart_recovery_cache_len(&mut test),
+        issis.len(),
+        "MM restart recovery cache should update in memory for every ISSI without rereading the file per update"
+    );
+    assert!(
+        debug_mm_restart_recovery_cache_dirty(&mut test),
+        "multiple same-window updates should be coalesced instead of forcing a full-file write per ISSI"
+    );
+
+    // EN 300 392-2 clause 16.4.4 permits SwMI-initiated registration after
+    // restart; this assertion is only about local persistence scaling. Force a
+    // flush to prove the coalesced cache still writes all recovered ISSIs.
+    debug_mm_flush_restart_recovery_cache(&mut test);
+    assert!(!debug_mm_restart_recovery_cache_dirty(&mut test));
+    let cache = std::fs::read_to_string(&path).expect("forced flush should persist restart recovery cache");
+    for issi in issis {
+        assert!(
+            cache.lines().any(|line| line.trim() == issi.to_string()),
+            "coalesced restart recovery cache should contain ISSI {issi}, got {cache:?}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_unsolicited_itsi_attach_without_groups_restores_cached_affiliation() {
     debug::setup_logging_verbose();
     let issi = 2260618;
@@ -6805,6 +6853,36 @@ fn debug_mm_solicited_group_report_pending(test: &mut ComponentTest, issi: u32) 
         .downcast_mut::<MmBs>()
         .expect("registered MM entity should be MmBs")
         .debug_solicited_group_report_pending_for_test(issi)
+}
+
+fn debug_mm_restart_recovery_cache_dirty(test: &mut ComponentTest) -> bool {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_restart_recovery_cache_dirty_for_test()
+}
+
+fn debug_mm_restart_recovery_cache_len(test: &mut ComponentTest) -> usize {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_restart_recovery_cache_len_for_test()
+}
+
+fn debug_mm_flush_restart_recovery_cache(test: &mut ComponentTest) {
+    test.router
+        .get_entity(TetraEntity::Mm)
+        .expect("MM entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<MmBs>()
+        .expect("registered MM entity should be MmBs")
+        .debug_flush_restart_recovery_cache_for_test()
 }
 
 fn debug_mm_swmi_group_transaction_pending(test: &mut ComponentTest, issi: u32) -> bool {
