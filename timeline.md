@@ -5164,3 +5164,55 @@ Next non-repeating execution:
 1. Commit this DL media queue backpressure patch.
 2. Run a final combined verification set across scheduler, MM, UMAC, CMCE, and diff checks.
 3. If deploy is requested, build locally and deploy direct to testing only; do not compile on the Pi and do not create binary backups.
+
+## 2026-06-05 17:19:27 EEST - UMAC downlink signalling queue caps
+
+User goal:
+
+- Make group operation robust for thousands of terminals, not only two or three radios.
+- Keep long-running Nexus-BS operation bounded when many terminals reattach, request floor, or receive group signalling at once.
+
+Component in simple technical terms:
+
+- UMAC is the MAC scheduler for the BS. It decides which downlink signalling PDU goes into each radio timeslot.
+- The downlink signalling queues hold MAC-RESOURCE, random-access ACKs, slot grants, channel allocations, and FACCH/STCH signalling before over-air transmission.
+- For large groups, these queues must have bounded memory growth while still preserving the control messages that keep PTT, attach, and call setup correct.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 21.4.3.1: random-access acknowledgement/grant timing is critical and must not be discarded as ordinary backlog.
+- EN 300 392-2 clause 23.5.2.2.2: slot grants must keep correct timing semantics.
+- EN 300 392-2 clause 23.5.2.2.7 and clause 23.7.6: downlink scheduling must account for energy-economy receive windows.
+- EN 300 392-2 clause 14.5.2.1 and 14.5.2.2.1: group-call/floor signalling remains protected through the existing FACCH/STCH and grant paths.
+- The queue caps are local implementation robustness; they are clause-scoped engineering hardening, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added bounded push helpers for per-timeslot downlink queues and the next-slot merge queue.
+  - Preserved protected control signalling under backpressure: direct grants, pending grants, random-access ACKs, FACCH/STCH stealing, channel allocations, and MAC-RESOURCEs carrying integrated grant/RA ACK.
+  - Ordinary queued MAC-RESOURCE/FragBuf backlog is discardable only through the existing reporter path, so upper layers can observe a local MAC transfer failure instead of waiting forever.
+  - The next-slot merge path also enforces the cap after deferred signalling is merged back into the active timeslot queue.
+
+Tests added:
+
+- `test_downlink_scheduler_discards_reported_ordinary_resource_when_queue_cap_is_reached`
+- `test_downlink_scheduler_backpressure_preserves_grants_over_ordinary_resources`
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 60 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 58 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 135 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC downlink signalling queue cap patch.
+2. Continue hardening the remaining large-group risks:
+   - global/message ingress queue backpressure for very large bursts,
+   - restart recovery and group affiliation tests at multi-thousand scale,
+   - active EG suspension memory shape for many simultaneous GSSI circuits.
+3. Keep the regression set anchored on private simplex/duplex, group-call turn taking, SDS/status, MM attach/group affiliation, and UMAC EG7 scheduling before deploy.

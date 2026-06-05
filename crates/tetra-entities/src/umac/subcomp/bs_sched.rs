@@ -53,6 +53,8 @@ pub const NUM_TIMESLOTS: usize = 4;
 
 const PREDEFINED_BROADCAST_GSSI: u32 = 0xFF_FFFF;
 const MAX_PENDING_RA_ACKS_PER_TIMESLOT: usize = 8192;
+const MAX_DLSCHED_ELEMS_PER_TIMESLOT: usize = 4096;
+const MAX_DLSCHED_NEXT_SLOT_ELEMS: usize = 4096;
 
 enum DlTchBlock {
     AcElp(BitBuffer),
@@ -824,7 +826,7 @@ impl BsChannelScheduler {
             usage_marker
         );
         let elem = DlSchedElem::Grant(addr, grant, usage_marker);
-        self.dltx_queues[slot].push(elem);
+        self.push_sched_queue_bounded(slot, elem, "dltx_queues:dl_enqueue_grant");
     }
 
     pub fn dl_enqueue_reservation_grant(&mut self, ts: u8, addr: TetraAddress, res_req: ReservationRequirement) {
@@ -838,7 +840,7 @@ impl BsChannelScheduler {
             addr
         );
         let elem = DlSchedElem::PendingGrant(addr, res_req);
-        self.dltx_queues[slot].push(elem);
+        self.push_sched_queue_bounded(slot, elem, "dltx_queues:dl_enqueue_reservation_grant");
     }
 
     pub fn dl_enqueue_random_access_ack(&mut self, ts: u8, addr: TetraAddress) {
@@ -851,7 +853,7 @@ impl BsChannelScheduler {
             addr
         );
         let elem = DlSchedElem::RandomAccessAck(addr);
-        self.dltx_queues[slot].push(elem);
+        self.push_sched_queue_bounded(slot, elem, "dltx_queues:dl_enqueue_random_access_ack");
     }
 
     fn common_control_downlink_timeslots() -> [u8; NUM_TIMESLOTS] {
@@ -862,6 +864,60 @@ impl BsChannelScheduler {
         // `dl_enqueue_stealing`, so do not pretend to discover per-SSI traffic
         // slots here.
         [1, 0, 0, 0]
+    }
+
+    fn elem_protected_from_backpressure(elem: &DlSchedElem) -> bool {
+        matches!(
+            elem,
+            DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_) | DlSchedElem::Stealing(..)
+        ) || Self::elem_has_channel_allocation(elem)
+            || Self::elem_has_integrated_grant_or_ack(elem)
+    }
+
+    fn mark_sched_elem_discarded_if_reported(elem: DlSchedElem) {
+        match elem {
+            DlSchedElem::Resource(_, _, tx_reporter, group_state) => {
+                Self::mark_reporter_discarded_if_pending(tx_reporter.or_else(|| group_state.and_then(|state| state.tx_reporter)));
+            }
+            DlSchedElem::FragBuf(_, group_state) => {
+                Self::mark_reporter_discarded_if_pending(group_state.and_then(|state| state.tx_reporter));
+            }
+            DlSchedElem::Stealing(_, _, tx_reporter, group_state) => {
+                Self::mark_reporter_discarded_if_pending(tx_reporter.or_else(|| group_state.and_then(|state| state.tx_reporter)));
+            }
+            DlSchedElem::Broadcast(_) | DlSchedElem::RandomAccessAck(_) | DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) => {}
+        }
+    }
+
+    fn enforce_sched_queue_cap(queue: &mut Vec<DlSchedElem>, cap: usize, label: &str) {
+        while queue.len() > cap {
+            let Some(pos) = queue.iter().position(|elem| !Self::elem_protected_from_backpressure(elem)) else {
+                tracing::warn!(
+                    "UMAC scheduler: {} has {} protected element(s), exceeding local cap {}",
+                    label,
+                    queue.len(),
+                    cap
+                );
+                break;
+            };
+            let elem = queue.remove(pos);
+            tracing::warn!(
+                "UMAC scheduler: discarding queued downlink element from {} because queue length exceeded cap {}",
+                label,
+                cap
+            );
+            Self::mark_sched_elem_discarded_if_reported(elem);
+        }
+    }
+
+    fn push_sched_queue_bounded(&mut self, slot: usize, elem: DlSchedElem, label: &str) {
+        self.dltx_queues[slot].push(elem);
+        Self::enforce_sched_queue_cap(&mut self.dltx_queues[slot], MAX_DLSCHED_ELEMS_PER_TIMESLOT, label);
+    }
+
+    fn push_next_slot_queue_bounded(&mut self, elem: DlSchedElem, label: &str) {
+        self.dltx_next_slot_queue.push(elem);
+        Self::enforce_sched_queue_cap(&mut self.dltx_next_slot_queue, MAX_DLSCHED_NEXT_SLOT_ELEMS, label);
     }
 
     pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
@@ -899,17 +955,17 @@ impl BsChannelScheduler {
             if deferred {
                 tracing::debug!("dl_enqueue_tma: ts {} deferring chan_alloc PDU to next frame (slot capacity)", ts);
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
-                self.dltx_next_slot_queue.push(elem);
+                self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma");
                 break;
             } else if next_ts > 0 {
                 // There is another ts for which we need to transmit this message.
                 // Clone the message now and push it to the current ts.
                 let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), None);
-                self.dltx_queues[ts as usize - 1].push(elem);
+                self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma");
             } else {
                 // This is the last ts on which we need to transmit this message
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
-                self.dltx_queues[ts as usize - 1].push(elem);
+                self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma");
                 break;
             }
         }
@@ -1003,7 +1059,11 @@ impl BsChannelScheduler {
             return;
         };
         tracing::info!("dl_enqueue_stealing: ts {} enqueueing STCH block ({} bits)", ts, block.get_len());
-        self.dltx_queues[slot].push(DlSchedElem::Stealing(block, addr, tx_reporter, None));
+        self.push_sched_queue_bounded(
+            slot,
+            DlSchedElem::Stealing(block, addr, tx_reporter, None),
+            "dltx_queues:dl_enqueue_stealing",
+        );
     }
 
     fn dl_requeue_group_stealing(&mut self, ts: u8, block: BitBuffer, addr: TetraAddress, group_state: GroupStealingState) {
@@ -1018,18 +1078,17 @@ impl BsChannelScheduler {
             group_state.targets.len(),
             ts
         );
-        self.dltx_queues[slot].push(DlSchedElem::Stealing(
-            block,
-            addr,
-            group_state.tx_reporter.clone(),
-            Some(group_state),
-        ));
+        self.push_sched_queue_bounded(
+            slot,
+            DlSchedElem::Stealing(block, addr, group_state.tx_reporter.clone(), Some(group_state)),
+            "dltx_queues:dl_requeue_group_stealing",
+        );
     }
 
     fn dl_enqueue_tma_frag_next_frame_with_group_state(&mut self, fragger: BsFragger, group_state: Option<GroupDeliveryState>) {
         tracing::debug!("dl_enqueue_tma_frag_next_frame: enqueueing {:?}", fragger);
         let elem = DlSchedElem::FragBuf(fragger, group_state);
-        self.dltx_next_slot_queue.push(elem);
+        self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma_frag_next_frame");
     }
 
     fn dl_enqueue_group_repeat_next_frame(&mut self, group_state: GroupDeliveryState) {
@@ -1045,7 +1104,7 @@ impl BsChannelScheduler {
             None,
             Some(group_state),
         );
-        self.dltx_next_slot_queue.push(elem);
+        self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_group_repeat_next_frame");
     }
 
     fn dl_defer_pending_grant_next_frame(&mut self, addr: TetraAddress, res_req: ReservationRequirement) {
@@ -1054,7 +1113,10 @@ impl BsChannelScheduler {
             res_req,
             addr
         );
-        self.dltx_next_slot_queue.push(DlSchedElem::PendingGrant(addr, res_req));
+        self.push_next_slot_queue_bounded(
+            DlSchedElem::PendingGrant(addr, res_req),
+            "dltx_next_slot_queue:dl_defer_pending_grant_next_frame",
+        );
     }
 
     fn elem_addr(elem: &DlSchedElem) -> Option<TetraAddress> {
@@ -1391,7 +1453,7 @@ impl BsChannelScheduler {
             sdu.dump_bin()
         );
         let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
-        self.dltx_next_slot_queue.push(elem);
+        self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma_next_frame");
     }
 
     pub fn dl_schedule_tmb(&mut self, traffic: BitBuffer, ts: &TdmaTime) {
@@ -1831,9 +1893,13 @@ impl BsChannelScheduler {
 
                     // Push new resource into the queue. These do not need a tx_reporter
                     let dlsched_res = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, None);
-                    let index = self.dltx_queues[slot].len();
-                    self.dltx_queues[slot].push(dlsched_res);
-                    resource_indexes.insert(addr, index);
+                    self.push_sched_queue_bounded(slot, dlsched_res, "dltx_queues:dl_integrate_sched_elems_for_timeslot");
+                    if let Some(index) = self.dltx_queues[slot]
+                        .iter()
+                        .rposition(|elem| matches!(elem, DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr)))
+                    {
+                        resource_indexes.insert(addr, index);
+                    }
                 }
             }
         }
@@ -1970,6 +2036,7 @@ impl BsChannelScheduler {
             let mut merged = std::mem::take(&mut self.dltx_next_slot_queue);
             merged.extend(current.drain(..));
             *current = merged;
+            Self::enforce_sched_queue_cap(current, MAX_DLSCHED_ELEMS_PER_TIMESLOT, "dltx_queues:next_slot_merge");
         }
 
         buf_opt
@@ -2937,6 +3004,13 @@ mod tests {
         (pdu, sdu)
     }
 
+    fn test_ordinary_resource_for_issi(issi: u32, sdu_bits: usize) -> (MacResource, BitBuffer) {
+        let (mut pdu, sdu) = test_resource_for_issi(issi, sdu_bits);
+        pdu.random_access_flag = false;
+        pdu.update_len_and_fill_ind(sdu.get_len());
+        (pdu, sdu)
+    }
+
     fn test_resource_for_gssi(gssi: u32, sdu_bits: usize) -> (MacResource, BitBuffer) {
         let addr = TetraAddress {
             ssi_type: SsiType::Gssi,
@@ -2975,6 +3049,52 @@ mod tests {
         assert!(sched.dltx_queues[1].is_empty());
         assert!(sched.dltx_queues[2].is_empty());
         assert!(sched.dltx_queues[3].is_empty());
+    }
+
+    #[test]
+    fn test_downlink_scheduler_discards_reported_ordinary_resource_when_queue_cap_is_reached() {
+        let mut sched = get_testing_slotter();
+        let first_reporter = TxReporter::new_unacked();
+
+        for offset in 0..=MAX_DLSCHED_ELEMS_PER_TIMESLOT {
+            let (pdu, sdu) = test_ordinary_resource_for_issi(300_000 + offset as u32, 8);
+            let reporter = (offset == 0).then(|| first_reporter.clone());
+            sched.dl_enqueue_tma(pdu, sdu, reporter);
+        }
+
+        // Local BS robustness guard: ordinary downlink signalling backlog is
+        // bounded so a large group/recovery storm cannot grow scheduler memory
+        // without limit. This does not define an over-air ETSI PDU change; the
+        // discarded TMA request is reported through TxReporter.
+        assert_eq!(sched.dltx_queues[0].len(), MAX_DLSCHED_ELEMS_PER_TIMESLOT);
+        assert_eq!(first_reporter.get_state(), TxState::Discarded);
+    }
+
+    #[test]
+    fn test_downlink_scheduler_backpressure_preserves_grants_over_ordinary_resources() {
+        let mut sched = get_testing_slotter();
+        for offset in 0..MAX_DLSCHED_ELEMS_PER_TIMESLOT {
+            let (pdu, sdu) = test_ordinary_resource_for_issi(310_000 + offset as u32, 8);
+            sched.dl_enqueue_tma(pdu, sdu, None);
+        }
+
+        let grant_addr = TetraAddress::issi(399_999);
+        let grant = BasicSlotgrant {
+            capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
+            granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
+        };
+        sched.dl_enqueue_grant(1, grant_addr, grant, None);
+
+        // EN 300 392-2 clauses 21.4.3.1 and 23.5.2.2.2 make random-access
+        // ACK/grant timing critical. Backpressure may discard ordinary queued
+        // downlinks, but it must preserve the grant lane.
+        assert_eq!(sched.dltx_queues[0].len(), MAX_DLSCHED_ELEMS_PER_TIMESLOT);
+        assert!(
+            sched.dltx_queues[0]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::Grant(addr, _, _) if *addr == grant_addr)),
+            "critical grant must survive downlink queue backpressure"
+        );
     }
 
     #[test]
