@@ -785,6 +785,15 @@ impl CcBsSubentity {
                 return;
             };
 
+            if self.pending_group_releases.contains_key(&call_id) {
+                tracing::debug!(
+                    "U-RELEASE ignored for pending group release call_id={} from ISSI {}",
+                    call_id,
+                    sender.ssi
+                );
+                return;
+            }
+
             let is_call_owner = matches!(&call.origin, CallOrigin::Local { caller_addr } if caller_addr.ssi == sender.ssi);
             if is_call_owner {
                 tracing::info!(
@@ -902,6 +911,15 @@ impl CcBsSubentity {
             tracing::debug!("U-DISCONNECT for unknown call_id={} (likely duplicate)", call_id);
             return;
         };
+
+        if self.pending_group_releases.contains_key(&call_id) {
+            tracing::debug!(
+                "U-DISCONNECT ignored for pending group release call_id={} from ISSI {}",
+                call_id,
+                sender.ssi
+            );
+            return;
+        }
 
         let is_call_owner = matches!(&call.origin, CallOrigin::Local { caller_addr } if caller_addr.ssi == sender.ssi);
 

@@ -6159,6 +6159,48 @@ fn test_group_release_pending_ignores_duplicate_release_without_extra_signalling
 }
 
 #[test]
+fn test_group_pending_release_ignores_non_owner_disconnect_release_without_extra_signalling() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let call_id = start_group_call(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let release_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&release_msgs),
+        2,
+        "initial group release should send FACCH plus MCCH D-RELEASE"
+    );
+    assert_eq!(count_umac_call_ended_or_close(&release_msgs), 0);
+
+    // EN 300 392-2 clause 14.5.2.3 clears the group call with D-RELEASE and
+    // does not require an MS response. While the old D-RELEASE is pending, late
+    // non-owner release/disconnect PDUs for the same call id are stale local
+    // traffic and must not create service-unavailable D-RELEASEs.
+    test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let non_owner_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&non_owner_disconnect_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&non_owner_disconnect_msgs), 0);
+
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let non_owner_release_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&non_owner_release_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&non_owner_release_msgs), 0);
+}
+
+#[test]
 fn test_group_release_pending_allows_same_gssi_restart_while_old_release_drains() {
     debug::setup_logging_verbose();
 

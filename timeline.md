@@ -6012,3 +6012,47 @@ Next non-repeating execution:
 2. Add the analogous P2P pending-release flood regression so private simplex teardown also stays bounded under repeated stale floor attempts.
 3. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.
 4. Continue global ingress queue pressure tests for attach + SDS + PTT bursts.
+
+## 2026-06-05 19:02:48 EEST - CMCE pending group release ignores non-owner stale release/disconnect
+
+User goal:
+
+- Group call release must be stable under repeated/stale uplink traffic from many group members, without extra `D-RELEASE` responses that can confuse terminals.
+- This specifically hardens the case where the group owner already started release and another affiliated MS sends late `U-DISCONNECT` or `U-RELEASE` for the same call id.
+
+Component in simple technical terms:
+
+- CMCE keeps a group call in `pending_group_releases` while the FACCH/MCCH `D-RELEASE` drains.
+- During that period the old call id is still visible locally, but the call is already clearing.
+- Late non-owner release/disconnect PDUs for that call are stale; the BS now ignores them instead of generating service-unavailable `D-RELEASE` noise.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.3: group-call clearing is performed by SwMI `D-RELEASE`; the procedure does not require an MS response.
+- EN 300 392-2 clause 14.5.2.2.1 remains relevant because stale uplink control traffic must not restart or contradict floor/call state while release is pending.
+- This is clause-scoped release-state hardening, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Added pending group-release guards in the group branches of `fsm_on_u_release` and `fsm_on_u_disconnect`.
+  - If the `call_id` is already pending group release, CMCE logs and returns before owner/non-owner rejection logic can emit another `D-RELEASE`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_group_pending_release_ignores_non_owner_disconnect_release_without_extra_signalling`.
+  - Starts a group call, enters pending release through owner `U-DISCONNECT`, then submits non-owner `U-DISCONNECT` and `U-RELEASE`.
+  - Asserts no extra `D-RELEASE` and no premature UMAC close.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_pending_release_ignores_non_owner_disconnect_release_without_extra_signalling --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 144 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE pending group-release stale non-owner guard.
+2. Extend the large pending-release flood test to prove release still completes after reporter transmission.
+3. Add the analogous P2P pending-release flood regression so private simplex teardown remains bounded.
+4. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
