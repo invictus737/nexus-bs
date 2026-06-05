@@ -5615,6 +5615,112 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
 }
 
 #[test]
+fn test_ten_thousand_member_group_floor_overflow_is_explicit_and_preserves_handoff() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.call_timeout_secs = 0;
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = 10_000_u32;
+    let first_issi = 900_000_u32;
+    let current_speaker = first_issi;
+    let first_waiter = first_issi + 1;
+    let fifo_capacity = LARGE_GSSI_MEMBER_COUNT as usize;
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+
+    for issi in (first_issi + 1)..(first_issi + member_count) {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+    }
+    test.run_stack(Some(member_count as usize + 64));
+    let demand_msgs = test.dump_sinks();
+    let grants: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .filter(|(prim, _)| prim.main_address.ssi > current_speaker && prim.main_address.ssi < first_issi + member_count)
+        .collect();
+
+    // EN 300 392-2 clause 14.5.2.2.1 defines explicit floor-control
+    // outcomes. At 10k affiliated members, Nexus-BS must not silently drop
+    // over-cap PTT contenders: in-cap contenders are queued, over-cap
+    // contenders are denied explicitly, and the active call remains usable.
+    assert_eq!(grants.len(), member_count as usize - 1);
+    assert_eq!(
+        grants
+            .iter()
+            .filter(|(_, grant)| grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+            .count(),
+        fifo_capacity,
+        "bounded FIFO should queue exactly {fifo_capacity} floor contenders"
+    );
+    assert_eq!(
+        grants
+            .iter()
+            .filter(|(_, grant)| grant.transmission_grant == TransmissionGrant::NotGranted.into_raw() as u8)
+            .count(),
+        member_count as usize - 1 - fifo_capacity,
+        "over-cap floor contenders must receive explicit NotGranted responses"
+    );
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+    assert_eq!(count_d_releases(&demand_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let first_handoff = handoff_grants
+        .iter()
+        .find(|(prim, grant)| {
+            prim.main_address == TetraAddress::issi(first_waiter) && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+        })
+        .expect("10k overflow storm must not disturb the head FIFO handoff");
+    assert_d_tx_granted_facch_allocation(
+        first_handoff.0,
+        &first_handoff.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "10k group floor overflow first handoff",
+    );
+    assert!(
+        handoff_grants.iter().all(|(prim, grant)| {
+            prim.main_address == TetraAddress::issi(first_waiter)
+                || (prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+                    && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8)
+        }),
+        "only the FIFO head and GSSI listeners should receive the first handoff after 10k overflow"
+    );
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_d_releases(&handoff_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
+}
+
+#[test]
 fn test_cross_layer_large_group_floor_grant_survives_wrapped_ptt_storm_to_lmac() {
     debug::setup_logging_verbose();
 

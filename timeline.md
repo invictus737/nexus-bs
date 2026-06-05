@@ -6875,3 +6875,47 @@ Next non-repeating execution:
 1. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
 2. Add deterministic over-cap tests/telemetry for CMCE/UMAC fixed queue ceilings so thousands-scale contention fails explicitly, not silently.
 3. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+
+## 2026-06-05 21:36 EEST - CMCE 10k-member group floor overflow evidence
+
+Component in simple technical terms:
+
+- CMCE is call control: it receives group/private call setup and PTT/floor requests, then decides whether a terminal is granted, queued, or denied.
+- The group floor FIFO is deliberately bounded. Above the local bound, ETSI-compatible behaviour is an explicit floor-control denial, not silent loss or call teardown.
+
+Problem covered:
+
+- Existing evidence covered 4096 waiters and 4098-member overflow.
+- The missing evidence for "mii de terminale pe grup" was a much larger affiliated GSSI, with more contenders than the local FIFO can hold.
+- New test registers 10,000 members on one GSSI, starts a group call, submits 9,999 simultaneous `U-TX DEMAND` contenders, and verifies:
+  - exactly 4096 contenders receive `RequestQueued`;
+  - every over-cap contender receives explicit `NotGranted`;
+  - the active group call is not released or closed by the overflow;
+  - when the current speaker ceases, the FIFO head receives the next `Granted` floor and listeners receive the GSSI notification.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group call floor-control grant/queued/not-granted responses.
+- EN 300 392-2 clause 23.5: assigned-channel FACCH/STCH floor-control delivery.
+- This is engineering evidence that local bounded overload is explicit and deterministic; it is not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_ten_thousand_member_group_floor_overflow_is_explicit_and_preserves_handoff`.
+  - The fixture sets `call_timeout_secs = 0` to isolate overflow handling from normal call timeout expiry.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_ten_thousand_member_group_floor_overflow_is_explicit_and_preserves_handoff --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs large_group_floor --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 152 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add UMAC over-cap protected-control evidence: all-protected backlog must preserve requester/listener/floor-withdraw semantics or fail with explicit telemetry.
+2. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+3. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
