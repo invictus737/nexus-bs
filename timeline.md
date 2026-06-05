@@ -4743,3 +4743,39 @@ Next non-repeating execution:
 2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with local build only.
 3. RF retest GSSI `226333`, especially repeated PTT from `2260082`.
 4. Expected live evidence after fix: for `2260082` PTT, log should show individual `D-TX GRANTED`, GSSI `GrantedToOtherUser` with transmitting party `2260082`, then `NormalTrainSeq*` and `UMAC voice route` before any inactivity timeout.
+
+## 2026-06-05 16:00:44 EEST - Deployed group floor notification hardening
+
+Commit deployed:
+
+- `3531b3c6` (`fix: harden group floor notification`)
+
+Build/deploy:
+
+- Command:
+  - `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`
+- Local build only; no compile on `chris@192.168.1.179`.
+- Remote binary copied directly to `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs`; no binary backup created.
+- Remote deployed binary SHA-256:
+  - `52918b7ca64258dac9c89c7b7f6e77f6a5a2025f24e110949ed2503a635cc036`
+
+Live startup evidence:
+
+- Running process:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+- Startup build line:
+  - `Build: v0.1.55-3531b3c6`
+- Startup registration/affiliation:
+  - `2260616` registered and affiliated to `226333`.
+  - `2260082` registered and affiliated to `226333`.
+  - `2260618` registered and affiliated to `226333`.
+- Startup filtered log sample showed no `RequestedServiceNotAvailable`, `Service unavailable`, `PTT denied`, or `Unit Not Attached`.
+
+Next non-repeating execution:
+
+1. RF retest GSSI `226333` with repeated PTT from `2260082` (MTP3550).
+2. Confirm live log contains:
+   - individual `D-TX GRANTED` to `2260082`;
+   - GSSI `D-TX GRANTED/GrantedToOtherUser` carrying transmitting party `2260082`;
+   - `NormalTrainSeq*` and `UMAC voice route` before inactivity timeout.
+3. If static persists with those logs present, next investigation should be PHY/RSSI/vocoder path for 2260082, not CMCE floor denial.
