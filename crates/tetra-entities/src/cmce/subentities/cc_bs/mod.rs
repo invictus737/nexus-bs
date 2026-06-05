@@ -9,8 +9,8 @@ use tetra_core::{
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
     enums::{
-        call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_ul::CmcePduTypeUl,
-        transmission_grant::TransmissionGrant, type3_elem_id::CmceType3ElemId,
+        call_timeout::CallTimeout, call_timeout_setup_phase::CallTimeoutSetupPhase, cmce_pdu_type_dl::CmcePduTypeDl,
+        cmce_pdu_type_ul::CmcePduTypeUl, transmission_grant::TransmissionGrant, type3_elem_id::CmceType3ElemId,
     },
     fields::basic_service_information::BasicServiceInformation,
     pdus::{

@@ -18,6 +18,9 @@ const INDIVIDUAL_DISCONNECT_DELIVERY_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOT
 // depth here, so simplex speech uses the same short N=4-equivalent guard as a
 // conservative bearer-tail compatibility drain before peer-facing clear state.
 const INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
+// EN 300 392-2 table 20.54 defines priority 7 as the highest TMA priority.
+// Keep this restricted to time-critical floor-control signalling.
+const CMCE_FLOOR_CONTROL_PDU_PRIO: i32 = 7;
 
 // EN 300 392-2 table 14.33 uses pointer 0 for an unsupported whole PDU.
 // Non-zero pointers below are bit offsets into the received-PDU extract, which
@@ -91,6 +94,32 @@ impl CcBsSubentity {
 
     pub fn set_config(&mut self, config: SharedConfig) {
         self.config = config;
+    }
+
+    fn cmce_downlink_pdu_prio(sdu: &BitBuffer) -> i32 {
+        let mut probe = BitBuffer::from_bitbuffer(sdu);
+        let pdu_type = probe
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok());
+
+        match pdu_type {
+            Some(CmcePduTypeDl::DTxCeased | CmcePduTypeDl::DTxInterrupt) => CMCE_FLOOR_CONTROL_PDU_PRIO,
+            Some(CmcePduTypeDl::DTxGranted) => {
+                let mut grant_probe = BitBuffer::from_bitbuffer(sdu);
+                if DTxGranted::from_bitbuf(&mut grant_probe).is_ok_and(|grant| {
+                    matches!(
+                        TransmissionGrant::try_from(grant.transmission_grant as u64),
+                        Ok(TransmissionGrant::Granted | TransmissionGrant::GrantedToOtherUser)
+                    )
+                }) {
+                    CMCE_FLOOR_CONTROL_PDU_PRIO
+                } else {
+                    0
+                }
+            }
+            _ => 0,
+        }
     }
 
     pub(in crate::cmce) fn debug_force_next_call_identifier(&mut self, next_call_identifier: u16) {
@@ -187,6 +216,7 @@ impl CcBsSubentity {
         layer2service: Layer2Service,
         reporter: Option<TxReporter>,
     ) -> SapMsg {
+        let pdu_prio = Self::cmce_downlink_pdu_prio(&sdu);
         SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -197,7 +227,7 @@ impl CcBsSubentity {
                 endpoint_id: 0,
                 link_id: 0,
                 layer2service,
-                pdu_prio: 0,
+                pdu_prio,
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
@@ -213,6 +243,7 @@ impl CcBsSubentity {
     /// Used for individually-addressed responses that must be routed back through
     /// the established LLC link of a specific MS.
     pub(super) fn build_sapmsg_direct(sdu: BitBuffer, address: TetraAddress, handle: u32, link_id: u32, endpoint_id: u32) -> SapMsg {
+        let pdu_prio = Self::cmce_downlink_pdu_prio(&sdu);
         SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -223,7 +254,7 @@ impl CcBsSubentity {
                 endpoint_id,
                 link_id,
                 layer2service: Layer2Service::Unacknowledged,
-                pdu_prio: 0,
+                pdu_prio,
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
@@ -360,6 +391,7 @@ impl CcBsSubentity {
             alloc_type: ChanAllocType::Replace,
             ul_dl_assigned,
         };
+        let pdu_prio = Self::cmce_downlink_pdu_prio(&sdu);
 
         SapMsg {
             sap: Sap::LcmcSap,
@@ -371,7 +403,7 @@ impl CcBsSubentity {
                 endpoint_id: 0,
                 link_id: 0,
                 layer2service: Layer2Service::Unacknowledged,
-                pdu_prio: 0,
+                pdu_prio,
                 layer2_qos: 0,
                 stealing_permission: true,
                 stealing_repeats_flag: false,

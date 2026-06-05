@@ -5168,6 +5168,20 @@ fn test_cross_layer_large_group_floor_grant_survives_wrapped_ptt_storm_to_lmac()
         "CMCE floor-control BL-UDATA should use the unacknowledged no-FCS path in this fixture"
     );
 
+    let listener_notification = wrapped_grants
+        .iter()
+        .find(|decoded| {
+            decoded.logical_channel == LogicalChannel::Stch
+                && decoded.resource.addr.is_some_and(|addr| addr.ssi == TEST_GSSI)
+                && decoded.grant.call_identifier == call_id
+                && decoded.grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        })
+        .unwrap_or_else(|| panic!("expected wrapped GSSI D-TX GRANTED/GrantedToOtherUser at LMAC; decoded grants={wrapped_grants:?}"));
+    assert!(
+        requester_positive.resource_sequence < listener_notification.resource_sequence,
+        "requester positive grant should reach STCH before the listener floor notification"
+    );
+
     let busy_grant_count = wrapped_grants
         .iter()
         .filter(|decoded| {
@@ -5193,6 +5207,10 @@ fn test_cross_layer_large_group_floor_grant_survives_wrapped_ptt_storm_to_lmac()
         assert!(
             requester_positive.resource_sequence < first_busy.resource_sequence,
             "positive requester floor grant must be emitted before lower-value storm NotGranted responses"
+        );
+        assert!(
+            listener_notification.resource_sequence < first_busy.resource_sequence,
+            "listener floor notification must stay ahead of lower-value storm NotGranted responses"
         );
     }
 }

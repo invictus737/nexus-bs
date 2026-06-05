@@ -3357,6 +3357,115 @@ fn test_large_group_ptt_storm_prioritizes_llc_wrapped_requester_grant_with_prese
 }
 
 #[test]
+fn test_large_group_ptt_storm_admits_llc_wrapped_listener_floor_grant() {
+    debug::setup_logging_verbose();
+
+    let first_speaker_issi = 2_260_618;
+    let new_speaker_issi = 2_260_082;
+    let gssi = 226_333;
+    let traffic_ts = 2;
+    let call_id = 6;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, new_speaker_issi, gssi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let make_wrapped_d_tx_granted_sdu =
+        |transmission_grant: TransmissionGrant| llc_wrapped_cmce_sdu(d_tx_granted_sdu(call_id, transmission_grant));
+
+    let busy_count = 4096;
+    for offset in 0..busy_count {
+        let busy_issi = 3_300_000 + offset;
+        test.submit_message(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle: 50_000 + offset as i32,
+                pdu: make_wrapped_d_tx_granted_sdu(TransmissionGrant::NotGranted),
+                main_address: TetraAddress::issi(busy_issi),
+                endpoint_id: 0,
+                pdu_prio: 0,
+                stealing_permission: true,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let listener_reporter = TxReporter::new_unacked();
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 60_000,
+            pdu: make_wrapped_d_tx_granted_sdu(TransmissionGrant::GrantedToOtherUser),
+            main_address: TetraAddress::new(gssi, SsiType::Gssi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Dl,
+                carrier: None,
+            }),
+            tx_reporter: Some(listener_reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(48));
+    let sink_msgs = test.dump_sinks();
+    let all_pdus = downlink_mac_pdus(&sink_msgs);
+    let listener_grant = all_pdus
+        .iter()
+        .find_map(|pdu| match pdu {
+            DownlinkMacPdu::Resource(LogicalChannel::Stch, resource)
+                if resource.addr.is_some_and(|addr| addr.ssi == gssi) && resource.chan_alloc_element.is_some() =>
+            {
+                Some(resource)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!(
+                "expected wrapped GSSI D-TX GRANTED/GrantedToOtherUser STCH under full TMA backlog; reporter={:?}; pdus={all_pdus:?}",
+                listener_reporter.get_state()
+            )
+        });
+    assert_eq!(
+        listener_grant
+            .chan_alloc_element
+            .as_ref()
+            .expect("listener floor grant should carry DL channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Dl
+    );
+    assert_eq!(listener_reporter.get_state(), TxState::Transmitted);
+
+    // EN 300 392-2 clause 14.5.2.2.1 b): group listeners need the
+    // GrantedToOtherUser notification for coherent floor state. Admission must
+    // not drop it behind thousands of lower-value busy responses before the
+    // scheduler can transmit it.
+}
+
+#[test]
 fn test_oversized_facch_stealing_falls_back_to_schf_instead_of_overflowing_stch() {
     debug::setup_logging_verbose();
 

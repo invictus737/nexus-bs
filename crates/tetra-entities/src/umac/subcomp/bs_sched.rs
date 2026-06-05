@@ -171,6 +171,7 @@ pub enum DlSchedElem {
 enum StealingSchedPriority {
     Ordinary,
     ChannelAllocation,
+    ListenerFloorGrant,
     PositiveFloorGrant,
     FloorWithdraw,
 }
@@ -1467,14 +1468,21 @@ impl BsChannelScheduler {
                 let Some(mut grant_probe) = Self::cmce_dl_payload_from_tma_sdu(&mac_payload) else {
                     return StealingSchedPriority::Ordinary;
                 };
-                let positive_grant = DTxGranted::from_bitbuf(&mut grant_probe)
-                    .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && uplink_allocated);
-                if positive_grant {
+                let Ok(grant) = DTxGranted::from_bitbuf(&mut grant_probe) else {
+                    return StealingSchedPriority::Ordinary;
+                };
+                if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && uplink_allocated {
                     // The positive D-TX GRANTED with an uplink channel
                     // allocation is the response that lets the requester
                     // transmit; keep it ahead of RequestQueued/NotGranted
                     // storm traffic in large GSSI cells.
                     StealingSchedPriority::PositiveFloorGrant
+                } else if grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8 && has_channel_allocation {
+                    // EN 300 392-2 clause 14.5.2.2.1 b): group listeners
+                    // must be told when another MS is granted transmit
+                    // permission. Keep the GSSI notification near the
+                    // positive grant, but below the requester grant itself.
+                    StealingSchedPriority::ListenerFloorGrant
                 } else {
                     StealingSchedPriority::Ordinary
                 }
@@ -4353,6 +4361,117 @@ mod tests {
                 .iter()
                 .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi)),
             "lower-priority wrapped busy responses should remain queued after the requester floor grant is sent"
+        );
+    }
+
+    #[test]
+    fn test_large_group_listener_floor_grant_stch_preempts_wrapped_busy_response_backlog_after_requester() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let requester = TetraAddress::issi(2_260_082);
+        let gssi = TetraAddress::new(226_333, SsiType::Gssi);
+        for offset in 0..MAX_DLSCHED_ELEMS_PER_TIMESLOT {
+            let busy_requester = TetraAddress::issi(2_700_000 + offset as u32);
+            sched.dl_enqueue_stealing(
+                traffic_ts,
+                test_llc_wrapped_d_tx_granted_stch_block(busy_requester, TransmissionGrant::RequestQueued, UlDlAssignment::Dl),
+                busy_requester,
+                None,
+            );
+        }
+
+        let listener_reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_llc_wrapped_d_tx_granted_stch_block(gssi, TransmissionGrant::GrantedToOtherUser, UlDlAssignment::Dl),
+            gssi,
+            Some(listener_reporter.clone()),
+        );
+
+        let grant_reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_llc_wrapped_d_tx_granted_stch_block(requester, TransmissionGrant::Granted, UlDlAssignment::Both),
+            requester,
+            Some(grant_reporter.clone()),
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let (_tch, first_stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let first_stch = first_stch.expect("requester positive grant should be sent first");
+        let mut parsed = BitBuffer::from_bitbuffer(&first_stch);
+        let first_resource = MacResource::from_bitbuf(&mut parsed).expect("first STCH should carry MAC-RESOURCE");
+        assert_eq!(first_resource.addr.map(|addr| addr.ssi), Some(requester.ssi));
+        assert_eq!(
+            first_resource
+                .chan_alloc_element
+                .as_ref()
+                .expect("positive floor grant must carry channel allocation")
+                .ul_dl_assigned,
+            UlDlAssignment::Both
+        );
+        let first_payload = BitBuffer::from_bitbuffer_pos(&parsed);
+        let mut first_cmce =
+            BsChannelScheduler::cmce_dl_payload_from_tma_sdu(&first_payload).expect("first STCH should carry BL-UDATA/MLE/CMCE payload");
+        let first_grant = DTxGranted::from_bitbuf(&mut first_cmce).expect("first STCH should carry D-TX GRANTED");
+        assert_eq!(first_grant.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+        assert_eq!(grant_reporter.get_state(), TxState::Transmitted);
+        assert_eq!(listener_reporter.get_state(), TxState::Pending);
+
+        let (_tch, second_stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let second_stch = second_stch.expect("listener floor notification should follow requester grant");
+        let mut parsed = BitBuffer::from_bitbuffer(&second_stch);
+        let second_resource = MacResource::from_bitbuf(&mut parsed).expect("second STCH should carry MAC-RESOURCE");
+        assert_eq!(second_resource.addr.map(|addr| addr.ssi), Some(gssi.ssi));
+        assert_eq!(
+            second_resource
+                .chan_alloc_element
+                .as_ref()
+                .expect("listener floor grant should carry DL assignment")
+                .ul_dl_assigned,
+            UlDlAssignment::Dl
+        );
+        let second_payload = BitBuffer::from_bitbuffer_pos(&parsed);
+        let mut second_cmce =
+            BsChannelScheduler::cmce_dl_payload_from_tma_sdu(&second_payload).expect("second STCH should carry BL-UDATA/MLE/CMCE payload");
+        let second_grant = DTxGranted::from_bitbuf(&mut second_cmce).expect("second STCH should carry D-TX GRANTED");
+        assert_eq!(
+            second_grant.transmission_grant,
+            TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        );
+        assert_eq!(listener_reporter.get_state(), TxState::Transmitted);
+
+        // EN 300 392-2 clause 14.5.2.2.1 b) requires the SwMI to inform
+        // listeners when another MS is granted the floor. The group-addressed
+        // notification must stay close to the positive grant and ahead of
+        // lower-value storm responses.
+        assert!(
+            sched.dltx_queues[traffic_ts as usize - 1]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi && addr.ssi != gssi.ssi)),
+            "lower-priority wrapped busy responses should remain queued after requester and listener floor grants are sent"
         );
     }
 

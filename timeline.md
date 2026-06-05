@@ -6325,3 +6325,60 @@ Next non-repeating execution:
 2. Continue restart/EG7 recovery regression for thousands of cached affiliates: after BS restart, MM and CMCE must restore attach-visible state and group affiliation coherently before group PTT.
 3. Add SDS/WAP accepted-vs-transmitted observability tests so dashboard/logs distinguish queued, transmitted, failed, and terminal-delivered states where the stack can know them.
 4. Keep private-call release validation queued: called party should receive correct end-call/release semantics, not `No answer`, and MXP600 must not be driven into soft reboot by release signalling.
+
+## 2026-06-05 - Listener floor notification priority and LLC pdu_prio storm hardening
+
+Component in simple technical terms:
+
+- CMCE creates floor-control messages such as `D-TX GRANTED`, `D-TX CEASED`, and `D-TX INTERRUPT`.
+- MLE adds the CMCE discriminator.
+- LLC stores and orders `BL-UDATA` before UMAC sees it.
+- UMAC admits the resulting `TMA-UNITDATA.req`.
+- MAC scheduler decides the STCH/FACCH order on the assigned channel.
+
+Problem fixed:
+
+- Group listener notifications `D-TX GRANTED(GrantedToOtherUser)` were protected at UMAC admission only as generic channel allocation, and scheduler priority treated non-`Granted` `D-TX GRANTED` as ordinary.
+- In a large GSSI PTT storm, that could let the requester receive the floor while the group listener notification sat behind many low-value `RequestQueued`/`NotGranted` responses.
+- Cross-layer testing then exposed a higher bottleneck: even with UMAC/MAC protection, CMCE emitted floor-control with `pdu_prio = 0`, so LLC could keep `GrantedToOtherUser` behind a large BL-UDATA backlog.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group-call floor grant, queued/not-granted, and listener notification behaviour.
+- EN 300 392-2 clause 20.4.1.1.3 and table 20.54: TMA priority/report handling; priority 7 is the highest TMA priority.
+- EN 300 392-2 clause 22.3.2.4.1: LLC `BL-UDATA` store/submit path.
+- EN 300 392-2 clauses 23.5 and 23.5.2.2.1: STCH/FACCH assigned-channel signalling.
+- This is clause-scoped regression evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added `cmce_downlink_pdu_prio`.
+  - Raises only time-critical floor-control downlink PDUs to priority 7:
+    `D-TX GRANTED(Granted)`, `D-TX GRANTED(GrantedToOtherUser)`, `D-TX CEASED`, and `D-TX INTERRUPT`.
+  - Leaves `D-CALL PROCEEDING`, `D-ALERT`, SDS/status, setup/release, and other non-floor CMCE at normal priority.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `ListenerFloorGrant` TMA admission priority, between generic channel allocation and positive requester grant.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `ListenerFloorGrant` scheduler priority, below positive requester grant and above ordinary busy responses.
+  - Added 4096-message wrapped STCH test proving requester grant first, GSSI listener notification second, and busy responses later.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added UMAC 4096-message wrapped admission test proving GSSI `GrantedToOtherUser` is not dropped before scheduler.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Strengthened the CMCE->MLE->LLC->UMAC->LMAC cross-layer 4096-member test to require wrapped GSSI `GrantedToOtherUser` at STCH before lower-value storm `NotGranted` responses.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs crates/tetra-entities/src/umac/umac_bs.rs crates/tetra-entities/src/umac/subcomp/bs_sched.rs crates/tetra-entities/tests/test_umac_bs.rs crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 70 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 62 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 146 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit listener floor notification priority and CMCE floor-control `pdu_prio` hardening.
+2. Implement bounded FIFO group floor fairness: replace the single waiter with a de-duplicated bounded queue, cleanup on deaffiliate/release, and large repeated-PTT tests.
+3. Continue restart/EG7 recovery regression for thousands of cached affiliates before group PTT.
+4. Continue SDS/WAP accepted-vs-transmitted observability and private-call release validation.

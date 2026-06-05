@@ -101,6 +101,7 @@ struct PendingTmaReport {
 enum TmaAdmissionPriority {
     Ordinary,
     ChannelAllocation,
+    ListenerFloorGrant,
     PositiveFloorGrant,
     FloorWithdraw,
 }
@@ -849,13 +850,23 @@ impl UmacBs {
                 let Some(mut grant_probe) = Self::cmce_dl_payload_from_tma_sdu(&prim.pdu) else {
                     return TmaAdmissionPriority::Ordinary;
                 };
-                let positive_floor_grant = DTxGranted::from_bitbuf(&mut grant_probe)
-                    .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && has_uplink_allocation);
-                if positive_floor_grant {
+                let Ok(grant) = DTxGranted::from_bitbuf(&mut grant_probe) else {
+                    return if has_channel_allocation {
+                        TmaAdmissionPriority::ChannelAllocation
+                    } else {
+                        TmaAdmissionPriority::Ordinary
+                    };
+                };
+                if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && has_uplink_allocation {
                     // This D-TX GRANTED is the response that lets an MS enter
                     // the assigned-channel U-plane; it must not be admitted
                     // behind thousands of lower-value busy responses.
                     TmaAdmissionPriority::PositiveFloorGrant
+                } else if grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8 && has_channel_allocation {
+                    // EN 300 392-2 clause 14.5.2.2.1 b): the group-addressed
+                    // listener notification must remain near the positive
+                    // grant under storm pressure.
+                    TmaAdmissionPriority::ListenerFloorGrant
                 } else if has_channel_allocation {
                     TmaAdmissionPriority::ChannelAllocation
                 } else {
