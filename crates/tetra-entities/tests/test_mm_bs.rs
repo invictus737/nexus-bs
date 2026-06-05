@@ -2512,9 +2512,9 @@ fn test_mixed_group_report_response_and_mode_one_preserves_existing_groups() {
     let sink_msgs = test.dump_sinks();
     let ack = extract_attach_detach_ack(&sink_msgs);
 
-    // The mixed PDU is rejected before mode=1 detach-all is applied, so the
-    // old affiliation remains intact and the requested replacement group is not
-    // partially attached.
+    // Outside a SwMI-requested group-report window, EN 300 392-2 clause
+    // 16.8.2 does not define group_report_response in an MS-initiated
+    // attach/detach request. Reject before mode=1 detach-all is applied.
     assert_eq!(ack.group_identity_accept_reject, 1);
     let rejected = ack
         .group_identity_downlink
@@ -2528,6 +2528,100 @@ fn test_mixed_group_report_response_and_mode_one_preserves_existing_groups() {
     let state = test.config.state_read();
     assert_eq!(state.subscribers.group_members(existing_group), vec![issi]);
     assert!(state.subscribers.group_members(requested_group).is_empty());
+}
+
+#[test]
+fn test_restart_recovery_keeps_group_report_pending_until_attach_detach_complete() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("demand-groups-then-attach-detach-complete");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let command_msgs = test.dump_sinks();
+    let command_details = location_update_command_details(&command_msgs);
+    assert_eq!(command_details.len(), 1);
+    assert_eq!(command_details[0].0, issi);
+    assert!(command_details[0].3.group_identity_report);
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+
+    // This mirrors the field log: the terminal first registers and includes
+    // its group list in U-LOCATION UPDATE DEMAND, but omits the
+    // group-report-complete IE. Per EN 300 392-2 clause 16.4.4, the BS must
+    // keep the group-report window open because a final U-ATTACH/DETACH may
+    // follow.
+    submit_location_update_with_group_identity_uplink(
+        &mut test,
+        issi,
+        LocationUpdateType::DemandLocationUpdating,
+        vec![GroupIdentityUplink {
+            class_of_usage: Some(4),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }],
+    );
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&demand_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::DemandLocationUpdating);
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    submit_attach_detach_group_identity_with_report_response(
+        &mut test,
+        issi,
+        true,
+        vec![GroupIdentityUplink {
+            class_of_usage: Some(4),
+            group_identity_detachment_uplink: None,
+            gssi: Some(gssi),
+            address_extension: None,
+            vgssi: None,
+        }],
+        1,
+        0,
+    );
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let ack = extract_attach_detach_ack(&sink_msgs);
+
+    assert_eq!(ack.group_identity_accept_reject, 0);
+    let accepted = ack
+        .group_identity_downlink
+        .expect("final complete group report should acknowledge the reported GSSI");
+    assert_eq!(accepted.len(), 1);
+    assert_eq!(accepted[0].gssi, Some(gssi));
+    assert_eq!(
+        accepted[0]
+            .group_identity_attachment
+            .as_ref()
+            .expect("accepted group should carry attachment information")
+            .class_of_usage,
+        4
+    );
+
+    let updates = subscriber_updates(&sink_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+    assert_eq!(updates[0].groups, vec![gssi]);
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].groups, vec![gssi]);
+    assert!(!debug_mm_solicited_group_report_pending(&mut test, issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
 }
 
 #[test]
@@ -4645,8 +4739,8 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
     assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg3);
     assert_energy_saving_start_avoids_frame_18(EnergySavingMode::Eg3, esi.frame_number, esi.multiframe_number);
     assert!(
-        !debug_mm_solicited_group_report_pending(&mut test, issi),
-        "reported group identities must complete the solicited restart group-report window"
+        debug_mm_solicited_group_report_pending(&mut test, issi),
+        "reported group identities without group-report-complete must keep the solicited restart group-report window open"
     );
 
     let updates = subscriber_updates(&demand_msgs);

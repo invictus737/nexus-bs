@@ -3360,3 +3360,49 @@ Remaining risk / next non-repeating execution:
 2. Retest private simplex `2260616 -> 2260618` with the same sequence that produced the bad first floor.
 3. Watch live logs for `U-SETUP request_to_transmit_send_data=true`, `D-SETUP transmission_grant=Granted`, `D-CONNECT transmission_grant=GrantedToOtherUser`, `D-CONNECT-ACKNOWLEDGE transmission_grant=Granted`, and `UMAC floor granted source_issi=2260618`.
 4. If static persists after the floor fix, do not change CMCE again first; inspect the remaining LMAC/UMAC raw `NormalTrainSeq2 Block2` path. That path preserves ETSI TCH/S half-slot timing but the current SAP cannot carry a bad-half-slot condition, so a future patch should add an explicit quality/condition field instead of treating unknown raw half-slots as clean speech.
+
+## 2026-06-05 10:11:00 EEST - MM restart group report completion keeps GSSI after BS restart
+
+Field symptom:
+
+- After a BS restart, terminals showed attached to the network but displayed `No Group`.
+- The post-restart log showed terminals sending `U-LOCATION UPDATE DEMAND` with GSSI `226333`, then a follow-up `U-ATTACH/DETACH GROUP IDENTITY` carrying the same GSSI plus `group_report_response = complete`.
+- The BS accepted the first group list but cleared the local solicited group-report window too early, then rejected the follow-up complete PDU as a mixed MS-initiated attach/detach request.
+
+Component explanation:
+
+- MM is Mobile Management. It owns terminal registration, energy saving mode negotiation, and group affiliation state.
+- Group report recovery is the restart path where the BS asks a still-camped terminal to restate its active groups so CMCE and the dashboard know which GSSI listeners exist.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: after `D-LOCATION UPDATE COMMAND` with group report request, the MS may report group identities in `U-LOCATION UPDATE DEMAND` or by `U-ATTACH/DETACH GROUP IDENTITY`.
+- Clause 16.4.4 further says if all reported groups fit in one PDU, the PDU contains `group report complete`; otherwise a final follow-up PDU may carry completion.
+- Clause 16.8.3 defines the SwMI-initiated group report response using `U-ATTACH/DETACH GROUP IDENTITY`.
+- Clause 16.10.27a defines `group_report_response` value `0` as group report complete.
+- This is clause-scoped hardening and test evidence, not a formal certification claim.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - `U-LOCATION UPDATE DEMAND` with group identities but without `group_report_response = complete` no longer clears the solicited group-report window.
+  - `U-ATTACH/DETACH GROUP IDENTITY` with group identities plus `group_report_response = complete` is accepted only while that solicited group-report window is pending.
+  - The existing reject path remains for the same mixed PDU outside the SwMI-requested report window.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added restart-recovery coverage for the real split sequence: `D-LOCATION UPDATE COMMAND`, then `U-LOCATION UPDATE DEMAND` with GSSI but no complete, then `U-ATTACH/DETACH GROUP IDENTITY` with GSSI and complete.
+  - Updated the EG3 restart recovery test so group identities without complete keep the report window open.
+  - Kept the negative non-solicited mixed-PDU rejection test.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs group_report --locked` -> 24 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 113 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy directly to `/home/chris/nexus-bs-v0.1.55-test` with EG7 config preserved.
+2. Restart the test BS and verify post-restart logs no longer contain `Rejecting mixed U-ATTACH/DETACH GROUP IDENTITY` for `2260082`, `2260616`, or `2260618`.
+3. Confirm terminals show GSSI `226333` rather than `No Group` after restart and before any PTT test.

@@ -1682,12 +1682,13 @@ impl MmBs {
         } else {
             None
         };
-        if group_report_complete || _has_groups {
+        if group_report_complete {
             // EN 300 392-2 clause 16.4.4 allows the MS to answer a SwMI
             // D-LOCATION-UPDATE-COMMAND group-report request by reporting group
-            // identities in U-LOCATION UPDATE DEMAND. Once a group identity
-            // demand has been processed, the local recovery window is complete
-            // even if the optional group-report-response IE is absent.
+            // identities in U-LOCATION UPDATE DEMAND. The local recovery window
+            // is complete only when the standardized group-report-complete IE
+            // is present; otherwise a final U-ATTACH/DETACH GROUP IDENTITY PDU
+            // may follow with remaining or repeated group identities.
             self.clear_solicited_group_report(issi);
         }
 
@@ -2161,33 +2162,33 @@ impl MmBs {
         }
 
         if let Some(response) = &pdu.group_report_response {
-            if self.solicited_group_report_pending(issi) {
-                if response.len == 1 && response.data == 0 {
-                    let Some(giu) = pdu.group_identity_uplink.as_ref() else {
-                        tracing::warn!(
-                            "MM: solicited group report completion from ISSI {} has no group identities after no-uplink handling",
-                            issi
-                        );
-                        self.send_d_attach_detach_ack_reject(queue, issi, prim.handle);
-                        return;
-                    };
-                    tracing::info!(
-                        "MM: accepting solicited U-ATTACH/DETACH GROUP IDENTITY group-report completion from ISSI {} with {} group identity item(s)",
-                        issi,
-                        giu.len()
-                    );
-                    if self.process_attach_detach_group_identity_uplink(
-                        queue,
-                        issi,
-                        prim.handle,
-                        pdu.group_identity_attach_detach_mode,
-                        giu,
-                    ) {
-                        self.clear_solicited_group_report(issi);
-                    }
-                    return;
-                }
+            // ETSI EN 300 392-2 clause 16.8.3/16.8.4 and 16.10.27a allow the
+            // final group-report PDU to carry both the reported groups and the
+            // "group report complete" IE in the solicited group-report window.
+            // Some terminals split restart recovery as U-LOCATION UPDATE DEMAND
+            // with groups followed by U-ATTACH/DETACH GROUP IDENTITY complete.
+            let report_complete = response.len == 1 && response.data == 0;
+            let complete_report_with_groups =
+                report_complete && pdu.group_identity_uplink.is_some() && self.solicited_group_report_pending(issi);
 
+            if complete_report_with_groups {
+                let Some(giu) = pdu.group_identity_uplink.as_ref() else {
+                    unreachable!("complete_report_with_groups requires group_identity_uplink");
+                };
+                tracing::info!(
+                    "MM: accepting U-ATTACH/DETACH GROUP IDENTITY group-report completion from ISSI {} with {} group identity item(s), solicited={}, mode_detach_all_then_attach={}",
+                    issi,
+                    giu.len(),
+                    self.solicited_group_report_pending(issi),
+                    pdu.group_identity_attach_detach_mode
+                );
+                if self.process_attach_detach_group_identity_uplink(queue, issi, prim.handle, pdu.group_identity_attach_detach_mode, giu) {
+                    self.clear_solicited_group_report(issi);
+                }
+                return;
+            }
+
+            if self.solicited_group_report_pending(issi) {
                 tracing::warn!(
                     "Rejecting solicited U-ATTACH/DETACH GROUP IDENTITY from {} with reserved/unsupported group_report_response len={} data={}",
                     issi,
