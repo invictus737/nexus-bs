@@ -5339,3 +5339,46 @@ Next non-repeating execution:
 
 1. Commit this CMCE large group setup evidence patch.
 2. Continue with MM restart recovery large-GSSI persistence and EG7 restart-derived group tests.
+
+## 2026-06-05 17:32:38 EEST - CMCE/MM large restart-recovered GSSI evidence
+
+User goal:
+
+- After BS restart, thousands of terminals must remain attached to their groups and group PTT must not degrade to `PTT denied`, `No Group`, or unsolicited release.
+
+Component in simple technical terms:
+
+- MM restart recovery restores cached ISSI/GSSI affiliation when a terminal reappears after BS restart.
+- CMCE consumes MM subscriber updates so call control knows which ISSIs are valid group listeners.
+- This test proves the restored state is usable for real group floor control, not only visible in dashboard state.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI may initiate or recover registration using location update procedures.
+- EN 300 392-2 clause 16.8.1: group identity attach/detach is confirmed through group identity procedures.
+- EN 300 392-2 clause 14.5.2.1 and 14.5.2.2.1: group call setup and floor request handling remain GSSI scoped after recovery.
+- The restart cache and large-scale test harness are local engineering evidence only, not formal certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_restart_recovery_large_cached_gssi_restores_cmce_listeners_and_turn_taking`.
+  - Seeds the restart recovery cache with 2048 ISSIs affiliated to one GSSI.
+  - Drives Demand Location Updating without group list for every ISSI.
+  - Sends SwMI group refresh ACKs with non-matching handles to cover the field-observed unrouted ACK path.
+  - Asserts all 2048 affiliates remain in the shared subscriber registry.
+  - Starts a group call and verifies a restored listener receives `RequestQueued` for return PTT, with no release or UMAC close.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_restart_recovery_large_cached_gssi_restores_cmce_listeners_and_turn_taking --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 137 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this large restart-recovered GSSI evidence patch.
+2. Continue with EG7 restart-derived large-group suspension/resume tests.
+3. Keep the deploy gate as local build only; do not compile on the Pi and do not create binary backups.

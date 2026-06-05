@@ -5228,6 +5228,97 @@ fn test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrou
 }
 
 #[test]
+fn test_restart_recovery_large_cached_gssi_restores_cmce_listeners_and_turn_taking() {
+    debug::setup_logging_verbose();
+
+    let path = unique_restart_recovery_path("cmce-large-cached-gssi-unrouted-ack");
+    let member_count = 2048_u32;
+    let first_issi = 2_264_000_u32;
+    let gssi = LAB_GROUP_GSSI;
+    let cache: String = (0..member_count)
+        .map(|offset| format!("{} {}:0:4\n", first_issi + offset, gssi))
+        .collect();
+    std::fs::write(&path, cache).expect("failed to seed large restart recovery cache");
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(
+        vec![TetraEntity::Mm, TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_location_update_without_group_identity_location_demand(&mut test, issi, LocationUpdateType::DemandLocationUpdating);
+        test.run_stack(Some(1));
+        let attach_msgs = test.dump_sinks();
+        assert!(
+            contains_location_update_accept(&attach_msgs),
+            "restart recovery LU for ISSI {issi} should still get D-LOCATION UPDATE ACCEPT"
+        );
+
+        // EN 300 392-2 clause 16.8.1 keeps the SwMI group refresh ACK as the
+        // confirmation point. The non-matching handle models unrouted field
+        // ACKs and must still converge to the restored cached affiliation.
+        submit_swmi_group_refresh_ack(&mut test, issi, 900_000 + offset);
+        test.run_stack(Some(1));
+        let ack_msgs = test.dump_sinks();
+        assert_eq!(
+            count_d_releases(&ack_msgs),
+            0,
+            "large restart ACK for ISSI {issi} must not release CMCE state"
+        );
+    }
+
+    let mut members = test.config.state_read().subscribers.group_members(gssi);
+    members.sort_unstable();
+    assert_eq!(members.len(), member_count as usize);
+    assert_eq!(members.first().copied(), Some(first_issi));
+    assert_eq!(members.last().copied(), Some(first_issi + member_count - 1));
+
+    // CMCE must receive enough restored listener state to run a real group
+    // floor exchange after restart. This is the field symptom guard: the
+    // return PTT must be queued/grantable, not denied because the BS forgot
+    // the listener's group affiliation after restart.
+    let speaker_issi = first_issi;
+    let requester_issi = first_issi + member_count - 1;
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, speaker_issi, gssi);
+    test.submit_message(build_u_tx_demand_msg(requester_issi, call_id));
+    test.run_stack(Some(1));
+    let ptt_msgs = test.dump_sinks();
+    let queued_grant = ptt_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(requester_issi))
+        .expect("large restart-restored listener should receive queued return PTT grant");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "large restart-restored GSSI return PTT while another MS has floor",
+    );
+    assert_eq!(count_d_releases(&ptt_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&ptt_msgs), 0);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_group_tx_ceased_does_not_grant_deaffiliated_queued_requester() {
     debug::setup_logging_verbose();
 
