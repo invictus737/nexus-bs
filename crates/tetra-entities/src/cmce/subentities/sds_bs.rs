@@ -166,6 +166,15 @@ impl SdsBsSubentity {
         }
     }
 
+    fn local_mni(&self) -> u64 {
+        let config = self.config.config();
+        ((config.net.mcc as u64) << 14) | config.net.mnc as u64
+    }
+
+    fn split_mni_extension(extension: u64) -> (u16, u16) {
+        (((extension >> 14) & 0x03ff) as u16, (extension & 0x3fff) as u16)
+    }
+
     fn build_cmce_function_not_supported_direct(
         unsupported_pdu_type: CmcePduTypeUl,
         target: TetraAddress,
@@ -460,7 +469,7 @@ impl SdsBsSubentity {
             }
         };
 
-        if !Self::feature_check_u_sds_data(&pdu) {
+        if !self.feature_check_u_sds_data(&pdu) {
             // EN 300 392-2 clauses 14.7.2.8 and 14.7.3.2/table 14.33:
             // respond to an individually addressed CMCE U-SDS-DATA that uses
             // an unsupported destination addressing form. Pointer 0 marks the
@@ -1079,7 +1088,7 @@ impl SdsBsSubentity {
             }
         };
 
-        if !Self::feature_check_u_status(&pdu) {
+        if !self.feature_check_u_status(&pdu) {
             // EN 300 392-2 clauses 14.7.2.7 and 14.7.3.2/table 14.33:
             // a registered ISSI-origin U-STATUS with unsupported SNA/TSI or
             // external/DM addressing is rejected explicitly instead of being
@@ -1543,54 +1552,128 @@ impl SdsBsSubentity {
         queue.push_back(msg);
     }
 
-    fn feature_check_u_sds_data(pdu: &USdsData) -> bool {
+    fn feature_check_called_party_address(
+        &self,
+        log_prefix: &str,
+        pdu_name: &str,
+        called_party_type_identifier: PartyTypeIdentifier,
+        called_party_short_number_address: Option<u64>,
+        called_party_ssi: Option<u64>,
+        called_party_extension: Option<u64>,
+        external_subscriber_number_present: bool,
+        dm_ms_address_present: bool,
+    ) -> bool {
         let mut supported = true;
-        if pdu.called_party_ssi.is_none() {
-            if pdu.called_party_short_number_address.is_some() {
-                unimplemented_log!("SDS: short number addressing not supported");
-            } else {
-                tracing::warn!("SDS: no destination address in U-SDS-DATA");
+
+        match called_party_type_identifier {
+            PartyTypeIdentifier::Sna => {
+                unimplemented_log!("{}: short number addressing not supported", log_prefix);
+                supported = false;
             }
+            PartyTypeIdentifier::Ssi => {
+                if called_party_short_number_address.is_some() {
+                    tracing::warn!("{}: {} has short-number field with SSI addressing", log_prefix, pdu_name);
+                    supported = false;
+                }
+                if called_party_extension.is_some() {
+                    tracing::warn!("{}: {} has extension field with SSI addressing", log_prefix, pdu_name);
+                    supported = false;
+                }
+                if called_party_ssi.is_none() {
+                    tracing::warn!("{}: no destination address in {}", log_prefix, pdu_name);
+                    supported = false;
+                }
+            }
+            PartyTypeIdentifier::Tsi => {
+                if called_party_short_number_address.is_some() {
+                    tracing::warn!("{}: {} has short-number field with TSI addressing", log_prefix, pdu_name);
+                    supported = false;
+                }
+                if called_party_ssi.is_none() {
+                    tracing::warn!("{}: TSI destination in {} is missing called_party_ssi", log_prefix, pdu_name);
+                    supported = false;
+                }
+                match called_party_extension {
+                    Some(extension) if extension == self.local_mni() => {}
+                    Some(extension) => {
+                        let (called_mcc, called_mnc) = Self::split_mni_extension(extension);
+                        let config = self.config.config();
+                        // EN 300 392-2 clauses 13.3.2.1, 13.3.2.3,
+                        // 14.7.2.7 and 14.7.2.8 define TSI addressing as
+                        // SSI plus address extension/MNI. A non-local MNI
+                        // must not be collapsed onto a local 24-bit SSI.
+                        tracing::warn!(
+                            "{}: {} to non-local TSI mcc={} mnc={} ssi={:?} rejected (local mcc={} mnc={})",
+                            log_prefix,
+                            pdu_name,
+                            called_mcc,
+                            called_mnc,
+                            called_party_ssi,
+                            config.net.mcc,
+                            config.net.mnc
+                        );
+                        supported = false;
+                    }
+                    None => {
+                        tracing::warn!("{}: TSI destination in {} is missing called_party_extension", log_prefix, pdu_name);
+                        supported = false;
+                    }
+                }
+            }
+            PartyTypeIdentifier::Reserved => {
+                tracing::warn!("{}: {} uses reserved called party type identifier", log_prefix, pdu_name);
+                supported = false;
+            }
+        }
+
+        if let Some(ssi) = called_party_ssi {
+            if ssi > MAX_AIR_INTERFACE_SSI as u64 {
+                tracing::warn!(
+                    "{}: {} destination SSI {} exceeds 24-bit air-interface range",
+                    log_prefix,
+                    pdu_name,
+                    ssi
+                );
+                supported = false;
+            }
+        }
+
+        if external_subscriber_number_present {
+            unimplemented_log!("{}: external_subscriber_number not supported", log_prefix);
             supported = false;
         }
-        if pdu.called_party_extension.is_some() {
-            unimplemented_log!("SDS: TSI extension addressing not supported");
+        if dm_ms_address_present {
+            unimplemented_log!("{}: dm_ms_address not supported", log_prefix);
             supported = false;
         }
-        if pdu.external_subscriber_number.is_some() {
-            unimplemented_log!("SDS: external_subscriber_number not supported");
-            supported = false;
-        }
-        if pdu.dm_ms_address.is_some() {
-            unimplemented_log!("SDS: dm_ms_address not supported");
-            supported = false;
-        }
+
         supported
     }
 
-    fn feature_check_u_status(pdu: &UStatus) -> bool {
-        let mut supported = true;
-        if pdu.called_party_ssi.is_none() {
-            if pdu.called_party_short_number_address.is_some() {
-                unimplemented_log!("SDS-STATUS: short number addressing not supported");
-            } else {
-                tracing::warn!("SDS-STATUS: no destination address in U-STATUS");
-            }
-            supported = false;
-        }
-        if pdu.called_party_extension.is_some() {
-            unimplemented_log!("SDS-STATUS: TSI extension addressing not supported");
-            supported = false;
-        }
-        if pdu.external_subscriber_number.is_some() {
-            unimplemented_log!("SDS-STATUS: external_subscriber_number not supported");
-            supported = false;
-        }
-        if pdu.dm_ms_address.is_some() {
-            unimplemented_log!("SDS-STATUS: dm_ms_address not supported");
-            supported = false;
-        }
-        supported
+    fn feature_check_u_sds_data(&self, pdu: &USdsData) -> bool {
+        self.feature_check_called_party_address(
+            "SDS",
+            "U-SDS-DATA",
+            pdu.called_party_type_identifier,
+            pdu.called_party_short_number_address,
+            pdu.called_party_ssi,
+            pdu.called_party_extension,
+            pdu.external_subscriber_number.is_some(),
+            pdu.dm_ms_address.is_some(),
+        )
+    }
+
+    fn feature_check_u_status(&self, pdu: &UStatus) -> bool {
+        self.feature_check_called_party_address(
+            "SDS-STATUS",
+            "U-STATUS",
+            pdu.called_party_type_identifier,
+            pdu.called_party_short_number_address,
+            pdu.called_party_ssi,
+            pdu.called_party_extension,
+            pdu.external_subscriber_number.is_some(),
+            pdu.dm_ms_address.is_some(),
+        )
     }
 
     /// Execute a configured local action triggered by SDS U-STATUS to ISSI 9999.

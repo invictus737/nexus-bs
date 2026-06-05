@@ -1,5 +1,76 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 13:34:45 EEST - SDS local TSI routing hardening and live restart `No Group` re-audit
+
+User report:
+
+- After BS restart, terminals can appear attached with `No Group`.
+- Continue broader clause-scoped ETSI EN 300 392-2 hardening without claiming formal certification.
+
+Component explanation:
+
+- SDS is the TETRA short data/status service inside CMCE.
+- SSI is the 24-bit local subscriber/group identity. TSI is the full TETRA identity: SSI plus network extension/MNI.
+- MNI is MCC+MNC. In this lab the local MNI is `901/9999`, encoded as `(901 << 14) | 9999 = 14771983`.
+- A local TSI with our MNI can be routed as a local SSI/GSSI. A foreign TSI must not be collapsed onto a local numeric SSI/GSSI.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 13.2: SDS includes individual and group user-defined/predefined messages.
+- Clauses 13.3.2.1 and 13.3.2.3: TNSDS status/unitdata primitives carry called party SSI and optional called party extension; if absent at the service boundary the current network MNI is assumed.
+- Clause 14.7.2.7/table 14.27: `U-STATUS` CPTI=2 carries called party SSI plus called party extension.
+- Clause 14.7.2.8/table 14.28: `U-SDS-DATA` CPTI=2 carries called party SSI plus called party extension.
+- Clause 14.7.3.2/table 14.33: unsupported SDS/status address forms are rejected with `CMCE FUNCTION NOT SUPPORTED`.
+- Clause 18.3.5.3.1: ISSI delivery uses acknowledged L2; GSSI delivery uses unacknowledged unitdata.
+- This is clause-scoped engineering evidence only, not formal TETRA certification.
+
+Live restart audit from `/home/chris/nexus-bs-v0.1.55-test/nexus-bs.log` build `v0.1.55-2b334a02`:
+
+- Runtime restart cache still contains:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+- Latest restart log from `13:21:03 EEST` shows `MM: restart recovery armed for 3 local ISSI(s): {2260082, 2260616, 2260618}`.
+- `2260082`, `2260618`, and `2260616` each sent location update with GSSI `226333`; MM returned `D-LOCATION UPDATE ACCEPT` with `GroupIdentityLocationAccept` for `226333`; CMCE logged `subscriber affiliate ... groups=[226333]` for all three.
+- No `No Group`, `Unit Not Attached`, `T353`, group refresh reject, failed transfer, `PTT denied`, or service-unavailable string was present in the latest restart log.
+- Live config still has `energy_saving_mode = "eg7"` and `call_preemptive = false`.
+- Conclusion: the current live evidence does not reproduce a BS-side persistent restart `No Group` state. If a terminal display still shows `No Group`, capture exact ISSI and timestamp so the terminal UI/over-air refresh path can be correlated.
+
+Live SDS issue found:
+
+- The same live log shows three `U-SDS-DATA` attempts rejected as `unimplemented: SDS: TSI extension addressing not supported`, followed by `CMCE FUNCTION NOT SUPPORTED`.
+- That rejection is wrong for local TSI when the extension is the configured local MNI.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/sds_bs.rs`
+  - Added local MNI decoding from configured MCC/MNC.
+  - Replaced blanket TSI-extension rejection with a common called-party address check for `U-SDS-DATA` and `U-STATUS`.
+  - Accepts TSI only when called-party extension matches the local MNI.
+  - Keeps SNA, external subscriber number, DM-MS address, reserved CPTI, malformed fields, out-of-range SSI, and foreign TSI fail-closed with `CMCE FUNCTION NOT SUPPORTED`.
+  - Preserves existing ambiguous ISSI/GSSI numeric collision drop behavior.
+- `crates/tetra-entities/tests/test_sds_bs.rs`
+  - Added local-MNI TSI tests for ISSI `D-SDS-DATA` and GSSI `D-SDS-DATA`.
+  - Added local-MNI TSI tests for ISSI `D-STATUS` and GSSI `D-STATUS`.
+  - Converted old TSI tests to prove foreign-MNI TSI is not rewritten to a local registered ISSI.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_sds_bs tsi --locked` -> 6 passed.
+- `cargo test -p tetra-entities --test test_sds_bs --locked` -> 116 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 25 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack --locked` -> 1 passed.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit the SDS local-TSI patch.
+2. Deploy direct to the Pi test instance, building locally only and without binary backups.
+3. Re-test the SDS/WAP/browser action that produced local TSI addressing; expected result is no `TSI extension addressing not supported` for local MNI.
+4. If any station still visually shows `No Group`, capture exact ISSI and wall-clock time immediately.
+
 ## 2026-06-05 13:23:30 EEST - Live deploy validation for restart `No Group` hardening
 
 Deployment:

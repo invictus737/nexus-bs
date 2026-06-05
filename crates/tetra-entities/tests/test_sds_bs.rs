@@ -49,6 +49,11 @@ fn affiliate_shared_subscriber(config: &SharedConfig, issi: u32, gssi: u32) {
     config.state_write().subscribers.affiliate(issi, gssi);
 }
 
+fn local_mni(config: &SharedConfig) -> u64 {
+    let config = config.config();
+    ((config.net.mcc as u64) << 14) | config.net.mnc as u64
+}
+
 /// Helper: build a U-SDS-DATA message from a source ISSI to a dest SSI with 16-bit payload
 fn build_u_sds_data_msg(source_issi: u32, dest_ssi: u32, payload: u16) -> SapMsg {
     let u_sds = USdsData {
@@ -903,7 +908,76 @@ fn test_periodic_sds_broadcast_rejects_wap_sds_tl_protocol_id_0x84() {
 }
 
 #[test]
-fn test_u_sds_tsi_extension_is_not_rewritten_to_registered_issi() {
+fn test_u_sds_local_tsi_to_registered_issi_routes_as_acknowledged_d_sds() {
+    debug::setup_logging_verbose();
+
+    let source_issi = 1000001;
+    let dest_issi = 2000001;
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_subscriber(&mut test, source_issi);
+    register_subscriber(&mut test, dest_issi);
+
+    // EN 300 392-2 clauses 13.3.2.3 and 14.7.2.8/table 14.28:
+    // CPTI=2 carries called-party SSI plus extension. When the extension is
+    // this SwMI MNI, the destination is the local TSI and may be routed by its
+    // local 24-bit SSI without discarding the message as unsupported.
+    let msg = build_u_sds_data_tsi_msg(source_issi, dest_issi, local_mni(&test.config), 0xABCD);
+    test.submit_message(msg);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    let (prim, pdu) = extract_d_sds_data(&sink_msgs);
+    assert_eq!(prim.main_address.ssi, dest_issi);
+    assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+    assert_eq!(prim.layer2service, Layer2Service::Acknowledged);
+    assert_eq!(pdu.calling_party_type_identifier, PartyTypeIdentifier::Ssi);
+    assert_eq!(pdu.calling_party_address_ssi, Some(source_issi as u64));
+    assert_eq!(pdu.calling_party_extension, None);
+    assert!(matches!(pdu.user_defined_data, SdsUserData::Type1(0xABCD)));
+    assert_eq!(count_d_sds_pdus(&sink_msgs), 1);
+    assert_eq!(count_d_status_pdus(&sink_msgs), 0);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+}
+
+#[test]
+fn test_u_sds_local_tsi_to_gssi_routes_as_unacknowledged_d_sds() {
+    debug::setup_logging_verbose();
+
+    let source_issi = 1000001;
+    let member_issi = 1000002;
+    let gssi = 226333;
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_subscriber(&mut test, source_issi);
+    register_subscriber(&mut test, member_issi);
+    affiliate_subscriber(&mut test, member_issi, gssi);
+
+    // EN 300 392-2 clauses 13.2 and 13.3.2.3 include user-defined group SDS.
+    // A local GTSI-form destination keeps group routing and unacknowledged L2.
+    let msg = build_u_sds_data_tsi_msg(source_issi, gssi, local_mni(&test.config), 0xBEEF);
+    test.submit_message(msg);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    let (prim, pdu) = extract_d_sds_data(&sink_msgs);
+    assert_eq!(prim.main_address.ssi, gssi);
+    assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+    assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(pdu.calling_party_address_ssi, Some(source_issi as u64));
+    assert_eq!(pdu.calling_party_extension, None);
+    assert!(matches!(pdu.user_defined_data, SdsUserData::Type1(0xBEEF)));
+    assert_eq!(count_d_sds_pdus(&sink_msgs), 1);
+    assert_eq!(count_d_status_pdus(&sink_msgs), 0);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+}
+
+#[test]
+fn test_u_sds_foreign_tsi_extension_is_not_rewritten_to_registered_issi() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -916,9 +990,10 @@ fn test_u_sds_tsi_extension_is_not_rewritten_to_registered_issi() {
     register_subscriber(&mut test, 2000001);
     register_subscriber(&mut test, 1000001);
 
-    // EN 300 392-2 clauses 14.7.2.8 and 14.7.3.2/table 14.33: TSI
-    // addressing includes an extension. This stack only implements SSI/GSSI
-    // SDS routing, so reject explicitly instead of routing by base SSI alone.
+    // EN 300 392-2 clauses 13.3.2.3, 14.7.2.8 and 14.7.3.2/table
+    // 14.33: TSI addressing includes an extension/MNI. A foreign MNI is not
+    // this local SwMI, so reject explicitly instead of routing by base SSI
+    // alone.
     let msg = build_u_sds_data_tsi_msg(1000001, 2000001, 0x12_3456, 0xABCD);
     test.submit_message(msg);
     test.run_stack(Some(1));
@@ -2060,7 +2135,78 @@ fn test_network_origin_sds_data_numeric_collision_explicit_issi_routes_individua
 }
 
 #[test]
-fn test_u_status_tsi_extension_is_not_rewritten_to_registered_issi() {
+fn test_u_status_local_tsi_to_registered_issi_routes_as_acknowledged_d_status() {
+    debug::setup_logging_verbose();
+
+    let source_issi = 1000001;
+    let dest_issi = 2000001;
+    let status = PreCodedStatus::try_from(0x8210).unwrap();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_subscriber(&mut test, source_issi);
+    register_subscriber(&mut test, dest_issi);
+
+    // EN 300 392-2 clauses 13.3.2.1 and 14.7.2.7/table 14.27:
+    // CPTI=2 carries called-party SSI plus extension. A local MNI extension
+    // is a local TSI, so predefined status routes like SSI-addressed status.
+    let msg = build_u_status_tsi_msg(source_issi, dest_issi, local_mni(&test.config), status);
+    test.submit_message(msg);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    let (prim, d_status) = extract_d_status(&sink_msgs);
+    assert_eq!(prim.main_address.ssi, dest_issi);
+    assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+    assert_eq!(prim.layer2service, Layer2Service::Acknowledged);
+    assert_eq!(d_status.calling_party_type_identifier, PartyTypeIdentifier::Ssi);
+    assert_eq!(d_status.calling_party_address_ssi, Some(source_issi as u64));
+    assert_eq!(d_status.calling_party_extension, None);
+    assert_eq!(d_status.pre_coded_status, status);
+    assert_eq!(count_d_sds_pdus(&sink_msgs), 0);
+    assert_eq!(count_d_status_pdus(&sink_msgs), 1);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+}
+
+#[test]
+fn test_u_status_local_tsi_to_gssi_routes_as_unacknowledged_d_status() {
+    debug::setup_logging_verbose();
+
+    let source_issi = 1000001;
+    let member_issi = 1000002;
+    let gssi = 226333;
+    let status = PreCodedStatus::NetworkUserSpecific(0x9001);
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_subscriber(&mut test, source_issi);
+    register_subscriber(&mut test, member_issi);
+    affiliate_subscriber(&mut test, member_issi, gssi);
+
+    // EN 300 392-2 clauses 13.2 and 13.3.2.1 include predefined group
+    // status. A local GTSI-form destination keeps GSSI routing and
+    // unacknowledged L2 service.
+    let msg = build_u_status_tsi_msg(source_issi, gssi, local_mni(&test.config), status);
+    test.submit_message(msg);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    let (prim, d_status) = extract_d_status(&sink_msgs);
+    assert_eq!(prim.main_address.ssi, gssi);
+    assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+    assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(d_status.calling_party_address_ssi, Some(source_issi as u64));
+    assert_eq!(d_status.calling_party_extension, None);
+    assert_eq!(d_status.pre_coded_status, status);
+    assert_eq!(count_d_sds_pdus(&sink_msgs), 0);
+    assert_eq!(count_d_status_pdus(&sink_msgs), 1);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+}
+
+#[test]
+fn test_u_status_foreign_tsi_extension_is_not_rewritten_to_registered_issi() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -2073,9 +2219,10 @@ fn test_u_status_tsi_extension_is_not_rewritten_to_registered_issi() {
     register_subscriber(&mut test, 1000001);
     register_subscriber(&mut test, 2000001);
 
-    // EN 300 392-2 clauses 14.7.2.7 and 14.7.3.2/table 14.33: TSI
-    // addressing includes an extension. This stack only implements SSI/GSSI
-    // status routing, so reject explicitly instead of routing by base SSI alone.
+    // EN 300 392-2 clauses 13.3.2.1, 14.7.2.7 and 14.7.3.2/table
+    // 14.33: TSI addressing includes an extension/MNI. A foreign MNI is not
+    // this local SwMI, so reject explicitly instead of routing by base SSI
+    // alone.
     let status = PreCodedStatus::try_from(0x8210).unwrap();
     let msg = build_u_status_tsi_msg(1000001, 2000001, 0x12_3456, status);
     test.submit_message(msg);
