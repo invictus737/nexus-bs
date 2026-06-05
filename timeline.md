@@ -5791,3 +5791,50 @@ Next non-repeating execution:
 1. Commit this MM 4096-member restart recovery/EG7 test-scale patch.
 2. Continue UMAC/MAC EG batch pressure below CMCE for 4096-member GSSI scheduling.
 3. Continue dashboard/API observability for accepted-vs-transmitted WAP/SDS where a synchronous response path exists.
+
+## 2026-06-05 18:39:33 EEST - UMAC STCH floor grants prioritized under 4096-entry group pressure
+
+User goal:
+
+- Group calls must remain robust for thousands of terminals, not just two or three radios.
+- A queued requester that becomes the next speaker must receive the positive floor grant promptly even if the group has generated thousands of lower-value busy/queued responses.
+
+Component in simple technical terms:
+
+- UMAC/MAC scheduler is the layer that chooses which downlink control block is placed into the next radio timeslot.
+- STCH/FACCH stealing is the assigned-channel control path used during voice traffic for urgent call-control messages such as `D-TX GRANTED`, `D-TX CEASED`, and `D-TX INTERRUPT`.
+- This patch does not change the CMCE floor-control decision; it changes only which already-built STCH control block is transmitted first when the assigned-channel queue is under heavy group pressure.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: SwMI group-call floor control uses `D-TX GRANTED`, `D-TX CEASED`, and related responses to grant, queue, reject, or withdraw transmission permission.
+- EN 300 392-2 clause 23.5: STCH/FACCH is the assigned-channel signalling path during traffic.
+- EN 300 392-2 clause 23.5.2.2.7 remains relevant because assigned uplink opportunities must be reserved/advertised coherently with downlink control.
+- This is clause-scoped scheduler hardening and regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added STCH scheduling priority derived from the actual MAC-RESOURCE/CMCE bitstream already queued for transmission.
+  - Keeps `D-TX INTERRUPT` and `D-TX CEASED` ahead of lower-value floor responses so withdrawal/preemption ordering is not inverted.
+  - Prioritizes positive `D-TX GRANTED` with an uplink channel allocation (`UL`/`Both`) ahead of DL-only `RequestQueued`/`NotGranted` backlog.
+  - Preserves FIFO ordering within the same priority class.
+  - Added `test_large_group_positive_floor_grant_stch_preempts_busy_response_backlog`, which queues 4096 DL-only `RequestQueued` STCH responses before a positive requester grant and proves the positive UL+DL grant is transmitted first.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib test_large_group_positive_floor_grant_stch_preempts_busy_response_backlog --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 67 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 59 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs large --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 139 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC STCH large-group floor-grant priority patch.
+2. Add a scheduler/integration regression that proves `D-TX INTERRUPT` remains before preemptive `D-TX GRANTED` on the air path, not just in CMCE message order.
+3. Continue pending group/private release call-id wrap and pending-release flood tests.
+4. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.

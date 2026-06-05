@@ -6,10 +6,15 @@ use tetra_core::{
 };
 use tetra_saps::{
     control::call_control::{Circuit, CircuitDlMediaSource},
+    lcmc::enums::ul_dl_assignment::UlDlAssignment,
     tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel},
 };
 
 use tetra_pdus::{
+    cmce::{
+        enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
+        pdus::d_tx_granted::DTxGranted,
+    },
     mle::pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
     umac::{
         enums::{
@@ -158,6 +163,14 @@ pub enum DlSchedElem {
     /// Contains MAC-U-SIGNAL (3 bits) + TM-SDU = 124 type1 bits.
     /// Delivers time-critical signaling (D-TX CEASED, D-TX GRANTED) per EN 300 392-2, clause 23.5.
     Stealing(BitBuffer, TetraAddress, Option<TxReporter>, Option<GroupStealingState>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum StealingSchedPriority {
+    Ordinary,
+    ChannelAllocation,
+    PositiveFloorGrant,
+    FloorWithdraw,
 }
 
 /// Delivery state for GSSI-addressed signalling while members use Energy Economy.
@@ -1334,6 +1347,83 @@ impl BsChannelScheduler {
         }
     }
 
+    fn stealing_sched_priority(elem: &DlSchedElem) -> StealingSchedPriority {
+        let DlSchedElem::Stealing(block, _, _, _) = elem else {
+            return StealingSchedPriority::Ordinary;
+        };
+        let mut mac_probe = BitBuffer::from_bitbuffer(block);
+        let Ok(resource) = MacResource::from_bitbuf(&mut mac_probe) else {
+            return StealingSchedPriority::Ordinary;
+        };
+        let uplink_allocated = resource
+            .chan_alloc_element
+            .as_ref()
+            .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both));
+        let has_channel_allocation = resource.chan_alloc_element.is_some();
+
+        let mut cmce_type_probe = mac_probe.clone();
+        let pdu_type = cmce_type_probe
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok());
+
+        match pdu_type {
+            Some(CmcePduTypeDl::DTxInterrupt | CmcePduTypeDl::DTxCeased) => {
+                // EN 300 392-2 clause 14.5.2.2.1 floor withdrawal must not
+                // sit behind lower-value queued floor responses on STCH.
+                StealingSchedPriority::FloorWithdraw
+            }
+            Some(CmcePduTypeDl::DTxGranted) => {
+                let mut grant_probe = mac_probe;
+                let positive_grant = DTxGranted::from_bitbuf(&mut grant_probe)
+                    .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && uplink_allocated);
+                if positive_grant {
+                    // The positive D-TX GRANTED with an uplink channel
+                    // allocation is the response that lets the requester
+                    // transmit; keep it ahead of RequestQueued/NotGranted
+                    // storm traffic in large GSSI cells.
+                    StealingSchedPriority::PositiveFloorGrant
+                } else if has_channel_allocation {
+                    StealingSchedPriority::ChannelAllocation
+                } else {
+                    StealingSchedPriority::Ordinary
+                }
+            }
+            _ if has_channel_allocation => StealingSchedPriority::ChannelAllocation,
+            _ => StealingSchedPriority::Ordinary,
+        }
+    }
+
+    fn dl_select_ready_stealing_index(
+        queue: &[DlSchedElem],
+        ts: TdmaTime,
+        subscribers: &SubscriberRegistry,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
+        readiness_cache: &mut GroupReadinessCache,
+    ) -> Option<usize> {
+        let mut selected = None;
+        let mut selected_priority = StealingSchedPriority::Ordinary;
+
+        for (index, elem) in queue.iter().enumerate() {
+            if !matches!(elem, DlSchedElem::Stealing(..))
+                || !Self::elem_is_ready_for_tx(elem, ts, energy_saving, subscribers, readiness_cache)
+            {
+                continue;
+            }
+
+            let priority = Self::stealing_sched_priority(elem);
+            if selected.is_none() || priority > selected_priority {
+                selected = Some(index);
+                selected_priority = priority;
+                if priority == StealingSchedPriority::FloorWithdraw {
+                    break;
+                }
+            }
+        }
+
+        selected
+    }
+
     fn mark_addr_signalling_activity(addr: Option<TetraAddress>, ts: TdmaTime, energy_saving: &mut HashMap<u32, EnergySavingAssignment>) {
         let Some(addr) = addr else {
             return;
@@ -2181,10 +2271,7 @@ impl BsChannelScheduler {
                 self.prune_completed_stale_group_states_for_slot(ts.t as usize - 1, subscribers, &mut readiness_cache, energy_saving);
             }
             let q = &mut self.dltx_queues[ts.t as usize - 1];
-            if let Some(i) = q.iter().position(|e| {
-                matches!(e, DlSchedElem::Stealing(..))
-                    && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, &mut readiness_cache)
-            }) {
+            if let Some(i) = Self::dl_select_ready_stealing_index(q, ts, subscribers, energy_saving, &mut readiness_cache) {
                 match q.remove(i) {
                     DlSchedElem::Stealing(buf, addr, tx_reporter, group_state) => (Some(buf), Some(addr), tx_reporter, group_state),
                     _ => unreachable!(),
@@ -3099,6 +3186,73 @@ mod tests {
         (pdu, sdu)
     }
 
+    fn test_d_tx_granted_stch_block(
+        addr: TetraAddress,
+        transmission_grant: TransmissionGrant,
+        ul_dl_assigned: UlDlAssignment,
+    ) -> BitBuffer {
+        const STCH_CAP: usize = 124;
+
+        let mut sdu = BitBuffer::new_autoexpand(40);
+        DTxGranted {
+            call_identifier: 7,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("serialize compact D-TX GRANTED");
+        sdu.seek(0);
+
+        let mut timeslots = [false; 4];
+        timeslots[1] = true;
+        let mut mac_pdu = MacResource {
+            fill_bits: false,
+            pos_of_grant: 0,
+            encryption_mode: 0,
+            random_access_flag: false,
+            length_ind: 0,
+            addr: Some(addr),
+            event_label: None,
+            usage_marker: Some(6),
+            power_control_element: None,
+            slot_granting_element: None,
+            chan_alloc_element: Some(ChanAllocElement {
+                alloc_type: ChanAllocType::Replace,
+                ts_assigned: timeslots,
+                ul_dl_assigned,
+                clch_permission: matches!(ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both),
+                cell_change_flag: false,
+                carrier_num: 1001,
+                ext: None,
+                mon_pattern: 1,
+                frame18_mon_pattern: None,
+            }),
+        };
+        let sdu_len = sdu.get_len();
+        let header_len = mac_pdu.compute_header_len();
+        let fill_bits = crate::umac::subcomp::fillbits::addition::compute_required(header_len + sdu_len, STCH_CAP);
+        let total_len = header_len + sdu_len + fill_bits;
+        assert!(total_len <= STCH_CAP, "test D-TX GRANTED STCH must fit in one stealing block");
+        mac_pdu.length_ind = (total_len / 8) as u8;
+        mac_pdu.fill_bits = fill_bits > 0;
+
+        let mut stch_block = BitBuffer::new(STCH_CAP);
+        mac_pdu.to_bitbuf(&mut stch_block);
+        stch_block.copy_bits(&mut sdu, sdu_len);
+        crate::umac::subcomp::fillbits::addition::write(&mut stch_block, Some(fill_bits));
+        stch_block
+    }
+
     fn test_ordinary_resource_for_issi(issi: u32, sdu_bits: usize) -> (MacResource, BitBuffer) {
         let (mut pdu, sdu) = test_resource_for_issi(issi, sdu_bits);
         pdu.random_access_flag = false;
@@ -3904,6 +4058,78 @@ mod tests {
         assert_eq!(
             energy_saving.get(&issi).and_then(|assignment| assignment.awake_until),
             Some(TdmaTime { t: 2, f: 2, m: 2, h: 0 })
+        );
+    }
+
+    #[test]
+    fn test_large_group_positive_floor_grant_stch_preempts_busy_response_backlog() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let requester = TetraAddress::issi(2_260_082);
+        for offset in 0..MAX_DLSCHED_ELEMS_PER_TIMESLOT {
+            let busy_requester = TetraAddress::issi(2_500_000 + offset as u32);
+            sched.dl_enqueue_stealing(
+                traffic_ts,
+                test_d_tx_granted_stch_block(busy_requester, TransmissionGrant::RequestQueued, UlDlAssignment::Dl),
+                busy_requester,
+                None,
+            );
+        }
+
+        let grant_reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_granted_stch_block(requester, TransmissionGrant::Granted, UlDlAssignment::Both),
+            requester,
+            Some(grant_reporter.clone()),
+        );
+        assert!(
+            sched.dltx_queues[traffic_ts as usize - 1].len() > MAX_DLSCHED_ELEMS_PER_TIMESLOT,
+            "all FACCH/STCH floor-control entries are protected from queue backpressure"
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let (_tch, stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let stch = stch.expect("assigned traffic channel should send one STCH block");
+
+        let mut parsed = BitBuffer::from_bitbuffer(&stch);
+        let resource = MacResource::from_bitbuf(&mut parsed).expect("selected STCH should carry MAC-RESOURCE");
+        assert_eq!(resource.addr.map(|addr| addr.ssi), Some(requester.ssi));
+        assert_eq!(
+            resource
+                .chan_alloc_element
+                .as_ref()
+                .expect("positive floor grant must carry channel allocation")
+                .ul_dl_assigned,
+            UlDlAssignment::Both
+        );
+        let granted = DTxGranted::from_bitbuf(&mut parsed).expect("selected STCH should carry D-TX GRANTED");
+        assert_eq!(granted.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+        assert_eq!(grant_reporter.get_state(), TxState::Transmitted);
+
+        // EN 300 392-2 clauses 14.5.2.2.1 b) and 23.5: the positive
+        // D-TX GRANTED with UL+DL allocation is the floor-control response
+        // that lets the queued requester enter U-plane. It must not be FIFO
+        // delayed behind thousands of DL-only RequestQueued/NotGranted STCH
+        // responses in a large GSSI cell.
+        assert!(
+            sched.dltx_queues[traffic_ts as usize - 1]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi)),
+            "lower-priority busy responses should remain queued after the requester floor grant is sent"
         );
     }
 
