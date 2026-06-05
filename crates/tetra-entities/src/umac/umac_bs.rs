@@ -87,6 +87,7 @@ struct PendingStch {
 struct PendingTmaReport {
     req_handle: Todo,
     tx_reporter: TxReporter,
+    created_at: TdmaTime,
 }
 
 struct PendingRawTchSHalfSlot {
@@ -108,6 +109,12 @@ struct EnergySavingSuspensionKey {
 const PREDEFINED_BROADCAST_GSSI: u32 = 0xFF_FFFF;
 
 impl UmacBs {
+    const MAX_PENDING_TMA_REPORTS: usize = 4096;
+    // Local guard for a retained TMA-UNITDATA reporter that never reaches a
+    // terminal TxReporter state. EN 300 392-2 clause 20.4.1.1.3 defines the
+    // report primitive; this timeout only prevents implementation-state leaks.
+    const TMA_REPORT_PENDING_TIMEOUT_TIMESLOTS: i32 = 30 * 18 * 4;
+
     pub fn new(config: SharedConfig) -> Self {
         let c = config.config();
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
@@ -129,6 +136,18 @@ impl UmacBs {
             current_ul_speaker: [None; 4],
             active_energy_saving_suspensions: HashMap::new(),
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_max_pending_tma_reports_for_test(&self) -> usize {
+        Self::MAX_PENDING_TMA_REPORTS
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_pending_tma_report_count_for_test(&self) -> usize {
+        self.pending_tma_reports.len()
     }
 
     fn mark_ms_signalling_activity(&self, addr: TetraAddress, activity_time: TdmaTime) {
@@ -722,13 +741,25 @@ impl UmacBs {
         queue.push_back(msg);
     }
 
-    fn track_tma_request(&mut self, handle: Todo, tx_reporter: Option<TxReporter>) -> TxReporter {
+    fn track_tma_request(&mut self, queue: &mut MessageQueue, handle: Todo, tx_reporter: Option<TxReporter>) -> Option<TxReporter> {
+        self.emit_completed_tma_reports(queue);
         let tx_reporter = tx_reporter.unwrap_or_else(TxReporter::new_unacked);
+        if self.pending_tma_reports.len() >= Self::MAX_PENDING_TMA_REPORTS {
+            tracing::warn!(
+                "UMAC: dropping TMA-UNITDATA req_handle={} because {} pending TMA reports are already retained",
+                handle,
+                self.pending_tma_reports.len()
+            );
+            tx_reporter.mark_discarded();
+            Self::send_tma_report_ind(queue, handle, TmaReport::FragmentationFailure);
+            return None;
+        }
         self.pending_tma_reports.push(PendingTmaReport {
             req_handle: handle,
             tx_reporter: tx_reporter.clone(),
+            created_at: self.dltime,
         });
-        tx_reporter
+        Some(tx_reporter)
     }
 
     fn rx_tma_cancel_req(&mut self, message: SapMsg) {
@@ -790,6 +821,17 @@ impl UmacBs {
                 // the TM-SDU. Report the standard TMA failure that LLC clause
                 // 22.3.2.3 uses for retry/failure handling instead of inventing
                 // a TMA "failed transfer" result.
+                Self::send_tma_report_ind(queue, report.req_handle, TmaReport::FragmentationFailure);
+            } else if self
+                .dltime
+                .diff(report.created_at.add_timeslots(Self::TMA_REPORT_PENDING_TIMEOUT_TIMESLOTS))
+                >= 0
+            {
+                tracing::warn!(
+                    "UMAC: TMA report req_handle={} timed out after local pending-report guard",
+                    report.req_handle
+                );
+                report.tx_reporter.mark_discarded();
                 Self::send_tma_report_ind(queue, report.req_handle, TmaReport::FragmentationFailure);
             } else {
                 pending.push(report);
@@ -1748,7 +1790,7 @@ impl UmacBs {
         self.channel_scheduler.dl_enqueue_reservation_grant(msg_dltime.t, addr, res_req);
     }
 
-    fn rx_ul_tma_unitdata_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
+    fn rx_ul_tma_unitdata_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_ul_tma_unitdata_req");
 
         // Extract sdu
@@ -1756,7 +1798,9 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
-        let tx_reporter = self.track_tma_request(prim.req_handle, prim.tx_reporter.take());
+        let Some(tx_reporter) = self.track_tma_request(queue, prim.req_handle, prim.tx_reporter.take()) else {
+            return;
+        };
         let mut sdu = prim.pdu;
 
         // ── FACCH/Stealing path ──────────────────────────────────────────

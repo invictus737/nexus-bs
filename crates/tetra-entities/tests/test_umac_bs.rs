@@ -1886,6 +1886,28 @@ fn build_tma_cancel_req(req_handle: i32) -> SapMsg {
     }
 }
 
+fn build_tma_unitdata_req(req_handle: i32, target_issi: u32) -> SapMsg {
+    SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle,
+            pdu: BitBuffer::from_bitstr("10101010"),
+            main_address: TetraAddress::issi(target_issi),
+            endpoint_id: 1,
+            pdu_prio: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    }
+}
+
 #[test]
 fn test_unsolicited_issi_downlink_does_not_set_random_access_ack_flag() {
     debug::setup_logging_verbose();
@@ -2039,6 +2061,60 @@ fn test_tma_unitdata_complete_transmission_emits_tma_report_ind() {
             Some(TmaReport::SuccessReservedOrStealing)
         ),
         "EN 300 392-2 clauses 20.4.1.1.3 and 23.1.2.1.1 require MAC to report complete TM-SDU transmission"
+    );
+}
+
+#[test]
+fn test_tma_report_tracking_is_bounded_under_stalled_downlink_completion() {
+    debug::setup_logging_verbose();
+
+    let base_handle = 30_000;
+    let base_issi = 500_000;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    let cap = {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.debug_max_pending_tma_reports_for_test()
+    };
+
+    for offset in 0..=cap {
+        test.submit_message(build_tma_unitdata_req(base_handle + offset as i32, base_issi + offset as u32));
+    }
+    test.deliver_all_messages();
+
+    let pending_count = {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.debug_pending_tma_report_count_for_test()
+    };
+    assert_eq!(
+        pending_count, cap,
+        "UMAC must cap retained TMA reports when downlink completion is stalled"
+    );
+
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, base_handle + cap as i32),
+            Some(TmaReport::FragmentationFailure)
+        ),
+        "EN 300 392-2 clause 20.4.1.1.3: overflowed local MAC request should fail via TMA-REPORT instead of growing pending state"
+    );
+    assert!(
+        tma_report_for_handle(&sink_msgs, base_handle).is_none(),
+        "requests inside the cap should remain pending until transmitted, cancelled, discarded, or timeout guarded"
     );
 }
 

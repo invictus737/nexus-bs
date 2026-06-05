@@ -4983,3 +4983,44 @@ Next non-repeating execution:
    - UMAC/TMA pending report bounds when downlink completion stalls.
    - DL media queue backpressure under sustained group-call overfeed.
 3. Before deploy, rerun UMAC scheduler, MM, CMCE group/private, and diff checks.
+
+## 2026-06-05 16:54:34 EEST - UMAC TMA pending report bounds
+
+User goal:
+
+- Keep Nexus-BS robust for long-running 24/7 operation with large groups and sustained signalling load.
+- Avoid internal queues that can grow forever when RF/downlink completion stalls.
+
+Component in simple technical terms:
+
+- TMA is the MAC service primitive used by LLC/upper layers to submit a downlink TM-SDU and later receive a `TMA-REPORT`.
+- UMAC tracks each submitted request with a `TxReporter`; when the scheduler transmits or discards the request, UMAC reports success or fragmentation failure back to LLC.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 20.4.1.1.1: `TMA-CANCEL` cancels a submitted `TMA-UNITDATA` request.
+- EN 300 392-2 clause 20.4.1.1.3: `TMA-REPORT` reports MAC transfer completion state to LLC.
+- EN 300 392-2 clause 22.3.2.3 uses MAC/TMA failure reporting for LLC retry/failure handling.
+- The new cap/timeout is local resource-control hardening; it preserves the existing `FragmentationFailure` report for incomplete local MAC transfer and does not claim formal conformance.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `MAX_PENDING_TMA_REPORTS` cap for retained TMA report state.
+  - Added local pending-report timeout guard for reporters that never reach transmitted/discarded.
+  - Overflowed reported requests are immediately marked discarded and reported as `TmaReport::FragmentationFailure` instead of growing `pending_tma_reports`.
+  - Added debug-only helpers for pending TMA report cap/count.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_tma_report_tracking_is_bounded_under_stalled_downlink_completion`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_tma_report_tracking_is_bounded_under_stalled_downlink_completion --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 57 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC TMA pending report bounds patch.
+2. Continue with DL media queue backpressure under sustained group-call overfeed.
+3. Before deploy, rerun UMAC scheduler, MM, CMCE group/private, and diff checks.
