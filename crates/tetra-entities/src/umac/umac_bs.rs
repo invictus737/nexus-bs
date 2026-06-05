@@ -228,6 +228,18 @@ impl UmacBs {
         self.current_ul_speaker[ts as usize - 1] = Some(addr);
     }
 
+    fn initial_ul_speaker_for_open_circuit(circuit: &Circuit) -> Option<TetraAddress> {
+        match circuit.active_addr {
+            Some(addr) if addr.ssi_type == SsiType::Issi => Some(addr),
+            Some(addr) if addr.ssi_type == SsiType::Gssi => circuit
+                .active_secondary_addrs
+                .iter()
+                .copied()
+                .find(|addr| addr.ssi_type == SsiType::Issi),
+            _ => None,
+        }
+    }
+
     fn clear_current_ul_speaker(&mut self, ts: u8) {
         if (1..=4).contains(&ts) {
             self.current_ul_speaker[ts as usize - 1] = None;
@@ -2217,8 +2229,8 @@ impl UmacBs {
             // Start UL inactivity timer when opening a UL circuit
             if d == Direction::Ul && (1..=4).contains(&ts) {
                 self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
-                if let Some(active_addr) = circuit.active_addr {
-                    self.set_current_ul_speaker(ts, active_addr);
+                if let Some(speaker_addr) = Self::initial_ul_speaker_for_open_circuit(&circuit) {
+                    self.set_current_ul_speaker(ts, speaker_addr);
                 }
             }
 

@@ -1327,6 +1327,9 @@ impl BsChannelScheduler {
             .is_some_and(|circuit| circuit.active_addresses().any(|addr| addr.ssi_type == SsiType::Issi))
     }
 
+    /// Participant-scoped means an individual/private bearer. A group circuit
+    /// may carry the first speaker ISSI as secondary metadata for EG/listening,
+    /// but the GSSI primary keeps the floor-control guard group-scoped.
     pub fn ul_circuit_is_private_participant_scoped(&self, ts: u8) -> bool {
         if !(1..=4).contains(&ts) {
             return false;
@@ -2813,6 +2816,82 @@ mod tests {
         assert!(sched.dltx_queues[1].is_empty());
         assert!(sched.dltx_queues[2].is_empty());
         assert!(sched.dltx_queues[3].is_empty());
+    }
+
+    #[test]
+    fn test_ul_private_scope_uses_primary_addr_not_secondary_group_speaker() {
+        let mut sched = get_testing_slotter();
+        let ts = 2;
+        let gssi = 0x226333;
+        let first_speaker = 0x2260616;
+        let second_speaker = 0x2260618;
+
+        sched.create_circuit(
+            Direction::Ul,
+            Circuit {
+                direction: Direction::Ul,
+                ts,
+                peer_ts: None,
+                usage: 4,
+                circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+                dl_media_source: CircuitDlMediaSource::LocalLoopback,
+                active_addr: Some(TetraAddress::new(gssi, SsiType::Gssi)),
+                active_secondary_addrs: vec![TetraAddress::issi(first_speaker)],
+            },
+        );
+
+        assert!(
+            sched.ul_circuit_has_issi_participants(ts),
+            "the first group speaker is still tracked as an active ISSI for EG/listening state"
+        );
+        assert!(
+            !sched.ul_circuit_is_private_participant_scoped(ts),
+            "EN 300 392-2 clause 14.5.2: a GSSI-primary group bearer must not use private/P2P participant filtering"
+        );
+        assert!(sched.circuit_is_active_for_addr(Direction::Ul, ts, TetraAddress::new(gssi, SsiType::Gssi)));
+        assert!(sched.circuit_is_active_for_addr(Direction::Ul, ts, TetraAddress::issi(first_speaker)));
+        assert!(
+            !sched.circuit_is_active_for_addr(Direction::Ul, ts, TetraAddress::issi(second_speaker)),
+            "later group speakers are admitted by group floor-control, not by preloading every ISSI as a private participant"
+        );
+    }
+
+    #[test]
+    fn test_ul_private_scope_remains_strict_for_p2p_primary_issi() {
+        let mut sched = get_testing_slotter();
+        let ts = 2;
+        let caller_issi = 0x2260616;
+        let called_issi = 0x2260618;
+        let outsider_issi = 0x2260082;
+
+        sched.create_circuit(
+            Direction::Ul,
+            Circuit {
+                direction: Direction::Ul,
+                ts,
+                peer_ts: None,
+                usage: 4,
+                circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+                dl_media_source: CircuitDlMediaSource::LocalLoopback,
+                active_addr: Some(TetraAddress::issi(caller_issi)),
+                active_secondary_addrs: vec![TetraAddress::issi(called_issi)],
+            },
+        );
+
+        assert!(
+            sched.ul_circuit_is_private_participant_scoped(ts),
+            "EN 300 392-2 clause 14.5.1: private/P2P calls use ISSI-primary bearers and keep strict participant filtering"
+        );
+        assert!(sched.circuit_is_active_for_addr(Direction::Ul, ts, TetraAddress::issi(caller_issi)));
+        assert!(sched.circuit_is_active_for_addr(Direction::Ul, ts, TetraAddress::issi(called_issi)));
+        assert!(
+            !sched.circuit_is_active_for_addr(Direction::Ul, ts, TetraAddress::issi(outsider_issi)),
+            "a third ISSI must not become a private-call participant through floor-control"
+        );
     }
 
     fn open_test_dl_circuit(sched: &mut BsChannelScheduler, ts: u8) {

@@ -4577,3 +4577,75 @@ Next non-repeating execution:
 1. Commit this patch, then deploy direct to the test Pi with local build only.
 2. Retest GSSI `226333`: initial group setup speech, hangtime retake by the original speaker, and handoff/return PTT by the other station.
 3. Expected live log around retake: `D-TX GRANTED` individual + group, `D-INFO` reset T310 DL-only, no immediate `DSetup` in the same floor-grant burst, then early `UMAC voice route` instead of `UL inactivity timeout`.
+
+## 2026-06-05 15:25:08 EEST - P2P/private-call scope guard and group initial-speaker seed
+
+User request:
+
+- Patch must take P2P calls into account while continuing group-call hardening.
+
+Component, simple technical meaning:
+
+- `Circuit.active_addr` is the primary address for an assigned traffic bearer.
+- For a private/P2P call this primary address is an ISSI, so only the two private participants may drive floor/audio state.
+- For a group call this primary address is a GSSI. The current speaker ISSI can be stored as secondary metadata so EG/listening state is correct, but that must not turn the group bearer into a private-call participant list.
+- UMAC scheduler is the component that enforces this distinction before accepting a `FloorGranted` update.
+- UMAC also owns STCH `MAC-U-SIGNAL` attribution. STCH signalling has no SSI field, so UMAC must already know the current ISSI speaker when it forwards early traffic-channel signalling.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1: individual/private calls are participant-scoped ISSI-to-ISSI services.
+- EN 300 392-2 clause 14.5.2: group calls are P2MP/GSSI-scoped services where different affiliated ISSIs may take transmit permission over the same group bearer.
+- EN 300 392-2 clause 23.7.6 remains relevant because assigned-channel activity must keep the correct EG terminals awake.
+- This is clause-scoped engineering hardening, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-saps/src/control/call_control.rs`
+  - Documented that `active_addr` is the primary bearer scope.
+  - Documented that secondary ISSIs are EG/listening metadata and do not by themselves make a group bearer private/P2P-scoped.
+  - Documented `Circuit::is_primary_issi_scoped()` as the private/P2P discriminator.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Documented `ul_circuit_is_private_participant_scoped()` as primary-address based, not "any secondary ISSI" based.
+  - Added a scheduler regression proving GSSI-primary + speaker-ISSI-secondary remains group-scoped.
+  - Added a scheduler regression proving ISSI-primary + peer-ISSI-secondary remains strict private/P2P-scoped and excludes a third ISSI.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - On circuit open, UMAC now seeds the current UL speaker from ISSI-primary circuits for P2P exactly as before.
+  - For GSSI-primary group circuits, UMAC seeds the current UL speaker from the first secondary ISSI if present. This covers early STCH before a later `FloorGranted`, without turning the bearer into a private/P2P participant list.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added a regression that a GSSI-primary group `Open` with speaker ISSI secondary forwards immediate STCH `MAC-U-SIGNAL` as that ISSI.
+  - Updated the group handoff audio-path test to use the real current group circuit shape: GSSI primary plus first-speaker ISSI secondary.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Tightened group setup helper assertions to require exactly one secondary speaker ISSI.
+  - Tightened hook private-simplex setup assertions to require exactly one secondary peer ISSI.
+
+P2P/private-call safety:
+
+- P2P audio and release runtime paths were not changed; the new speaker seed keeps the existing ISSI-primary P2P behavior and adds only the GSSI-primary group secondary fallback.
+- The new tests protect the current behavior so future group-call fixes cannot weaken private-call participant filtering.
+
+Verification:
+
+- `cargo fmt --package tetra-saps --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib test_ul_private_scope --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_stch_mac_u_signal_uses_secondary_speaker_from_group_open_circuit --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor_handoff_reopens_ul_traffic_for_lmac_tch_s_decode --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_stch_mac_u_signal_uses_current_ul_speaker_from_private_open_circuit --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor_grant_accepts_new_speaker_when_initial_speaker_is_secondary --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_stch_mac_u_signal_ignores_floor_granted_for_non_participant_private_speaker --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_simplex_p2p_current_floor_holder_u_tx_demand_is_granted_not_denied --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_setup_sends_proceeding_connect_and_group_setup_with_allocations --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor --locked` -> pass.
+- `cargo check -p tetra-saps -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Operational note:
+
+- Local `target` filled the disk during parallel Cargo tests. Ran `cargo clean` locally and reran verification sequentially with `CARGO_INCREMENTAL=0`.
+
+Next non-repeating execution:
+
+1. Commit this guard/seed patch.
+2. Continue group-call live validation on GSSI `226333`; if static/no-voice persists, inspect the next live log for actual `UMAC voice route` vs FACCH/STCH-only frames rather than changing P2P release paths.
+3. Keep P2P regressions in the verification set for every group-call patch.

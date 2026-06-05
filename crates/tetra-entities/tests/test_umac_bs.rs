@@ -797,7 +797,7 @@ fn test_group_floor_handoff_reopens_ul_traffic_for_lmac_tch_s_decode() {
     let mut umac_test = ComponentTest::new(StackMode::Bs, Some(start));
     umac_test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
 
-    umac_test.submit_message(group_call_open_msg(gssi, traffic_ts));
+    umac_test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker, traffic_ts));
     umac_test.run_stack(Some(2));
     let _ = umac_test.dump_sinks();
 
@@ -1077,6 +1077,29 @@ fn test_stch_mac_u_signal_uses_current_ul_speaker_from_private_open_circuit() {
         addresses,
         vec![TetraAddress::issi(caller_issi)],
         "EN 300 392-2 clauses 21.4.5 and 14.5.1.2.1 require STCH U-plane signalling to inherit the current private-call speaker, not ISSI 0"
+    );
+}
+
+#[test]
+fn test_stch_mac_u_signal_uses_secondary_speaker_from_group_open_circuit() {
+    debug::setup_logging_verbose();
+
+    let gssi = 0x3100;
+    let first_speaker = 0x3101;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker, traffic_ts));
+    submit_stch_mac_u_signal(&mut test);
+    test.run_stack(Some(1));
+
+    let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
+    assert_eq!(
+        addresses,
+        vec![TetraAddress::issi(first_speaker)],
+        "EN 300 392-2 clauses 14.5.2.1, 14.5.2.2.1 and 21.4.5: group Open is GSSI-scoped, but the first speaker ISSI carried as secondary must seed STCH signalling before a later FloorGranted"
     );
 }
 

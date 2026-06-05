@@ -1502,9 +1502,10 @@ fn start_group_call_with_circuit_for(test: &mut ComponentTest, calling_issi: u32
         Some(TetraAddress::new(dest_gssi, SsiType::Gssi)),
         "group traffic circuit should be scoped to the destination GSSI"
     );
-    assert!(
-        circuit.active_secondary_addrs.contains(&TetraAddress::issi(calling_issi)),
-        "group traffic circuit should carry the first speaker ISSI as secondary without changing the primary GSSI scope"
+    assert_eq!(
+        circuit.active_secondary_addrs,
+        vec![TetraAddress::issi(calling_issi)],
+        "group traffic circuit should carry only the first speaker ISSI as secondary without changing the primary GSSI scope"
     );
     (call_id, circuit.ts, circuit.usage)
 }
@@ -7573,9 +7574,10 @@ fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
     // speech burst follows the setup grant.
     assert_eq!(open.peer_ts, None);
     assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
-    assert!(
-        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
-        "shared simplex private bearer must still keep the calling MS active for assigned-channel listening"
+    assert_eq!(
+        open.active_secondary_addrs,
+        vec![TetraAddress::new(TEST_ISSI, SsiType::Issi)],
+        "shared simplex private bearer must still keep exactly the calling MS active for assigned-channel listening"
     );
     assert!(connect_msgs.iter().any(|msg| {
         matches!(

@@ -41,12 +41,19 @@ pub struct Circuit {
     /// Downlink media source policy for this circuit.
     pub dl_media_source: CircuitDlMediaSource,
 
-    /// Local ISSI/GSSI whose energy-economy sleep cycle is suspended while
-    /// this assigned-channel/call context is active.
+    /// Primary local ISSI/GSSI whose energy-economy sleep cycle is suspended
+    /// while this assigned-channel/call context is active.
+    ///
+    /// The primary address also defines the bearer scope: group calls keep a
+    /// GSSI primary even when the current speaker ISSI is tracked as secondary;
+    /// private/P2P calls use an ISSI primary so UMAC can enforce the individual
+    /// participant set.
     pub active_addr: Option<TetraAddress>,
 
     /// Additional local ISSI/GSSI values whose energy-economy sleep cycle is
-    /// suspended by the same assigned-channel/call context.
+    /// suspended by the same assigned-channel/call context. Secondary ISSIs
+    /// are metadata for EG/listening and do not by themselves make a group
+    /// bearer private/P2P-scoped.
     pub active_secondary_addrs: Vec<TetraAddress>,
 }
 
@@ -59,6 +66,10 @@ impl Circuit {
         self.active_addresses().any(|active_addr| active_addr == addr)
     }
 
+    /// True for individual/private bearers where the primary address is an
+    /// ISSI. EN 300 392-2 clause 14.5.1 individual calls need strict
+    /// participant filtering, while clause 14.5.2 group calls remain GSSI
+    /// scoped even when the current speaker ISSI is stored as secondary.
     pub fn is_primary_issi_scoped(&self) -> bool {
         self.active_addr.is_some_and(|active_addr| active_addr.ssi_type == SsiType::Issi)
     }
