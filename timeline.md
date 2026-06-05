@@ -7003,3 +7003,42 @@ Next non-repeating execution:
 1. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
 2. Continue dashboard/telemetry scaling work: bounded client queues and coalesced station rendering for 10k MS snapshots.
 3. Add SDS/status aftercare under large registered MS set.
+
+## 2026-06-05 21:46 EEST - Dashboard websocket broadcast queue bounded
+
+Component in simple technical terms:
+
+- Dashboard websocket broadcast sends telemetry updates to browser clients.
+- A slow or frozen browser must not create an unbounded queue inside the BS process when thousands of MS/group/EG events are flowing.
+
+Problem covered:
+
+- The server state now handles group/EG event ordering correctly, but per-client websocket queues were unbounded.
+- A slow dashboard tab could accumulate unlimited broadcast messages during a high-rate 10k-station event storm.
+- The patch bounds each websocket broadcast queue at 4096 messages. If a browser cannot drain that queue, the server drops that slow client instead of growing memory without limit.
+
+ETSI clause scope:
+
+- This patch is not an ETSI air-interface change. It is operational hardening around dashboard observability for clause-scoped MM/CMCE/UMAC events.
+- It does not change over-air TETRA PDUs, floor control, attach, SDS, or Energy Economy behaviour.
+
+Patch summary:
+
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added `DASHBOARD_WS_BROADCAST_QUEUE_MAX`.
+  - Changed websocket broadcast channels from unbounded to bounded.
+  - Changed `broadcast()` to use `try_send`; full queues drop the slow client with a warning.
+  - Added `dashboard_broadcast_drops_slow_ws_client_at_bounded_queue_cap`.
+
+Verification:
+
+- `cargo test -p tetra-entities dashboard_broadcast_drops_slow_ws_client_at_bounded_queue_cap --locked` -> 1 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/src/net_dashboard/server.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Coalesce/limit browser station rendering for 10k MS snapshots so UI remains responsive.
+2. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+3. Add SDS/status aftercare under large registered MS set.

@@ -28,6 +28,7 @@ type WsClients = Arc<Mutex<Vec<WsBroadcastTx>>>;
 const MAX_AIR_INTERFACE_SSI: u64 = 0x00FF_FFFF;
 const DASHBOARD_WAP_SOURCE_SSI: u32 = 0x00FF_FFFF;
 const DASHBOARD_OTA_UPDATE_ENABLED: bool = false;
+const DASHBOARD_WS_BROADCAST_QUEUE_MAX: usize = 4096;
 
 #[derive(Debug, PartialEq, Eq)]
 struct LiveSdsPost {
@@ -890,7 +891,17 @@ impl DashboardServer {
 
     fn broadcast(&self, msg: &str) {
         let mut clients = self.clients.lock().unwrap();
-        clients.retain(|tx| tx.send(msg.to_owned()).is_ok());
+        clients.retain(|tx| match tx.try_send(msg.to_owned()) {
+            Ok(()) => true,
+            Err(crossbeam_channel::TrySendError::Full(_)) => {
+                tracing::warn!(
+                    "dashboard WS client broadcast queue exceeded {} messages; dropping slow client",
+                    DASHBOARD_WS_BROADCAST_QUEUE_MAX
+                );
+                false
+            }
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
+        });
     }
 }
 
@@ -1814,7 +1825,7 @@ fn handle_ws(
     };
 
     // Register this connection for broadcasts
-    let (broadcast_tx, broadcast_rx) = crossbeam_channel::unbounded::<String>();
+    let (broadcast_tx, broadcast_rx) = crossbeam_channel::bounded::<String>(DASHBOARD_WS_BROADCAST_QUEUE_MAX);
     {
         let mut c = clients.lock().unwrap();
         c.push(broadcast_tx);
@@ -3187,6 +3198,24 @@ mod tests {
         assert!(dashboard.contains("e.energy_saving_frame=msg.frame??null;"));
         assert!(dashboard.contains("e.energy_saving_multiframe=msg.multiframe??null;"));
         assert!(dashboard.contains("e._last_seen_ts=Date.now();"));
+    }
+
+    #[test]
+    fn dashboard_broadcast_drops_slow_ws_client_at_bounded_queue_cap() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        let (tx, _rx) = crossbeam_channel::bounded::<String>(DASHBOARD_WS_BROADCAST_QUEUE_MAX);
+        dashboard.clients.lock().unwrap().push(tx);
+
+        for idx in 0..DASHBOARD_WS_BROADCAST_QUEUE_MAX {
+            dashboard.broadcast(&format!("msg-{idx}"));
+        }
+        assert_eq!(dashboard.clients.lock().unwrap().len(), 1);
+
+        dashboard.broadcast("overflow");
+        assert!(
+            dashboard.clients.lock().unwrap().is_empty(),
+            "slow websocket client should be dropped instead of growing an unbounded broadcast queue"
+        );
     }
 
     #[test]
