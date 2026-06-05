@@ -1,5 +1,62 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 13:07:20 EEST - Live restart `No Group` audit under EG7, no protocol patch required
+
+User report:
+
+- After BS restart, stations appeared attached but with `No Group`.
+- The live config was intentionally harder: `energy_saving_mode = "eg7"`.
+
+Component explanation:
+
+- MM is Mobility Management: it registers ISSIs, receives/accepts reported GSSIs, persists restart recovery cache, and assigns EG modes.
+- CMCE is Call Management and Control Entity: it consumes MM `Register` and `Affiliate` events so group PTT knows which subscribers listen on a GSSI.
+- Dashboard is observability: it renders MM telemetry. It is not the protocol source of truth, so live WebSocket state was checked against MM/CMCE logs.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: the SwMI may command location update and request group identity reporting after restart.
+- Clauses 16.8.0, 16.8.1, 16.8.4, 16.8.5, and 16.10.27a: group identities are valid when reported/accepted or refreshed by SwMI attach/detach, with T353 bounding acknowledged SwMI group refresh.
+- Clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7, and 23.7.6 remain the EG7 scheduling scope.
+- This is live engineering evidence for the affected clauses, not formal TETRA certification.
+
+Live evidence:
+
+- Running Pi build: `Nexus-BS v0.1.55`, build `v0.1.55-113f2a91`.
+- Runtime cache `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` contained:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+- Fresh log from the latest restart showed:
+  - `MM: restart recovery armed for 3 local ISSI(s): {2260082, 2260616, 2260618}`.
+  - `2260618` sent `U-LOCATION UPDATE DEMAND` with GSSI `226333`; MM replied with `D-LOCATION UPDATE ACCEPT` containing `GroupIdentityLocationAccept` for `226333`; CMCE logged `subscriber affiliate issi=2260618 groups=[226333]`.
+  - `2260082` sent `DemandLocationUpdating` with GSSI `226333`; MM replied with `D-LOCATION UPDATE ACCEPT` containing `226333`; CMCE logged `subscriber affiliate issi=2260082 groups=[226333]`.
+  - `2260616` sent `ItsiAttach` with requested EG7 and GSSI `226333`; MM replied with `D-LOCATION UPDATE ACCEPT` containing EG7 start `F1/MF20` and `GroupIdentityLocationAccept` for `226333`; CMCE logged `subscriber affiliate issi=2260616 groups=[226333]`; LLC/MLE later reported successful transfer for the tracked accept handle.
+- Live dashboard WebSocket snapshot showed all three local stations with `groups:[226333]`:
+  - `2260616`: EG7, `groups=[226333]`
+  - `2260082`: StayAlive after T352 expiry, `groups=[226333]`
+  - `2260618`: StayAlive after T352 expiry, `groups=[226333]`
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 22 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack --locked` -> 1 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Conclusion:
+
+- Current deployed build did not reproduce dashboard/MM/CMCE `No Group`; the active BS state has all three lab ISSIs affiliated to `226333`.
+- No protocol patch was made in this checkpoint because changing MM semantics without a reproduced failing path would risk breaking the clause-scoped restart recovery behavior that is currently passing tests.
+
+Next non-repeating execution:
+
+1. If a terminal screen still shows `No Group` while dashboard WebSocket shows `groups=[226333]`, capture the exact ISSI and timestamp immediately after restart and inspect whether the terminal received/ACKed the `D-LOCATION UPDATE ACCEPT` carrying `GroupIdentityLocationAccept`.
+2. Add a focused regression only if a real failing path is found. Candidate edges already identified:
+   - EG7 response arriving before cached SwMI group-refresh ACK.
+   - Group-less `U-LOCATION UPDATE DEMAND` arriving while a cached SwMI refresh is pending.
+   - Cached selected GSSI beyond the first 12-GSSI scan-list refresh batch.
+3. Continue broader stack hardening with private/group call, SDS, WAP, and 24/7 robustness tests; do not claim formal certification.
+
 ## 2026-06-05 12:03:36 EEST - MM segmented cached restart scan-list refresh
 
 Context:
