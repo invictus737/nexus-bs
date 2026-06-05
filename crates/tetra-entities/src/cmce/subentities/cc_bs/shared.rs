@@ -136,39 +136,6 @@ impl CcBsSubentity {
         cached.last_resend_reporter = None;
     }
 
-    pub(super) fn send_group_d_setup_refresh(
-        &mut self,
-        queue: &mut MessageQueue,
-        call_id: u16,
-        speaker_issi: u32,
-        dest_gssi: u32,
-        ts: u8,
-        usage: u8,
-    ) {
-        self.refresh_group_cached_d_setup_speaker(call_id, speaker_issi);
-        let Some(cached) = self.cached_setups.get(&call_id) else {
-            return;
-        };
-        if cached.is_individual {
-            return;
-        }
-
-        let expected_dest = TetraAddress::new(dest_gssi, SsiType::Gssi);
-        if cached.dest_addr != expected_dest {
-            tracing::warn!(
-                "CMCE: group D-SETUP refresh call_id={} cached dest {:?} differs from active GSSI {}",
-                call_id,
-                cached.dest_addr,
-                dest_gssi
-            );
-        }
-
-        let dest_addr = cached.dest_addr;
-        let (sdu, chan_alloc) = Self::build_d_setup_prim(&cached.pdu, usage, ts, UlDlAssignment::Both);
-        let msg = Self::build_sapmsg(sdu, Some(chan_alloc), dest_addr, Layer2Service::Unacknowledged, None);
-        queue.push_back(msg);
-    }
-
     /// Build a generic SAP message addressed to MLE via LCMC.
     /// `layer2service` controls acknowledged vs unacknowledged LLC.
     pub(super) fn build_sapmsg(
@@ -1772,9 +1739,11 @@ impl CcBsSubentity {
         // D-INFO with Reset call time-out timer = 1 restarts T310 using the
         // current call-timeout value. Keep the PDU compact and group-addressed
         // on assigned-channel FACCH/STCH so listeners reset the same timer the
-        // SwMI just reset locally after a real floor grant. Preserve the active
-        // bidirectional traffic allocation: this timer refresh is not a floor
-        // withdrawal or a DL-only channel reassignment.
+        // SwMI just reset locally after a real floor grant. This timer refresh
+        // is not transmit authorization; clause 14.5.2.2.1 grants UL only with
+        // the individually addressed D-TX GRANTED, so keep the group reset
+        // downlink-only and avoid refreshing a GSSI uplink marker during the
+        // first speech frames of a new floor epoch.
         let pdu = DInfo {
             call_identifier: call_id,
             reset_call_time_out_timer_t310_: true,
@@ -1801,7 +1770,7 @@ impl CcBsSubentity {
         sdu.seek(0);
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
-        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Both, Some(0));
+        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
         queue.push_back(msg);
     }
 

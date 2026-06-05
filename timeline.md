@@ -4451,3 +4451,61 @@ Next non-repeating execution:
 1. Commit and deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with the normal local-build deploy script.
 2. Retest exact field case: `2260616 -> 2260618`, let `2260618` speak last if desired, then press red on `2260616`.
 3. Expected live log: prompt `D-RELEASE(UserRequestedDisconnection)` to `2260616`, no peer `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE(SwmiRequestedDisconnection)` to `2260618`, no peer `U-RELEASE` required, no MXP600 soft reboot, no `Not Answered`.
+
+## 2026-06-05 15:12:44 EEST - Group first-speaker floor retake without immediate back-up D-SETUP
+
+User symptom:
+
+- In GSSI group call, the station that opens/retakes PTT could produce static/no voice, while later interventions by other stations could carry voice.
+- The live log slice for `call_id=11`, GSSI `226333`, showed a floor grant to ISSI `2260082`, then a burst of FACCH/STCH signalling with `speech_present=false`, followed by UL inactivity timeout. Earlier and later periods showed normal `UMAC voice route`, so the failure path was tied to the first frames after group floor retake.
+
+Component, simple technical meaning:
+
+- CMCE/CC-BS group floor control decides who is allowed to speak in a group call and sends `D-TX GRANTED` / `D-TX CEASED`.
+- UMAC media routing carries actual TCH/S speech bits on the assigned traffic slot after CMCE has granted floor.
+- Back-up `D-SETUP` is the group-call late-entry mechanism: radios that missed the original setup can still join an ongoing group call. It is not the immediate floor-grant mechanism.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: SwMI controls group transmit permission; the speaking MS gets individually addressed `D-TX GRANTED`, while the group gets `D-TX GRANTED` with "granted to another user".
+- EN 300 392-2 clause 14.5.2.1 and Annex D: `D-SETUP` establishes/backs up group-call entry; Annex D describes optional back-up `D-SETUP` for called group members.
+- EN 300 392-2 clause 23.8.2.3.1 requires both CC transmit authorization and an uplink-applicable traffic usage marker before an MS transmits traffic.
+- This is clause-scoped hardening of the group-call floor path, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Group floor grant paths now update the cached late-entry `D-SETUP` speaker but do not immediately enqueue a fresh group `D-SETUP` in the same burst as `D-TX GRANTED`.
+  - Immediate floor retake therefore sends the individual grant to the new speaker and the group grant to listeners without a same-burst setup refresh that can disturb the first speech frames.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - UL-inactivity handoff to a queued group requester follows the same rule: grant floor immediately, refresh cached late-entry setup, defer the actual back-up `D-SETUP` to the normal late-entry scheduler.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Group `D-INFO` T310 reset remains FACCH/STCH but now carries DL-only channel allocation. It is timer/listener signalling, not transmit authorization for all GSSI members.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated group handoff, hangtime retake, repeated same-GSSI setup, and UL-inactivity handoff regressions to assert no immediate back-up `D-SETUP` during the first floor-grant burst.
+  - Added/kept checks that the deferred late-entry `D-SETUP` still advertises the new speaker when the retry window runs.
+  - Updated group `D-INFO` reset assertions to require DL-only allocation.
+
+P2P/private-call safety:
+
+- No P2P/private-call code path was changed.
+- P2P regression suite still passes, including simplex floor handoff, caller/called release, pending disconnect, and MXP600-safe called-peer release tests.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_tx_ceased_hands_floor_to_queued_requester --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_ul_inactivity_hands_floor_to_queued_requester --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` -> 52 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 65 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 51 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 132 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this patch, then deploy direct to the test Pi with local build only.
+2. Retest GSSI `226333`: initial group setup speech, hangtime retake by the original speaker, and handoff/return PTT by the other station.
+3. Expected live log around retake: `D-TX GRANTED` individual + group, `D-INFO` reset T310 DL-only, no immediate `DSetup` in the same floor-grant burst, then early `UMAC voice route` instead of `UL inactivity timeout`.

@@ -622,7 +622,7 @@ impl CcBsSubentity {
             );
             self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
             self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
-            self.send_group_d_setup_refresh(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
+            self.refresh_group_cached_d_setup_speaker(call_id, requester.ssi);
 
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
                 call_id,

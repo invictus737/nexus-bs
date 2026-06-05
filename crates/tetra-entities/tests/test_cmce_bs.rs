@@ -1264,8 +1264,8 @@ fn assert_one_group_d_info_reset_t310(msgs: &[SapMsg], call_id: u16, gssi: u32, 
     assert_chan_alloc_matches_circuit(chan_alloc, ts, usage, context);
     assert_eq!(
         chan_alloc.ul_dl_assigned,
-        UlDlAssignment::Both,
-        "{context}: D-INFO reset preserves active bidirectional traffic allocation"
+        UlDlAssignment::Dl,
+        "{context}: D-INFO reset is timer signalling for group listeners, not transmit authorization"
     );
 }
 
@@ -3569,22 +3569,11 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
         );
     }
 
-    let setup_refreshes: Vec<_> = repeated_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        setup_refreshes.len(),
-        1,
-        "hangtime retake should refresh the maintained call D-SETUP without opening a second call"
+        count_d_setups(&repeated_msgs),
+        0,
+        "hangtime retake must not inject an immediate back-up D-SETUP over the first speech frames"
     );
-    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
-    assert_eq!(setup_refresh.call_identifier, active_call_id);
-    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
-    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
     assert_eq!(count_umac_open(&repeated_msgs), 0, "hangtime retake must not open a second circuit");
     assert_eq!(
         count_umac_call_ended_or_close(&repeated_msgs),
@@ -3596,6 +3585,20 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
         1,
         "hangtime retake must hand the existing traffic floor to the requester"
     );
+
+    test.run_stack(Some(8));
+    let backup_msgs = test.dump_sinks();
+    let setup_refresh = backup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .next()
+        .expect("deferred back-up D-SETUP should still advertise the maintained call");
+    assert_eq!(setup_refresh.1.call_identifier, active_call_id);
+    assert_eq!(setup_refresh.1.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
+    assert_eq!(setup_refresh.0.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
 }
 
 #[test]
@@ -4386,30 +4389,11 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         .expect("FACCH group grant should carry channel allocation");
     assert_eq!(group_alloc.ul_dl_assigned, UlDlAssignment::Dl);
 
-    let setup_refreshes: Vec<_> = ceased_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        setup_refreshes.len(),
-        1,
-        "queued group floor handoff should refresh late-entry D-SETUP with the new speaker"
+        count_d_setups(&ceased_msgs),
+        0,
+        "queued group floor handoff must not inject an immediate back-up D-SETUP over the first speech frames"
     );
-    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
-    assert_eq!(setup_refresh.call_identifier, call_id);
-    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
-    assert_eq!(setup_refresh.transmission_grant, TransmissionGrant::GrantedToOtherUser);
-    assert!(!setup_refresh.transmission_request_permission);
-    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
-    let setup_refresh_alloc = setup_refresh_prim
-        .chan_alloc
-        .as_ref()
-        .expect("group D-SETUP refresh should carry channel allocation");
-    assert_chan_alloc_matches_circuit(setup_refresh_alloc, active_ts, active_usage, "queued handoff D-SETUP refresh");
-    assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
     assert_one_group_d_info_reset_t310(
         &ceased_msgs,
         call_id,
@@ -4524,28 +4508,11 @@ fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
         "group UL inactivity listener grant",
     );
 
-    let setup_refreshes: Vec<_> = timeout_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        setup_refreshes.len(),
-        1,
-        "queued timeout handoff should refresh late-entry D-SETUP with the new speaker"
+        count_d_setups(&timeout_msgs),
+        0,
+        "queued timeout handoff must not inject an immediate back-up D-SETUP over the first speech frames"
     );
-    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
-    assert_eq!(setup_refresh.call_identifier, call_id);
-    assert_eq!(setup_refresh.calling_party_address_ssi, Some(LAB_ISSI_B));
-    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi));
-    let setup_alloc = setup_refresh_prim
-        .chan_alloc
-        .as_ref()
-        .expect("group timeout D-SETUP refresh should carry channel allocation");
-    assert_chan_alloc_matches_circuit(setup_alloc, active_ts, active_usage, "group timeout D-SETUP refresh");
-    assert_eq!(setup_alloc.ul_dl_assigned, UlDlAssignment::Both);
     assert_one_group_d_info_reset_t310(
         &timeout_msgs,
         call_id,
@@ -5018,7 +4985,7 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
 }
 
 #[test]
-fn test_group_hangtime_tx_demand_refreshes_late_entry_speaker() {
+fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -5036,38 +5003,21 @@ fn test_group_hangtime_tx_demand_refreshes_late_entry_speaker() {
     test.run_stack(Some(1));
     let _hangtime_msgs = test.dump_sinks();
 
-    // EN 300 392-2 clauses 14.5.2.1.1/14.5.2.1.2 use D-SETUP for
-    // group-call setup/late entry; clause 14.5.2.2.1 moves the active floor
-    // with D-TX GRANTED. A new U-TX DEMAND after hangtime must not leave the
-    // cached back-up D-SETUP advertising the previous speaker.
+    // EN 300 392-2 clauses 14.5.2.1.1/14.5.2.1.2 and Annex D allow back-up
+    // D-SETUP for group-call setup/late entry; clause 14.5.2.2.1 moves the
+    // active floor with D-TX GRANTED. A new U-TX DEMAND after hangtime must
+    // not inject D-SETUP in the immediate floor-grant burst, but the cached
+    // back-up D-SETUP still has to advertise the new speaker when the late
+    // entry scheduler sends it later.
     test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let demand_msgs = test.dump_sinks();
 
-    let setup_refreshes: Vec<_> = demand_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
     assert_eq!(
-        setup_refreshes.len(),
-        1,
-        "hangtime floor retake should refresh late-entry D-SETUP with the new speaker"
+        count_d_setups(&demand_msgs),
+        0,
+        "hangtime floor retake must not inject an immediate back-up D-SETUP over the first speech frames"
     );
-    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
-    assert_eq!(setup_refresh.call_identifier, call_id);
-    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
-    assert_eq!(setup_refresh.transmission_grant, TransmissionGrant::GrantedToOtherUser);
-    assert!(!setup_refresh.transmission_request_permission);
-    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
-    let setup_refresh_alloc = setup_refresh_prim
-        .chan_alloc
-        .as_ref()
-        .expect("group D-SETUP refresh should carry channel allocation");
-    assert_chan_alloc_matches_circuit(setup_refresh_alloc, active_ts, active_usage, "hangtime retake D-SETUP refresh");
-    assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
 
     let grants: Vec<_> = demand_msgs
         .iter()
@@ -5086,6 +5036,37 @@ fn test_group_hangtime_tx_demand_refreshes_late_entry_speaker() {
     }));
     assert_one_group_d_info_reset_t310(&demand_msgs, call_id, TEST_GSSI, active_ts, active_usage, "hangtime floor retake");
     assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
+
+    test.run_stack(Some(8));
+    let backup_msgs = test.dump_sinks();
+    let setup_refreshes: Vec<_> = backup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !setup_refreshes.is_empty(),
+        "deferred late-entry D-SETUP should still be sent after the immediate floor-grant burst"
+    );
+    let (setup_refresh_prim, setup_refresh) = &setup_refreshes[0];
+    assert_eq!(setup_refresh.call_identifier, call_id);
+    assert_eq!(setup_refresh.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
+    assert_eq!(setup_refresh.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+    assert!(!setup_refresh.transmission_request_permission);
+    assert_eq!(setup_refresh_prim.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
+    let setup_refresh_alloc = setup_refresh_prim
+        .chan_alloc
+        .as_ref()
+        .expect("deferred group D-SETUP refresh should carry channel allocation");
+    assert_chan_alloc_matches_circuit(
+        setup_refresh_alloc,
+        active_ts,
+        active_usage,
+        "deferred hangtime retake D-SETUP refresh",
+    );
+    assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
 }
 
 #[test]
