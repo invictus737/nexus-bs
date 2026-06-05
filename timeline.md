@@ -1,5 +1,36 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 13:37:22 EEST - Deployed SDS local TSI hardening to Pi test instance
+
+Deployment:
+
+- Deployed direct to `chris@192.168.1.179` test instance with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Built locally only; no build was performed on the Pi and no binary backup was created.
+- Running build: `Nexus-BS v0.1.55`, build `v0.1.55-29de6e15`.
+- Deployed commit: `29de6e15`.
+- Deployed binary SHA256: `365b08eee4e073cf23f8741e77009a888c0587ba69fe4f5c3176de1744e48838`.
+- Running processes:
+  - `nexus-bs-control-service --listen 127.0.0.1:9002`
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Post-deploy restart evidence:
+
+- Runtime restart cache still contains:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+- Fresh log from the new build marker contains 416 lines in the startup window.
+- `MM: restart recovery armed for 3 local ISSI(s): {2260082, 2260616, 2260618}`.
+- `2260082`: `D-LOCATION UPDATE ACCEPT` includes `GroupIdentityLocationAccept` for `226333`; CMCE logs `subscriber affiliate issi=2260082 groups=[226333]`.
+- `2260618`: `D-LOCATION UPDATE ACCEPT` includes `GroupIdentityLocationAccept` for `226333`; CMCE logs `subscriber affiliate issi=2260618 groups=[226333]`.
+- `2260616`: `D-LOCATION UPDATE ACCEPT` includes `GroupIdentityLocationAccept` for `226333` with EG7 information; CMCE logs `subscriber affiliate issi=2260616 groups=[226333]`.
+- No `No Group`, `Unit Not Attached`, `T353`, failed transfer, `PTT denied`, service-unavailable, `FUNCTION NOT SUPPORTED`, or `TSI extension` strings appear in the new startup window.
+
+Remaining live validation:
+
+- No new `U-SDS-DATA` occurred after this deploy in the captured startup window, so the local-MNI TSI SDS fix is validated by local tests and ready for live WAP/browser trigger.
+- Next live action: open the terminal WAP/browser home page again and confirm the previous `TSI extension addressing not supported` log does not recur for local MNI.
+
 ## 2026-06-05 13:34:45 EEST - SDS local TSI routing hardening and live restart `No Group` re-audit
 
 User report:
