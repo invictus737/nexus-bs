@@ -3960,3 +3960,57 @@ Next non-repeating execution:
    - `2260082`, `2260616`, `2260618` end with `groups=[226333]`;
    - soft re-attach logs `ReleaseIndividualCalls`/private cleanup and no CMCE `Deregister -> Register -> Affiliate` group churn for retained `226333`;
    - no `No Group`, `Unit Not Attached`, `PTT denied`, `RequestedServiceNotAvailable`, or `T353 expired` during restart recovery.
+
+## 2026-06-05 12:56:41 EEST - Deployed soft re-attach group preservation to test BS
+
+Deployment:
+
+- Commit deployed: `113f2a91` (`fix: preserve groups during soft reattach cleanup`).
+- Command used: `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Build happened locally and binary was copied directly to testing; no Rust compile on Pi and no binary backup step.
+- Live header now shows `Build: v0.1.55-113f2a91`.
+
+Remote restart evidence:
+
+- Fresh full log copied to `/private/tmp/nexus-bs-after-113f2a91.log` and read from process start.
+- Recovery cache remains coherent:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+- Dashboard WebSocket snapshot after restart:
+  - `2260082` has `groups:[226333]`;
+  - `2260616` has `groups:[226333]`;
+  - `2260618` has `groups:[226333]`.
+- `2260082` soft re-attach now logs:
+  - `MM: requested CMCE individual-call cleanup for ISSI 2260082 while preserving group affiliation (soft re-attach)`;
+  - `CMCE: individual-call cleanup issi=2260082 preserved groups=[226333]`.
+- The old local `CMCE Deregister -> Register -> Affiliate` churn for `2260082` no longer appears in this restart interval.
+
+Negative log review:
+
+- No `PTT denied`.
+- No `No Group`.
+- No `Unit Not Attached`.
+- No `RequestedServiceNotAvailable`.
+- No `Service unavailable`.
+- No `T353 expired`.
+- No `CMCE: subscriber deaffiliate` or `CMCE: subscriber deregister` for `2260082`, `2260616`, or `2260618` with retained `226333`.
+
+Observed non-blocking warnings:
+
+- Startup TX late / lost samples.
+- `SX1255 temperature read failed` while streams are active.
+- LLC retransmission exhaustion while radios are not yet answering during restart probing.
+- One unexpected ACK from `2260616` after successful registration.
+- Short malformed MAC access bursts from live RF.
+
+Status:
+
+- The restart `No Group` transient caused by soft re-attach private-call cleanup has been removed in this live deployment.
+- Current validation is engineering evidence scoped to the touched EN 300 392-2 procedures and local CMCE state handling; it is not formal TETRA certification.
+
+Next non-repeating execution:
+
+1. User should test group PTT on `226333` immediately after this restart and report any `PTT denied` or radio-side `No Group`.
+2. If a new failure appears, inspect the live interval around `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, `ReleaseIndividualCalls`, and UMAC floor events.
+3. Continue broader hardening on remaining basic stack surfaces: long-run registration/affiliation retention, group floor handoff under EG7, private simplex/duplex, SDS, and WAP.
