@@ -6093,6 +6093,49 @@ fn test_group_release_pending_allows_same_gssi_restart_while_old_release_drains(
 }
 
 #[test]
+fn test_group_pending_release_call_id_wrap_skips_old_release_id() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let (old_call_id, _old_ts, _old_usage) = start_group_call_with_circuit(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, old_call_id));
+    test.run_stack(Some(1));
+    let release_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&release_msgs), 2);
+    assert_eq!(count_umac_call_ended_or_close(&release_msgs), 0);
+
+    force_cmce_next_call_identifier(&mut test, old_call_id);
+    test.submit_message(build_u_setup_msg(TEST_CALLED_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let restart_msgs = test.dump_sinks();
+
+    let new_call_id = first_d_setup_call_id(&restart_msgs);
+    assert_ne!(
+        new_call_id, old_call_id,
+        "EN 300 392-2 clause 14.2.3/table 14.36: a fresh group setup must skip an old call id while D-RELEASE is still pending"
+    );
+    assert_eq!(count_d_releases(&restart_msgs), 0);
+    assert_eq!(count_umac_open(&restart_msgs), 1);
+
+    let occupied_ids = cmce_debug_active_call_ids(&mut test);
+    assert!(
+        occupied_ids.contains(&old_call_id),
+        "old pending group release id should stay occupied"
+    );
+    assert!(occupied_ids.contains(&new_call_id), "replacement group call id should be occupied");
+}
+
+#[test]
 fn test_group_release_pending_ignores_late_floor_pdus_without_extra_signalling() {
     debug::setup_logging_verbose();
 
@@ -6712,6 +6755,68 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
     let next_setup_msgs = test.dump_sinks();
     assert_eq!(count_d_setups(&next_setup_msgs), 1);
     assert_eq!(count_d_releases(&next_setup_msgs), 0);
+}
+
+#[test]
+fn test_p2p_pending_release_call_id_wrap_skips_old_release_id() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let new_caller = TEST_OTHER_ISSI + 50;
+    let new_called = TEST_OTHER_ISSI + 51;
+    submit_subscriber_update(&mut test, new_caller, Vec::new(), BrewSubscriberAction::Register);
+    submit_subscriber_update(&mut test, new_called, Vec::new(), BrewSubscriberAction::Register);
+    test.run_stack(Some(4));
+    let _ = test.dump_sinks();
+
+    let old_call_id = start_active_p2p_call(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, old_call_id));
+    test.run_stack(Some(1));
+    let initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        old_call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
+
+    drain_private_simplex_tail(&mut test, dltime);
+    let peer_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &peer_release_msgs,
+        old_call_id,
+        DisconnectCause::SwmiRequestedDisconnection,
+        &[TEST_CALLED_ISSI],
+    );
+    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+
+    force_cmce_next_call_identifier(&mut test, old_call_id);
+    let (new_call_id, setup_msgs) = start_p2p_setup_between(&mut test, new_caller, new_called);
+
+    assert_ne!(
+        new_call_id, old_call_id,
+        "EN 300 392-2 clauses 14.2.3/table 14.36 and 14.5.1.3: a fresh P2P setup must skip an old call id while private release is pending"
+    );
+    assert_eq!(count_d_setups(&setup_msgs), 1);
+    assert_eq!(count_umac_open(&setup_msgs), 0);
+    assert_eq!(count_d_releases(&setup_msgs), 0);
+
+    let occupied_ids = cmce_debug_active_call_ids(&mut test);
+    assert!(
+        occupied_ids.contains(&old_call_id),
+        "old pending P2P release id should stay occupied"
+    );
+    assert!(occupied_ids.contains(&new_call_id), "fresh P2P setup id should be occupied");
 }
 
 #[test]

@@ -5884,3 +5884,45 @@ Next non-repeating execution:
 2. Continue pending group/private release call-id wrap tests.
 3. Continue large pending-release PTT flood tests.
 4. Continue restart-recovered EG7 affiliation through UMAC scheduling.
+
+## 2026-06-05 18:50:03 EEST - CMCE pending-release call-id wrap regressions added
+
+User goal:
+
+- Group and private calls must remain stable across repeated setup/release cycles and must not confuse old release signalling with a fresh call when the 14-bit call identifier wraps.
+
+Component in simple technical terms:
+
+- CMCE owns call setup, call release, and the short call identifier used in all call-control PDUs.
+- Pending release means the BS has started clearing the call, but it is still waiting for FACCH/MCCH delivery reports or local guard timers before the old call identity can be reused safely.
+- These tests force the allocator to try reusing the old identifier while release is pending and prove it skips to a fresh identifier instead.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.2.3 and table 14.36: the SwMI call identifier is the call reference and is only 14 real bits.
+- EN 300 392-2 clause 14.5.2.3: group-call release uses `D-RELEASE` and may remain locally pending while delivery drains.
+- EN 300 392-2 clauses 14.5.1.3.2 and 14.5.1.3.3: individual/private-call clearing must keep the call reference coherent until the release path completes.
+- This is clause-scoped regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_group_pending_release_call_id_wrap_skips_old_release_id`.
+  - Added `test_p2p_pending_release_call_id_wrap_skips_old_release_id`.
+  - Both tests force `next_call_identifier` to the old pending-release call id, start a fresh call, and assert the new setup uses a different call id while the old pending id remains occupied.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_pending_release_call_id_wrap_skips_old_release_id --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_pending_release_call_id_wrap_skips_old_release_id --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 141 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE pending-release call-id wrap test patch.
+2. Continue large pending-release PTT flood tests.
+3. Continue restart-recovered EG7 affiliation through UMAC scheduling.
+4. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.
