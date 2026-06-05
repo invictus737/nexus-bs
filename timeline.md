@@ -5751,3 +5751,43 @@ Next non-repeating execution:
 2. Continue MM restart/affiliation persistence with EG7-scale tests.
 3. Continue UMAC/MAC EG batch pressure below CMCE for 4096-member GSSI scheduling.
 4. Add dashboard/API observability for accepted-vs-transmitted WAP/SDS where a synchronous response path exists.
+
+## 2026-06-05 18:28:08 EEST - MM restart recovery EG7 scale raised to 4096 members
+
+User goal:
+
+- After BS restart, terminals must not come back as `Unit Not Attached` or `No Group`; cached affiliations and EG mode must converge robustly for thousands of terminals.
+
+Component in simple technical terms:
+
+- MM owns registration, group affiliation, restart recovery, and energy-economy negotiation.
+- The restart recovery cache seeds known ISSIs/GSSIs after process restart; MM then refreshes the group on air and waits for explicit terminal ACK/EG response.
+- EG7 is the longest configured energy economy mode in this test, so it is the harshest case for restart recovery plus sleeping terminals.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.4 and 16.8: registration and group attach/detach procedures restore the MS and its group identities.
+- EN 300 392-2 clauses 16.7.1, 16.10.9 and 16.10.10: energy-economy mode is negotiated and activated after the matching MS response.
+- EN 300 392-2 clause 23.7.6 and table 23.9: EG7 has the longest sleep-cycle behavior, so it must not be activated speculatively before explicit response.
+- This is scale regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `LARGE_RESTART_RECOVERY_MEMBER_COUNT = 4096`.
+  - Raised `test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members` from 2048 to 4096 members.
+  - The test now confirms 4096 cached members can ITSI attach, receive cached group refresh, ACK it, explicitly respond to EG7, remain affiliated to the GSSI, and receive an EG7 assignment.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 135 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this MM 4096-member restart recovery/EG7 test-scale patch.
+2. Continue UMAC/MAC EG batch pressure below CMCE for 4096-member GSSI scheduling.
+3. Continue dashboard/API observability for accepted-vs-transmitted WAP/SDS where a synchronous response path exists.

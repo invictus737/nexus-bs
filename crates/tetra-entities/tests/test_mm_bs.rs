@@ -45,6 +45,8 @@ use tetra_saps::tla::TLA_REPORT_FAILED_TRANSFER;
 
 use crate::common::ComponentTest;
 
+const LARGE_RESTART_RECOVERY_MEMBER_COUNT: u32 = 4096;
+
 #[test]
 fn test_u_mm_status_energy_saving() {
     // Motorola requesting power management (ChangeOfEnergySavingModeRequest)
@@ -5105,7 +5107,7 @@ fn test_restart_recovery_unsolicited_itsi_attach_eg7_refreshes_cached_group_befo
 #[test]
 fn test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_members() {
     debug::setup_logging_verbose();
-    let member_count = 2048_u32;
+    let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT;
     let first_issi = 2_264_000_u32;
     let gssi = 226333;
     let path = unique_restart_recovery_path("large-unsolicited-itsi-eg7-cached-group");
