@@ -5298,3 +5298,44 @@ Next non-repeating execution:
 
 1. Commit this test-only deferred queue cap evidence patch.
 2. Continue with CMCE large initial group setup fanout or MM restart recovery large-GSSI persistence tests.
+
+## 2026-06-05 17:29:37 EEST - CMCE large group setup fanout evidence
+
+User goal:
+
+- Group call setup must scale to thousands of terminals without sending one call setup per ISSI.
+
+Component in simple technical terms:
+
+- CMCE is TETRA call control: it owns group/private call setup, release, and floor-control decisions.
+- For a group call, CMCE should address setup signalling to the GSSI and open one UMAC traffic circuit for that group, not create per-terminal setup fanout.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1 defines normal group call setup using group identity scoped signalling.
+- The test verifies the existing implementation remains group-scoped for a 2048-member GSSI; it is engineering regression evidence only, not formal certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_large_group_setup_uses_one_gssi_d_setup_and_one_umac_open`.
+  - The test registers and affiliates 2048 ISSIs to one GSSI, starts a group call, and asserts:
+    - exactly one `D-SETUP`,
+    - the `D-SETUP` main address is the GSSI,
+    - exactly one UMAC `Open`,
+    - the traffic circuit primary address is the GSSI,
+    - the initial speaker is only a secondary ISSI,
+    - no release is emitted during setup.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_setup_uses_one_gssi_d_setup_and_one_umac_open --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 136 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE large group setup evidence patch.
+2. Continue with MM restart recovery large-GSSI persistence and EG7 restart-derived group tests.

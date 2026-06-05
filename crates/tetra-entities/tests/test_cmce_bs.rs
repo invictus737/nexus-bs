@@ -1544,6 +1544,59 @@ fn start_group_call_with_u_setup(test: &mut ComponentTest, u_setup: USetup) -> u
     first_d_setup_call_id(&initial_msgs)
 }
 
+#[test]
+fn test_large_group_setup_uses_one_gssi_d_setup_and_one_umac_open() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = 2048_u32;
+    let first_issi = 420_000_u32;
+    let speaker_issi = first_issi;
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_u_setup_msg(speaker_issi, TEST_GSSI));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 14.5.2.1 keeps normal group setup addressed to the
+    // group identity. A large GSSI must not fan out one D-SETUP per affiliate.
+    let setups: Vec<_> = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(setups.len(), 1, "large group setup must emit one GSSI D-SETUP");
+    assert_eq!(setups[0].0.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
+
+    let opens: Vec<_> = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(opens.len(), 1, "large group setup must open one GSSI traffic circuit");
+    assert_eq!(opens[0].active_addr, Some(TetraAddress::new(TEST_GSSI, SsiType::Gssi)));
+    assert_eq!(opens[0].active_secondary_addrs, vec![TetraAddress::issi(speaker_issi)]);
+    assert_eq!(count_umac_open(&setup_msgs), 1);
+    assert_eq!(count_d_releases(&setup_msgs), 0);
+}
+
 fn start_p2p_setup(test: &mut ComponentTest) -> (u16, Vec<SapMsg>) {
     start_p2p_setup_between(test, TEST_ISSI, TEST_CALLED_ISSI)
 }
