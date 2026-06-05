@@ -32,6 +32,8 @@ use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 
 use crate::common::ComponentTest;
 
+const LARGE_LOCAL_GROUP_MEMBER_COUNT: u32 = 1024;
+
 /// Helper: register a subscriber ISSI in the StackState subscriber registry
 fn register_subscriber(test: &mut ComponentTest, issi: u32) {
     test.config.state_write().subscribers.register(issi);
@@ -40,6 +42,16 @@ fn register_subscriber(test: &mut ComponentTest, issi: u32) {
 /// Helper: affiliate a subscriber with a GSSI in the StackState subscriber registry
 fn affiliate_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
     test.config.state_write().subscribers.affiliate(issi, gssi);
+}
+
+fn register_affiliated_group_members(test: &mut ComponentTest, first_issi: u32, count: u32, gssi: u32) {
+    let mut state = test.config.state_write();
+    for offset in 0..count {
+        let issi = first_issi + offset;
+        state.subscribers.register(issi);
+        assert!(state.subscribers.affiliate(issi, gssi));
+    }
+    assert_eq!(state.subscribers.group_members(gssi).len(), count as usize);
 }
 
 fn register_shared_subscriber(config: &SharedConfig, issi: u32) {
@@ -1624,6 +1636,39 @@ fn test_u_sds_to_local_group_uses_unacknowledged_l2_and_preserves_fields() {
 }
 
 #[test]
+fn test_u_sds_to_large_local_group_routes_once_as_unacknowledged_gssi() {
+    debug::setup_logging_verbose();
+
+    let first_issi = 1000001;
+    let source_issi = first_issi + LARGE_LOCAL_GROUP_MEMBER_COUNT - 1;
+    let gssi = 226333;
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_affiliated_group_members(&mut test, first_issi, LARGE_LOCAL_GROUP_MEMBER_COUNT, gssi);
+
+    test.submit_message(build_u_sds_data_msg(source_issi, gssi, 0xBEEF));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let (prim, pdu) = extract_d_sds_data(&sink_msgs);
+
+    // EN 300 392-2 clauses 13.2 and 18.3.5.3.1 include user-defined group
+    // SDS over unacknowledged delivery. A large local affiliate set must still
+    // route as one GSSI-addressed D-SDS-DATA, not per-member ISSI fan-out.
+    assert_eq!(count_d_sds_pdus(&sink_msgs), 1);
+    assert_eq!(count_d_status_pdus(&sink_msgs), 0);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+    assert_eq!(prim.main_address.ssi, gssi);
+    assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+    assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(pdu.calling_party_type_identifier, PartyTypeIdentifier::Ssi);
+    assert_eq!(pdu.calling_party_address_ssi, Some(source_issi as u64));
+    assert_eq!(pdu.calling_party_extension, None);
+    assert!(matches!(pdu.user_defined_data, SdsUserData::Type1(0xBEEF)));
+}
+
+#[test]
 fn test_u_sds_to_all_ones_group_without_affiliation_uses_gssi_unitdata() {
     debug::setup_logging_verbose();
 
@@ -2377,6 +2422,42 @@ fn test_u_status_to_local_group_reaches_llc_as_tl_unitdata_request() {
     assert_eq!(prim.main_address.ssi, gssi);
     assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
     let d_status = extract_tla_d_status(&prim.tl_sdu);
+    assert_eq!(d_status.calling_party_type_identifier, PartyTypeIdentifier::Ssi);
+    assert_eq!(d_status.calling_party_address_ssi, Some(source_issi as u64));
+    assert_eq!(d_status.calling_party_extension, None);
+    assert_eq!(d_status.pre_coded_status, status);
+    assert!(d_status.external_subscriber_number.is_none());
+    assert!(d_status.dm_ms_address.is_none());
+}
+
+#[test]
+fn test_u_status_to_large_local_group_routes_once_as_unacknowledged_gssi() {
+    debug::setup_logging_verbose();
+
+    let first_issi = 1000001;
+    let source_issi = first_issi;
+    let gssi = 226333;
+    let status = PreCodedStatus::NetworkUserSpecific(0x9001);
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+    register_affiliated_group_members(&mut test, first_issi, LARGE_LOCAL_GROUP_MEMBER_COUNT, gssi);
+
+    test.submit_message(build_u_status_msg(source_issi, gssi, status));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let (prim, d_status) = extract_d_status(&sink_msgs);
+
+    // EN 300 392-2 clauses 13.2, 14.7.1.11 and 14.7.2.7 include
+    // predefined group status. With 1024 local affiliates, the BS should
+    // still emit a single GSSI-addressed D-STATUS using unacknowledged L2.
+    assert_eq!(count_d_sds_pdus(&sink_msgs), 0);
+    assert_eq!(count_d_status_pdus(&sink_msgs), 1);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+    assert_eq!(prim.main_address.ssi, gssi);
+    assert_eq!(prim.main_address.ssi_type, SsiType::Gssi);
+    assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
     assert_eq!(d_status.calling_party_type_identifier, PartyTypeIdentifier::Ssi);
     assert_eq!(d_status.calling_party_address_ssi, Some(source_issi as u64));
     assert_eq!(d_status.calling_party_extension, None);

@@ -5580,6 +5580,117 @@ fn test_restart_recovery_large_cached_group_eg7_activates_assignments_for_all_me
 }
 
 #[test]
+fn test_large_eg7_group_repeated_group_less_updates_preserve_all_affiliations() {
+    debug::setup_logging_verbose();
+    let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT;
+    let first_issi = 2_264_000_u32;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("large-eg7-group-less-long-run");
+    let _ = std::fs::remove_file(&path);
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
+        test.run_stack(Some(1));
+        let attach_msgs = test.dump_sinks();
+        assert!(
+            contains_location_update_accept(&attach_msgs),
+            "initial large-group attach for ISSI {issi} should be accepted"
+        );
+
+        submit_u_mm_status_energy_saving(
+            &mut test,
+            issi,
+            StatusUplink::ChangeOfEnergySavingModeResponse,
+            EnergySavingMode::Eg7,
+        );
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+    }
+
+    for cycle in 0..3 {
+        for offset in 0..member_count {
+            let issi = first_issi + offset;
+
+            // EN 300 392-2 clauses 16.4.4, 16.8.0, 16.9.3.4 and
+            // 16.10.35a make this a location registration refresh, not an
+            // implicit group detach. Clauses 16.7.1/16.10.9/16.10.10/23.7.6
+            // keep the already negotiated EG7 receive cycle valid until a
+            // real energy-economy procedure changes it.
+            submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+            test.run_stack(Some(1));
+            let update_msgs = test.dump_sinks();
+
+            let accept = extract_location_update_accept(&update_msgs);
+            assert_eq!(
+                accept.location_update_accept_type,
+                LocationUpdateAcceptType::DemandLocationUpdating,
+                "cycle {cycle} ISSI {issi} should keep DemandLocationUpdating accept type"
+            );
+            assert!(
+                !contains_location_update_command(&update_msgs),
+                "cycle {cycle} ISSI {issi} is already known; group-less refresh must not start a command loop"
+            );
+            for update in subscriber_updates(&update_msgs) {
+                assert_ne!(
+                    update.action,
+                    BrewSubscriberAction::Deregister,
+                    "cycle {cycle} ISSI {issi} must not be deregistered by a group-less refresh"
+                );
+                assert_ne!(
+                    update.action,
+                    BrewSubscriberAction::Deaffiliate,
+                    "cycle {cycle} ISSI {issi} must not lose GSSI {gssi} on a group-less refresh"
+                );
+            }
+        }
+
+        let state = test.config.state_read();
+        let mut members = state.subscribers.group_members(gssi);
+        members.sort_unstable();
+        assert_eq!(
+            members.len(),
+            member_count as usize,
+            "cycle {cycle}: no terminal may disappear from the large GSSI registry"
+        );
+        assert_eq!(members.first().copied(), Some(first_issi));
+        assert_eq!(members.last().copied(), Some(first_issi + member_count - 1));
+        for offset in [0, member_count / 2, member_count - 1] {
+            let issi = first_issi + offset;
+            let assignment = state
+                .energy_saving
+                .get(&issi)
+                .copied()
+                .expect("sampled large-group member must keep EG7 after group-less refresh cycles");
+            assert_eq!(assignment.mode, EnergySavingMode::Eg7 as u8);
+            assert_eq!(assignment.suspension_count, 0);
+        }
+    }
+
+    debug_mm_flush_restart_recovery_cache(&mut test);
+    let cache = std::fs::read_to_string(&path).expect("large long-run group state should persist");
+    for issi in [first_issi, first_issi + member_count / 2, first_issi + member_count - 1] {
+        let expected = format!("{issi} {gssi}:0:0");
+        assert!(
+            cache.lines().any(|line| line.trim() == expected),
+            "restart recovery cache should retain sampled large-group member {issi}, got {cache:?}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
     debug::setup_logging_verbose();
     let issi = 2260618;

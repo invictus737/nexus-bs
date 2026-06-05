@@ -7081,3 +7081,52 @@ Next non-repeating execution:
 1. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
 2. Add SDS/status aftercare under large registered MS set.
 3. Continue telemetry channel policy review; keep core telemetry lossless unless a protocol-safe coalescing layer is added.
+
+## 2026-06-05 21:57 EEST - Large-group MM/SDS robustness evidence
+
+Component in simple technical terms:
+
+- MM is the registration and affiliation ledger: it tracks each ISSI, which GSSI groups it belongs to, and the negotiated Energy Economy mode.
+- SDS/status is short data and pre-coded status delivery. For a group address it must stay one GSSI transmission, not fan out into thousands of per-ISSI messages.
+- CMCE controls who has the PTT floor in a group call. UMAC is the radio scheduler that has to deliver the resulting floor-control signalling while respecting EG7 listen windows.
+
+Problem covered:
+
+- Added a long-run MM model test with 4096 registered members on one GSSI in EG7. After initial attach and EG7 confirmation, every member performs three group-less `DemandLocationUpdating` refresh cycles.
+- The test proves that these refreshes do not create a D-LOCATION-UPDATE-COMMAND loop, do not emit `Deregister`/`Deaffiliate`, keep all 4096 members in the GSSI registry, preserve sampled EG7 assignments, and keep the restart-recovery cache coherent.
+- Added SDS/status large-GSSI tests with 1024 locally registered and affiliated members. U-SDS and U-STATUS to the group produce exactly one GSSI-addressed downlink PDU using unacknowledged L2, with no per-ISSI fan-out and no Brew forwarding.
+- Re-ran existing CMCE 4096/10k large-group floor-control tests and UMAC large-group PTT storm tests so this checkpoint ties MM persistence, SDS/status group routing, CMCE floor admission, and UMAC scheduling evidence together.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.4.4, 16.8.0, 16.9.3.4, and 16.10.35a for location update/group-affiliation persistence during group-less refresh.
+- EN 300 392-2 clauses 16.7.1, 16.10.9, 16.10.10, 23.7.6, and T.210 for preserving negotiated EG7 state until a real energy-economy procedure changes it.
+- EN 300 392-2 clauses 13.2, 14.7.1.11, 14.7.2.7, and 18.3.5.3.1 for SDS/status group delivery over unacknowledged GSSI addressing.
+- EN 300 392-2 clause 14.5.2.2.1 and clause 23.5 for existing group floor-control grant/queued/not-granted signalling and assigned-channel delivery checks.
+- This remains clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `test_large_eg7_group_repeated_group_less_updates_preserve_all_affiliations`.
+- `crates/tetra-entities/tests/test_sds_bs.rs`
+  - Added a 1024-member local group helper.
+  - Added large-GSSI U-SDS and U-STATUS routing tests.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs test_large_eg7_group_repeated_group_less_updates_preserve_all_affiliations --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_large --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_sds_bs large_local_group --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_sds_bs --locked` -> 119 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs large_group --locked` -> 8 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs ten_thousand --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs large_group_ptt_storm --locked` -> 4 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_mm_bs.rs crates/tetra-entities/tests/test_sds_bs.rs` -> pass.
+
+Next non-repeating execution:
+
+1. Add deterministic MM restart-recovery startup sweep evidence for a large cached group where overdue probes stay ordered by ISSI and do not burst if ticks are delayed.
+2. Add UMAC same-priority protected-control admission/coalescing evidence for over-cap floor-withdraw storms, especially when every queued element is already protected.
+3. Add operator-visible metrics or config documentation for hard local scale caps: CMCE floor FIFO 4096, UMAC pending TMA 4096, and RA ACK queue 8192.
