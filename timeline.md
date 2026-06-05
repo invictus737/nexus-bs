@@ -3821,3 +3821,47 @@ Next non-repeating execution:
    - `CMCE: subscriber affiliate issi=... groups=[226333]`;
    - no `T353 expired` rollback for accepted same-ISSI ACKs;
    - no `No Group` steady state for `2260082`, `2260616`, `2260618`.
+
+## 2026-06-05 12:26:33 EEST - Deployed restart ACK hardening to test BS
+
+Deployment:
+
+- Commit deployed: `40398d91` (`fix: accept restart group ack handles`).
+- Command used: `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Build happened locally and binary was copied directly to testing; no Rust compile on Pi and no binary backup step.
+- Live header now shows `Build: v0.1.55-40398d91`.
+
+Remote state after restart:
+
+- Running processes:
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+  - `nexus-bs-control-service --listen 127.0.0.1:9002`
+- Recovery cache:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+
+Fresh log review from last restart:
+
+- Full log copied to `/private/tmp/nexus-bs-after-40398d91.log` and read in chunks.
+- `MM: restart recovery armed for 3 local ISSI(s): {2260082, 2260616, 2260618}` appears immediately after startup.
+- `2260082` registers with `226333` and CMCE affiliates `groups=[226333]`.
+- `2260618` registers with `226333`; one solicited attach/detach completion briefly deaffiliates then immediately reaffiliates `226333`, ending affiliated.
+- `2260616` initially misses a few recovery command deliveries, then sends `DemandLocationUpdating` with EG7 and `226333`; CMCE registers and affiliates `groups=[226333]`.
+- No `T353 expired`, `No Group`, `PTT denied`, `Unit Not Attached`, `RequestedServiceNotAvailable`, or `service unavailable` found in the fresh restart log.
+- Remaining warnings are RF/startup or expected live-radio noise:
+  - startup TX late / lost samples;
+  - `SX1255 temperature read failed` while streams are active;
+  - initial LLC retransmission exhaustion before the radios answer;
+  - occasional malformed/short MAC access bursts.
+
+Status:
+
+- The deployed build fixes the MM restart ACK-handle purge path in code and proves, from this restart, that the three lab terminals are affiliated to `226333` at CMCE level.
+- This is clause-scoped engineering validation for the touched ETSI procedures, not formal certification.
+
+Next non-repeating execution:
+
+1. User should visually confirm terminals no longer show `No Group` after this restart.
+2. If any terminal still displays `No Group`, capture the fresh log interval after that visual state and compare dashboard state vs MM/CMCE affiliation lines.
+3. Run a live group PTT test on `226333`; if failure occurs, inspect from the current build log around `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, and UMAC floor events.
