@@ -885,9 +885,14 @@ impl BsChannelScheduler {
     fn elem_protected_from_backpressure(elem: &DlSchedElem) -> bool {
         matches!(
             elem,
-            DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_) | DlSchedElem::Stealing(..)
+            DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_)
         ) || Self::elem_has_channel_allocation(elem)
             || Self::elem_has_integrated_grant_or_ack(elem)
+            || matches!(
+                elem,
+                DlSchedElem::Stealing(..)
+                    if Self::stealing_sched_priority(elem) > StealingSchedPriority::Ordinary
+            )
     }
 
     fn mark_sched_elem_discarded_if_reported(elem: DlSchedElem) {
@@ -1383,8 +1388,6 @@ impl BsChannelScheduler {
                     // transmit; keep it ahead of RequestQueued/NotGranted
                     // storm traffic in large GSSI cells.
                     StealingSchedPriority::PositiveFloorGrant
-                } else if has_channel_allocation {
-                    StealingSchedPriority::ChannelAllocation
                 } else {
                     StealingSchedPriority::Ordinary
                 }
@@ -2998,6 +3001,7 @@ mod tests {
     };
 
     use tetra_pdus::{
+        cmce::pdus::d_tx_interrupt::DTxInterrupt,
         mle::{
             fields::bs_service_details::BsServiceDetails,
             pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
@@ -3186,31 +3190,9 @@ mod tests {
         (pdu, sdu)
     }
 
-    fn test_d_tx_granted_stch_block(
-        addr: TetraAddress,
-        transmission_grant: TransmissionGrant,
-        ul_dl_assigned: UlDlAssignment,
-    ) -> BitBuffer {
+    fn test_cmce_stch_block(addr: TetraAddress, mut sdu: BitBuffer, ul_dl_assigned: UlDlAssignment) -> BitBuffer {
         const STCH_CAP: usize = 124;
 
-        let mut sdu = BitBuffer::new_autoexpand(40);
-        DTxGranted {
-            call_identifier: 7,
-            transmission_grant: transmission_grant.into_raw() as u8,
-            transmission_request_permission: false,
-            encryption_control: false,
-            reserved: false,
-            notification_indicator: None,
-            transmitting_party_type_identifier: None,
-            transmitting_party_address_ssi: None,
-            transmitting_party_extension: None,
-            external_subscriber_number: None,
-            facility: None,
-            dm_ms_address: None,
-            proprietary: None,
-        }
-        .to_bitbuf(&mut sdu)
-        .expect("serialize compact D-TX GRANTED");
         sdu.seek(0);
 
         let mut timeslots = [false; 4];
@@ -3251,6 +3233,54 @@ mod tests {
         stch_block.copy_bits(&mut sdu, sdu_len);
         crate::umac::subcomp::fillbits::addition::write(&mut stch_block, Some(fill_bits));
         stch_block
+    }
+
+    fn test_d_tx_granted_stch_block(
+        addr: TetraAddress,
+        transmission_grant: TransmissionGrant,
+        ul_dl_assigned: UlDlAssignment,
+    ) -> BitBuffer {
+        let mut sdu = BitBuffer::new_autoexpand(40);
+        DTxGranted {
+            call_identifier: 7,
+            transmission_grant: transmission_grant.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("serialize compact D-TX GRANTED");
+        test_cmce_stch_block(addr, sdu, ul_dl_assigned)
+    }
+
+    fn test_d_tx_interrupt_stch_block(addr: TetraAddress, ul_dl_assigned: UlDlAssignment) -> BitBuffer {
+        let mut sdu = BitBuffer::new_autoexpand(40);
+        DTxInterrupt {
+            call_identifier: 7,
+            transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            transmission_request_permission: false,
+            encryption_control: false,
+            reserved: false,
+            notification_indicator: None,
+            transmitting_party_type_identifier: None,
+            transmitting_party_address_ssi: None,
+            transmitting_party_extension: None,
+            external_subscriber_number: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("serialize compact D-TX INTERRUPT");
+        test_cmce_stch_block(addr, sdu, ul_dl_assigned)
     }
 
     fn test_ordinary_resource_for_issi(issi: u32, sdu_bits: usize) -> (MacResource, BitBuffer) {
@@ -4086,9 +4116,10 @@ mod tests {
             requester,
             Some(grant_reporter.clone()),
         );
-        assert!(
-            sched.dltx_queues[traffic_ts as usize - 1].len() > MAX_DLSCHED_ELEMS_PER_TIMESLOT,
-            "all FACCH/STCH floor-control entries are protected from queue backpressure"
+        assert_eq!(
+            sched.dltx_queues[traffic_ts as usize - 1].len(),
+            MAX_DLSCHED_ELEMS_PER_TIMESLOT,
+            "low-value DL-only busy/queued STCH responses may be shed so a positive floor grant does not grow the queue"
         );
 
         let subscribers = SubscriberRegistry::new();
@@ -4131,6 +4162,77 @@ mod tests {
                 .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi)),
             "lower-priority busy responses should remain queued after the requester floor grant is sent"
         );
+    }
+
+    #[test]
+    fn test_preemptive_floor_interrupt_stch_stays_ahead_of_positive_grant() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let new_speaker = TetraAddress::issi(2_260_616);
+        let old_speaker = TetraAddress::issi(2_260_082);
+        let grant_reporter = TxReporter::new_unacked();
+        let interrupt_reporter = TxReporter::new_unacked();
+
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_granted_stch_block(new_speaker, TransmissionGrant::Granted, UlDlAssignment::Both),
+            new_speaker,
+            Some(grant_reporter.clone()),
+        );
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_interrupt_stch_block(old_speaker, UlDlAssignment::Dl),
+            old_speaker,
+            Some(interrupt_reporter.clone()),
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let (_tch, first_stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let first_stch = first_stch.expect("preemptive handoff should send D-TX INTERRUPT first");
+
+        let mut parsed = BitBuffer::from_bitbuffer(&first_stch);
+        let _resource = MacResource::from_bitbuf(&mut parsed).expect("selected STCH should carry MAC-RESOURCE");
+        let pdu_type = parsed
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok());
+        assert_eq!(pdu_type, Some(CmcePduTypeDl::DTxInterrupt));
+        assert_eq!(interrupt_reporter.get_state(), TxState::Transmitted);
+        assert_eq!(grant_reporter.get_state(), TxState::Pending);
+
+        let (_tch, second_stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let second_stch = second_stch.expect("positive grant should remain queued after interrupt");
+        let mut parsed = BitBuffer::from_bitbuffer(&second_stch);
+        let _resource = MacResource::from_bitbuf(&mut parsed).expect("selected STCH should carry MAC-RESOURCE");
+        let granted = DTxGranted::from_bitbuf(&mut parsed).expect("second STCH should carry D-TX GRANTED");
+        assert_eq!(granted.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+        assert_eq!(grant_reporter.get_state(), TxState::Transmitted);
+
+        // EN 300 392-2 clause 14.5.2.2.1 f): interruption withdraws the
+        // current permission before the new floor is advertised. This protects
+        // the UMAC air path, not only CMCE's message production order.
     }
 
     #[test]

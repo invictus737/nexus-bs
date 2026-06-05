@@ -5838,3 +5838,49 @@ Next non-repeating execution:
 2. Add a scheduler/integration regression that proves `D-TX INTERRUPT` remains before preemptive `D-TX GRANTED` on the air path, not just in CMCE message order.
 3. Continue pending group/private release call-id wrap and pending-release flood tests.
 4. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.
+
+## 2026-06-05 18:45:46 EEST - UMAC STCH backpressure bounded for low-value group floor responses
+
+User goal:
+
+- The BS must stay robust with thousands of terminals in one group and must not grow unbounded STCH control queues during PTT storms.
+- Preemptive floor-control ordering must stay correct: withdraw/interruption before the new grant.
+
+Component in simple technical terms:
+
+- Backpressure is the scheduler's safety valve when too many downlink control messages are waiting for one traffic timeslot.
+- `D-TX GRANTED/RequestQueued/NotGranted` DL-only responses are useful feedback, but under a storm they are lower value than the one positive grant that lets the next speaker enter U-plane.
+- `D-TX INTERRUPT` and `D-TX CEASED` are floor-withdrawal messages; those remain protected because they stop or move the current speaker.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: floor-control responses grant, queue, reject, or withdraw permission to transmit.
+- EN 300 392-2 clause 14.5.2.2.1 f): transmission interruption withdraws the current permission before the new speaker is advertised.
+- EN 300 392-2 clause 23.5: these messages are carried on assigned-channel STCH/FACCH during traffic.
+- This is queue robustness and ordering regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Backpressure no longer protects every `DlSchedElem::Stealing` item blindly.
+  - Protects floor-withdrawal STCH (`D-TX INTERRUPT`, `D-TX CEASED`) and positive `D-TX GRANTED` with `UL`/`Both` channel allocation.
+  - Allows lower-value DL-only `D-TX GRANTED` outcomes (`RequestQueued`, `NotGranted`, listener-only `GrantedToOtherUser`) to be shed when the STCH queue is full.
+  - Added `test_preemptive_floor_interrupt_stch_stays_ahead_of_positive_grant`, proving the air-path scheduler sends interrupt before a positive grant even when the grant was queued first.
+  - Tightened the 4096-entry large-group test to assert the queue stays bounded at `MAX_DLSCHED_ELEMS_PER_TIMESLOT` while preserving/transmitting the positive grant.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib test_large_group_positive_floor_grant_stch_preempts_busy_response_backlog --locked` -> 1 passed after the bounded-backpressure assertion.
+- `cargo test -p tetra-entities --lib test_preemptive_floor_interrupt_stch_stays_ahead_of_positive_grant --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 68 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 59 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this bounded STCH backpressure/preemption regression patch.
+2. Continue pending group/private release call-id wrap tests.
+3. Continue large pending-release PTT flood tests.
+4. Continue restart-recovered EG7 affiliation through UMAC scheduling.
