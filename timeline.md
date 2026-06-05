@@ -4398,3 +4398,56 @@ Next non-repeating execution:
 1. Have the user check the actual radio display after the completed location update window, especially `2260616` in EG7.
 2. If a radio still shows `No Group`, capture the exact ISSI and wall-clock time, then inspect the log around that station's `U-LOCATION UPDATE DEMAND`, `D-LOCATION UPDATE ACCEPT`, LLC ACK, and any subsequent group report/attach-detach PDU.
 3. Continue live group PTT validation on `226333`; if PTT fails, inspect the interval around `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, floor ownership, and UMAC voice grant timing.
+
+## 2026-06-05 14:30:21 EEST - Private simplex called-ISSI End Call release
+
+User symptom:
+
+- Private simplex end-of-call still had two bad peer-side outcomes: the called ISSI could show `Not Answered`, or Motorola MXP600 `2260618` could soft-reset after the remote caller pressed red.
+- The high-risk live shape is `2260616 -> 2260618`: caller clears with `U-DISCONNECT`, while `2260618` is the called ISSI and may have recently held or released the simplex floor.
+
+Component, simple technical meaning:
+
+- CMCE/CC-BS is the private-call control state machine inside the BS. It decides which call-control PDU is sent when a terminal opens, speaks in, or ends a private call.
+- `U-DISCONNECT` is the uplink terminal request to end the call.
+- `D-RELEASE` is the downlink release indication that does not require a terminal response; this is the clean peer-side "end call" path.
+- `D-DISCONNECT` is a downlink disconnect request that requires the peer to answer `U-RELEASE`; keeping this path for sensitive caller-hangup-to-called-peer cases was the likely source of the bad UI/reset behavior.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: either calling or called user may initiate individual-call disconnection; the MS that sent `U-DISCONNECT` waits for `D-RELEASE`; the SwMI should inform the other MS of call clearance either by `D-DISCONNECT` or by `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: an MS receiving `D-DISCONNECT` shall respond with `U-RELEASE`; an MS receiving `D-RELEASE` sends no response.
+- This patch uses the `D-RELEASE` alternative explicitly allowed by clause 14.5.1.3.1 for the called ISSI in local private simplex caller-hangup cases. It is clause-scoped hardening, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Private simplex caller-hangup now detects `sender == calling_addr` and `peer == called_addr`.
+  - In that case the called peer is cleared after the existing tail drain with `D-RELEASE`, not `D-DISCONNECT`.
+  - The disconnecting caller still gets prompt `D-RELEASE(UserRequestedDisconnection)`.
+  - The called peer gets `D-RELEASE(SwmiRequestedDisconnection)`, so the peer sees SwMI call release / end-call semantics instead of a user-request/no-answer-style handshake.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`
+  - Pending private disconnect tail-drain state now stores a separate peer cause.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Tail-drain completion now uses that separate peer cause when sending peer `D-RELEASE`.
+  - A private disconnect now also consumes any pending simplex `U-TX CEASED` tail-drain for the same call. This preserves the bearer-tail wait but suppresses stale `D-TX CEASED` / floor-release signalling after call release has started.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated direct simple private call workflow and unsolicited `U-RELEASE` regression to assert no peer `D-DISCONNECT` for caller-hangup-to-called-ISSI.
+  - Added/kept D-DISCONNECT coverage by making the called party disconnect after it has held the floor, so the caller peer path still exercises `D-DISCONNECT -> U-RELEASE` where applicable.
+  - Updated MXP600 regressions to require peer `D-RELEASE(SwmiRequestedDisconnection)`.
+  - Added overlap regression for `2260616 -> 2260618`: MXP600 peer sends `U-TX CEASED`, caller presses red before tail-drain expiry, and BS sends only peer `D-RELEASE` with no delayed `D-TX CEASED`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_disconnect_cancels_pending_peer_tx_ceased_tail --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 65 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 132 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit and deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with the normal local-build deploy script.
+2. Retest exact field case: `2260616 -> 2260618`, let `2260618` speak last if desired, then press red on `2260616`.
+3. Expected live log: prompt `D-RELEASE(UserRequestedDisconnection)` to `2260616`, no peer `D-DISCONNECT` to `2260618`, tail-drained `D-RELEASE(SwmiRequestedDisconnection)` to `2260618`, no peer `U-RELEASE` required, no MXP600 soft reboot, no `Not Answered`.

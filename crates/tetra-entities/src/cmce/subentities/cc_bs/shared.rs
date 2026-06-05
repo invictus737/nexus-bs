@@ -993,6 +993,7 @@ impl CcBsSubentity {
         sender: TetraAddress,
         peer_issi: u32,
         disconnect_cause: DisconnectCause,
+        peer_disconnect_cause: DisconnectCause,
         peer_clear: IndividualDisconnectPeerClear,
     ) {
         if self.pending_individual_disconnect_tail_drains.contains_key(&call_id) {
@@ -1003,17 +1004,16 @@ impl CcBsSubentity {
             return;
         }
 
-        let started_at = if self
-            .pending_individual_tx_ceased_tail_drains
-            .get(&call_id)
-            .is_some_and(|pending| pending.sender.addr.ssi == sender.ssi)
-        {
-            self.pending_individual_tx_ceased_tail_drains
-                .remove(&call_id)
-                .map(|pending| pending.started_at)
-                .unwrap_or(self.dltime)
-        } else {
-            self.dltime
+        let started_at = match self.pending_individual_tx_ceased_tail_drains.remove(&call_id) {
+            Some(pending) => {
+                tracing::debug!(
+                    "CMCE: simplex private disconnect call_id={} supersedes pending TX-CEASED tail drain from ISSI {}; suppressing stale D-TX CEASED",
+                    call_id,
+                    pending.sender.addr.ssi
+                );
+                pending.started_at
+            }
+            None => self.dltime,
         };
 
         tracing::debug!(
@@ -1029,6 +1029,7 @@ impl CcBsSubentity {
                 sender,
                 peer_issi,
                 cause: disconnect_cause,
+                peer_cause: peer_disconnect_cause,
                 peer_clear,
                 started_at,
             },
@@ -1226,7 +1227,7 @@ impl CcBsSubentity {
                     }
                 }
                 IndividualDisconnectPeerClear::Release => {
-                    self.send_individual_disconnect_peer_release(queue, call_id, pending.peer_issi, pending.cause);
+                    self.send_individual_disconnect_peer_release(queue, call_id, pending.peer_issi, pending.peer_cause);
                 }
             }
         }

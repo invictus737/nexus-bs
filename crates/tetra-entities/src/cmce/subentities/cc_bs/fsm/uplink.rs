@@ -858,18 +858,32 @@ impl CcBsSubentity {
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
                 if !call_snapshot.simplex_duplex {
-                    let peer_clear = if call_snapshot.peer_is_current_or_last_floor_holder(peer_issi) {
+                    let caller_clearing_called_peer =
+                        sender.ssi == call_snapshot.calling_addr.ssi && peer_issi == call_snapshot.called_addr.ssi;
+                    let peer_clear = if caller_clearing_called_peer || call_snapshot.peer_is_current_or_last_floor_holder(peer_issi) {
                         // EN 300 392-2 clause 14.5.1.3.1 allows the SwMI to
                         // inform the other individual-call MS by D-RELEASE as
-                        // an alternative to D-DISCONNECT. If that peer is the
-                        // current or most recent simplex floor holder, avoid a
-                        // response exchange during U-plane clear and send
-                        // tail-drained D-RELEASE instead.
+                        // an alternative to D-DISCONNECT. For local simplex
+                        // MO private calls, clear the called MS with a SwMI
+                        // end-call D-RELEASE instead of making it enter a
+                        // D-DISCONNECT -> U-RELEASE response exchange while
+                        // the traffic bearer is draining.
                         IndividualDisconnectPeerClear::Release
                     } else {
                         IndividualDisconnectPeerClear::Disconnect
                     };
-                    self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause, peer_clear);
+                    let peer_disconnect_cause = match peer_clear {
+                        IndividualDisconnectPeerClear::Release => DisconnectCause::SwmiRequestedDisconnection,
+                        IndividualDisconnectPeerClear::Disconnect => disconnect_cause,
+                    };
+                    self.begin_individual_disconnect_tail_drain(
+                        call_id,
+                        sender,
+                        peer_issi,
+                        disconnect_cause,
+                        peer_disconnect_cause,
+                        peer_clear,
+                    );
                     return;
                 }
                 if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {

@@ -104,6 +104,7 @@ struct PendingIndividualDisconnectTailDrain {
     sender: TetraAddress,
     peer_issi: u32,
     cause: DisconnectCause,
+    peer_cause: DisconnectCause,
     peer_clear: IndividualDisconnectPeerClear,
     started_at: TdmaTime,
 }
