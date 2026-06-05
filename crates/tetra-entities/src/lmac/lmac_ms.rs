@@ -272,7 +272,10 @@ impl LmacMs {
         // block, coded to a 168-bit type-5 block and mapped with the
         // extended training sequence in a control uplink burst. This is the
         // narrow MS random-access path used by small MAC-ACCESS PDUs.
-        let encoded_blk1 = errorcontrol::encode_cp(blk1);
+        let Some(encoded_blk1) = errorcontrol::encode_cp(blk1) else {
+            tracing::warn!("LMAC-MS: failed encoding SCH/HU uplink request, dropping");
+            return;
+        };
         let prim_phy = TpUnitdataReqSlot {
             train_type: TrainingSequence::ExtendedTrainSeq,
             burst_type: BurstType::CUB,

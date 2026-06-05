@@ -66,21 +66,23 @@ pub const TCH_S_PARAMS: ErrorControlParams = ErrorControlParams {
     have_crc16: false,
 };
 
-/// Gets error control parameters for a given DL logical channel.
-pub fn get_params(lchan: LogicalChannel) -> &'static ErrorControlParams {
+/// Gets implemented error-control parameters for a given logical channel.
+pub fn get_params(lchan: LogicalChannel) -> Option<&'static ErrorControlParams> {
     match lchan {
-        LogicalChannel::Bsch => &BSCH_PARAMS,
-        LogicalChannel::SchHd | LogicalChannel::Stch | LogicalChannel::Bnch => &SCH_HD_PARAMS,
-        LogicalChannel::Aach => &AACH_PARAMS,
-        LogicalChannel::SchF => &SCH_F_PARAMS,
-        LogicalChannel::SchHu => &SCH_HU_PARAMS,
-        LogicalChannel::TchS => &TCH_S_PARAMS,
+        LogicalChannel::Bsch => Some(&BSCH_PARAMS),
+        LogicalChannel::SchHd | LogicalChannel::Stch | LogicalChannel::Bnch => Some(&SCH_HD_PARAMS),
+        LogicalChannel::Aach => Some(&AACH_PARAMS),
+        LogicalChannel::SchF => Some(&SCH_F_PARAMS),
+        LogicalChannel::SchHu => Some(&SCH_HU_PARAMS),
+        LogicalChannel::TchS => Some(&TCH_S_PARAMS),
 
-        LogicalChannel::Tch24 => unimplemented!(),
-        LogicalChannel::Tch48 => unimplemented!(),
-        LogicalChannel::Tch72 => unimplemented!(),
+        // EN 300 392-2 defines these as distinct logical channels, but this
+        // stack does not implement their channel coding paths yet. Return
+        // None so LMAC can fail closed instead of panicking or reusing the
+        // wrong TCH/S speech coding.
+        LogicalChannel::Tch24 | LogicalChannel::Tch48 | LogicalChannel::Tch72 => None,
 
-        LogicalChannel::Blch => unimplemented!(),
-        LogicalChannel::Clch => unimplemented!(),
+        // Linearization channels are not ordinary control-plane coding paths.
+        LogicalChannel::Blch | LogicalChannel::Clch => None,
     }
 }

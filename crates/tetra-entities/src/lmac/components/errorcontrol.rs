@@ -14,21 +14,29 @@ const MAX_TYPE2_BITS: usize = 288;
 const MAX_TYPE345_BITS: usize = 432;
 const MAX_TYPE345_HALFSLOT_BITS: usize = 216;
 
-/// Encodes control plane message from type1 to type5 bits
-/// Handles CP channels except AACH
-pub fn encode_cp(mut prim: TmvUnitdataReq) -> BitBuffer {
+/// Encodes control plane message from type1 to type5 bits.
+/// Handles implemented CP channels except AACH.
+pub fn encode_cp(mut prim: TmvUnitdataReq) -> Option<BitBuffer> {
     let lchan = prim.logical_channel;
-    assert!(lchan.is_control_channel() && lchan != LogicalChannel::Aach);
+    if !lchan.is_control_channel() || lchan == LogicalChannel::Aach {
+        tracing::warn!("encode_cp: unsupported logical channel {:?}, dropping", lchan);
+        return None;
+    }
 
-    let params = errorcontrol_params::get_params(lchan);
+    let Some(params) = errorcontrol_params::get_params(lchan) else {
+        tracing::warn!("encode_cp: no implemented error-control parameters for {:?}, dropping", lchan);
+        return None;
+    };
 
-    assert!(
-        prim.mac_block.get_len() == params.type1_bits,
-        "encode_cp: prim.mac_block length {} does not match type1_bits {} for lchan {:?}",
-        prim.mac_block.get_len(),
-        params.type1_bits,
-        lchan
-    );
+    if prim.mac_block.get_len() != params.type1_bits {
+        tracing::warn!(
+            "encode_cp: prim.mac_block length {} does not match type1_bits {} for lchan {:?}, dropping",
+            prim.mac_block.get_len(),
+            params.type1_bits,
+            lchan
+        );
+        return None;
+    }
     tracing::trace!("encode_cp {:?} type1 {}", lchan, prim.mac_block.dump_bin());
 
     // Convert bitbuffer to bitarray -> type1
@@ -37,7 +45,10 @@ pub fn encode_cp(mut prim: TmvUnitdataReq) -> BitBuffer {
     prim.mac_block.to_bitarr(&mut type2_arr[0..params.type1_bits]);
 
     // CRC addition, type1 -> type2
-    assert!(params.have_crc16);
+    if !params.have_crc16 {
+        tracing::warn!("encode_cp: {:?} does not use CRC-16 control coding, dropping", lchan);
+        return None;
+    }
     let crc = !crc16::crc16_ccitt_bits(&type2_arr[0..params.type1_bits], params.type1_bits);
     for i in 0..16 {
         type2_arr[params.type1_bits + i] = ((crc >> (15 - i)) & 1) as u8;
@@ -75,7 +86,7 @@ pub fn encode_cp(mut prim: TmvUnitdataReq) -> BitBuffer {
     tracing::trace!("encode_cp {:?} type5: {:?}", lchan, type5.dump_bin());
 
     // Pass block to Phy
-    type5
+    Some(type5)
 }
 
 /// Decodes control plane message from type5 to type1 bits
@@ -83,7 +94,10 @@ pub fn encode_cp(mut prim: TmvUnitdataReq) -> BitBuffer {
 /// buf is BitBuffer with type1 bits if decoding successful
 /// bool is true if CRC check was successful
 pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code: Option<u32>) -> (Option<BitBuffer>, bool) {
-    assert!(lchan.is_control_channel() && lchan != LogicalChannel::Aach);
+    if !lchan.is_control_channel() || lchan == LogicalChannel::Aach {
+        tracing::warn!("decode_cp: unsupported logical channel {:?}, dropping", lchan);
+        return (None, false);
+    }
 
     // Various intermediate buffers, needed for decoding stages
     // We allocate the largest block we may possibly need
@@ -93,7 +107,10 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
     let mut type2_arr = [0u8; MAX_TYPE2_BITS];
 
     // Fetch decoding parameters for this logical channel type
-    let params = errorcontrol_params::get_params(lchan);
+    let Some(params) = errorcontrol_params::get_params(lchan) else {
+        tracing::warn!("decode_cp: no implemented error-control parameters for {:?}, dropping", lchan);
+        return (None, false);
+    };
 
     let mut type5 = prim.block;
     tracing::trace!("decode_cp {:?} type5: {:?}", lchan, type5.dump_bin());
@@ -136,7 +153,10 @@ pub fn decode_cp(lchan: LogicalChannel, prim: TpUnitdataInd, default_scramb_code
     );
 
     // CRC check, type2 -> type1
-    assert!(params.have_crc16);
+    if !params.have_crc16 {
+        tracing::warn!("decode_cp: {:?} does not use CRC-16 control coding, dropping", lchan);
+        return (None, false);
+    }
     let type1_arr = &type2_arr[0..params.type1_bits];
     let crc = crc16::crc16_ccitt_bits(&type2_arr, params.type1_bits + 16);
     let crc_ok = crc == crc16::TETRA_CRC_OK;
@@ -193,9 +213,19 @@ fn speech_crc(class2_bits: &[u8]) -> [u8; 8] {
 /// Encode traffic plane from type1 to type5 bits (EN 300 395-2): 274 ACELP bits → UEP encoding
 /// (class0 uncoded, class1/2 convenc+punct) → 432 bits → interleave → scramble.
 /// `blk_num`: 1 = full-slot (432 bits), 2 = half-slot stolen by STCH (returns second 216 bits, triggers BFI).
-pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
+pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> Option<BitBuffer> {
     let lchan = prim.logical_channel;
-    let params = errorcontrol_params::get_params(lchan);
+    if lchan != LogicalChannel::TchS {
+        // EN 300 392-2 clauses 8.3.1.3.2 to 8.3.1.3.4 define circuit-mode
+        // data TCHs separately from TCH/S speech. Do not encode them with the
+        // speech UEP path.
+        tracing::warn!("encode_tp: unsupported traffic logical channel {:?}, dropping", lchan);
+        return None;
+    }
+    let Some(params) = errorcontrol_params::get_params(lchan) else {
+        tracing::warn!("encode_tp: no implemented error-control parameters for {:?}, dropping", lchan);
+        return None;
+    };
 
     // ── Extract type-1 bits from BitBuffer ──────────────────────────
     prim.mac_block.seek(0);
@@ -275,14 +305,14 @@ pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
 
     if blk_num == 1 {
         // Full slot: return all 432 type5 bits
-        type4
+        Some(type4)
     } else {
         // Half slot (STCH stole first half): encode full 432-bit block, return second 216 bits.
         // Interleaving spreads UEP classes across both halves, so missing first half causes BFI (acceptable at PTT boundaries).
         let mut full_arr = [0u8; MAX_TYPE345_BITS];
         type4.seek(0);
         type4.to_bitarr(&mut full_arr[0..params.type345_bits]);
-        BitBuffer::from_bitarr(&full_arr[MAX_TYPE345_HALFSLOT_BITS..params.type345_bits])
+        Some(BitBuffer::from_bitarr(&full_arr[MAX_TYPE345_HALFSLOT_BITS..params.type345_bits]))
     }
 }
 
@@ -290,9 +320,15 @@ pub fn encode_tp(mut prim: TmvUnitdataReq, blk_num: u8) -> BitBuffer {
 /// descramble → deinterleave → split UEP → Class0 copy, Class1+2 depuncture+Viterbi → CRC → reassemble → reorder.
 /// Returns (Option<BitBuffer>, bool): 274 ACELP bits if successful, CRC check result for Class 2.
 pub fn decode_tp(lchan: LogicalChannel, type5_block: BitBuffer, scrambling_code: u32) -> (Option<BitBuffer>, bool) {
-    assert_eq!(lchan, LogicalChannel::TchS);
+    if lchan != LogicalChannel::TchS {
+        tracing::warn!("decode_tp: unsupported traffic logical channel {:?}, dropping", lchan);
+        return (None, false);
+    }
 
-    let params = errorcontrol_params::get_params(lchan);
+    let Some(params) = errorcontrol_params::get_params(lchan) else {
+        tracing::warn!("decode_tp: no implemented error-control parameters for {:?}, dropping", lchan);
+        return (None, false);
+    };
 
     // ── De-scramble type5 → type4 ──────────────────────────────────
     let mut type5 = type5_block;
@@ -457,7 +493,7 @@ mod tests {
             logical_channel: lchan,
             scrambling_code: scramb_code,
         };
-        let type5 = encode_cp(prim_req);
+        let type5 = encode_cp(prim_req).expect("BNCH should have implemented CP coding");
         // println!("type5:   {}", type5.dump_bin());
         assert_eq!(type5vec, type5.to_bitstr());
 
@@ -490,7 +526,7 @@ mod tests {
             logical_channel: lchan,
             scrambling_code: scramb_code,
         };
-        let type5 = encode_cp(prim_req);
+        let type5 = encode_cp(prim_req).expect("BSCH should have implemented CP coding");
         let prim_ind = TpUnitdataInd {
             train_type: TrainingSequence::SyncTrainSeq,
             burst_type: BurstType::SDB,
@@ -564,7 +600,7 @@ mod tests {
             logical_channel: lchan,
             scrambling_code: scramb_code,
         };
-        let type5 = encode_cp(prim_req);
+        let type5 = encode_cp(prim_req).expect("SCH/F should have implemented CP coding");
         let prim_ind = TpUnitdataInd {
             train_type: TrainingSequence::NormalTrainSeq1,
             burst_type: BurstType::NDB,
@@ -594,7 +630,7 @@ mod tests {
             logical_channel: lchan,
             scrambling_code: scramb_code,
         };
-        let type5 = encode_tp(prim_req, 1);
+        let type5 = encode_tp(prim_req, 1).expect("TCH/S should have implemented TP coding");
         assert_eq!(type5.get_len(), 432);
 
         let (decoded, crc_ok) = decode_tp(lchan, type5, scramb_code);
@@ -605,5 +641,38 @@ mod tests {
             BitBuffer::from_bitarr(&codec_bits).to_bitstr(),
             "Round-trip encode→decode mismatch for TCH/S"
         );
+    }
+
+    #[test]
+    fn test_unsupported_logical_channels_fail_closed() {
+        let scramb_code = scrambler::tetra_scramb_get_init(204, 1337, 1);
+
+        for lchan in [LogicalChannel::Tch24, LogicalChannel::Tch48, LogicalChannel::Tch72] {
+            let prim_req = TmvUnitdataReq {
+                mac_block: BitBuffer::new(274),
+                logical_channel: lchan,
+                scrambling_code: scramb_code,
+            };
+            assert!(
+                encode_tp(prim_req, 1).is_none(),
+                "unsupported traffic channel {lchan:?} must fail closed instead of panicking"
+            );
+
+            let (decoded, crc_ok) = decode_tp(lchan, BitBuffer::new(432), scramb_code);
+            assert!(decoded.is_none());
+            assert!(!crc_ok);
+        }
+
+        for lchan in [LogicalChannel::Blch, LogicalChannel::Clch] {
+            let prim_req = TmvUnitdataReq {
+                mac_block: BitBuffer::new(124),
+                logical_channel: lchan,
+                scrambling_code: scramb_code,
+            };
+            assert!(
+                encode_cp(prim_req).is_none(),
+                "linearization channel {lchan:?} must not enter ordinary C-plane coding"
+            );
+        }
     }
 }

@@ -465,6 +465,7 @@ fn encoded_tch_s(codec_bits: &[u8], blk_num: u8) -> BitBuffer {
         },
         blk_num,
     )
+    .expect("TCH/S test frame should encode")
 }
 
 fn build_uplink_tch_s_ind(train_type: TrainingSequence, block_num: PhyBlockNum, block: BitBuffer) -> SapMsg {

@@ -498,11 +498,21 @@ impl LmacBs {
 
         // Encode blk1 and optionally blk2
         prim_phy.bbk = Some(errorcontrol::encode_aach(bbk.mac_block, bbk.scrambling_code));
-        if blk1.logical_channel.is_traffic() {
-            prim_phy.blk1 = Some(errorcontrol::encode_tp(blk1, 1));
+        prim_phy.blk1 = if blk1.logical_channel.is_traffic() {
+            let logical_channel = blk1.logical_channel;
+            let Some(encoded) = errorcontrol::encode_tp(blk1, 1) else {
+                tracing::warn!("LMAC: failed encoding {:?} blk1, dropping slot", logical_channel);
+                return;
+            };
+            Some(encoded)
         } else {
-            prim_phy.blk1 = Some(errorcontrol::encode_cp(blk1));
-        }
+            let logical_channel = blk1.logical_channel;
+            let Some(encoded) = errorcontrol::encode_cp(blk1) else {
+                tracing::warn!("LMAC: failed encoding {:?} blk1, dropping slot", logical_channel);
+                return;
+            };
+            Some(encoded)
+        };
         if let Some(blk2) = blk2 {
             if blk2.logical_channel.is_traffic() {
                 if blk2.logical_channel == LogicalChannel::TchS && blk2.mac_block.get_len() == 216 {
@@ -512,10 +522,20 @@ impl LmacBs {
                     // EN 300 392-2 clause 23.8.5.
                     prim_phy.blk2 = Some(blk2.mac_block);
                 } else {
-                    prim_phy.blk2 = Some(errorcontrol::encode_tp(blk2, 2));
+                    let logical_channel = blk2.logical_channel;
+                    let Some(encoded) = errorcontrol::encode_tp(blk2, 2) else {
+                        tracing::warn!("LMAC: failed encoding {:?} blk2, dropping slot", logical_channel);
+                        return;
+                    };
+                    prim_phy.blk2 = Some(encoded);
                 }
             } else {
-                prim_phy.blk2 = Some(errorcontrol::encode_cp(blk2));
+                let logical_channel = blk2.logical_channel;
+                let Some(encoded) = errorcontrol::encode_cp(blk2) else {
+                    tracing::warn!("LMAC: failed encoding {:?} blk2, dropping slot", logical_channel);
+                    return;
+                };
+                prim_phy.blk2 = Some(encoded);
             }
         }
 

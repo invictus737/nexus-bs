@@ -1,5 +1,63 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 11:18:02 EEST - Restart `No Group` remains deploy/log blocked; LMAC fail-closed verified locally
+
+User report:
+
+- After BS restart, stations attach but show `No Group`.
+- The test setup is intentionally harsher now because the BS config is expected to run `energy_saving_mode = "eg7"`.
+
+Component explanation:
+
+- MM is Mobility Management: it owns terminal registration, group affiliation, restart recovery, and energy economy negotiation.
+- CMCE is call control: it consumes MM `Register`/`Affiliate` events so group calls know which ISSIs are valid listeners.
+- Dashboard is observability: it must display MM/CMCE state without losing group events that race registration events.
+- LMAC is the lower MAC/channel-coding edge: it turns logical MAC blocks into PHY channel-coded bits and must not encode unsupported logical channels as the wrong channel type.
+
+Current local finding:
+
+- The restart `No Group` fix is already present in local history:
+  - `f02371a fix: recover restart candidate groups before eg`
+  - Current HEAD is `a5d8b9e docs: record restart no group validation`.
+- The relevant local MM/dashboard behavior is already covered:
+  - restart candidates are captured before registration removes them from the recovery map;
+  - group-less restart candidate self-attach restores cached GSSI locally when present;
+  - `D-LOCATION UPDATE COMMAND(group_identity_report=1)` is queued before configured BS-initiated EG7 request;
+  - explicit empty complete group reports remain authoritative and clear cached groups;
+  - dashboard preserves group attach/snapshot events that arrive before registration events.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI may initiate registration and request group identity report after restart.
+- Clauses 16.8.0, 16.8.2, 16.8.3, 16.8.4 and 16.10.27a: reported groups and explicit complete empty reports are authoritative for affiliation state.
+- Clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7 and 23.7.6/T.210: EG7 scheduling must not make the terminal sleep before the BS requests the group report.
+- LMAC fail-closed work is scoped to implemented channel coding only: unsupported TCH/2.4, TCH/4.8, TCH/7.2 and linearization channels are dropped with warnings instead of being encoded through TCH/S or ordinary C-plane paths.
+- This is clause-scoped engineering evidence, not formal TETRA certification.
+
+Verification run:
+
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 16 passed.
+- `cargo test -p tetra-entities --lib dashboard_ --locked` -> 8 passed.
+- `cargo test -p tetra-entities --lib test_unsupported_logical_channels_fail_closed --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 8 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 51 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/log status:
+
+- Commit created after verification:
+  - `da6fa25 fix: fail closed unsupported lmac channels`
+- `ssh chris@192.168.1.179 ...` timed out on port 22 while trying to read `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` and the full `/home/chris/nexus-bs-v0.1.55-test/nexus-bs.log` from the latest restart.
+- Live restart validation and direct deploy are still blocked by SSH reachability, not by local code/test failures.
+
+Next non-repeating execution:
+
+1. When SSH returns, deploy directly with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`; do not compile on the Pi and do not create binary backups.
+2. Confirm remote build id is current HEAD and read the cache:
+   - expected: `2260082 226333:0:4`, `2260616 226333:0:4`, `2260618 226333:0:4` or equivalent class values.
+3. Read the fresh full log from the latest restart and compare terminal/dashboard `No Group` with MM/CMCE `subscriber affiliate` evidence before making another MM patch.
+
 ## 2026-06-05 09:49:05 EEST - Group restart grant and raw Block2 same-burst floor-release hardening
 
 Live problem targeted:
