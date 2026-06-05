@@ -11,7 +11,7 @@ use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::tla::{
     TLA_REPORT_FAILED_TRANSFER, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION, TLA_REPORT_NO_SPECIFIC_REPORT, TLA_REPORT_SUCCESSFUL_TRANSFER,
-    TlDataConfBl, TlaTlDataIndBl, TlaTlDataReqBl, TlaTlReportInd, TlaTlUnitdataIndBl,
+    TlDataConfBl, TlaTlDataIndBl, TlaTlDataReqBl, TlaTlReportInd, TlaTlUnitdataIndBl, TlaTlUnitdataReqBl,
 };
 use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaReportInd, TmaUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
@@ -37,6 +37,8 @@ const INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES: u32 =
     (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as u32 + 1) * T251_SENDER_RETRY_SIGNALLING_FRAMES;
 const N253_MAX_REQUESTED_TLSDU_REPEATS: u8 = 5;
 const TMA_HIGHEST_PDU_PRIORITY: Todo = 7;
+pub const LLC_MAX_OUTBOUND_ACKED_MESSAGES: usize = 8192;
+pub const LLC_MAX_OUTBOUND_UDATA_MESSAGES: usize = 8192;
 
 const _: () = assert!(T251_SENDER_RETRY_TIMER % TDMA_TIMESLOTS_PER_FRAME == 0);
 
@@ -451,6 +453,69 @@ impl Llc {
         }
     }
 
+    fn lowest_priority_unsubmitted_udata_below(messages: &VecDeque<QueuedUdata>, incoming_pdu_prio: Todo) -> Option<usize> {
+        let mut selected: Option<(usize, Todo)> = None;
+        for (idx, udata) in messages.iter().enumerate() {
+            if udata.submitted || udata.pdu_prio >= incoming_pdu_prio {
+                continue;
+            }
+
+            match selected {
+                Some((_, selected_prio)) if selected_prio <= udata.pdu_prio => {}
+                _ => selected = Some((idx, udata.pdu_prio)),
+            }
+        }
+        selected.map(|(idx, _)| idx)
+    }
+
+    fn ensure_udata_backlog_capacity(
+        queue: &mut MessageQueue,
+        messages: &mut VecDeque<QueuedUdata>,
+        incoming_pdu_prio: Todo,
+        limit: usize,
+    ) -> bool {
+        while messages.len() >= limit {
+            let Some(victim_idx) = Self::lowest_priority_unsubmitted_udata_below(messages, incoming_pdu_prio) else {
+                return false;
+            };
+            let Some(mut victim) = messages.remove(victim_idx) else {
+                return false;
+            };
+
+            // EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.4.1 define the
+            // service-user failure report and BL-UDATA store/repeat model.
+            // This cap is local resource control: only an unsubmitted
+            // lower-priority TL-UNITDATA is failed, and it is reported
+            // explicitly rather than being silently dropped.
+            Self::mark_udata_current_mac_discarded(&mut victim);
+            Self::mark_udata_service_discarded(&victim);
+            tracing::warn!(
+                "LLC: evicting queued BL-UDATA req_handle={} prio={} for incoming prio={} after backlog limit {}",
+                victim.req_handle,
+                victim.pdu_prio,
+                incoming_pdu_prio,
+                limit
+            );
+            Self::push_tla_report(queue, victim.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(victim.endpoint_id));
+        }
+
+        true
+    }
+
+    fn reject_tl_unitdata_backlog_full(queue: &mut MessageQueue, prim: &mut TlaTlUnitdataReqBl) {
+        if let Some(reporter) = prim.tx_reporter.take() {
+            Self::mark_reporter_discarded_if_pending(&reporter);
+        }
+        Self::push_tla_report(queue, prim.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(prim.endpoint_id));
+    }
+
+    fn reject_tldata_backlog_full(queue: &mut MessageQueue, prim: &mut TlaTlDataReqBl) {
+        if let Some(reporter) = prim.tx_reporter.take() {
+            Self::mark_reporter_discarded_if_pending(&reporter);
+        }
+        Self::push_tla_report(queue, prim.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(prim.endpoint_id));
+    }
+
     fn has_pending_outbound_for_key(&self, key: BasicLinkKey) -> bool {
         self.outbound_messages.iter().any(|ack| Self::expected_ack_key(ack) == key)
     }
@@ -746,6 +811,26 @@ impl Llc {
             return;
         }
 
+        if !Self::ensure_udata_backlog_capacity(
+            queue,
+            &mut self.outbound_udata_messages,
+            prim.pdu_prio,
+            LLC_MAX_OUTBOUND_UDATA_MESSAGES,
+        ) {
+            // EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.4.1 do not require
+            // an unbounded implementation queue. When local admission fails,
+            // fail the TL-UNITDATA request explicitly before any MAC request
+            // is created.
+            tracing::warn!(
+                "LLC: rejecting TL-UNITDATA.req req_handle={} prio={} after BL-UDATA backlog reached {}",
+                prim.req_handle,
+                prim.pdu_prio,
+                LLC_MAX_OUTBOUND_UDATA_MESSAGES
+            );
+            Self::reject_tl_unitdata_backlog_full(queue, &mut prim);
+            return;
+        }
+
         let mut pdu_buf = BitBuffer::new_autoexpand(32);
         let pdu = BlUdata { has_fcs: prim.fcs_flag };
         pdu.to_bitbuf(&mut pdu_buf);
@@ -848,6 +933,21 @@ impl Llc {
                 reporter.mark_discarded();
             }
             Self::push_tla_report(queue, prim.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(prim.endpoint_id));
+            return;
+        }
+
+        if self.outbound_messages.len() >= LLC_MAX_OUTBOUND_ACKED_MESSAGES {
+            // EN 300 392-2 clause 22.3.2.3 gives the N(S)/ACK/retransmission
+            // procedure once a BL-DATA transfer is admitted. Rejecting here is
+            // deliberately before N(S) allocation, so the basic-link send
+            // sequence is not consumed by a locally failed request.
+            tracing::warn!(
+                "LLC: rejecting TL-DATA.req req_handle={} prio={} after BL-DATA backlog reached {}",
+                prim.req_handle,
+                prim.pdu_prio,
+                LLC_MAX_OUTBOUND_ACKED_MESSAGES
+            );
+            Self::reject_tldata_backlog_full(queue, &mut prim);
             return;
         }
 
@@ -2283,12 +2383,69 @@ impl TetraEntityTrait for Llc {
 #[cfg(test)]
 mod tests {
     use super::{
-        INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES, Llc, ReceiveSeqState, ScheduledOutAck, T251_SENDER_RETRY_SIGNALLING_FRAMES,
-        TDMA_TIMESLOTS_PER_FRAME,
+        INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES, LLC_MAX_OUTBOUND_ACKED_MESSAGES, LLC_MAX_OUTBOUND_UDATA_MESSAGES, Llc,
+        QueuedUdata, ReceiveSeqState, ScheduledOutAck, T251_SENDER_RETRY_SIGNALLING_FRAMES, TDMA_TIMESLOTS_PER_FRAME,
     };
     use std::collections::VecDeque;
-    use tetra_core::{SsiType, TdmaTime, TetraAddress};
+    use tetra_core::tetra_entities::TetraEntity;
+    use tetra_core::{BitBuffer, EndpointId, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, TxState};
     use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
+    use tetra_saps::tla::TLA_REPORT_FAILED_TRANSFER;
+    use tetra_saps::tma::TmaUnitdataReq;
+    use tetra_saps::{SapMsg, SapMsgInner};
+
+    use crate::MessageQueue;
+
+    fn queued_udata_for_test(req_handle: Todo, pdu_prio: Todo, submitted: bool, reporter: Option<TxReporter>) -> QueuedUdata {
+        let addr = TetraAddress::new(1001, SsiType::Issi);
+        let endpoint_id: EndpointId = 0;
+        QueuedUdata {
+            addr,
+            t_first: TdmaTime::default(),
+            req_handle,
+            endpoint_id,
+            pdu_prio,
+            sapmsg: SapMsg {
+                sap: Sap::TmaSap,
+                src: TetraEntity::Llc,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                    req_handle,
+                    pdu: BitBuffer::from_bytes(&[0x55]),
+                    main_address: addr,
+                    endpoint_id,
+                    pdu_prio,
+                    stealing_permission: false,
+                    subscriber_class: 0,
+                    air_interface_encryption: None,
+                    stealing_repeats_flag: None,
+                    data_category: None,
+                    chan_alloc: None,
+                    tx_reporter: None,
+                }),
+            },
+            service_tx_reporter: reporter,
+            current_mac_reporter: None,
+            n253: 0,
+            target_complete_transmissions: 1,
+            complete_transmissions: 0,
+            failed_transmissions: 0,
+            submitted,
+            defer_mac_ready_once: false,
+        }
+    }
+
+    fn pop_failed_report_req_handle(queue: &mut MessageQueue) -> Option<Todo> {
+        let msg = queue.pop_front()?;
+        let SapMsgInner::TlaTlReportInd(report) = msg.msg else {
+            panic!("expected TL-REPORT.ind");
+        };
+        assert_eq!(msg.sap, Sap::TlaSap);
+        assert_eq!(msg.src, TetraEntity::Llc);
+        assert_eq!(msg.dest, TetraEntity::Mle);
+        assert_eq!(report.report, TLA_REPORT_FAILED_TRANSFER);
+        report.req_handle
+    }
 
     #[test]
     fn llc_timer_signalling_frame_constants_match_annex_timer_constants() {
@@ -2296,6 +2453,52 @@ mod tests {
             T251_SENDER_RETRY_SIGNALLING_FRAMES * TDMA_TIMESLOTS_PER_FRAME,
             T251_SENDER_RETRY_TIMER
         );
+    }
+
+    #[test]
+    fn outbound_backlog_limits_are_sized_for_thousands_of_terminals() {
+        assert!(LLC_MAX_OUTBOUND_ACKED_MESSAGES >= 4096);
+        assert!(LLC_MAX_OUTBOUND_UDATA_MESSAGES >= 4096);
+    }
+
+    #[test]
+    fn udata_backlog_limit_evicts_lower_priority_unsubmitted_with_failed_report() {
+        let low_reporter = TxReporter::new_unacked();
+        let mut messages = VecDeque::from([
+            queued_udata_for_test(10, 1, false, Some(low_reporter.clone())),
+            queued_udata_for_test(11, 6, false, None),
+        ]);
+        let mut queue = MessageQueue::new();
+
+        assert!(
+            Llc::ensure_udata_backlog_capacity(&mut queue, &mut messages, 7, 2),
+            "incoming highest-priority BL-UDATA may displace a lower-priority unsubmitted backlog entry"
+        );
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].req_handle, 11);
+        assert_eq!(low_reporter.get_state(), TxState::Discarded);
+        assert_eq!(pop_failed_report_req_handle(&mut queue), Some(10));
+        assert!(
+            queue.pop_front().is_none(),
+            "one evicted TL-UNITDATA must produce exactly one failed-transfer report"
+        );
+    }
+
+    #[test]
+    fn udata_backlog_limit_preserves_submitted_and_equal_priority_entries() {
+        let mut messages = VecDeque::from([queued_udata_for_test(20, 1, true, None), queued_udata_for_test(21, 6, false, None)]);
+        let mut queue = MessageQueue::new();
+
+        assert!(
+            !Llc::ensure_udata_backlog_capacity(&mut queue, &mut messages, 6, 2),
+            "LLC must not evict submitted MAC work or equal-priority FIFO backlog entries"
+        );
+
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].req_handle, 20);
+        assert_eq!(messages[1].req_handle, 21);
+        assert!(queue.pop_front().is_none());
     }
 
     #[test]

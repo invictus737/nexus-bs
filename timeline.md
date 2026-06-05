@@ -5424,3 +5424,56 @@ Next non-repeating execution:
 1. Commit this MM EG7 restart-recovery evidence patch.
 2. Run a final focused combined regression across UMAC scheduler, UMAC integration, CMCE, MM, and diff checks.
 3. Next implementation target after that: inspect global `MessageQueue` and LLC queue backpressure policies without dropping protocol-critical messages blindly.
+
+## 2026-06-05 17:46:15 EEST - LLC outbound backlog caps for large groups
+
+User goal:
+
+- Group and SDS/status operation must remain robust with thousands of affiliated terminals, not only two or three radios.
+- Local queues must not grow without bound under group traffic, EG scheduling delay, or MAC congestion.
+
+Component in simple technical terms:
+
+- LLC is the link layer between TETRA service users and MAC. It stores BL-DATA while waiting for ACK/retransmission and stores BL-UDATA for `N.253 + 1` repeated transmissions.
+- For large groups, LLC must keep control/data queues finite, report local admission failure explicitly, and preserve already-submitted MAC work.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 20.4.1.1.3: MAC/LLC completion or failure is reported upward through TMA/TLA report semantics.
+- EN 300 392-2 clause 22.3.2.3: acknowledged BL-DATA owns N(S), ACK, T.251, and retransmission once admitted.
+- EN 300 392-2 clause 22.3.2.4.1: BL-UDATA is stored for `N.253 + 1` complete transmissions.
+- The queue caps are local Nexus-BS resource-control hardening. They do not claim formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - Added finite LLC outbound caps sized for thousands of terminals:
+    - `LLC_MAX_OUTBOUND_ACKED_MESSAGES = 8192`
+    - `LLC_MAX_OUTBOUND_UDATA_MESSAGES = 8192`
+  - BL-DATA now rejects new requests before N(S) allocation when the acknowledged backlog is full, preserving the basic-link sequence state and returning `TLA_REPORT_FAILED_TRANSFER`.
+  - BL-UDATA now enforces capacity before creating new MAC work. If an incoming higher-priority UDATA arrives at capacity, LLC may evict only a lower-priority unsubmitted UDATA entry and reports that evicted service as failed.
+  - Submitted MAC work, equal-priority FIFO entries, and existing priority-7 work are not evicted by the local cap.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib llc::llc_bs_ms::tests::udata_backlog_limit --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 80 passed.
+- `cargo test -p tetra-entities --lib llc::llc_bs_ms::tests::outbound_backlog_limits_are_sized_for_thousands_of_terminals --locked` -> 1 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this LLC backpressure patch.
+2. Integrate any returned agent audit findings into the next implementation target.
+3. Continue with global `MessageRouter`/UMAC queue pressure and CMCE group floor robustness for thousands of listeners.
+
+Agent audit integration:
+
+- LLC/timers agent confirmed the global outbound caps are the correct first backpressure step. Remaining LLC work is per-link admission caps, per-tick standalone BL-ACK budget, O(n) scan reduction for TMA report routing, and T.251 timer scheduling that does not scan thousands of non-due entries every tick.
+- QA agent prioritized large-group round-robin PTT, restart-recovered usable CMCE, SDS/status/WAP one-GSSI delivery, mixed EG3/EG7 resource batching, and LLC pressure tests at 4096+ scale.
+- MM/EG agent flagged restart-recovery pacing fairness, mass T353 rollback/reprobe, mass T352 non-response fallback, and the combined case of restart-restored EG7 members entering an assigned-channel group call.
+- UMAC/MAC EG agent flagged stale GSSI repeat snapshots after floor changes, late-affiliating EG listeners during active group calls, mixed StayAlive+EG groups retaining too much per-member repeat state, and 5000-member grant/RA storms exceeding existing 4096 scheduler cap assumptions.
+- SDS/status/WAP agent flagged unbounded ingress/control queues before LLC caps, live SDS queue/repeat pressure, dashboard "sent" logging before confirmed acceptance, and missing queue/failure observability.
+- CMCE group/private call auditor did not return before this commit gate; keep CMCE floor/private release robustness as an active next audit/patch target rather than treating it as completed.
