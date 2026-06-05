@@ -4303,3 +4303,57 @@ Next non-repeating execution:
 1. User should test group PTT on `226333` immediately after this restart and report any `PTT denied` or radio-side `No Group`.
 2. If a new failure appears, inspect the live interval around `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, `ReleaseIndividualCalls`, and UMAC floor events.
 3. Continue broader hardening on remaining basic stack surfaces: long-run registration/affiliation retention, group floor handoff under EG7, private simplex/duplex, SDS, and WAP.
+
+## 2026-06-05 13:54:03 EEST - Live restart No Group report audit on build 7cf2e4a2
+
+User report:
+
+- After BS restart, radios appeared attached but with `No Group`.
+
+Live evidence read from the current test Pi process:
+
+- Running build: `Nexus-BS v0.1.55`, build `v0.1.55-7cf2e4a2`.
+- Runtime restart cache `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` still contains:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+- Fresh log from the current restart shows `MM: restart recovery armed for 3 local ISSI(s): {2260082, 2260616, 2260618}`.
+- `2260082` sent `U-LOCATION UPDATE DEMAND` with `GroupIdentityLocationDemand` for `226333`; BS replied with `D-LOCATION UPDATE ACCEPT` carrying `GroupIdentityLocationAccept` for `226333`, then CMCE registered and affiliated `groups=[226333]`.
+- `2260618` followed the same location update and group accept path for `226333`.
+- `2260616`, configured/requested for EG7, missed early BS-initiated restart probes but later sent `DemandLocationUpdating` with `energy_saving_mode=Eg7` and `GroupIdentityLocationDemand` for `226333`; BS replied with `D-LOCATION UPDATE ACCEPT` carrying EG7 information and `GroupIdentityLocationAccept` for `226333`.
+- Dashboard WebSocket snapshot after the restart reports:
+  - `2260082 groups=[226333] energy_saving_mode=0`
+  - `2260618 groups=[226333] energy_saving_mode=0`
+  - `2260616 groups=[226333] energy_saving_mode=7 frame=12 multiframe=19`
+
+Negative log review for the current restart interval:
+
+- No `No Group`.
+- No `Unit Not Attached`.
+- No `PTT denied`.
+- No `RequestedServiceNotAvailable`.
+- No `Service unavailable`.
+- No `T353 expired`.
+
+Observed but non-blocking:
+
+- EG7 station `2260616` may not hear early restart recovery `D-LOCATION-UPDATE-COMMAND` transmissions until its listen window or next uplink activity; it later completed the standardized location update with the group included and acknowledged.
+- `2260082` and `2260618` timed out BS-initiated EG7 assignment and stayed in `StayAlive`; this is expected when those radios do not accept the optional BS-initiated energy saving change.
+
+Technical conclusion:
+
+- The current BS state, CMCE listener state, restart cache, and dashboard snapshot all have `226333` restored. The specific stale dashboard `No Group` path is covered by commit `7cf2e4a2`.
+- If a radio screen still shows `No Group` while the BS snapshot has `groups=[226333]`, the next investigation is terminal-side retained display/scan-list state or a short visible interval before the radio receives/ACKs the group-bearing `D-LOCATION UPDATE ACCEPT`, not a lost BS restart cache.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.9.2.8, 16.9.3.4, and 16.10.35a: location update accept type and accepted location update response path.
+- EN 300 392-2 clauses 16.8.0, 16.8.4, and 16.10.17: accepted group identities and attach/detach group identity semantics.
+- EN 300 392-2 clauses 16.7.1, 16.10.9, 16.10.10, 16.10.35a, 23.5.2.2.7, and 23.7.6: EG7 negotiation/assignment and scheduling awareness.
+- Dashboard telemetry remains observability evidence only; it is not formal ETSI conformance evidence.
+
+Next non-repeating execution:
+
+1. Have the user check the actual radio display after the completed location update window, especially `2260616` in EG7.
+2. If a radio still shows `No Group`, capture the exact ISSI and wall-clock time, then inspect the log around that station's `U-LOCATION UPDATE DEMAND`, `D-LOCATION UPDATE ACCEPT`, LLC ACK, and any subsequent group report/attach-detach PDU.
+3. Continue live group PTT validation on `226333`; if PTT fails, inspect the interval around `U-SETUP`, `U-TX DEMAND`, `D-TX GRANTED`, floor ownership, and UMAC voice grant timing.
