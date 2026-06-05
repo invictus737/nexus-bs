@@ -3564,3 +3564,49 @@ Next non-repeating execution:
 1. When `chris@192.168.1.179` is reachable again, rerun `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
 2. Confirm remote build id changes from `v0.1.55-7d72c06b` to the current HEAD.
 3. Re-read `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` and verify all three ISSIs still persist `226333:0:4`.
+
+## 2026-06-05 11:04:26 EEST - Restart `No Group` status check after user report
+
+User report:
+
+- After BS restart, terminals attach but appear with `No Group`.
+- This is the MM/GMM restart-recovery path: MM owns terminal registration and GSSI affiliation state; CMCE consumes MM register/affiliate events for group calls; dashboard only displays that state.
+
+Local findings:
+
+- Repo was clean before inspection.
+- Current HEAD is `70ad46f` with the prior MM restart recovery fixes already committed.
+- Local code already contains the follow-up fix from `f02371a`:
+  - restart candidates are captured before registration removes them from the recovery map;
+  - a new group-less restart candidate restores cached GSSI locally when available;
+  - an unsolicited group-less `ITSI attach` still gets `D-LOCATION UPDATE COMMAND(group_identity_report=1)`;
+  - that group-report command is queued before the configured BS-initiated EG7 `D-MM STATUS` request;
+  - no fake over-air `GroupIdentityLocationAccept` is generated when the MS did not report a group.
+- Dashboard code already preserves `ms_groups` / group snapshot events if they arrive before `ms_registered`, preventing UI-only `No Group`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI may command registration and request group identity report.
+- Clauses 16.8.0, 16.8.2, 16.8.3, 16.8.4 and 16.10.27a: explicit group reports and complete empty reports remain authoritative.
+- Clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7 and 23.7.6/T.210: EG7 scheduling must not hide the MS before group recovery is requested.
+- This is engineering evidence for the touched clauses only, not formal TETRA certification.
+
+Verification rerun:
+
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 16 passed.
+- `cargo test -p tetra-entities --lib dashboard_ --locked` -> 8 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/log status:
+
+- `ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=2 -o ServerAliveCountMax=1 chris@192.168.1.179 date` timed out twice.
+- Could not read live logs or deploy current HEAD because port 22 is unreachable.
+- Do not patch further from the field symptom alone while local clause-scoped tests already cover it; next execution is deploy current HEAD and inspect the fresh full log from the next restart.
+
+Next non-repeating execution:
+
+1. When SSH returns, deploy directly with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+2. Confirm remote build id is current HEAD, not `v0.1.55-7d72c06b`.
+3. Read `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers`; expected steady state after terminal reports is `2260082`, `2260616`, and `2260618` with `226333:0:4` or equivalent class values.
+4. Read the fresh full log from the latest restart and compare MM `subscriber affiliate` state with dashboard display if any terminal still shows `No Group`.
