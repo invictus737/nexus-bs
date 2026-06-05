@@ -2540,6 +2540,97 @@ fn test_facch_stealing_preserves_channel_allocation_in_stch_mac_resource() {
 }
 
 #[test]
+fn test_group_listener_floor_grant_with_speaker_id_stays_on_stch() {
+    debug::setup_logging_verbose();
+
+    let speaker_issi = 2_260_082;
+    let gssi = 226_333;
+    let traffic_ts = 2;
+    let call_id = 6;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, speaker_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let d_tx_granted = DTxGranted {
+        call_identifier: call_id,
+        transmission_grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+        transmission_request_permission: false,
+        encryption_control: false,
+        reserved: false,
+        notification_indicator: None,
+        transmitting_party_type_identifier: Some(1),
+        transmitting_party_address_ssi: Some(speaker_issi as u64),
+        transmitting_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    };
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    d_tx_granted.to_bitbuf(&mut pdu).expect("serialize speaker-qualified D-TX GRANTED");
+    pdu.seek(0);
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let reporter = TxReporter::new_unacked();
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 74,
+            pdu,
+            main_address: TetraAddress::new(gssi, SsiType::Gssi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Dl,
+                carrier: None,
+            }),
+            tx_reporter: Some(reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(8));
+    let sink_msgs = test.dump_sinks();
+    let resources = mac_resources_for_addr(&sink_msgs, TetraAddress::new(gssi, SsiType::Gssi));
+    let group_stch = resources
+        .iter()
+        .find(|(logical_channel, _)| *logical_channel == LogicalChannel::Stch)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected speaker-qualified GSSI D-TX GRANTED to remain on assigned-channel STCH; reporter={:?}; resources={resources:?}",
+                reporter.get_state()
+            )
+        });
+
+    assert_eq!(
+        group_stch.1.usage_marker,
+        Some(6),
+        "EN 300 392-2 clauses 14.5.2.2.1 and 23.8.1: GSSI listener grant should keep the active traffic usage marker"
+    );
+    assert!(
+        group_stch.1.chan_alloc_element.is_none(),
+        "speaker-qualified GSSI D-TX GRANTED must omit redundant MAC channel allocation so it fits STCH for assigned-channel listeners"
+    );
+    assert!(
+        !group_stch.1.random_access_flag,
+        "a GSSI listener grant must not acknowledge one ISSI's random access to every member of a large group"
+    );
+}
+
+#[test]
 fn test_private_floor_grant_stch_carries_preserved_random_access_ack() {
     debug::setup_logging_verbose();
 
@@ -2653,8 +2744,8 @@ fn test_private_floor_grant_stch_carries_preserved_random_access_ack() {
         .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_none())
         .expect("expected first ACK-only STCH for the requester");
     assert!(
-        !ack_only.1.random_access_flag,
-        "ACK-only STCH must not consume the random-access ACK preserved from hangtime"
+        ack_only.1.random_access_flag,
+        "EN 300 392-2 clause 21.4.3.1: first STCH MAC-RESOURCE after random access should acknowledge the requester without consuming the preserved floor-grant ACK"
     );
 
     let grant = resources
@@ -2670,6 +2761,150 @@ fn test_private_floor_grant_stch_carries_preserved_random_access_ack() {
     assert!(
         grant.1.random_access_flag,
         "EN 300 392-2 clauses 21.4.3.1, 14.5.1.2.1 b) and 23.5.2.2.1: the private-call floor grant STCH should carry the random-access ACK that lets the requesting MS continue onto the assigned channel"
+    );
+    assert_eq!(
+        grant
+            .1
+            .chan_alloc_element
+            .as_ref()
+            .expect("grant should keep channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+}
+
+#[test]
+fn test_group_floor_grant_stch_repeats_preserved_random_access_ack_for_requester() {
+    debug::setup_logging_verbose();
+
+    let first_speaker_issi = 2_260_618;
+    let requester_issi = 2_260_082;
+    let gssi = 226_333;
+    let traffic_ts = 2;
+    let call_id = 6;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker_issi, traffic_ts));
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.channel_scheduler
+            .dl_enqueue_random_access_ack(traffic_ts, TetraAddress::issi(requester_issi));
+        assert!(
+            umac.channel_scheduler.dl_drop_all_except_stolen(traffic_ts),
+            "test setup should preserve the requester's hangtime random-access ACK for STCH"
+        );
+    }
+
+    let mut grant_sdu = BitBuffer::new_autoexpand(40);
+    DTxGranted {
+        call_identifier: call_id,
+        transmission_grant: TransmissionGrant::Granted.into_raw() as u8,
+        transmission_request_permission: false,
+        encryption_control: false,
+        reserved: false,
+        notification_indicator: None,
+        transmitting_party_type_identifier: None,
+        transmitting_party_address_ssi: None,
+        transmitting_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut grant_sdu)
+    .expect("serialize compact D-TX GRANTED");
+    grant_sdu.seek(0);
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let ack_reporter = TxReporter::new_unacked();
+    let grant_reporter = TxReporter::new_unacked();
+
+    test.submit_message(floor_granted_msg(call_id, requester_issi, gssi, traffic_ts));
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 72,
+            pdu: BitBuffer::from_bitstr("00111"),
+            main_address: TetraAddress::issi(requester_issi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: Some(ack_reporter.clone()),
+        }),
+    });
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 73,
+            pdu: grant_sdu,
+            main_address: TetraAddress::issi(requester_issi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: Some(grant_reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(24));
+    let sink_msgs = test.dump_sinks();
+    let all_pdus = downlink_mac_pdus(&sink_msgs);
+    let resources = mac_resources_for_addr(&sink_msgs, TetraAddress::issi(requester_issi));
+
+    let ack_only = resources
+        .iter()
+        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_none())
+        .expect("expected first ACK-only STCH for the group requester");
+    assert!(
+        ack_only.1.random_access_flag,
+        "EN 300 392-2 clauses 21.4.3.1 and 14.5.2.2.1 b): group requester should see MAC random-access acknowledgement before the floor-grant STCH"
+    );
+
+    let grant = resources
+        .iter()
+        .find(|(logical_channel, resource)| {
+            *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_some()
+        })
+        .unwrap_or_else(|| panic!(
+            "expected requester D-TX GRANTED STCH with channel allocation; ack_reporter={:?}; grant_reporter={:?}; resources={resources:?}; all_pdus={all_pdus:?}",
+            ack_reporter.get_state(),
+            grant_reporter.get_state()
+        ));
+    assert!(
+        grant.1.random_access_flag,
+        "EN 300 392-2 clauses 21.4.3.1, 14.5.2.2.1 b) and 23.5.2.2.1: group D-TX GRANTED should repeat the preserved random-access ACK for the MS entering U-plane"
     );
     assert_eq!(
         grant

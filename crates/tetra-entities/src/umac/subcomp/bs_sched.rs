@@ -864,30 +864,35 @@ impl BsChannelScheduler {
         }
     }
 
-    /// Consumes a hangtime-preserved random-access acknowledgement only when the
-    /// STCH also carries a channel allocation. In a simplex private-call floor
-    /// change, LLC can enqueue a short BL-ACK before CMCE's D-TX GRANTED. EN 300
-    /// 392-2 clause 21.4.3.1 defines the random access flag as the BS
-    /// acknowledgement of successful random access, while clauses 14.5.1.2.1 b)
-    /// and 23.5.2.2.1 make the following channel-allocation D-TX GRANTED the
-    /// response that lets the requesting MS enter the assigned-channel U-plane.
-    /// Keep the preserved ACK for that response instead of spending it on an
-    /// ACK-only STCH.
+    /// Returns whether an STCH MAC-RESOURCE should carry random_access_flag for
+    /// this address. ACK-only STCH mirrors the acknowledgement but keeps it
+    /// pending for the following channel-allocation STCH.
+    ///
+    /// EN 300 392-2 clause 21.4.3.1 defines the random access flag as the BS
+    /// acknowledgement of successful random access, so the first MAC-RESOURCE
+    /// after a U-TX DEMAND random access should not suppress it. Clauses
+    /// 14.5.1.2.1 b), 14.5.2.2.1 b), and 23.5.2.2.1 make the following
+    /// channel-allocation D-TX GRANTED the response that lets the requesting MS
+    /// enter the assigned-channel U-plane; keep the acknowledgement pending for
+    /// that PDU as well.
     pub fn take_pending_ra_ack_for_stch(&mut self, ts: u8, addr: TetraAddress, carries_channel_allocation: bool) -> bool {
-        if !carries_channel_allocation {
-            if self.pending_ra_acks[ts as usize - 1]
-                .iter()
-                .any(|pending_addr| pending_addr.ssi == addr.ssi && pending_addr.ssi_type == addr.ssi_type)
-            {
-                tracing::debug!(
-                    "take_pending_ra_ack_for_stch: preserving pending RA ACK for {} on ts {} until channel-allocation STCH",
-                    addr,
-                    ts
-                );
-            }
+        let has_pending = self.pending_ra_acks[ts as usize - 1]
+            .iter()
+            .any(|pending_addr| pending_addr.ssi == addr.ssi && pending_addr.ssi_type == addr.ssi_type);
+        if !has_pending {
             return false;
         }
-        self.take_pending_ra_ack(ts, addr)
+
+        if carries_channel_allocation {
+            self.take_pending_ra_ack(ts, addr)
+        } else {
+            tracing::debug!(
+                "take_pending_ra_ack_for_stch: mirroring pending RA ACK for {} on ts {} and preserving it until channel-allocation STCH",
+                addr,
+                ts
+            );
+            true
+        }
     }
 
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
@@ -4913,18 +4918,32 @@ mod tests {
             ssi_type: SsiType::Issi,
             ssi: 1234,
         };
+        let other_addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 5678,
+        };
 
         sched.dl_enqueue_random_access_ack(1, addr);
         assert!(sched.dl_drop_all_except_stolen(1));
 
         // EN 300 392-2 clause 21.4.3.1 defines random_access_flag as the
-        // successful random-access ACK. In a private-call floor transition, the
-        // grant that matters is the channel-allocation D-TX GRANTED response
-        // described by clauses 14.5.1.2.1 b) and 23.5.2.2.1; an intervening
-        // ACK-only STCH must not consume the preserved MAC ACK.
+        // successful random-access ACK. In a private/group floor transition,
+        // the channel-allocation D-TX GRANTED response described by clauses
+        // 14.5.1.2.1 b), 14.5.2.2.1 b) and 23.5.2.2.1 is the response that
+        // moves the requesting MS into U-plane. A preceding ACK-only STCH may
+        // acknowledge random access but must keep the ACK pending for the
+        // channel-allocation STCH, and another ISSI must not consume it.
         assert!(
-            !sched.take_pending_ra_ack_for_stch(1, addr, false),
-            "ACK-only STCH must leave the preserved random-access ACK pending"
+            !sched.take_pending_ra_ack_for_stch(1, other_addr, false),
+            "another ISSI in a large group must not mirror this random-access ACK"
+        );
+        assert!(
+            sched.take_pending_ra_ack_for_stch(1, addr, false),
+            "ACK-only STCH should acknowledge random access while leaving it pending"
+        );
+        assert!(
+            !sched.take_pending_ra_ack_for_stch(1, other_addr, true),
+            "another ISSI in a large group must not consume this random-access ACK"
         );
         assert!(
             sched.take_pending_ra_ack_for_stch(1, addr, true),

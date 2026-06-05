@@ -965,17 +965,33 @@ fn parse_d_tx_granted(prim: &LcmcMleUnitdataReq) -> Option<DTxGranted> {
 }
 
 fn assert_compact_d_tx_granted_facch(prim: &LcmcMleUnitdataReq, grant: &DTxGranted) {
-    assert_eq!(grant.transmitting_party_type_identifier, None);
-    assert_eq!(grant.transmitting_party_address_ssi, None);
+    if prim.main_address.ssi_type == SsiType::Gssi && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8 {
+        assert_eq!(
+            grant.transmitting_party_type_identifier,
+            Some(1),
+            "GSSI D-TX GRANTED/GrantedToOtherUser should identify the current speaker SSI"
+        );
+        assert!(
+            grant.transmitting_party_address_ssi.is_some(),
+            "GSSI D-TX GRANTED/GrantedToOtherUser should carry the current speaker SSI"
+        );
+        assert!(
+            prim.sdu.get_len() > 25,
+            "speaker-qualified GSSI D-TX GRANTED should include optional transmitting-party IEs"
+        );
+    } else {
+        assert_eq!(grant.transmitting_party_type_identifier, None);
+        assert_eq!(grant.transmitting_party_address_ssi, None);
+        assert_eq!(
+            prim.sdu.get_len(),
+            25,
+            "non-GSSI D-TX GRANTED should omit optional transmitting-party IEs so it fits assigned-channel FACCH/STCH"
+        );
+    }
     assert_eq!(
         prim.unacked_bl_repetitions,
         Some(0),
         "D-TX GRANTED FACCH is time-sensitive floor control and must not repeat stale BL-UDATA over a later floor state"
-    );
-    assert_eq!(
-        prim.sdu.get_len(),
-        25,
-        "D-TX GRANTED must omit optional transmitting-party IEs so it fits assigned-channel FACCH/STCH"
     );
 }
 

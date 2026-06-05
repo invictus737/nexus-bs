@@ -4682,3 +4682,64 @@ Next non-repeating execution:
 1. RF retest GSSI `226333`: first PTT after group setup, then alternating PTT between stations.
 2. RF retest private simplex P2P `2260616` <-> `2260618`, including reverse PTT and red-key close.
 3. If group static/no-voice persists, inspect post-deploy log for `UMAC voice route`, `rx_blk_traffic`, early STCH/FACCH stealing, and `UL inactivity timeout` around the exact PTT window.
+
+## 2026-06-05 15:58:03 EEST - GSSI floor notification hardening for 2260082/MTP3550
+
+Observed live issue:
+
+- User RF test on GSSI `226333` showed repeated PTT static/no-voice only from ISSI `2260082` (Motorola MTP3550).
+- The terminal did not display `PTT denied`; UI looked normal for TX/RX.
+- Log analysis confirmed this was not a CMCE denial:
+  - `U-TX DEMAND` from `2260082` was accepted.
+  - CMCE emitted individual `D-TX GRANTED` to `2260082`.
+  - UMAC emitted `FloorGranted` for `source_issi=2260082`.
+  - After grant, no `NormalTrainSeq*` / `UMAC voice route` appeared before `UL inactivity timeout`.
+
+ETSI clause-scoped reasoning, not formal certification:
+
+- EN 300 392-2 clause 14.5.2.2.1 b): group floor response must send individual `D-TX GRANTED` to the granted MS and group-addressed `D-TX GRANTED` to listeners indicating "granted to another user".
+- The same clause notes the group-addressed grant should identify the transmitting party when needed to prevent the newly granted MS from switching back to U-plane receive.
+- Clause 21.4.3.1: `random_access_flag` acknowledges successful random access. This must remain ISSI-scoped; do not acknowledge one ISSI's access on a GSSI resource for a large group.
+- Clause 23.8 / assigned-channel FACCH/STCH: listener floor-control signalling should stay on the assigned traffic channel where group members are listening.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Group-addressed `D-TX GRANTED/GrantedToOtherUser` now carries `transmitting_party_type_identifier=SSI` and `transmitting_party_address_ssi=<current speaker ISSI>`.
+  - This keeps one scalable GSSI notification for all listeners while preventing the just-granted speaker from interpreting the GSSI PDU as "someone else got the floor".
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - If a speaker-qualified GSSI listener grant would exceed 124-bit STCH when serializing a redundant MAC channel allocation, UMAC keeps it on STCH and omits only that MAC channel-allocation element.
+  - The primitive still carries channel allocation internally for timeslot routing; the on-air GSSI listener PDU keeps the usage marker and remains FACCH/STCH.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Preserved random-access ACKs remain exact `TetraAddress` matches.
+  - ACK-only STCH may mirror `random_access_flag` for the same ISSI but does not consume it before the following channel-allocation STCH.
+  - Another ISSI cannot mirror or consume that ACK, which is required for groups with many members.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_group_listener_floor_grant_with_speaker_id_stays_on_stch`.
+  - Added group requester RA ACK regression for `2260082`-like floor grant.
+  - Updated private RA ACK regression to prove P2P remains protected.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated D-TX GRANTED helper: ISSI/P2P stays compact; GSSI listener grants must carry speaker SSI.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib test_pending_random_access_ack_for_stch_waits_for_channel_allocation --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_listener_floor_grant_with_speaker_id_stays_on_stch --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_private_floor_grant_stch_carries_preserved_random_access_ack --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor_grant_stch_repeats_preserved_random_access_ack_for_requester --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_ul_inactivity_hands_floor_to_queued_requester --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_floor --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_simplex_p2p_u_tx_ceased_hands_floor_to_queued_requester --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 56 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 132 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this patch.
+2. Deploy direct to `/home/chris/nexus-bs-v0.1.55-test` with local build only.
+3. RF retest GSSI `226333`, especially repeated PTT from `2260082`.
+4. Expected live evidence after fix: for `2260082` PTT, log should show individual `D-TX GRANTED`, GSSI `GrantedToOtherUser` with transmitting party `2260082`, then `NormalTrainSeq*` and `UMAC voice route` before any inactivity timeout.

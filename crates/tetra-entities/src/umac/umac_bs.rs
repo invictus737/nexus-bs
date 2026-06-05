@@ -1805,9 +1805,30 @@ impl UmacBs {
                         chan_alloc_element: mac_chan_alloc,
                     };
                     let sdu_len = sdu.get_len();
-                    let header_len = mac_pdu.compute_header_len();
-                    let fill_bits = fillbits::addition::compute_required(header_len + sdu_len, STCH_CAP);
-                    let total_len = header_len + sdu_len + fill_bits;
+                    let mut header_len = mac_pdu.compute_header_len();
+                    let mut fill_bits = fillbits::addition::compute_required(header_len + sdu_len, STCH_CAP);
+                    let mut total_len = header_len + sdu_len + fill_bits;
+
+                    if total_len > STCH_CAP
+                        && prim.main_address.ssi_type == SsiType::Gssi
+                        && prim
+                            .chan_alloc
+                            .as_ref()
+                            .is_some_and(|chan_alloc| chan_alloc.ul_dl_assigned == UlDlAssignment::Dl)
+                    {
+                        // EN 300 392-2 clause 14.5.2.2.1 b) recommends that
+                        // group-addressed "granted to another user" signalling
+                        // can identify the current speaker. On an already
+                        // assigned traffic channel, the channel allocation in
+                        // this TMA primitive is routing metadata; if including
+                        // it would push the speaker-qualified GSSI PDU out of
+                        // STCH capacity, keep the FACCH delivery and omit the
+                        // redundant MAC channel allocation element.
+                        mac_pdu.chan_alloc_element = None;
+                        header_len = mac_pdu.compute_header_len();
+                        fill_bits = fillbits::addition::compute_required(header_len + sdu_len, STCH_CAP);
+                        total_len = header_len + sdu_len + fill_bits;
+                    }
 
                     if total_len <= STCH_CAP {
                         mac_pdu.random_access_flag = self.channel_scheduler.take_pending_ra_ack_for_stch(
