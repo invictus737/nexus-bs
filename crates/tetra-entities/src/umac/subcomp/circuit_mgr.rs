@@ -26,6 +26,11 @@ impl CircuitMgr {
     }
 
     pub fn is_active(&self, dir: Direction, ts: u8) -> bool {
+        if !(1..=4).contains(&ts) {
+            tracing::error!("UMAC CircuitMgr::is_active: invalid timeslot {}", ts);
+            return false;
+        }
+
         match dir {
             Direction::Dl => self.dl[ts as usize - 1].is_some(),
             Direction::Ul => self.ul[ts as usize - 1].is_some(),
@@ -37,6 +42,11 @@ impl CircuitMgr {
     }
 
     pub fn get_usage(&self, dir: Direction, ts: u8) -> Option<u8> {
+        if !(1..=4).contains(&ts) {
+            tracing::error!("UMAC CircuitMgr::get_usage: invalid timeslot {}", ts);
+            return None;
+        }
+
         match dir {
             Direction::Dl => {
                 if let Some(circuit) = &self.dl[ts as usize - 1] {
@@ -61,6 +71,11 @@ impl CircuitMgr {
 
     /// Closes an active circuit, and return the Circuit to the caller
     pub fn close_circuit(&mut self, dir: Direction, ts: u8) -> Option<Circuit> {
+        if !(1..=4).contains(&ts) {
+            tracing::error!("UMAC CircuitMgr::close_circuit: invalid timeslot {}", ts);
+            return None;
+        }
+
         match dir {
             Direction::Dl => {
                 self.tx_data[ts as usize - 1].clear();
@@ -78,6 +93,10 @@ impl CircuitMgr {
     /// This channel should be free, if not, warnings will be issued and the existing circuit will be closed first
     pub fn create_circuit(&mut self, dir: Direction, circuit: Circuit) {
         let ts = circuit.ts;
+        if !(1..=4).contains(&ts) {
+            tracing::error!("UMAC CircuitMgr::create_circuit: invalid timeslot {}", ts);
+            return;
+        }
 
         // Sanity check
         if self.is_active(dir, ts) {
@@ -103,6 +122,10 @@ impl CircuitMgr {
 
     /// Put a block in the queue for transmission on an associated channel
     pub fn put_block(&mut self, ts: u8, block: Vec<u8>) {
+        if !(1..=4).contains(&ts) {
+            tracing::error!("CircuitMgr::put_block on invalid timeslot {}", ts);
+            return;
+        }
         if !self.is_active(Direction::Dl, ts) {
             tracing::warn!("CircuitMgr::put_block on inactive circuit {:?} {}", Direction::Dl, ts);
             return;
@@ -111,6 +134,10 @@ impl CircuitMgr {
     }
 
     pub fn put_raw_tch_s_half_slot(&mut self, ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
+        if !(1..=4).contains(&ts) {
+            tracing::error!("CircuitMgr::put_raw_tch_s_half_slot on invalid timeslot {}", ts);
+            return;
+        }
         if !self.is_active(Direction::Dl, ts) {
             tracing::warn!("CircuitMgr::put_raw_tch_s_half_slot on inactive circuit {:?} {}", Direction::Dl, ts);
             return;

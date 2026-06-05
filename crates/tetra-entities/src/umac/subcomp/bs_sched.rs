@@ -1360,10 +1360,26 @@ impl BsChannelScheduler {
     }
 
     pub fn create_circuit(&mut self, dir: Direction, circuit: Circuit) {
-        // New/updated circuit implies traffic mode.
-        if (1..=4).contains(&circuit.ts) {
-            self.hangtime[circuit.ts as usize - 1] = false;
+        if !(1..=4).contains(&circuit.ts) {
+            tracing::error!(
+                "BsChannelScheduler::create_circuit: rejecting invalid traffic timeslot {} for {:?}",
+                circuit.ts,
+                dir
+            );
+            return;
         }
+        if circuit.ts == 1 {
+            // This BS scheduler uses TS1 as the MCCH/SCH-F common-control
+            // carrier. EN 300 392-2 clause 23.5.2.2.7 still allows reserved
+            // UL access on TS1 via ACCESS-ASSIGN, but assigned-channel voice
+            // traffic is modelled only on TS2..TS4. Rejecting here keeps a bad
+            // CMCE/UMAC allocation from becoming a process-killing AACH assert.
+            tracing::error!("BsChannelScheduler::create_circuit: rejecting traffic circuit on TS1 common control");
+            return;
+        }
+
+        // New/updated circuit implies traffic mode.
+        self.hangtime[circuit.ts as usize - 1] = false;
         self.circuits.create_circuit(dir, circuit);
     }
 
@@ -2805,6 +2821,46 @@ mod tests {
                 active_secondary_addrs: Vec::new(),
             },
         );
+    }
+
+    #[test]
+    fn test_ts1_traffic_circuit_request_is_rejected_without_panic() {
+        let mut sched = get_testing_slotter();
+
+        open_test_dl_circuit(&mut sched, 1);
+        assert!(
+            !sched.circuit_is_active(Direction::Dl, 1),
+            "TS1 is the MCCH/SCH-F common-control path in this scheduler, not an assigned traffic channel"
+        );
+
+        sched.create_circuit(
+            Direction::Dl,
+            Circuit {
+                direction: Direction::Dl,
+                ts: 0,
+                peer_ts: None,
+                usage: 4,
+                circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+                speech_service: Some(0),
+                etee_encrypted: false,
+                dl_media_source: CircuitDlMediaSource::LocalLoopback,
+                active_addr: None,
+                active_secondary_addrs: Vec::new(),
+            },
+        );
+        assert!(!sched.circuit_is_active(Direction::Dl, 0));
+
+        let mut bbk = sched.generate_bbk_block(TdmaTime { t: 1, f: 2, m: 1, h: 0 }).mac_block;
+        bbk.seek(0);
+        let aach = AccessAssign::from_bitbuf(&mut bbk).expect("TS1 AACH should remain parseable");
+
+        // EN 300 392-2 clauses 21.4.6.5 and 23.5.2.2.7 keep this single
+        // carrier scheduler's TS1 as common-control downlink. Uplink
+        // reservations may still be represented by ACCESS-ASSIGN fields, but
+        // an erroneous assigned-channel voice circuit must not turn TS1 into
+        // traffic or crash the BS.
+        assert_eq!(aach.dl_usage, AccessAssignDlUsage::CommonControl);
+        assert_eq!(aach.ul_usage, AccessAssignUlUsage::CommonOnly);
     }
 
     fn assert_stch_null_block(block: &TmvUnitdataReq) {

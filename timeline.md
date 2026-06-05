@@ -1,5 +1,46 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 14:08:45 EEST - UMAC rejects invalid traffic timeslots before clean Pi redeploy
+
+User report:
+
+- Clear the BS log and restart the test BS with the latest deployed updates.
+- Keep ETSI clause-scoped hardening and do not claim formal certification.
+
+Component explanation:
+
+- UMAC is the MAC scheduler. It turns MM/CMCE/LLC requests into TETRA downlink and uplink slot usage.
+- The circuit manager is UMAC's table of active assigned traffic channels.
+- In this single-carrier Nexus-BS scheduler, TS1 is the MCCH/SCH-F common-control carrier. Assigned voice traffic circuits are modelled on TS2..TS4. TS1 may still carry reserved uplink access through ACCESS-ASSIGN, but it must not be converted into an assigned voice traffic channel by a bad request.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 21.4.6.5: SCH/F/common-control channel context.
+- EN 300 392-2 clause 23.5.2.2.7: BS slot granting and energy-economy-aware scheduling.
+- This patch is fail-closed local robustness for invalid UMAC requests. It is clause-scoped engineering evidence only, not formal TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/subcomp/circuit_mgr.rs`
+  - Added bounds checks for UMAC circuit timeslot access so TS0/TS5+ return/log instead of indexing out of bounds.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - `BsChannelScheduler::create_circuit` now rejects invalid timeslots and rejects TS1 traffic circuits before AACH generation.
+  - Added `test_ts1_traffic_circuit_request_is_rejected_without_panic` to prove TS1 remains common control and invalid TS0 does not panic.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib ts1_traffic_circuit --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 51 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deployment note:
+
+- A temporary dirty build `v0.1.55-6e783b4e-modified` was deployed direct to the Pi and restarted once to confirm the patch boots.
+- Fresh restart evidence after log clear showed `2260616`, `2260082`, and `2260618` affiliated to GSSI `226333`; no `PTT denied`, `Service unavailable`, `Unit Not Attached`, or `T353` rollback appeared in the filtered startup evidence.
+- Next action: commit this patch and redeploy once more so the Pi runs a clean commit build ID, then clear the log and restart again for the operator test.
+
 ## 2026-06-05 13:48:26 EEST - MM coverage-return group snapshot hardening for restart `No Group` visibility
 
 User report:
