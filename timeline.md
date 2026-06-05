@@ -5216,3 +5216,51 @@ Next non-repeating execution:
    - restart recovery and group affiliation tests at multi-thousand scale,
    - active EG suspension memory shape for many simultaneous GSSI circuits.
 3. Keep the regression set anchored on private simplex/duplex, group-call turn taking, SDS/status, MM attach/group affiliation, and UMAC EG7 scheduling before deploy.
+
+## 2026-06-05 17:24:32 EEST - UMAC StayAlive large-GSSI state fast path
+
+User goal:
+
+- Make group operation robust for thousands of terminals, not just a two-radio lab case.
+- Avoid per-member repeat state when a group has no Energy Economy subscribers.
+
+Component in simple technical terms:
+
+- `GroupDeliveryState` and `GroupStealingState` are UMAC bookkeeping objects.
+- They remember which GSSI members have already had an EG receive opportunity for a group-addressed MAC-RESOURCE or FACCH/STCH block.
+- If no group member has an Energy Economy assignment, all members are treated as continuously listening, so this repeat tracker is unnecessary.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require the BS to account for Energy Economy receive windows.
+- This patch keeps the EG repeat path unchanged when any affiliated target has an Energy Economy assignment.
+- For pure `StayAlive` groups, one GSSI-addressed downlink remains sufficient; skipping the local repeat tracker is an implementation memory/CPU optimization, not an over-air PDU change.
+- This is engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - `group_state_for_resource` now receives the current Energy Economy assignment map.
+  - Large GSSI MAC-RESOURCE delivery skips `GroupDeliveryState` allocation when no target ISSI has an Energy Economy assignment.
+  - GSSI FACCH/STCH stealing similarly skips `GroupStealingState` allocation for pure `StayAlive` groups.
+  - Existing EG mixed/EG7 tests continue to exercise the full repeat-by-receive-batch path.
+
+Tests added:
+
+- `test_large_stayalive_gssi_resource_skips_group_delivery_state_snapshot`
+- `test_large_stayalive_gssi_facch_transmits_once_without_group_stealing_state`
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 62 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 58 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 135 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC StayAlive large-GSSI fast path.
+2. Continue with large-group restart/affiliation persistence tests at multi-thousand scale.
+3. Review global `MessageQueue`/LLC queue behavior separately; do not add arbitrary drops without clause-scoped handling/reporting.

@@ -1217,6 +1217,7 @@ impl BsChannelScheduler {
         tx_reporter: Option<TxReporter>,
         subscribers: &SubscriberRegistry,
         readiness_cache: &mut GroupReadinessCache,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) -> Option<GroupDeliveryState> {
         if addr.ssi_type != SsiType::Gssi {
             return None;
@@ -1224,6 +1225,9 @@ impl BsChannelScheduler {
 
         let targets = readiness_cache.targets_for(addr, subscribers);
         if targets.is_empty() {
+            return None;
+        }
+        if !Self::targets_have_energy_saving_assignment(targets, energy_saving) {
             return None;
         }
 
@@ -1234,6 +1238,10 @@ impl BsChannelScheduler {
             tx_reporter,
             addr.ssi != PREDEFINED_BROADCAST_GSSI,
         ))
+    }
+
+    fn targets_have_energy_saving_assignment(targets: &[u32], energy_saving: &HashMap<u32, EnergySavingAssignment>) -> bool {
+        targets.iter().any(|issi| energy_saving.contains_key(issi))
     }
 
     fn group_state_ready_for_tx(
@@ -1928,7 +1936,15 @@ impl BsChannelScheduler {
                             let addr = pdu.addr;
                             let mut group_state = group_state.or_else(|| {
                                 addr.and_then(|addr| {
-                                    Self::group_state_for_resource(addr, &pdu, &sdu, tx_reporter.clone(), subscribers, &mut readiness_cache)
+                                    Self::group_state_for_resource(
+                                        addr,
+                                        &pdu,
+                                        &sdu,
+                                        tx_reporter.clone(),
+                                        subscribers,
+                                        &mut readiness_cache,
+                                        energy_saving,
+                                    )
                                 })
                             });
                             if let Some(state) = group_state.as_mut() {
@@ -2114,26 +2130,27 @@ impl BsChannelScheduler {
         if let (Some(block), Some(addr)) = (stch_opt.as_ref(), stealing_addr_opt)
             && addr.ssi_type == SsiType::Gssi
         {
-            let mut group_state = group_state_opt.unwrap_or_else(|| {
-                GroupStealingState::new(
-                    readiness_cache.targets_for(addr, subscribers).to_vec(),
-                    tx_reporter_opt.clone(),
-                    addr.ssi != PREDEFINED_BROADCAST_GSSI,
-                )
-            });
-            if !group_state.targets.is_empty() {
-                Self::retain_current_group_stealing_targets(&mut group_state, addr, subscribers, &mut readiness_cache);
-            }
-            if !group_state.targets.is_empty() {
-                group_state.begin_batch_if_needed(ts, energy_saving);
-                Self::mark_stealing_signalling_activity(addr, Some(&group_state), ts, subscribers, energy_saving);
-                group_state.mark_batch_covered();
-                should_report_transmitted = group_state.is_complete();
-                if !should_report_transmitted {
-                    self.dl_requeue_group_stealing(ts.t, block.clone(), addr, group_state);
-                }
-            } else {
+            let targets = readiness_cache.targets_for(addr, subscribers);
+            if !Self::targets_have_energy_saving_assignment(targets, energy_saving) {
                 Self::mark_stealing_signalling_activity(addr, None, ts, subscribers, energy_saving);
+            } else {
+                let mut group_state = group_state_opt.unwrap_or_else(|| {
+                    GroupStealingState::new(targets.to_vec(), tx_reporter_opt.clone(), addr.ssi != PREDEFINED_BROADCAST_GSSI)
+                });
+                if !group_state.targets.is_empty() {
+                    Self::retain_current_group_stealing_targets(&mut group_state, addr, subscribers, &mut readiness_cache);
+                }
+                if !group_state.targets.is_empty() {
+                    group_state.begin_batch_if_needed(ts, energy_saving);
+                    Self::mark_stealing_signalling_activity(addr, Some(&group_state), ts, subscribers, energy_saving);
+                    group_state.mark_batch_covered();
+                    should_report_transmitted = group_state.is_complete();
+                    if !should_report_transmitted {
+                        self.dl_requeue_group_stealing(ts.t, block.clone(), addr, group_state);
+                    }
+                } else {
+                    Self::mark_stealing_signalling_activity(addr, None, ts, subscribers, energy_saving);
+                }
             }
         } else if let Some(addr) = stealing_addr_opt {
             Self::mark_stealing_signalling_activity(addr, None, ts, subscribers, energy_saving);
@@ -4380,6 +4397,42 @@ mod tests {
     }
 
     #[test]
+    fn test_large_stayalive_gssi_resource_skips_group_delivery_state_snapshot() {
+        let gssi = 91;
+        let member_count = 4096;
+        let (pdu, sdu) = test_resource_for_gssi(gssi, 8);
+        let addr = pdu.addr.expect("test GSSI resource must be addressed");
+
+        let mut subscribers = SubscriberRegistry::new();
+        for offset in 0..member_count {
+            let issi = 40_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+        }
+
+        let mut readiness_cache = GroupReadinessCache::default();
+        let energy_saving = HashMap::new();
+        let state = BsChannelScheduler::group_state_for_resource(
+            addr,
+            &pdu,
+            &sdu,
+            Some(TxReporter::new_unacked()),
+            &subscribers,
+            &mut readiness_cache,
+            &energy_saving,
+        );
+
+        // Local scale guard: when no affiliate has an Energy Economy
+        // assignment, all members are continuously listening from the
+        // scheduler's point of view. EN 300 392-2 clauses 23.5.2.2.7 and
+        // 23.7.6 do not require a per-member repeat tracker in that case.
+        assert!(
+            state.is_none(),
+            "StayAlive GSSI signalling must not allocate a per-member repeat snapshot"
+        );
+    }
+
+    #[test]
     fn test_large_stayalive_gssi_resource_transmits_once_without_per_member_repeat() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
@@ -4410,6 +4463,49 @@ mod tests {
             "StayAlive GSSI delivery must not create one queued repeat per affiliated ISSI"
         );
         assert_eq!(subscribers.group_members(gssi).len(), member_count as usize);
+    }
+
+    #[test]
+    fn test_large_stayalive_gssi_facch_transmits_once_without_group_stealing_state() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let gssi = 91;
+        let member_count = 4096;
+        let reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            2,
+            BitBuffer::new(SCH_HD_CAP),
+            TetraAddress::new(gssi, SsiType::Gssi),
+            Some(reporter.clone()),
+        );
+
+        let mut subscribers = SubscriberRegistry::new();
+        for offset in 0..member_count {
+            let issi = 70_000 + offset;
+            subscribers.register(issi);
+            assert!(subscribers.affiliate(issi, gssi));
+        }
+
+        let mut energy_saving = HashMap::new();
+        let delivered = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        // Same scale guard as MAC-RESOURCE delivery, applied to already encoded
+        // FACCH/STCH group signalling. With no EG assignments, there is no
+        // member-batch repeat state to retain.
+        assert_eq!(delivered.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        assert_eq!(
+            delivered.blk1.as_ref().map(|block| block.logical_channel),
+            Some(LogicalChannel::Stch)
+        );
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
+        assert!(
+            sched.dltx_queues[1]
+                .iter()
+                .all(|elem| !matches!(elem, DlSchedElem::Stealing(_, addr, _, Some(_)) if addr.ssi == gssi)),
+            "StayAlive GSSI FACCH must not keep a per-member stealing repeat state"
+        );
     }
 
     #[test]
