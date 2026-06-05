@@ -6098,3 +6098,46 @@ Next non-repeating execution:
 2. Add the analogous P2P pending-release flood regression so private simplex teardown remains bounded.
 3. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
 4. Re-run targeted UMAC large EG7/group tests before the next field deploy.
+
+## 2026-06-05 19:13:38 EEST - CMCE P2P pending release duplicate flood regression added
+
+User goal:
+
+- Private simplex/P2P call teardown must remain robust after stale PTT/disconnect bursts and must not regress the MXP600-safe release path.
+- A pending private-call release must not emit contradictory `D-TX`, `D-DISCONNECT`, or duplicate `D-RELEASE` signalling under a 4096-message stale flood.
+
+Component in simple technical terms:
+
+- P2P/private simplex release has two related pieces: prompt `D-RELEASE` to the MS that requested disconnect, and peer clearing with `D-DISCONNECT` followed by expected peer `U-RELEASE`.
+- The new regression floods duplicate initiator `U-DISCONNECT` and peer `U-TX DEMAND` while that release path is pending.
+- After the flood, the expected peer `U-RELEASE` must still close the call and free the call id once the initiator's `D-RELEASE` reporter is transmitted.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.3.2 and 14.5.1.3.3: individual-call clearing uses `D-RELEASE`/`D-DISCONNECT` sequencing.
+- EN 300 392-2 clauses 14.7.1.6 and 14.7.2.9: peer `U-RELEASE` is the response path to `D-DISCONNECT`.
+- This is clause-scoped private-call teardown regression evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_p2p_pending_release_large_duplicate_disconnect_ptt_flood_is_ignored_and_closes`.
+  - Starts an active private simplex call, moves floor to the called party, begins disconnect release, and marks peer `D-DISCONNECT` transmitted.
+  - Injects 4096 stale duplicate initiator `U-DISCONNECT` / peer `U-TX DEMAND` messages.
+  - Asserts no `D-DISCONNECT`, no duplicate `D-RELEASE`, no `D-TX GRANTED`, no UMAC floor grant, and no premature close.
+  - Marks the initiator `D-RELEASE` reporter transmitted, sends the expected peer `U-RELEASE`, then asserts UMAC close and call-id cleanup.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_pending_release_large_duplicate_disconnect_ptt_flood_is_ignored_and_closes --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 145 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this P2P pending-release duplicate flood regression.
+2. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
+3. Re-run targeted UMAC large EG7/group tests before next field deploy.
+4. Continue network-origin call-id wrap regressions for group/private call starts.

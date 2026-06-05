@@ -6979,7 +6979,7 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
     for reporter in &release_ack_reporters {
         reporter.mark_transmitted();
     }
-    test.run_stack(Some(1));
+    test.run_stack(Some(8));
     let closed_msgs = test.dump_sinks();
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
@@ -10615,6 +10615,73 @@ fn test_p2p_pending_release_ignores_duplicate_u_disconnect_and_tx_demand() {
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
         "Reporter completion should still close the pending P2P release"
+    );
+}
+
+#[test]
+fn test_p2p_pending_release_large_duplicate_disconnect_ptt_flood_is_ignored_and_closes() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let call_id = start_active_p2p_call(&mut test);
+
+    let (release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
+
+    disconnect_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let pending_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_umac_call_ended_or_close(&pending_disconnect_msgs), 0);
+
+    for offset in 0..LARGE_GSSI_MEMBER_COUNT {
+        if offset % 2 == 0 {
+            test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
+        } else {
+            test.submit_message(build_u_tx_demand_msg(TEST_ISSI, call_id));
+        }
+    }
+    test.deliver_all_messages();
+    let flood_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 14.5.1.3.2/14.5.1.3.3 clear an established
+    // individual call with D-RELEASE/D-DISCONNECT sequencing. While that
+    // release path is pending, stale duplicate disconnects and PTT floor
+    // requests must not create new maintenance signalling or close early.
+    assert_eq!(count_d_disconnects(&flood_msgs), 0);
+    assert_eq!(count_d_releases(&flood_msgs), 0);
+    assert_eq!(count_d_tx_granted(&flood_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&flood_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&flood_msgs), 0);
+    assert!(
+        cmce_debug_active_call_ids(&mut test).contains(&call_id),
+        "large stale P2P release flood must not evict the pending call id"
+    );
+
+    for reporter in &release_ack_reporters {
+        reporter.mark_transmitted();
+    }
+    test.submit_message(build_u_release_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&closed_msgs),
+        0,
+        "expected peer U-RELEASE after the flood must not duplicate the initiator D-RELEASE"
+    );
+    assert!(
+        count_umac_call_ended_or_close(&closed_msgs) >= 2,
+        "large stale P2P release flood must not prevent the expected peer U-RELEASE close"
+    );
+    assert!(
+        !cmce_debug_active_call_ids(&mut test).contains(&call_id),
+        "pending P2P call id should be freed after expected peer U-RELEASE completion"
     );
 }
 
