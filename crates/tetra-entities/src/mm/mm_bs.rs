@@ -73,7 +73,7 @@ struct PendingSwmiGroupTransaction {
     expires_at: TdmaTime,
     group_identity_downlink: Vec<GroupIdentityDownlink>,
     detach_all_then_attach: bool,
-    accepts_unrouted_ack_handle_zero: bool,
+    accepts_unrouted_ack_handle: bool,
     rollback_unconfirmed_attachments_on_failure: bool,
     reprobe_group_report_on_failure: bool,
     remaining_restart_group_refresh: Vec<(u32, GroupAttachmentInfo)>,
@@ -162,7 +162,6 @@ impl MmBs {
     const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 2 * 18 * 4;
     const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 150;
-    const UNROUTED_UPLINK_HANDLE: MleHandle = 0;
     // Local acceptance window for the group-report phase requested by
     // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
     // clause 16.4.4. This is not an ETSI timer value; it matches the local
@@ -425,7 +424,11 @@ impl MmBs {
             .is_some_and(|ranges| !ranges.contains(gssi))
     }
 
-    fn current_restart_recovery_groups_for_client(&mut self, issi: u32) -> BTreeMap<u32, GroupAttachmentInfo> {
+    fn current_restart_recovery_groups_for_client_with_remaining(
+        &mut self,
+        issi: u32,
+        remaining_restart_group_refresh: &[(u32, GroupAttachmentInfo)],
+    ) -> BTreeMap<u32, GroupAttachmentInfo> {
         let groups: Vec<u32> = self
             .client_mgr
             .get_client_by_issi(issi)
@@ -445,10 +448,23 @@ impl MmBs {
                 }
             }
         }
+        for &(gssi, info) in remaining_restart_group_refresh {
+            if self.restart_recovery_group_allowed(gssi) {
+                cached_groups.insert(gssi, info);
+            }
+        }
         cached_groups
     }
 
+    fn current_restart_recovery_groups_for_client(&mut self, issi: u32) -> BTreeMap<u32, GroupAttachmentInfo> {
+        self.current_restart_recovery_groups_for_client_with_remaining(issi, &[])
+    }
+
     fn remember_restart_recovery_issi(&mut self, issi: u32) {
+        self.remember_restart_recovery_issi_with_remaining(issi, &[]);
+    }
+
+    fn remember_restart_recovery_issi_with_remaining(&mut self, issi: u32, remaining_restart_group_refresh: &[(u32, GroupAttachmentInfo)]) {
         self.restart_recovery.remove(&issi);
         if !Self::restart_recovery_eligible(&self.config, issi) {
             return;
@@ -457,7 +473,7 @@ impl MmBs {
             return;
         };
 
-        let groups = self.current_restart_recovery_groups_for_client(issi);
+        let groups = self.current_restart_recovery_groups_for_client_with_remaining(issi, remaining_restart_group_refresh);
         let mut cache = Self::read_restart_recovery_cache(&path);
         let changed = cache.get(&issi) != Some(&groups);
         cache.insert(issi, groups);
@@ -694,7 +710,7 @@ impl MmBs {
                 expires_at: self.dltime.add_timeslots(Self::T353_GROUP_RESPONSE_TIMESLOTS),
                 group_identity_downlink,
                 detach_all_then_attach,
-                accepts_unrouted_ack_handle_zero: false,
+                accepts_unrouted_ack_handle: false,
                 rollback_unconfirmed_attachments_on_failure: false,
                 reprobe_group_report_on_failure: false,
                 remaining_restart_group_refresh: Vec::new(),
@@ -1100,8 +1116,8 @@ impl MmBs {
     ) {
         if !deaff_groups.is_empty() {
             self.emit_subscriber_update(queue, issi, deaff_groups, BrewSubscriberAction::Deaffiliate);
-            self.remember_restart_recovery_issi(issi);
         }
+        self.remember_restart_recovery_issi_with_remaining(issi, &pending.remaining_restart_group_refresh);
         if pending.reprobe_group_report_on_failure {
             tracing::info!(
                 "MM: requesting fresh group report from ISSI {} after failed restart group refresh ({})",
@@ -1200,7 +1216,6 @@ impl MmBs {
                 Vec::new(),
                 "U-ATTACH/DETACH GROUP IDENTITY ACK rejected attachment",
             );
-            self.remember_restart_recovery_issi(issi);
         } else if pending.rollback_unconfirmed_attachments_on_failure && !pending.remaining_restart_group_refresh.is_empty() {
             let split_at = pending.remaining_restart_group_refresh.len().min(Self::MAX_GROUPS_PER_ATTACH);
             let (next_batch, remaining) = pending.remaining_restart_group_refresh.split_at(split_at);
@@ -2659,8 +2674,7 @@ impl MmBs {
             return;
         };
 
-        let unrouted_zero_ack = pending.accepts_unrouted_ack_handle_zero && prim.handle == Self::UNROUTED_UPLINK_HANDLE;
-        if pending.handle != prim.handle && !unrouted_zero_ack {
+        if pending.handle != prim.handle && !pending.accepts_unrouted_ack_handle {
             tracing::debug!(
                 "MM: U-ATTACH/DETACH GROUP IDENTITY ACK handle mismatch for ISSI {}: pending={} received={}; ignoring",
                 issi,
@@ -3057,9 +3071,9 @@ impl MmBs {
                         detach_all_then_attach: false,
                         // LLC/MLE uplink indications generated for a standalone
                         // MS ACK may not preserve the downlink request handle.
-                        // Accept handle 0 for this restart-refresh transaction,
-                        // but keep non-zero wrong handles rejected.
-                        accepts_unrouted_ack_handle_zero: true,
+                        // EN 300 392-2 clause 16.8.1 keys the over-air ACK by
+                        // the same ISSI/procedure, not by this local handle.
+                        accepts_unrouted_ack_handle: true,
                         rollback_unconfirmed_attachments_on_failure: true,
                         reprobe_group_report_on_failure: true,
                         remaining_restart_group_refresh,

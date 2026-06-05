@@ -34,10 +34,12 @@ use tetra_pdus::cmce::pdus::u_release::URelease;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_pdus::cmce::pdus::u_tx_ceased::UTxCeased;
 use tetra_pdus::cmce::pdus::u_tx_demand::UTxDemand;
+use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
 use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
+use tetra_pdus::mm::pdus::u_attach_detach_group_identity_acknowledgement::UAttachDetachGroupIdentityAcknowledgement;
 use tetra_pdus::mm::pdus::u_location_update_demand::ULocationUpdateDemand;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::control::call_control::{CallControl, CircuitDlMediaSource, NetworkCircuitCall};
@@ -66,6 +68,16 @@ const PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS: i32 = 16;
+
+fn unique_restart_recovery_path(label: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock should be after UNIX_EPOCH")
+        .as_nanos();
+    let mut path = std::env::temp_dir();
+    path.push(format!("nexus-bs-cmce-restart-recovery-{label}-{}-{nanos}.txt", std::process::id()));
+    path.to_string_lossy().into_owned()
+}
 
 fn type3_marker() -> Type3FieldGeneric {
     Type3FieldGeneric {
@@ -114,6 +126,69 @@ fn drain_private_simplex_tail(test: &mut ComponentTest, dltime: TdmaTime) {
 /// Helper: submit a real MM U-LOCATION UPDATE DEMAND carrying group affiliation.
 fn submit_location_update_with_group_identity_location_demand(test: &mut ComponentTest, issi: u32, gssi: u32) {
     submit_location_update_with_type_and_group_identity_location_demand(test, issi, gssi, LocationUpdateType::ItsiAttach);
+}
+
+fn submit_location_update_without_group_identity_location_demand(
+    test: &mut ComponentTest,
+    issi: u32,
+    location_update_type: LocationUpdateType,
+) {
+    let pdu = ULocationUpdateDemand {
+        location_update_type,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: None,
+        energy_saving_mode: None,
+        la_information: None,
+        ssi: None,
+        address_extension: None,
+        group_identity_location_demand: None,
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    };
+
+    let mut sdu = BitBuffer::new_autoexpand(64);
+    pdu.to_bitbuf(&mut sdu)
+        .expect("Failed to serialize group-less ULocationUpdateDemand");
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_swmi_group_refresh_ack(test: &mut ComponentTest, issi: u32, handle: u32) {
+    let pdu = UAttachDetachGroupIdentityAcknowledgement {
+        group_identity_acknowledgement_type: false,
+        group_identity_uplink: None,
+        proprietary: None,
+    };
+
+    let mut sdu = BitBuffer::new_autoexpand(64);
+    pdu.to_bitbuf(&mut sdu)
+        .expect("Failed to serialize UAttachDetachGroupIdentityAcknowledgement");
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
 }
 
 fn submit_location_update_with_type_and_group_identity_location_demand(
@@ -4553,6 +4628,109 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     assert_eq!(count_umac_floor_released(&current_speaker_retry_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&current_speaker_retry_msgs), 0);
     assert_eq!(count_umac_floor_granted(&current_speaker_retry_msgs), 1);
+}
+
+#[test]
+fn test_restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack() {
+    debug::setup_logging_verbose();
+
+    let path = unique_restart_recovery_path("cmce-cached-226333-unrouted-ack");
+    std::fs::write(
+        &path,
+        format!(
+            "{} {}:0:4\n{} {}:0:4\n{} {}:0:4\n",
+            LAB_ISSI_A, LAB_GROUP_GSSI, LAB_ISSI_B, LAB_GROUP_GSSI, LAB_ISSI_MXP600, LAB_GROUP_GSSI
+        ),
+    )
+    .expect("failed to seed restart recovery cache");
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(
+        vec![TetraEntity::Mm, TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    for issi in [LAB_ISSI_A, LAB_ISSI_B, LAB_ISSI_MXP600] {
+        submit_location_update_without_group_identity_location_demand(&mut test, issi, LocationUpdateType::DemandLocationUpdating);
+        test.run_stack(Some(1));
+        let attach_msgs = test.dump_sinks();
+        assert!(
+            contains_location_update_accept(&attach_msgs),
+            "restart recovery LU for ISSI {issi} should still get D-LOCATION UPDATE ACCEPT"
+        );
+        assert!(
+            test.config.state_read().subscribers.group_members(LAB_GROUP_GSSI).contains(&issi),
+            "cached GSSI should be provisionally restored for ISSI {issi}"
+        );
+
+        // EN 300 392-2 clause 16.8.1 requires an MS ACK for the SwMI group
+        // refresh. The MLE handle is local plumbing, so this deliberately uses
+        // a non-matching handle to exercise the restart path seen in field logs.
+        submit_swmi_group_refresh_ack(&mut test, issi, 123_000 + issi);
+        test.run_stack(Some(1));
+        let ack_msgs = test.dump_sinks();
+        assert_eq!(
+            count_d_releases(&ack_msgs),
+            0,
+            "group refresh ACK for ISSI {issi} must not cause a CMCE release"
+        );
+    }
+
+    test.run_stack(Some(721));
+    let after_t353_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&after_t353_msgs),
+        0,
+        "accepted restart refresh ACKs must prevent later T353 rollback/release"
+    );
+
+    let mut members = test.config.state_read().subscribers.group_members(LAB_GROUP_GSSI);
+    members.sort_unstable();
+    assert_eq!(
+        members,
+        vec![LAB_ISSI_B, LAB_ISSI_A, LAB_ISSI_MXP600],
+        "restart recovery should leave every lab ISSI affiliated to 226333"
+    );
+
+    // CMCE consumes the MM Register/Affiliate updates. A valid group call plus
+    // queued return PTT proves the restored GSSI is usable beyond dashboard
+    // state and local MM cache bookkeeping.
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let ptt_msgs = test.dump_sinks();
+    let queued_grant = ptt_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("restored 226333 listener should receive queued return PTT grant");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "restart-restored 226333 return PTT while another MS has floor",
+    );
+    assert_eq!(count_d_releases(&ptt_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&ptt_msgs), 0);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
 }
 
 #[test]

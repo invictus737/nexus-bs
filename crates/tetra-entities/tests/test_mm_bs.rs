@@ -4864,18 +4864,10 @@ fn test_restart_recovery_unsolicited_itsi_attach_eg7_refreshes_cached_group_befo
     assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
     assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
 
+    // The local MLE handle is not an over-air field in the group-identity ACK.
+    // Restart refresh accepts a same-ISSI ACK even when LLC/MLE reports an
+    // unrouted non-zero handle, preventing a false T353 rollback to No Group.
     submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
-    test.run_stack(Some(1));
-    let wrong_ack_msgs = test.dump_sinks();
-    assert!(
-        subscriber_updates(&wrong_ack_msgs)
-            .iter()
-            .all(|update| update.action != BrewSubscriberAction::Affiliate),
-        "wrong non-zero ACK handle must not consume restart refresh"
-    );
-    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
-
-    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
     test.run_stack(Some(1));
     let ack_msgs = test.dump_sinks();
     assert!(!contains_attach_detach_ack(&ack_msgs));
@@ -4886,6 +4878,21 @@ fn test_restart_recovery_unsolicited_itsi_attach_eg7_refreshes_cached_group_befo
         "ACK for already-restored cached EG7 group must not duplicate affiliation"
     );
     assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    test.run_stack(Some(721));
+    let after_t353_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&after_t353_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate),
+        "accepted unrouted restart ACK must not roll back after T353"
+    );
+    assert!(
+        !contains_location_update_command(&after_t353_msgs),
+        "accepted unrouted restart ACK must not reprobe after T353"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 
     submit_u_mm_status_energy_saving(
         &mut test,
@@ -5048,7 +5055,7 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
         );
     }
 
-    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
     test.run_stack(Some(1));
     let second_msgs = test.dump_sinks();
     let second_refreshes = swmi_group_attach_refresh_details(&second_msgs);
@@ -5063,7 +5070,7 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
     assert_eq!(test.config.state_read().subscribers.group_members(groups[12]), vec![issi]);
     assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
 
-    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
+    submit_swmi_group_ack(&mut test, issi, 123_457, false, vec![]);
     test.run_stack(Some(1));
     let final_ack_msgs = test.dump_sinks();
     assert!(swmi_group_attach_refresh_details(&final_ack_msgs).is_empty());
@@ -5079,6 +5086,73 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
             "final segmented refresh cache should retain GSSI {gssi}, got {cache:?}"
         );
     }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_groups() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let groups: Vec<u32> = (226300..=226312).collect();
+    let path = unique_restart_recovery_path("cached-scan-list-segment-t353-preserves-remaining");
+    let cached_groups = groups.iter().map(|gssi| format!("{gssi}:0:4")).collect::<Vec<String>>().join(",");
+    std::fs::write(&path, format!("{issi} {cached_groups}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let first_refreshes = swmi_group_attach_refresh_details(&demand_msgs);
+    assert_eq!(first_refreshes.len(), 1);
+    assert_eq!(
+        first_refreshes[0].groups,
+        groups[..12].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
+    );
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    test.run_stack(Some(721));
+    let expired_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&expired_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups.as_slice() == &groups[..12]),
+        "T353 expiry should roll back only the unconfirmed first scan-list batch"
+    );
+    assert!(
+        contains_location_update_command(&expired_msgs),
+        "T353 expiry should request a fresh authoritative group report"
+    );
+    for gssi in &groups {
+        assert!(
+            test.config.state_read().subscribers.group_members(*gssi).is_empty(),
+            "GSSI {gssi} should not remain provisionally affiliated after T353 expiry"
+        );
+    }
+
+    let cache = std::fs::read_to_string(&path).expect("T353 segmented rollback should persist cache");
+    for gssi in &groups[..12] {
+        assert!(
+            !cache.lines().any(|line| line.contains(&gssi.to_string())),
+            "unconfirmed first-batch GSSI {gssi} should be removed after T353, got {cache:?}"
+        );
+    }
+    assert!(
+        cache.lines().any(|line| line.contains(&groups[12].to_string())),
+        "unsent cached scan-list GSSI {} should stay in restart cache, got {cache:?}",
+        groups[12]
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
@@ -5137,6 +5211,76 @@ fn test_restart_recovery_group_refresh_reject_rolls_back_cached_affiliation_and_
     assert!(
         !cache.lines().any(|line| line.contains(&gssi.to_string())),
         "reject rollback must remove unconfirmed cached GSSI {gssi}, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_group_refresh_accepts_unrouted_nonzero_ack_without_t353_purge() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("cached-group-refresh-unrouted-nonzero-ack");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    assert_swmi_group_attach_refresh(&demand_msgs, gssi, 4, "group-less DemandLocationUpdating cached restart restore");
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    // EN 300 392-2 clause 16.8.1 defines the ACK procedure over air, but the
+    // MLE primitive handle is local plumbing. Restart refresh must accept the
+    // same-ISSI ACK even when that local handle is not routed back.
+    submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
+    test.run_stack(Some(1));
+    let ack_msgs = test.dump_sinks();
+    assert!(!contains_attach_detach_ack(&ack_msgs));
+    assert!(
+        subscriber_updates(&ack_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate),
+        "accepted unrouted ACK must not deaffiliate cached restart group"
+    );
+    assert!(
+        !contains_location_update_command(&ack_msgs),
+        "accepted unrouted ACK must not request a fresh group report"
+    );
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    test.run_stack(Some(721));
+    let after_t353_msgs = test.dump_sinks();
+    assert!(
+        subscriber_updates(&after_t353_msgs)
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate),
+        "accepted unrouted ACK must prevent later T353 rollback"
+    );
+    assert!(
+        !contains_location_update_command(&after_t353_msgs),
+        "accepted unrouted ACK must prevent later T353 reprobe"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
+
+    let cache = std::fs::read_to_string(&path).expect("accepted ACK should preserve cache");
+    assert!(
+        cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:4")),
+        "accepted ACK should keep cached GSSI {gssi}, got {cache:?}"
     );
 
     let _ = std::fs::remove_file(&path);

@@ -3767,3 +3767,57 @@ Next non-repeating execution:
 2. Confirm remote build id is current HEAD, not `v0.1.55-7d72c06b`.
 3. Read `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers`; expected steady state after terminal reports is `2260082`, `2260616`, and `2260618` with `226333:0:4` or equivalent class values.
 4. Read the fresh full log from the latest restart and compare MM `subscriber affiliate` state with dashboard display if any terminal still shows `No Group`.
+
+## 2026-06-05 12:23:29 EEST - MM restart `No Group` ACK hardening and CMCE proof
+
+User report:
+
+- After BS restart, terminals attach but appear with `No Group`.
+- Field concern is especially relevant with `2260616`, `2260082`, `2260618`, group `226333`, and EG7 energy saving.
+
+Components touched:
+
+- MM restart recovery: restores cached GSSI affiliation after restart and runs the SwMI-initiated `D-ATTACH/DETACH GROUP IDENTITY` refresh.
+- CMCE group call control: consumes MM `Register`/`Affiliate` updates; if these are missing, group call/PTT behaves like the terminal has no group.
+- Restart recovery cache: local persistent memory of `ISSI -> GSSI:lifetime:class_of_usage` used after BS restart.
+
+Patch summary:
+
+- Restart-refresh group ACKs now accept the same ISSI even if the local MLE primitive handle is non-zero and does not match the downlink handle.
+- Normal non-restart SwMI group transactions remain strict on matching MLE handle.
+- Segmented cached scan-list recovery now preserves groups that were not yet sent over air if an earlier batch fails or T353 expires.
+- Added MM tests for non-zero ACK, EG7 restart refresh, segmented success, and T353 segmented failure preservation.
+- Added MM+CMCE integration for `226333`: three lab ISSIs recover cached group, ACK with non-matching handles, survive T353, start a group call, and queue return PTT without release/deny.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.8.1: SwMI-initiated attach/detach group identity procedure and ACK request.
+- Clauses 16.10.14/16.10.17/16.10.19: ACK type and group identity attachment information.
+- Clause 16.11.1.3: T353 expiry handling.
+- Clause 14.5.2.2.1: group call floor request/queued transmission behavior after CMCE receives restored affiliation.
+- The MLE handle is local stack plumbing, not an over-air ETSI ACK discriminator; the clause-scoped key is the same ISSI and active group identity procedure.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_group_refresh_accepts_unrouted_nonzero_ack_without_t353_purge --locked` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_group_less_demand_segments_cached_scan_list_refresh --locked` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_groups --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs restart_recovery_cached_226333_group_restores_cmce_listeners_after_unrouted_ack --locked` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 22 passed.
+- `cargo test -p tetra-entities --test test_mm_bs swmi_group_ack --locked` -> 12 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs 226333 --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_ --locked` -> 51 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this patch.
+2. Deploy directly to testing with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Confirm remote build id changes from the old live `v0.1.55-7d72c06b` to the new commit.
+4. After restart, read the fresh full log and confirm:
+   - `MM: sending SwMI group attach refresh` for cached `226333` when a terminal answers without group IE;
+   - `CMCE: subscriber affiliate issi=... groups=[226333]`;
+   - no `T353 expired` rollback for accepted same-ISSI ACKs;
+   - no `No Group` steady state for `2260082`, `2260616`, `2260618`.
