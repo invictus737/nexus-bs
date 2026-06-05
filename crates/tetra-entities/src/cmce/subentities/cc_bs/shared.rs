@@ -379,14 +379,52 @@ impl CcBsSubentity {
     }
 
     pub(super) fn has_listener(&self, gssi: u32) -> bool {
+        if self.config.state_read().subscribers.has_group_members(gssi) {
+            return true;
+        }
         self.group_listeners.get(&gssi).copied().unwrap_or(0) > 0
     }
 
     pub(super) fn subscriber_affiliated_to_group(&self, issi: u32, gssi: u32) -> bool {
+        if self.config.state_read().subscribers.contains_group_member(gssi, issi) {
+            return true;
+        }
         self.subscriber_groups
             .get(&issi)
             .map(|groups| groups.contains(&gssi))
             .unwrap_or(false)
+    }
+
+    fn sync_shared_subscribers_from_mm_update(&self, issi: u32, groups: &[u32], action: BrewSubscriberAction) {
+        let mut state = self.config.state_write();
+        match action {
+            BrewSubscriberAction::Register => {
+                if !state.subscribers.is_registered(issi) {
+                    state.subscribers.register(issi);
+                }
+            }
+            BrewSubscriberAction::Deregister => {
+                state.subscribers.deregister(issi);
+            }
+            BrewSubscriberAction::Affiliate => {
+                if !state.subscribers.is_registered(issi) {
+                    tracing::warn!(
+                        "CMCE: not syncing affiliate for unknown ISSI {} into shared subscriber registry",
+                        issi
+                    );
+                    return;
+                }
+                for &gssi in groups {
+                    state.subscribers.affiliate(issi, gssi);
+                }
+            }
+            BrewSubscriberAction::Deaffiliate => {
+                for &gssi in groups {
+                    state.subscribers.deaffiliate(issi, gssi);
+                }
+            }
+            BrewSubscriberAction::ReleaseIndividualCalls => {}
+        }
     }
 
     pub(super) fn clear_group_floor_state_for_departure(&mut self, queue: &mut MessageQueue, issi: u32, gssi: u32) {
@@ -489,6 +527,7 @@ impl CcBsSubentity {
     pub fn handle_subscriber_update(&mut self, queue: &mut MessageQueue, update: MmSubscriberUpdate) {
         let issi = update.issi;
         let groups = update.groups;
+        self.sync_shared_subscribers_from_mm_update(issi, &groups, update.action);
 
         match update.action {
             BrewSubscriberAction::Register => {

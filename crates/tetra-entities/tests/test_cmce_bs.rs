@@ -4717,6 +4717,57 @@ fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted()
 }
 
 #[test]
+fn test_group_call_uses_shared_registry_when_cmce_listener_mirror_is_empty() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    {
+        let mut state = test.config.state_write();
+        for issi in [LAB_ISSI_A, LAB_ISSI_B] {
+            state.subscribers.register(issi);
+            assert!(state.subscribers.affiliate(issi, LAB_GROUP_GSSI));
+        }
+    }
+
+    // CMCE has not received MmSubscriberUpdate messages in this fixture, so
+    // its local subscriber_groups/group_listeners mirror is empty. The shared
+    // MM registry is authoritative after restart recovery/resync; group setup
+    // and floor requests must not fail as "no listener"/unaffiliated.
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let grant = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("shared-registry group member should receive queued PTT response");
+
+    assert_eq!(grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        grant.0,
+        &grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "shared-registry group floor request",
+    );
+    assert_eq!(count_d_releases(&demand_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+}
+
+#[test]
 fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
     debug::setup_logging_verbose();
 

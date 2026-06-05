@@ -1,5 +1,51 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 17:11:23 EEST - CMCE shared registry fallback for restart-affiliated groups
+
+User report:
+
+- Group affiliations must survive BS restart/resync and remain usable for many terminals.
+- Avoid the "No Group"/"no listeners" failure mode when the central MM registry knows the GSSI but CMCE's local mirror is not yet rebuilt.
+
+Component explanation:
+
+- MM is Mobility Management. It owns the shared subscriber registry: registered ISSIs and their GSSI affiliations.
+- CMCE is Call Control. It keeps a local mirror of subscribers for fast call/floor decisions, but after restart recovery that mirror can lag the shared registry.
+- A GSSI listener check asks "is anyone affiliated to this group?". A floor-affiliation check asks "is this ISSI allowed to request PTT on this GSSI?".
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1: group call setup is addressed to a GSSI with locally affiliated listeners.
+- EN 300 392-2 clause 14.5.2.2.1: SwMI floor control grants/queues/rejects PTT requests from affiliated group members.
+- EN 300 392-2 clause 16.4.4: SwMI may initiate registration recovery.
+- EN 300 392-2 clause 16.8.1: group attach/detach state must remain coherent.
+- This is restart/resync robustness hardening, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - `has_listener(gssi)` now checks the shared `SubscriberRegistry` first and falls back to CMCE's local listener count.
+  - `subscriber_affiliated_to_group(issi, gssi)` now checks the shared `SubscriberRegistry` first and falls back to CMCE's local `subscriber_groups`.
+  - `handle_subscriber_update` syncs MM updates into the shared registry as a defensive reconciliation path.
+  - Duplicate `Register` does not clear existing shared affiliations; this preserves current tolerant CMCE semantics.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_group_call_uses_shared_registry_when_cmce_listener_mirror_is_empty`.
+  - Seeds only the shared registry, leaves CMCE's local mirror empty, starts a group call, and confirms a second shared-registry member gets `RequestQueued` rather than release/no-listener rejection.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_call_uses_shared_registry_when_cmce_listener_mirror_is_empty --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 135 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add large restart-recovery tests for thousands of cached ISSIs all affiliated to one GSSI.
+2. Add UMAC scheduler queue depth caps/coalescing for non-critical downlink backlog while preserving call-control/FACCH priority.
+3. Audit global `MessageQueue` boundedness/backpressure.
+
 ## 2026-06-05 17:06:39 EEST - Large-group UMAC/CMCE robustness for thousands of affiliates
 
 User report:
