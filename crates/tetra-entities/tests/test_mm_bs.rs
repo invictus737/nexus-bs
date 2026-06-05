@@ -5000,6 +5000,77 @@ fn test_restart_recovery_large_cache_first_sweep_reaches_every_issi_before_retry
 }
 
 #[test]
+fn test_restart_recovery_large_cache_overdue_sweep_remains_ordered_and_paced() {
+    debug::setup_logging_verbose();
+    let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT;
+    let first_issi = 2_264_000_u32;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("large-overdue-paced");
+    let cache: String = (0..member_count)
+        .map(|offset| format!("{} {}:0:0\n", first_issi + offset, gssi))
+        .collect();
+    std::fs::write(&path, cache).expect("failed to seed large recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    test.run_stack(Some(1));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "first restart-recovery tick only initializes the local recovery clock"
+    );
+
+    // EN 300 392-2 clause 16.4.4 permits SwMI-commanded registration, but the
+    // local large-cache recovery policy must not burst thousands of
+    // acknowledged D-LOCATION-UPDATE-COMMAND PDUs after a delayed scheduler
+    // tick. Even if many cached ISSIs are overdue at once, the BS must emit one
+    // ordered probe and then re-apply the inter-ISSI RF pacing interval.
+    test.router.set_dl_time(TdmaTime::default().add_timeslots((18 * 4 * 2048) as i32));
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    let first_commands = location_update_command_details(&first_msgs);
+    assert_eq!(first_commands.len(), 1);
+    assert_eq!(first_commands[0].0, first_issi);
+    assert_eq!(first_commands[0].2, Layer2Service::Acknowledged);
+    assert!(first_commands[0].3.group_identity_report);
+
+    test.run_stack(Some(71));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "overdue large-cache recovery must not burst follow-up commands during the 72-timeslot pacing window"
+    );
+
+    test.run_stack(Some(1));
+    let second_msgs = test.dump_sinks();
+    let second_commands = location_update_command_details(&second_msgs);
+    assert_eq!(second_commands.len(), 1);
+    assert_eq!(second_commands[0].0, first_issi + 1);
+    assert_eq!(second_commands[0].2, Layer2Service::Acknowledged);
+    assert!(second_commands[0].3.group_identity_report);
+
+    test.router.set_dl_time(TdmaTime::default().add_timeslots((18 * 4 * 4096) as i32));
+    test.run_stack(Some(1));
+    let third_msgs = test.dump_sinks();
+    let third_commands = location_update_command_details(&third_msgs);
+    assert_eq!(
+        third_commands.len(),
+        1,
+        "a second delayed tick should still emit one command, not all overdue probes"
+    );
+    assert_eq!(third_commands[0].0, first_issi + 2);
+    assert_eq!(third_commands[0].2, Layer2Service::Acknowledged);
+    assert!(third_commands[0].3.group_identity_report);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_successful_location_update_persists_restart_recovery_cache() {
     debug::setup_logging_verbose();
     let issi = 2260082;

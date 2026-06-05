@@ -7130,3 +7130,39 @@ Next non-repeating execution:
 1. Add deterministic MM restart-recovery startup sweep evidence for a large cached group where overdue probes stay ordered by ISSI and do not burst if ticks are delayed.
 2. Add UMAC same-priority protected-control admission/coalescing evidence for over-cap floor-withdraw storms, especially when every queued element is already protected.
 3. Add operator-visible metrics or config documentation for hard local scale caps: CMCE floor FIFO 4096, UMAC pending TMA 4096, and RA ACK queue 8192.
+
+## 2026-06-05 22:03 EEST - Restart-recovery overdue sweep pacing
+
+Component in simple technical terms:
+
+- MM restart recovery is the BS-side process that re-probes known ISSIs after a BS restart using `D-LOCATION-UPDATE-COMMAND`.
+- With thousands of cached terminals, many probes can become due if the process stalls or the scheduler tick is delayed. The BS must still pace commands; otherwise it can overload RF/control signalling and leave terminals in inconsistent "Unit Not Attached" states.
+
+Problem covered:
+
+- Added a 4096-member cached GSSI test that initializes MM, jumps TDMA time far enough for many restart probes to be overdue, and verifies only one acknowledged `D-LOCATION-UPDATE-COMMAND(group_identity_report=1)` is emitted.
+- The test then verifies the 72-timeslot inter-ISSI pacing window stays quiet, the next ISSI is probed in deterministic order, and a second large delayed tick still emits only one further probe.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4 covers SwMI-commanded location updating using `D-LOCATION-UPDATE-COMMAND`.
+- The 72-timeslot inter-ISSI delay is Nexus-BS local RF robustness policy around that standardized procedure, not an ETSI timer.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `test_restart_recovery_large_cache_overdue_sweep_remains_ordered_and_paced`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_large_cache_overdue_sweep_remains_ordered_and_paced --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_large --locked` -> 4 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_mm_bs.rs` -> pass.
+
+Next non-repeating execution:
+
+1. Add UMAC same-priority protected-control admission/coalescing evidence for over-cap floor-withdraw storms, especially when every queued element is already protected.
+2. Add operator-visible metrics or config documentation for hard local scale caps: CMCE floor FIFO 4096, UMAC pending TMA 4096, and RA ACK queue 8192.
+3. Add cross-layer long-run SDS/status plus group/PTT aftercare in one runtime so data service storms cannot regress call-control floor handling.
