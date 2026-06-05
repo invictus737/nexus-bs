@@ -1581,6 +1581,7 @@ impl MmBs {
         let issi = prim.received_address.ssi;
         let handle = prim.handle;
         let was_solicited_group_report_pending = self.solicited_group_report_pending(issi);
+        let was_restart_recovery_candidate = self.restart_recovery.contains_key(&issi);
 
         // ISSI whitelist check — reject if whitelist is non-empty and ISSI not in it.
         // The dashboard can override the config whitelist at runtime (state override takes
@@ -1909,12 +1910,7 @@ impl MmBs {
             }
         }
 
-        if is_new
-            && was_solicited_group_report_pending
-            && pdu.location_update_type != LocationUpdateType::ItsiAttach
-            && !_has_groups
-            && !group_report_complete
-        {
+        if is_new && !_has_groups && !group_report_complete && (was_solicited_group_report_pending || was_restart_recovery_candidate) {
             // EN 300 392-2 clause 16.8.0 keeps previously accepted group
             // identities valid while their lifetime remains valid. When a
             // restarted BS has just recovered the registration but the MS did
@@ -2000,24 +1996,18 @@ impl MmBs {
             }),
         };
         queue.push_back(msg);
-        self.remember_restart_recovery_issi(issi);
 
-        if let Some(esi) = post_attach_energy_saving_request {
-            tracing::info!(
-                "MM: allocating energy saving mode {:?} to ISSI {} after registration",
-                esi.energy_saving_mode,
-                issi
-            );
-            Self::send_d_mm_status_energy_saving_request(queue, issi, prim.handle, esi);
-        }
-
-        // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI + group
-        // identity report) ONLY for a genuinely new (unknown) radio that didn't ITSI-attach
-        // and didn't already include a group report.
+        // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI +
+        // group identity report) for a genuinely new radio that did not already
+        // include a group report.
         //
-        // This mirrors the legacy upstream behaviour and is deliberately narrow:
+        // This remains deliberately narrow:
         //  - A new radio doing RoamingLocationUpdating without groups gets exactly one
         //    COMMAND so it re-registers with its group list.
+        //  - A restart-recovery candidate doing an unsolicited ITSI attach without
+        //    groups also gets exactly one COMMAND. If a persistent GSSI was cached,
+        //    local routing was restored above, but the MS report remains the final
+        //    authority and can still clear/replace that cache.
         //  - A radio we ALREADY know never gets a COMMAND here. This is critical for
         //    receive-only devices like the Motorola TPG2200 pager, which never report any
         //    talkgroups: keying COMMAND at them on every update made them answer with yet
@@ -2028,9 +2018,25 @@ impl MmBs {
         //    RoamingLocationUpdating are now known on that second update, so they get no
         //    further COMMAND and can't loop.
         let has_groups = _has_groups || group_report_complete;
-        if is_new && pdu.location_update_type != LocationUpdateType::ItsiAttach && !has_groups && !was_solicited_group_report_pending {
+        let request_restart_group_report = is_new
+            && !has_groups
+            && !was_solicited_group_report_pending
+            && (pdu.location_update_type != LocationUpdateType::ItsiAttach || was_restart_recovery_candidate);
+
+        self.remember_restart_recovery_issi(issi);
+
+        if request_restart_group_report {
             tracing::info!("Sending D-LOCATION UPDATE COMMAND to returning MS {} to request group report", issi);
             self.send_d_location_update_command(queue, issi, handle);
+        }
+
+        if let Some(esi) = post_attach_energy_saving_request {
+            tracing::info!(
+                "MM: allocating energy saving mode {:?} to ISSI {} after registration",
+                esi.energy_saving_mode,
+                issi
+            );
+            Self::send_d_mm_status_energy_saving_request(queue, issi, prim.handle, esi);
         }
     }
 

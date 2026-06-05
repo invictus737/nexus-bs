@@ -4691,6 +4691,124 @@ fn test_successful_location_update_persists_restart_recovery_groups() {
 }
 
 #[test]
+fn test_restart_recovery_unsolicited_itsi_attach_without_groups_restores_cached_affiliation() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("unsolicited-itsi-cached-group");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    // EN 300 392-2 clause 16.4.4 gives the SwMI a group-report command path,
+    // but a still-camped MS may also self-attach before the startup command is
+    // sent. If it omits group identities, restore only the cached, previously
+    // accepted group locally; do not fabricate an over-air group accept.
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::ItsiAttach, None);
+    test.run_stack(Some(1));
+    let attach_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&attach_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    assert!(
+        accept.group_identity_location_accept.is_none(),
+        "cached restart restoration must not fabricate a GroupIdentityLocationAccept for a group-less ITSI attach"
+    );
+
+    let commands = location_update_command_details(&attach_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, issi);
+    assert!(commands[0].3.group_identity_report);
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+
+    let updates = subscriber_updates(&attach_msgs);
+    assert_eq!(updates.len(), 2);
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
+    assert_eq!(updates[0].issi, issi);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![gssi]);
+
+    let state = test.config.state_read();
+    assert!(state.subscribers.is_registered(issi));
+    assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
+    drop(state);
+
+    let cache = std::fs::read_to_string(&path).expect("restored affiliation should keep cached group");
+    assert!(
+        cache.lines().any(|line| line.trim() == format!("{issi} {gssi}:0:4")),
+        "cache should preserve restored GSSI/class, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_unsolicited_itsi_attach_eg7_requests_group_report_before_bs_eg() {
+    debug::setup_logging_verbose();
+    let issi = 2260616;
+    let path = unique_restart_recovery_path("unsolicited-itsi-eg7-no-group");
+    std::fs::write(&path, format!("{issi}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::ItsiAttach, None);
+    test.run_stack(Some(1));
+    let attach_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&attach_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    assert!(accept.group_identity_location_accept.is_none());
+    assert!(
+        test.config.state_read().subscribers.group_members(226333).is_empty(),
+        "bare restart cache must not invent a GSSI"
+    );
+    assert!(
+        !test.config.state_read().energy_saving.contains_key(&issi),
+        "BS-initiated EG7 request must remain pending until the MS explicitly responds"
+    );
+
+    let downlink_types = mm_downlink_pdu_types(&attach_msgs);
+    let command_idx = downlink_types
+        .iter()
+        .position(|pdu| *pdu == MmPduTypeDl::DLocationUpdateCommand)
+        .expect("group-report command should be queued for restart candidate");
+    let status_idx = downlink_types
+        .iter()
+        .position(|pdu| *pdu == MmPduTypeDl::DMmStatus)
+        .expect("configured EG7 should still be requested");
+    assert!(
+        command_idx < status_idx,
+        "group report command must be queued before BS-initiated EG7 request, got {downlink_types:?}"
+    );
+    assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
+
+    let cache = std::fs::read_to_string(&path).expect("bare ISSI cache should remain readable");
+    assert!(
+        cache.lines().any(|line| line.trim() == issi.to_string()),
+        "bare cache should keep ISSI and no fabricated GSSI, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
     debug::setup_logging_verbose();
     let issi = 2260618;
@@ -5559,6 +5677,18 @@ fn location_update_command_details(msgs: &[SapMsg]) -> Vec<(u32, u32, Layer2Serv
                 let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
                 let pdu = DLocationUpdateCommand::from_bitbuf(&mut sdu).ok()?;
                 Some((prim.address.ssi, prim.handle, prim.layer2service.clone(), pdu))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn mm_downlink_pdu_types(msgs: &[SapMsg]) -> Vec<MmPduTypeDl> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LmmMleUnitdataReq(prim) => {
+                let sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+                MmPduTypeDl::try_from(sdu.peek_bits(4)?).ok()
             }
             _ => None,
         })

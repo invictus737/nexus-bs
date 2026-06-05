@@ -3498,3 +3498,50 @@ Next non-repeating execution:
 2. Restart the test BS with EG7 still active and confirm the cache rewrites to `2260616 226333:0:4`, `2260082 226333:0:4`, `2260618 226333:0:4` or equivalent class values after the terminals report.
 3. Re-open the dashboard after restart and verify all three stations show `226333`, not `No Group`.
 4. If a terminal itself, not the dashboard, still displays `No Group`, inspect whether it received/ACKed `D-LOCATION UPDATE ACCEPT` and whether it later sends an explicit empty group-report-complete.
+
+## 2026-06-05 10:54:12 EEST - Restart candidate self-attach without groups no longer clears cached GSSI
+
+Additional audit finding:
+
+- A read-only MM audit found a remaining race: a terminal can self-attach before BS sends the startup `D-LOCATION UPDATE COMMAND`.
+- If that early self-attach is `U-LOCATION UPDATE DEMAND` / `ITSI attach` with no group identities, old logic did not treat it as a solicited restart recovery response and could call `remember_restart_recovery_issi()` with an empty local group set.
+- With EG7, that missed group-report command can persist longer because the terminal sleeps more aggressively after the initial attach.
+
+Component explanation:
+
+- MM restart recovery has two valid field orders:
+  - BS first: BS sends `D-LOCATION UPDATE COMMAND(group identity report=1)`, then MS answers.
+  - MS first: still-camped MS sends its own attach/update before the BS command is due.
+- The second order must not erase the restart cache just because the MS did not include a fresh GSSI in that first PDU.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4 permits SwMI-commanded registration and group identity report.
+- Clauses 16.8.0, 16.8.2, 16.8.3, 16.8.4 and 16.10.27a keep explicit group reports/complete reports authoritative.
+- Clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7 and 23.7.6/T.210 constrain the EG7 interaction: group-report recovery must be scheduled before a BS-initiated EG request can make the MS harder to reach.
+- This remains clause-scoped hardening and test evidence, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Captures `was_restart_recovery_candidate` before registration removes the candidate from the recovery map.
+  - For a new, group-less restart candidate, restores cached GSSI locally even if no `D-LOCATION UPDATE COMMAND` was already pending and even if the LU type is `ITSI attach`.
+  - Still does not fabricate `GroupIdentityLocationAccept`; the explicit MS group report or empty complete report remains authoritative.
+  - Queues `D-LOCATION UPDATE COMMAND(group_identity_report=1)` for a restart candidate that self-attaches without groups.
+  - Queues that group-report command before a configured BS-initiated `D-MM STATUS` energy-saving request, so EG7 does not hide the terminal before group recovery is requested.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added coverage for unsolicited group-less `ITSI attach` restoring cached GSSI and preserving cache.
+  - Added EG7 coverage proving group-report command order precedes `D-MM STATUS`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 16 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this second MM hardening patch.
+2. Redeploy to test BS and confirm build id changes from `7d72c06b`.
+3. Verify cache stays `ISSI 226333:0:4` for `2260082`, `2260616`, and `2260618` after restart.
