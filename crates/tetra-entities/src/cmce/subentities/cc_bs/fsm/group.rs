@@ -447,37 +447,43 @@ impl CcBsSubentity {
         };
 
         let state = call.state();
+        let current_speaker_issi = call.source_issi;
+        let is_current_speaker = call.is_current_speaker(sender.ssi);
         Self::validate_group_transition(call_id, state, GroupEvent::TxCeased)?;
 
-        if !call.is_current_speaker(sender.ssi) {
+        if !is_current_speaker {
+            if let Some(call) = self.active_calls.get_mut(&call_id)
+                && call.clear_queued_tx_demand_from(sender.ssi)
+            {
+                // EN 300 392-2 clause 14.5.2.2.1 a) allows an MS with a
+                // queued request-to-transmit to withdraw it using U-TX CEASED.
+                // No CC protocol response is expected from the SwMI.
+                tracing::info!(
+                    "FSM: U-TX CEASED call_id={} from queued group requester ISSI {} withdrew pending floor request",
+                    call_id,
+                    sender.ssi
+                );
+                return Ok(());
+            }
             return Err(GroupTransitionError::NotCurrentSpeaker {
                 call_id,
                 sender_issi: sender.ssi,
-                current_speaker_issi: call.source_issi,
+                current_speaker_issi,
             });
         }
 
+        let Some(call) = self.active_calls.get(&call_id) else {
+            return Err(GroupTransitionError::UnknownCall(call_id));
+        };
         let ts = call.ts;
         let usage = call.usage;
         let dest_ssi = call.dest_gssi;
-        let queued_request = call.queued_tx_demand;
-        let queued_request = queued_request.filter(|requester| {
-            let affiliated = self.subscriber_affiliated_to_group(requester.ssi, dest_ssi);
-            if !affiliated {
-                tracing::info!(
-                    "FSM: dropping queued group floor requester ISSI {} for call_id={} gssi={} after affiliation loss",
-                    requester.ssi,
-                    call_id,
-                    dest_ssi
-                );
-            }
-            affiliated
-        });
+        let queued_request = self.first_affiliated_group_floor_requester(call_id, call, "U-TX CEASED");
 
         let Some(call) = self.active_calls.get_mut(&call_id) else {
             return Err(GroupTransitionError::UnknownCall(call_id));
         };
-        let _ = call.take_queued_tx_demand();
+        let queued_request = call.take_queued_tx_demand_through(queued_request.map(|requester| requester.ssi));
         if let Some(requester) = queued_request {
             // Transmitting -> Transmitting, hand over floor directly to queued requester.
             call.grant_floor(requester.ssi, Some(requester));
@@ -589,7 +595,7 @@ impl CcBsSubentity {
         let Some(call) = self.active_calls.get_mut(&call_id) else {
             return Err(GroupTransitionError::UnknownCall(call_id));
         };
-        let _ = call.take_queued_tx_demand();
+        call.clear_all_queued_tx_demands();
         call.enter_hangtime(self.dltime);
 
         let Some(cached) = self.cached_setups.get(&call_id) else {

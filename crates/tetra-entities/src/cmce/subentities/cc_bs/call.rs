@@ -2,6 +2,7 @@ use super::*;
 
 // TETRA TDMA timing: one slot is 170/12 milliseconds.
 const TIMESLOT_DURATION_MS: f64 = 170.0 / 12.0;
+const MAX_GROUP_FLOOR_WAITERS: usize = 4096;
 
 #[inline]
 fn seconds_to_timeslots(seconds: i32) -> i32 {
@@ -74,7 +75,8 @@ pub(super) struct ActiveCall {
     pub(super) usage: u8,
     pub(super) tx_active: bool,
     pub(super) hangtime_start: Option<TdmaTime>,
-    pub(super) queued_tx_demand: Option<TetraAddress>,
+    queued_floor_demands: VecDeque<TetraAddress>,
+    queued_floor_demand_ssis: HashSet<u32>,
     pub(super) brew_uuid: Option<uuid::Uuid>,
 }
 
@@ -100,7 +102,8 @@ impl ActiveCall {
             usage,
             tx_active: true,
             hangtime_start: None,
-            queued_tx_demand: None,
+            queued_floor_demands: VecDeque::new(),
+            queued_floor_demand_ssis: HashSet::new(),
             brew_uuid: None,
         }
     }
@@ -126,7 +129,8 @@ impl ActiveCall {
             usage,
             tx_active: true,
             hangtime_start: None,
-            queued_tx_demand: None,
+            queued_floor_demands: VecDeque::new(),
+            queued_floor_demand_ssis: HashSet::new(),
             brew_uuid: Some(brew_uuid),
         }
     }
@@ -177,7 +181,6 @@ impl ActiveCall {
         self.source_issi = source_issi;
         self.tx_active = true;
         self.hangtime_start = None;
-        self.queued_tx_demand = None;
     }
 
     pub(super) fn queue_tx_demand(&mut self, requester: TetraAddress) -> TxDemandQueueResult {
@@ -185,27 +188,51 @@ impl ActiveCall {
             return TxDemandQueueResult::FromCurrentSpeaker;
         }
 
-        match self.queued_tx_demand {
-            Some(existing) if existing.ssi == requester.ssi => TxDemandQueueResult::AlreadyQueuedBySameUser,
-            Some(_) => TxDemandQueueResult::QueueBusy,
-            None => {
-                self.queued_tx_demand = Some(requester);
-                TxDemandQueueResult::Queued
-            }
+        if self.queued_floor_demand_ssis.contains(&requester.ssi) {
+            return TxDemandQueueResult::AlreadyQueuedBySameUser;
         }
+
+        if self.queued_floor_demands.len() >= MAX_GROUP_FLOOR_WAITERS {
+            return TxDemandQueueResult::QueueBusy;
+        }
+
+        self.queued_floor_demands.push_back(requester);
+        self.queued_floor_demand_ssis.insert(requester.ssi);
+        TxDemandQueueResult::Queued
     }
 
     pub(super) fn take_queued_tx_demand(&mut self) -> Option<TetraAddress> {
-        self.queued_tx_demand.take()
+        let requester = self.queued_floor_demands.pop_front()?;
+        self.queued_floor_demand_ssis.remove(&requester.ssi);
+        Some(requester)
+    }
+
+    pub(super) fn queued_tx_demands(&self) -> impl Iterator<Item = TetraAddress> + '_ {
+        self.queued_floor_demands.iter().copied()
+    }
+
+    pub(super) fn take_queued_tx_demand_through(&mut self, target_issi: Option<u32>) -> Option<TetraAddress> {
+        while let Some(requester) = self.queued_floor_demands.pop_front() {
+            self.queued_floor_demand_ssis.remove(&requester.ssi);
+            if Some(requester.ssi) == target_issi {
+                return Some(requester);
+            }
+        }
+        None
     }
 
     pub(super) fn clear_queued_tx_demand_from(&mut self, issi: u32) -> bool {
-        if self.queued_tx_demand.is_some_and(|requester| requester.ssi == issi) {
-            self.queued_tx_demand = None;
-            true
-        } else {
-            false
+        let removed = self.queued_floor_demand_ssis.remove(&issi);
+        if !removed {
+            return false;
         }
+        self.queued_floor_demands.retain(|requester| requester.ssi != issi);
+        true
+    }
+
+    pub(super) fn clear_all_queued_tx_demands(&mut self) {
+        self.queued_floor_demands.clear();
+        self.queued_floor_demand_ssis.clear();
     }
 }
 
@@ -448,5 +475,65 @@ impl IndividualCall {
             return false;
         };
         started.age(now) > limit
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_group_call() -> ActiveCall {
+        ActiveCall::new_local(TetraAddress::issi(100), 91, 100, 2, 4, TdmaTime::default(), CallTimeout::T30s, 0)
+    }
+
+    #[test]
+    fn group_floor_waiter_fifo_is_deduplicated_and_bounded() {
+        let mut call = test_group_call();
+
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(101)), TxDemandQueueResult::Queued);
+        assert_eq!(
+            call.queue_tx_demand(TetraAddress::issi(101)),
+            TxDemandQueueResult::AlreadyQueuedBySameUser
+        );
+
+        for offset in 1..MAX_GROUP_FLOOR_WAITERS {
+            assert_eq!(
+                call.queue_tx_demand(TetraAddress::issi(101 + offset as u32)),
+                TxDemandQueueResult::Queued,
+                "waiter offset {offset} should fit in the bounded FIFO"
+            );
+        }
+
+        assert_eq!(
+            call.queue_tx_demand(TetraAddress::issi(900_000)),
+            TxDemandQueueResult::QueueBusy,
+            "overflow beyond the bounded group floor FIFO must be rejected"
+        );
+        assert_eq!(call.take_queued_tx_demand().map(|addr| addr.ssi), Some(101));
+        assert_eq!(call.take_queued_tx_demand().map(|addr| addr.ssi), Some(102));
+        assert_eq!(
+            call.queue_tx_demand(TetraAddress::issi(101)),
+            TxDemandQueueResult::Queued,
+            "a requester removed from the FIFO may request the floor again later"
+        );
+        assert!(call.clear_queued_tx_demand_from(101));
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(101)), TxDemandQueueResult::Queued);
+    }
+
+    #[test]
+    fn group_floor_waiter_take_through_drops_stale_prefix_and_preserves_tail() {
+        let mut call = test_group_call();
+
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(101)), TxDemandQueueResult::Queued);
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(102)), TxDemandQueueResult::Queued);
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(103)), TxDemandQueueResult::Queued);
+
+        assert_eq!(
+            call.take_queued_tx_demand_through(Some(102)).map(|requester| requester.ssi),
+            Some(102)
+        );
+        assert_eq!(call.take_queued_tx_demand().map(|requester| requester.ssi), Some(103));
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(101)), TxDemandQueueResult::Queued);
+        assert_eq!(call.queue_tx_demand(TetraAddress::issi(102)), TxDemandQueueResult::Queued);
     }
 }

@@ -573,18 +573,7 @@ impl CcBsSubentity {
 
         let (dest_gssi, usage, queued_request) = {
             let call = self.active_calls.get(&call_id).unwrap();
-            let queued_request = call.queued_tx_demand.filter(|requester| {
-                let affiliated = self.subscriber_affiliated_to_group(requester.ssi, call.dest_gssi);
-                if !affiliated {
-                    tracing::info!(
-                        "CMCE: dropping queued group floor requester ISSI {} for call_id={} gssi={} after affiliation loss during UL inactivity",
-                        requester.ssi,
-                        call_id,
-                        call.dest_gssi
-                    );
-                }
-                affiliated
-            });
+            let queued_request = self.first_affiliated_group_floor_requester(call_id, call, "UL inactivity");
             (call.dest_gssi, call.usage, queued_request)
         };
 
@@ -603,7 +592,8 @@ impl CcBsSubentity {
             );
             {
                 let call = self.active_calls.get_mut(&call_id).unwrap();
-                let _ = call.take_queued_tx_demand();
+                let queued_request = call.take_queued_tx_demand_through(Some(requester.ssi));
+                debug_assert_eq!(queued_request.map(|requester| requester.ssi), Some(requester.ssi));
                 call.grant_floor(requester.ssi, Some(requester));
             }
 
@@ -659,7 +649,7 @@ impl CcBsSubentity {
             tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
             {
                 let call = self.active_calls.get_mut(&call_id).unwrap();
-                let _ = call.take_queued_tx_demand();
+                call.clear_all_queued_tx_demands();
                 call.enter_hangtime(self.dltime);
             }
 

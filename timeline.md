@@ -6382,3 +6382,70 @@ Next non-repeating execution:
 2. Implement bounded FIFO group floor fairness: replace the single waiter with a de-duplicated bounded queue, cleanup on deaffiliate/release, and large repeated-PTT tests.
 3. Continue restart/EG7 recovery regression for thousands of cached affiliates before group PTT.
 4. Continue SDS/WAP accepted-vs-transmitted observability and private-call release validation.
+
+## 2026-06-05 - Bounded FIFO group floor fairness for thousands of terminals
+
+Component in simple technical terms:
+
+- CMCE group floor control decides which ISSI may transmit on a GSSI group call.
+- A `D-TX GRANTED(RequestQueued)` tells a waiting terminal that its PTT request is accepted into the SwMI queue, but the current speaker still owns the floor.
+- A `D-TX GRANTED(Granted)` with uplink allocation gives the next terminal permission to talk.
+- A GSSI `D-TX GRANTED(GrantedToOtherUser)` tells group listeners that another terminal now owns the floor.
+
+Problem fixed:
+
+- Group calls previously retained only one queued floor requester. That was enough for 2-3 radios, but not robust for thousands of affiliated terminals contending on the same GSSI.
+- The active group call now keeps a bounded FIFO of queued floor requesters, capped at 4096 waiters.
+- The FIFO is de-duplicated by ISSI with a `HashSet`, so repeated PTT/U-SETUP aliases from the same terminal do not scan or grow the whole queue.
+- On `U-TX CEASED` or UL inactivity, CMCE grants the floor to the first still-affiliated queued requester and drops stale deaffiliated requesters ahead of it.
+- A queued requester may now withdraw its own pending request with `U-TX CEASED` before floor grant; no CC protocol response is emitted and the withdrawn ISSI is not granted later.
+- The 4097th queued contender receives explicit `NotGranted` without disturbing the 4096 accepted FIFO waiters.
+- Private simplex/duplex calls keep their existing one-waiter P2P logic; this patch is group-call scoped.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group-call floor request response can be grant, queued, or not granted. The bounded FIFO is Nexus-BS SwMI policy over that allowed signalling.
+- EN 300 392-2 clause 14.5.2.2.1 a): a user application may withdraw a queued request-to-transmit by sending `U-TX CEASED`; no CC protocol response is expected from the SwMI.
+- EN 300 392-2 clause 14.5.2.1: repeated same-GSSI `U-SETUP` while a group call is already maintained is handled as floor-control alias, not as a duplicate setup fanout.
+- EN 300 392-2 clause 20.4.1.1.3 and clause 23.5: floor-control signalling must survive the CMCE/MLE/LLC/UMAC assigned-channel path.
+- This is clause-scoped regression evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - Replaced the group `queued_tx_demand: Option<TetraAddress>` with `VecDeque<TetraAddress>` plus `HashSet<u32>`.
+  - Added bounded FIFO queue, O(1) duplicate detection, FIFO pop-through for stale requester cleanup, and clear-on-departure/release helpers.
+  - Added unit coverage for deduplication, 4096-waiter cap, FIFO pop, pop-through stale-prefix cleanup, re-queue after removal, and explicit clear.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added first-affiliated queued requester selection so deaffiliated stale waiters are skipped before handoff.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - `U-TX CEASED` now hands the floor to the first still-affiliated FIFO waiter, not a single overwritten waiter.
+  - `U-TX CEASED` from a queued non-speaker now withdraws that requester from the FIFO without emitting contradictory floor signalling.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - UL inactivity fallback uses the same affiliated FIFO handoff path.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated repeated same-GSSI `U-SETUP` alias tests to expect FIFO `RequestQueued` behaviour without D-SETUP fanout.
+  - Added/strengthened 4096-member group tests proving first and second FIFO handoffs.
+  - Added CMCE regressions for queued-request withdrawal, deaffiliated head-waiter skip to the next FIFO requester, and overflow `NotGranted` after 4096 waiters.
+  - Updated cross-layer storm validation so lower-value storm responses may be `RequestQueued` or `NotGranted`, while requester and listener grants still win priority.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --lib group_floor_waiter --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_cross_layer_large_group_floor_grant_survives_wrapped_ptt_storm_to_lmac --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_queued_requester_u_tx_ceased_withdraws_before_handoff --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_tx_ceased_skips_deaffiliated_front_waiter_and_grants_next_fifo_waiter --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 149 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 62 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit bounded FIFO group floor fairness.
+2. Continue restart/EG7 recovery regression for thousands of cached affiliates: after BS restart, MM and CMCE must restore attach-visible state and GSSI affiliation before group PTT.
+3. Continue live-lab validation for Motorola MTP3550 static-audio-on-repeated-PTT, using logs from last restart and without changing ETSI baseline.
+4. Continue SDS/WAP accepted-vs-transmitted observability and private-call release validation.

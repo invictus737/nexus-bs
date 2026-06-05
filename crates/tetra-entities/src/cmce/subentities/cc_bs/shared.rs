@@ -469,6 +469,27 @@ impl CcBsSubentity {
             .unwrap_or(false)
     }
 
+    pub(super) fn first_affiliated_group_floor_requester(
+        &self,
+        call_id: u16,
+        call: &ActiveCall,
+        context: &str,
+    ) -> Option<TetraAddress> {
+        call.queued_tx_demands().find(|requester| {
+            let affiliated = self.subscriber_affiliated_to_group(requester.ssi, call.dest_gssi);
+            if !affiliated {
+                tracing::info!(
+                    "CMCE: dropping queued group floor requester ISSI {} for call_id={} gssi={} after affiliation loss during {}",
+                    requester.ssi,
+                    call_id,
+                    call.dest_gssi,
+                    context
+                );
+            }
+            affiliated
+        })
+    }
+
     fn sync_shared_subscribers_from_mm_update(&self, issi: u32, groups: &[u32], action: BrewSubscriberAction) {
         let mut state = self.config.state_write();
         match action {

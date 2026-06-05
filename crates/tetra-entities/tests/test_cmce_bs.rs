@@ -1667,7 +1667,7 @@ fn test_large_group_setup_uses_one_gssi_d_setup_and_one_umac_open() {
         vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
     );
 
-    let member_count = LARGE_GSSI_MEMBER_COUNT;
+    let member_count = LARGE_GSSI_MEMBER_COUNT + 2;
     let first_issi = 420_000_u32;
     let speaker_issi = first_issi;
     for offset in 0..member_count {
@@ -3786,7 +3786,7 @@ fn test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout
     // EN 300 392-2 clause 14.5.2.1 covers group setup. Once the same GSSI
     // call is already maintained, clause 14.5.2.2.1 floor control applies.
     // Treat repeated same-GSSI U-SETUPs as bounded floor requests: do not fan
-    // out setup transactions, and keep only the first queued requester.
+    // out setup transactions, and keep affiliated contenders in FIFO order.
     assert_eq!(count_d_call_proceedings(&busy_msgs), 0);
     assert_eq!(count_d_connects(&busy_msgs), 0);
     assert_eq!(count_d_setups(&busy_msgs), 0);
@@ -3812,8 +3812,8 @@ fn test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout
         assert_eq!(grant.call_identifier, call_id);
         assert_eq!(
             grant.transmission_grant,
-            TransmissionGrant::NotGranted.into_raw() as u8,
-            "second and later repeated U-SETUP aliases must not replace the queued requester"
+            TransmissionGrant::RequestQueued.into_raw() as u8,
+            "affiliated repeated U-SETUP aliases inside the bounded FIFO should wait their turn"
         );
         assert_d_tx_granted_facch_allocation(
             prim,
@@ -3845,11 +3845,38 @@ fn test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout
         handoff_grants.iter().all(|(prim, _)| {
             prim.main_address.ssi == queued_requester || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
         }),
-        "busy repeated U-SETUP contenders must not replace the first queued floor requester"
+        "later repeated U-SETUP contenders must not jump ahead of the first queued floor requester"
     );
     assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
+
+    let second_queued_requester = first_issi + 2;
+    test.submit_message(build_u_tx_ceased_msg(queued_requester, call_id));
+    test.run_stack(Some(1));
+    let second_handoff_msgs = test.dump_sinks();
+    let second_handoff_grants: Vec<_> = second_handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let second_handoff = second_handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(second_queued_requester))
+        .expect("FIFO should hand the next repeated U-SETUP alias the floor");
+    assert_eq!(second_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert!(
+        second_handoff_grants.iter().all(|(prim, _)| {
+            prim.main_address.ssi == second_queued_requester
+                || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+        }),
+        "second FIFO handoff must still produce only requester and GSSI listener grants"
+    );
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+    assert_eq!(count_d_releases(&second_handoff_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&second_handoff_msgs), 0);
 }
 
 #[test]
@@ -4990,7 +5017,7 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
 }
 
 #[test]
-fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted() {
+fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -5040,15 +5067,16 @@ fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted()
     let busy_msgs = test.dump_sinks();
 
     // EN 300 392-2 clause 14.5.2.2.1 lets the SwMI answer a floor request
-    // with queued/granted/not-granted state. This implementation deliberately
-    // keeps one bounded waiter for group floor handoff: later affiliated
-    // contenders are explicitly rejected and must not replace the queued MS.
+    // with queued/granted/not-granted state. Nexus-BS keeps a bounded FIFO so
+    // thousands of affiliated contenders can wait their turn without replacing
+    // the first queued MS.
     let busy_grants: Vec<_> = busy_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
             SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
             _ => None,
         })
+        .filter(|(prim, _)| prim.main_address.ssi >= first_issi + 2 && prim.main_address.ssi < first_issi + member_count)
         .collect();
     assert_eq!(busy_grants.len(), member_count as usize - 2);
     for (prim, grant) in &busy_grants {
@@ -5057,10 +5085,9 @@ fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted()
             prim.main_address.ssi >= first_issi + 2 && prim.main_address.ssi < first_issi + member_count,
             "only busy requesters should receive busy queue responses"
         );
-        assert_eq!(
-            grant.transmission_grant,
-            TransmissionGrant::NotGranted.into_raw() as u8,
-            "second and later waiters must not be retained as queued group floor owners"
+        assert!(
+            grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8,
+            "large group contenders inside the bounded FIFO should be queued"
         );
         assert_d_tx_granted_facch_allocation(
             prim,
@@ -5095,11 +5122,113 @@ fn test_large_group_floor_queue_is_bounded_and_busy_requesters_are_not_granted()
         handoff_grants.iter().all(|(prim, _)| {
             prim.main_address.ssi == queued_requester || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
         }),
-        "busy requesters must not replace the first queued floor requester"
+        "later requesters must not jump ahead of the first queued floor requester"
     );
     assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
+
+    let second_queued_requester = first_issi + 2;
+    test.submit_message(build_u_tx_ceased_msg(queued_requester, call_id));
+    test.run_stack(Some(1));
+    let second_handoff_msgs = test.dump_sinks();
+    let second_handoff_grants: Vec<_> = second_handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let second_handoff = second_handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(second_queued_requester))
+        .expect("FIFO should hand the next floor to the second queued requester");
+    assert_eq!(second_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert!(
+        second_handoff_grants.iter().all(|(prim, _)| {
+            prim.main_address.ssi == second_queued_requester
+                || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+        }),
+        "FIFO handoff must not skip to later large-group requesters"
+    );
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+}
+
+#[test]
+fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = LARGE_GSSI_MEMBER_COUNT + 2;
+    let first_issi = 760_000_u32;
+    let current_speaker = first_issi;
+    let first_waiter = first_issi + 1;
+    let overflow_waiter = first_issi + member_count - 1;
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let (call_id, _active_ts, _active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+
+    for issi in (first_issi + 1)..(first_issi + member_count) {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+    }
+    test.run_stack(Some(member_count as usize + 16));
+    let demand_msgs = test.dump_sinks();
+    let grants: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .filter(|(prim, _)| prim.main_address.ssi > current_speaker && prim.main_address.ssi < first_issi + member_count)
+        .collect();
+    assert_eq!(grants.len(), member_count as usize - 1);
+    assert_eq!(
+        grants
+            .iter()
+            .filter(|(_, grant)| grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+            .count(),
+        LARGE_GSSI_MEMBER_COUNT as usize,
+        "bounded FIFO should accept exactly 4096 group floor waiters"
+    );
+    let overflow = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(overflow_waiter))
+        .expect("overflow requester should receive an explicit floor response");
+    assert_eq!(
+        overflow.1.transmission_grant,
+        TransmissionGrant::NotGranted.into_raw() as u8,
+        "requester beyond the bounded FIFO must be explicitly denied"
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let first_handoff = handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(first_waiter))
+        .expect("overflow denial must not disturb the head of the FIFO");
+    assert_eq!(first_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
 }
 
 #[test]
@@ -5182,35 +5311,41 @@ fn test_cross_layer_large_group_floor_grant_survives_wrapped_ptt_storm_to_lmac()
         "requester positive grant should reach STCH before the listener floor notification"
     );
 
-    let busy_grant_count = wrapped_grants
+    let lower_value_grant_count = wrapped_grants
         .iter()
         .filter(|decoded| {
             decoded.resource.addr.is_some_and(|addr| {
                 (first_issi + 2..first_issi + member_count).contains(&addr.ssi)
                     && decoded.grant.call_identifier == call_id
-                    && decoded.grant.transmission_grant == TransmissionGrant::NotGranted.into_raw() as u8
+                    && matches!(
+                        TransmissionGrant::try_from(decoded.grant.transmission_grant as u64),
+                        Ok(TransmissionGrant::RequestQueued | TransmissionGrant::NotGranted)
+                    )
             })
         })
         .count();
     assert!(
-        busy_grant_count > 0,
-        "fixture should emit at least one wrapped busy/NotGranted response so the PTT storm is observable at LMAC"
+        lower_value_grant_count > 0,
+        "fixture should emit at least one wrapped queued/not-granted response so the PTT storm is observable at LMAC"
     );
 
-    if let Some(first_busy) = wrapped_grants.iter().find(|decoded| {
+    if let Some(first_lower_value) = wrapped_grants.iter().find(|decoded| {
         decoded.resource.addr.is_some_and(|addr| {
             (first_issi + 2..first_issi + member_count).contains(&addr.ssi)
                 && decoded.grant.call_identifier == call_id
-                && decoded.grant.transmission_grant == TransmissionGrant::NotGranted.into_raw() as u8
+                && matches!(
+                    TransmissionGrant::try_from(decoded.grant.transmission_grant as u64),
+                    Ok(TransmissionGrant::RequestQueued | TransmissionGrant::NotGranted)
+                )
         })
     }) {
         assert!(
-            requester_positive.resource_sequence < first_busy.resource_sequence,
-            "positive requester floor grant must be emitted before lower-value storm NotGranted responses"
+            requester_positive.resource_sequence < first_lower_value.resource_sequence,
+            "positive requester floor grant must be emitted before lower-value storm queue/denial responses"
         );
         assert!(
-            listener_notification.resource_sequence < first_busy.resource_sequence,
-            "listener floor notification must stay ahead of lower-value storm NotGranted responses"
+            listener_notification.resource_sequence < first_lower_value.resource_sequence,
+            "listener floor notification must stay ahead of lower-value storm queue/denial responses"
         );
     }
 }
@@ -5820,6 +5955,138 @@ fn test_group_tx_ceased_does_not_grant_deaffiliated_queued_requester() {
             }) if *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_GSSI
         )
     }));
+}
+
+#[test]
+fn test_group_tx_ceased_skips_deaffiliated_front_waiter_and_grants_next_fifo_waiter() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_OTHER_ISSI, TEST_GSSI);
+    let call_id = start_group_call(&mut test);
+
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.submit_message(build_u_tx_demand_msg(TEST_OTHER_ISSI, call_id));
+    test.run_stack(Some(2));
+    let demand_msgs = test.dump_sinks();
+    let queued_grants: Vec<_> = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .filter(|(_, grant)| grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+        .collect();
+    assert_eq!(queued_grants.len(), 2);
+
+    test.submit_message(build_mm_deaffiliate_msg(TEST_CALLED_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // EN 300 392-2 clause 14.5.2.2.1 scopes queued floor requests to MSs
+    // still involved in the group call. A deaffiliated head waiter is stale;
+    // the SwMI policy may grant the next valid queued requester.
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let ceased_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = ceased_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_grants.len(), 2);
+    let next_handoff = handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_OTHER_ISSI))
+        .expect("next affiliated FIFO waiter should receive the floor");
+    assert_eq!(next_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert!(
+        handoff_grants.iter().all(|(prim, _)| {
+            prim.main_address.ssi == TEST_OTHER_ISSI || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+        }),
+        "deaffiliated front waiter must not receive the handoff"
+    );
+    assert_eq!(count_umac_floor_granted(&ceased_msgs), 1);
+    assert_eq!(count_d_tx_ceased(&ceased_msgs), 0);
+}
+
+#[test]
+fn test_group_queued_requester_u_tx_ceased_withdraws_before_handoff() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_OTHER_ISSI, TEST_GSSI);
+    let call_id = start_group_call(&mut test);
+
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.submit_message(build_u_tx_demand_msg(TEST_OTHER_ISSI, call_id));
+    test.run_stack(Some(2));
+    let demand_msgs = test.dump_sinks();
+    assert_eq!(
+        demand_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim),
+                _ => None,
+            })
+            .filter(|grant| grant.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+            .count(),
+        2
+    );
+
+    // EN 300 392-2 clause 14.5.2.2.1 a) states that a queued request-to-
+    // transmit may be withdrawn with U-TX CEASED and no CC protocol response
+    // shall be received from the SwMI for that message.
+    test.submit_message(build_u_tx_ceased_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let withdraw_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_granted(&withdraw_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&withdraw_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&withdraw_msgs), 0);
+    assert_eq!(count_umac_floor_released(&withdraw_msgs), 0);
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(handoff_grants.len(), 2);
+    let next_handoff = handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_OTHER_ISSI))
+        .expect("withdrawn queued requester must be skipped in favour of next FIFO waiter");
+    assert_eq!(next_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert!(
+        handoff_grants.iter().all(|(prim, _)| {
+            prim.main_address.ssi == TEST_OTHER_ISSI || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+        }),
+        "withdrawn queued requester must not receive a later floor grant"
+    );
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
 }
 
 #[test]
