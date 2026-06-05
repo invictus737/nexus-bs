@@ -1,5 +1,39 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 13:23:30 EEST - Live deploy validation for restart `No Group` hardening
+
+Deployment:
+
+- Deployed direct to `chris@192.168.1.179` test instance with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- No build was performed on the Pi and no binary backup was created.
+- Running build: `Nexus-BS v0.1.55`, build `v0.1.55-2b334a02`.
+- Deployed binary SHA256: `822514d2ac772e127c66e0f91c519c9de91e9dd1d1f9752c8bf5f9b64a16f43c`.
+- Running processes:
+  - `nexus-bs-control-service --listen 127.0.0.1:9002`
+  - `/home/chris/nexus-bs-v0.1.55-test/bin/nexus-bs /home/chris/nexus-bs-v0.1.55-test/config.live.toml`
+
+Live restart evidence:
+
+- Runtime cache `/home/chris/nexus-bs-v0.1.55-test/config.live.toml.subscribers` contains:
+  - `2260082 226333:0:4`
+  - `2260616 226333:0:4`
+  - `2260618 226333:0:4`
+- Fresh log from the new build marker showed:
+  - `MM: restart recovery armed for 3 local ISSI(s): {2260082, 2260616, 2260618}`.
+  - `2260082` sent `RoamingLocationUpdating` with `GroupIdentityLocationDemand` for GSSI `226333`; MM returned `D-LOCATION UPDATE ACCEPT` with `GroupIdentityLocationAccept`; CMCE logged `subscriber register` and `subscriber affiliate groups=[226333]`.
+  - `2260618` registered and CMCE logged `subscriber affiliate groups=[226333]`.
+  - `2260616` registered and CMCE logged `subscriber affiliate groups=[226333]`.
+- Dashboard WebSocket snapshot after restart:
+  - `2260082`: `groups=[226333]`, `energy_saving_mode=0` after T352 fallback.
+  - `2260616`: `groups=[226333]`, `energy_saving_mode=7`, EG frame/multiframe present.
+  - `2260618`: `groups=[226333]`, `energy_saving_mode=0` after T352 fallback.
+
+Conclusion:
+
+- The deployed build has all three lab terminals affiliated to `226333` after restart at MM/CMCE/dashboard state level.
+- The specific group-less LU interleaving fixed in code did not occur in this fresh live restart because the observed terminals reported GSSI `226333` directly; unit tests cover the missing interleaving.
+- Next live action is operator PTT validation on group and private call. If a terminal still displays `No Group`, capture the exact ISSI and timestamp immediately.
+
 ## 2026-06-05 13:18:48 EEST - MM restart group refresh survives group-less LU without masking explicit clear
 
 User report:
