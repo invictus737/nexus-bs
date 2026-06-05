@@ -3135,6 +3135,93 @@ fn test_call_control_open_suspends_group_energy_saving_until_close_plus_t210() {
 }
 
 #[test]
+fn test_large_eg7_group_call_open_suspends_all_members_once_and_resumes_after_close() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime::default();
+    let gssi = 226_333;
+    let first_issi = 300_000;
+    let member_count = 4096;
+    let unrelated_issi = 399_999;
+    let ts = 2;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    {
+        let mut state = test.config.state_write();
+        for offset in 0..member_count {
+            let issi = first_issi + offset;
+            state.subscribers.register(issi);
+            assert!(state.subscribers.affiliate(issi, gssi));
+            state.energy_saving.insert(issi, eg_assignment(start));
+        }
+        state.subscribers.register(unrelated_issi);
+        state.energy_saving.insert(unrelated_issi, eg_assignment(start));
+    }
+    test.populate_entities(vec![TetraEntity::Umac], vec![]);
+
+    test.submit_message(group_call_open_msg(gssi, ts));
+    test.run_stack(Some(1));
+
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.subscribers.group_members(gssi).len(), member_count as usize);
+        for offset in 0..member_count {
+            let issi = first_issi + offset;
+            let assignment = state
+                .energy_saving
+                .get(&issi)
+                .expect("large-group EG7 member should remain tracked");
+            assert_eq!(
+                assignment.suspension_count, 1,
+                "EN 300 392-2 clause 23.7.6: assigned-channel GSSI call should suspend each affiliated EG member exactly once"
+            );
+            assert!(
+                assignment.listens_at(start.add_timeslots(4)),
+                "assigned-channel suspension should keep every EG7 group member awake while the call is active"
+            );
+        }
+        assert_eq!(
+            state
+                .energy_saving
+                .get(&unrelated_issi)
+                .expect("unrelated EG7 member should remain tracked")
+                .suspension_count,
+            0,
+            "unrelated EG7 ISSI must not be suspended by another GSSI's group call"
+        );
+    }
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Both, ts)),
+    });
+    test.run_stack(Some(1));
+
+    let state = test.config.state_read();
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        let assignment = state
+            .energy_saving
+            .get(&issi)
+            .expect("large-group EG7 member should remain tracked after close");
+        assert_eq!(assignment.suspension_count, 0);
+        assert!(
+            assignment.awake_until.is_some(),
+            "EG7 resume after assigned-channel group close should keep the T.210 awake guard"
+        );
+    }
+    assert_eq!(
+        state
+            .energy_saving
+            .get(&unrelated_issi)
+            .expect("unrelated EG7 member should remain tracked after close")
+            .suspension_count,
+        0
+    );
+}
+
+#[test]
 fn test_group_secondary_speaker_does_not_double_suspend_energy_saving() {
     debug::setup_logging_verbose();
 

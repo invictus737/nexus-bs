@@ -52,6 +52,7 @@ pub const TCH_S_CAP: usize = 274;
 pub const NUM_TIMESLOTS: usize = 4;
 
 const PREDEFINED_BROADCAST_GSSI: u32 = 0xFF_FFFF;
+const MAX_PENDING_RA_ACKS_PER_TIMESLOT: usize = 8192;
 
 enum DlTchBlock {
     AcElp(BitBuffer),
@@ -926,11 +927,38 @@ impl BsChannelScheduler {
             .iter()
             .position(|pending_addr| pending_addr.ssi == addr.ssi && pending_addr.ssi_type == addr.ssi_type)
         {
-            pending.remove(pos);
+            pending.swap_remove(pos);
             true
         } else {
             false
         }
+    }
+
+    fn store_pending_ra_ack(&mut self, slot: usize, ts: u8, addr: TetraAddress) {
+        let pending = &mut self.pending_ra_acks[slot];
+        if pending
+            .iter()
+            .any(|pending_addr| pending_addr.ssi == addr.ssi && pending_addr.ssi_type == addr.ssi_type)
+        {
+            tracing::debug!(
+                "store_pending_ra_ack: random-access ACK for {} on ts {} is already pending",
+                addr,
+                ts
+            );
+            return;
+        }
+
+        if pending.len() >= MAX_PENDING_RA_ACKS_PER_TIMESLOT {
+            let dropped = pending.swap_remove(0);
+            tracing::warn!(
+                "store_pending_ra_ack: dropping deferred random-access ACK {} on ts {} because {} ACK(s) are already pending",
+                dropped,
+                ts,
+                MAX_PENDING_RA_ACKS_PER_TIMESLOT
+            );
+        }
+
+        pending.push(addr);
     }
 
     /// Returns whether an STCH MAC-RESOURCE should carry random_access_flag for
@@ -1609,68 +1637,70 @@ impl BsChannelScheduler {
         let Some(slot) = Self::dl_slot_index(timeslot, "dl_drop_all_except_stolen") else {
             return false;
         };
-        let queue = &mut self.dltx_queues[slot];
-        let dropped_grant_addrs: Vec<TetraAddress> = queue
+        let dropped_grant_addrs: HashSet<TetraAddress> = self.dltx_queues[slot]
             .iter()
             .filter_map(|elem| match elem {
                 DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _) => Some(*addr),
                 _ => None,
             })
             .collect();
-        let mut i = 0;
         let mut item_was_discarded = false;
-        while i < queue.len() {
-            if matches!(queue[i], DlSchedElem::Stealing(..)) {
-                i += 1;
-            } else {
-                // Found a to-be-discarded element.
-                // Remove, log, and call tx_reporter::mark_discarded() if applicable.
-                // Logged at debug because this fires during normal hangtime entry/exit
-                // races and isn't an anomaly worth surfacing as a warning. Per
-                // proxiboi69 in MidnightBlueLabs/tetra-bluestation PR #85.
-                let elem = queue.remove(i);
-                item_was_discarded = true;
-                tracing::debug!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
 
-                match elem {
-                    DlSchedElem::Resource(_, _, tx_reporter, group_state) => {
-                        // Report as discarded manually
-                        Self::mark_reporter_discarded_if_pending(tx_reporter.or_else(|| group_state.and_then(|s| s.tx_reporter)));
-                    }
+        let old_queue = std::mem::take(&mut self.dltx_queues[slot]);
+        let mut retained = Vec::with_capacity(old_queue.len());
+        for elem in old_queue {
+            if matches!(elem, DlSchedElem::Stealing(..)) {
+                retained.push(elem);
+                continue;
+            }
 
-                    DlSchedElem::FragBuf(_, group_state) => {
-                        // Fragger self-marks any unsent fragments as discarded when dropped, so we don't need to do anything here.
-                        Self::mark_reporter_discarded_if_pending(group_state.and_then(|s| s.tx_reporter));
-                    }
+            // Found a to-be-discarded element.
+            // Log and call tx_reporter::mark_discarded() if applicable.
+            // Logged at debug because this fires during normal hangtime entry/exit
+            // races and isn't an anomaly worth surfacing as a warning. Per
+            // proxiboi69 in MidnightBlueLabs/tetra-bluestation PR #85.
+            item_was_discarded = true;
+            tracing::debug!("dl_drop_all_except_stolen: discarding scheduled {:?} on ts {}", elem, timeslot);
 
-                    DlSchedElem::RandomAccessAck(addr) => {
-                        if dropped_grant_addrs
-                            .iter()
-                            .any(|grant_addr| grant_addr.ssi == addr.ssi && grant_addr.ssi_type == addr.ssi_type)
-                        {
-                            // ETSI EN 300 392-2 clauses 21.4.3.1 and 23.5.1.3.3
-                            // tie a reserved random access acknowledgement to the
-                            // corresponding slot grant. If hangtime cleanup drops
-                            // the grant, do not later transmit an ACK-only STCH.
-                            tracing::debug!(
-                                "dl_drop_all_except_stolen: dropping RA ACK for {} because its grant is also discarded on ts {}",
-                                addr,
-                                timeslot
-                            );
-                        } else {
-                            // Save the SSI so the next STCH for this address can carry
-                            // random_access_flag=true (ETSI 21.4.3.1)
-                            self.pending_ra_acks[slot].push(addr);
-                        }
-                    }
-
-                    DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::Broadcast(_) => {
-                        // Silently dropped as internal or not equipped with a tx_reporter
-                    }
-                    _ => unreachable!(),
+            match elem {
+                DlSchedElem::Resource(_, _, tx_reporter, group_state) => {
+                    // Report as discarded manually
+                    Self::mark_reporter_discarded_if_pending(tx_reporter.or_else(|| group_state.and_then(|s| s.tx_reporter)));
                 }
+
+                DlSchedElem::FragBuf(_, group_state) => {
+                    // Fragger self-marks any unsent fragments as discarded when dropped, so we don't need to do anything here.
+                    Self::mark_reporter_discarded_if_pending(group_state.and_then(|s| s.tx_reporter));
+                }
+
+                DlSchedElem::RandomAccessAck(addr) => {
+                    if dropped_grant_addrs.contains(&addr) {
+                        // ETSI EN 300 392-2 clauses 21.4.3.1 and 23.5.1.3.3
+                        // tie a reserved random access acknowledgement to the
+                        // corresponding slot grant. If hangtime cleanup drops
+                        // the grant, do not later transmit an ACK-only STCH.
+                        tracing::debug!(
+                            "dl_drop_all_except_stolen: dropping RA ACK for {} because its grant is also discarded on ts {}",
+                            addr,
+                            timeslot
+                        );
+                    } else {
+                        // Save the SSI so the next STCH for this address can carry
+                        // random_access_flag=true (ETSI 21.4.3.1). Keep the
+                        // local queue deduplicated and bounded so repeated
+                        // random access from thousands of group listeners cannot
+                        // grow scheduler state without limit.
+                        self.store_pending_ra_ack(slot, timeslot, addr);
+                    }
+                }
+
+                DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::Broadcast(_) => {
+                    // Silently dropped as internal or not equipped with a tx_reporter
+                }
+                _ => unreachable!(),
             }
         }
+        self.dltx_queues[slot] = retained;
 
         item_was_discarded
     }
@@ -5446,6 +5476,53 @@ mod tests {
         assert!(
             !sched.take_pending_ra_ack_for_stch(1, addr, true),
             "random-access ACK should be consumed only once"
+        );
+    }
+
+    #[test]
+    fn test_pending_random_access_ack_deduplicates_same_issi() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress {
+            ssi_type: SsiType::Issi,
+            ssi: 1234,
+        };
+
+        for _ in 0..16 {
+            sched.dl_enqueue_random_access_ack(1, addr);
+        }
+        assert!(sched.dl_drop_all_except_stolen(1));
+
+        // EN 300 392-2 clause 21.4.3.1 acknowledges random access per
+        // addressed MS. Repeated local preservation of the same ACK after a
+        // hangtime cleanup must not create unbounded duplicate scheduler state.
+        assert_eq!(sched.pending_ra_acks[0].len(), 1);
+        assert!(sched.take_pending_ra_ack(1, addr));
+        assert!(!sched.take_pending_ra_ack(1, addr));
+    }
+
+    #[test]
+    fn test_pending_random_access_ack_queue_is_bounded_for_large_group_churn() {
+        let mut sched = get_testing_slotter();
+        let base_issi = 200_000;
+        let total = MAX_PENDING_RA_ACKS_PER_TIMESLOT + 32;
+
+        for offset in 0..total {
+            sched.dl_enqueue_random_access_ack(1, TetraAddress::issi(base_issi + offset as u32));
+        }
+        assert!(sched.dl_drop_all_except_stolen(1));
+
+        // Local robustness guard for large GSSI cells: preserving ACKs across
+        // hangtime cleanup is clause 21.4.3.1 compatible, but the BS must not
+        // retain unbounded per-timeslot state when thousands of affiliates
+        // repeatedly contend for access.
+        assert_eq!(sched.pending_ra_acks[0].len(), MAX_PENDING_RA_ACKS_PER_TIMESLOT);
+        assert!(
+            !sched.take_pending_ra_ack(1, TetraAddress::issi(base_issi)),
+            "overflow should shed at least the earliest retained ACK instead of growing without bound"
+        );
+        assert!(
+            sched.take_pending_ra_ack(1, TetraAddress::issi(base_issi + total as u32 - 1)),
+            "bounded queue should still retain a recent ACK for consumption by the next STCH"
         );
     }
 

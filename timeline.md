@@ -1,5 +1,60 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 17:06:39 EEST - Large-group UMAC/CMCE robustness for thousands of affiliates
+
+User report:
+
+- Make group operation robust for thousands of terminals on one GSSI, not just two or three radios.
+- Continue clause-scoped ETSI EN 300 392-2 hardening and do not claim formal certification.
+
+Component explanation:
+
+- CMCE is call control. For a group call it keeps one current PTT floor owner and decides how the next requesting ISSI receives `D-TX GRANTED`, `RequestQueued`, or `NotGranted`.
+- UMAC is the MAC scheduler. It turns CMCE decisions into MAC resources, FACCH/STCH signalling, random-access ACKs, and assigned-channel state on the radio timeslots.
+- RA ACK is the MAC acknowledgement that a terminal's random access was heard. When hangtime cleanup has to preserve an ACK for the next STCH, that preserved state must stay bounded under mass access.
+- Energy Economy/EG7 lets terminals sleep between receive windows. While a GSSI assigned channel is active, each affiliated EG member must be suspended exactly once and resumed with a T.210 awake guard after close.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1: normal group calls are listener-signalled by the GSSI while floor responses can address the requesting ISSI.
+- EN 300 392-2 clause 14.5.2.2.1: SwMI-controlled group floor procedure uses `D-TX GRANTED` states for granted, queued, or not-granted PTT requests.
+- EN 300 392-2 clause 21.4.3.1: MAC random-access acknowledgement is carried by the random-access flag.
+- EN 300 392-2 clause 23.5.1.3.3: random access acknowledgement and reserved access grant must remain coherent.
+- EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6/T.210: BS downlink scheduling and assigned-channel operation must account for Energy Economy receive windows.
+- This is clause-scoped engineering hardening and test evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `MAX_PENDING_RA_ACKS_PER_TIMESLOT = 8192`.
+  - Deduplicated deferred random-access ACKs by full `TetraAddress`.
+  - Bounded deferred RA ACK retention during hangtime cleanup so repeated access from thousands of affiliates cannot grow scheduler memory without limit.
+  - Reworked `dl_drop_all_except_stolen` from repeated middle `Vec::remove` to a linear drain/rebuild pass, preserving STCH/FACCH stealing items while discarding/reporting other queued signalling as before.
+  - Switched dropped grant lookup to `HashSet<TetraAddress>` so ACK/grant coherence checks stay linear under mass access.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_large_eg7_group_call_open_suspends_all_members_once_and_resumes_after_close` with 4096 EG7 affiliates on one GSSI plus an unrelated ISSI.
+  - Asserts each affiliate gets one assigned-channel EG suspension on group call open and resumes with T.210 awake guard on close.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Strengthened `test_large_group_floor_handoff_uses_one_gssi_listener_grant` from two-speaker ping-pong to 32 distinct speakers within a 2048-member GSSI.
+  - Asserts each handoff emits one individual requester grant, one GSSI listener grant, one UMAC `FloorGranted`, and no release/close.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 58 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_large_eg7_group_call_open_suspends_all_members_once_and_resumes_after_close --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_floor_handoff_uses_one_gssi_listener_grant --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 58 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 134 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add large restart-recovery tests for thousands of cached ISSIs affiliated to the same GSSI, covering MM recovery cache and CMCE listener restoration.
+2. Add a many-queued-GSSI-resources test that asserts queue length remains resource-count bounded across mixed StayAlive/EG7 batches.
+3. Continue SDS/status and LLC field-level hardening after group-call scale tests remain green.
+
 ## 2026-06-05 16:26:47 EEST - CMCE bounded group floor queue stress coverage
 
 User report:

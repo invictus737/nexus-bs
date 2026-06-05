@@ -4493,8 +4493,6 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
 
     let member_count = 2048_u32;
     let first_issi = 500_000_u32;
-    let speaker_a = first_issi;
-    let speaker_b = first_issi + 1;
     for offset in 0..member_count {
         let issi = first_issi + offset;
         submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
@@ -4503,11 +4501,12 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
     test.run_stack(Some((member_count as usize * 2) + 16));
     let _ = test.dump_sinks();
 
-    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, speaker_a, TEST_GSSI);
+    let speaker_count = 32_u32;
+    let speakers: Vec<u32> = (0..speaker_count).map(|offset| first_issi + offset).collect();
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, speakers[0], TEST_GSSI);
 
-    let mut current_speaker = speaker_a;
-    let mut next_speaker = speaker_b;
-    for cycle in 0..16 {
+    let mut current_speaker = speakers[0];
+    for (cycle, next_speaker) in speakers.iter().copied().enumerate().skip(1) {
         test.submit_message(build_u_tx_demand_msg(next_speaker, call_id));
         test.run_stack(Some(1));
         let queued_msgs = test.dump_sinks();
@@ -4600,7 +4599,7 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
         assert_eq!(count_d_releases(&handoff_msgs), 0, "cycle {cycle}");
         assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0, "cycle {cycle}");
 
-        std::mem::swap(&mut current_speaker, &mut next_speaker);
+        current_speaker = next_speaker;
     }
 }
 
