@@ -5926,3 +5926,46 @@ Next non-repeating execution:
 2. Continue large pending-release PTT flood tests.
 3. Continue restart-recovered EG7 affiliation through UMAC scheduling.
 4. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.
+
+## 2026-06-05 18:56:04 EEST - CMCE large pending group PTT flood regression added
+
+User goal:
+
+- Group calls must remain robust for thousands of terminals in one GSSI, not only for two or three radios.
+- During group-call release, late or repeated PTT attempts from many affiliated terminals must not restart the old call, steal the floor, evict the pending call id, or generate contradictory downlink signalling.
+
+Component in simple technical terms:
+
+- CMCE is the call-control state machine: it owns group setup, floor/turn-taking, and release.
+- Pending release means the BS already sent `D-RELEASE`, but keeps the old call locally alive until the release can drain over FACCH/MCCH or a bounded guard expires.
+- This regression floods the pending-release state with 4095 additional `U-TX DEMAND` messages from a 4096-member GSSI and proves the BS ignores them without reopening floor control.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.3: group-call release is cleared with `D-RELEASE`, so the old group call remains in release handling until the SwMI completes local cleanup.
+- EN 300 392-2 clause 14.5.2.2.1: group floor-control PDUs grant, queue, reject, cease, or withdraw transmission permission; while release is pending, old-call floor traffic must not resume normal turn-taking.
+- This is clause-scoped regression evidence and queue/state robustness hardening, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_group_pending_release_large_ptt_flood_is_ignored_without_signalling`.
+  - Registers and affiliates 4096 members to one GSSI.
+  - Starts a group call, enters pending release, then submits `U-TX DEMAND` from every other member.
+  - Asserts the flood emits no `D-TX GRANTED`, no `D-TX CEASED`, no extra `D-RELEASE`, no UMAC floor grant/release, and no premature UMAC call close.
+  - Asserts the pending call id remains occupied, preventing reuse confusion while release is still draining.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_pending_release_large_ptt_flood_is_ignored_without_signalling --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 142 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this CMCE large pending-release flood regression.
+2. Add the analogous P2P pending-release flood regression so private simplex teardown also stays bounded under repeated stale floor attempts.
+3. Continue restart-recovered EG7 affiliation through real UMAC scheduling.
+4. Continue SDS/WAP accepted-vs-transmitted observability and long-run bounded queues.

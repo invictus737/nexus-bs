@@ -6179,6 +6179,61 @@ fn test_group_release_pending_ignores_late_floor_pdus_without_extra_signalling()
 }
 
 #[test]
+fn test_group_pending_release_large_ptt_flood_is_ignored_without_signalling() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    let member_count = LARGE_GSSI_MEMBER_COUNT;
+    let first_issi = 430_000_u32;
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+        submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+    }
+    test.run_stack(Some((member_count as usize * 2) + 16));
+    let _ = test.dump_sinks();
+
+    let speaker_issi = first_issi;
+    let (call_id, _ts, _usage) = start_group_call_with_circuit_for(&mut test, speaker_issi, TEST_GSSI);
+
+    test.submit_message(build_u_disconnect_msg(speaker_issi, call_id));
+    test.run_stack(Some(1));
+    let release_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&release_msgs), 2);
+    assert_eq!(count_umac_call_ended_or_close(&release_msgs), 0);
+
+    for offset in 1..member_count {
+        test.submit_message(build_u_tx_demand_msg(first_issi + offset, call_id));
+    }
+    test.deliver_all_messages();
+    let flood_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 14.5.2.3 clears the group call with D-RELEASE.
+    // While that release is pending, clause 14.5.2.2.1 floor-control traffic
+    // for the old call must not restart turn taking or emit contradictory
+    // queued/not-granted responses for thousands of late contenders.
+    assert_eq!(count_d_tx_granted(&flood_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&flood_msgs), 0);
+    assert_eq!(count_d_releases(&flood_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&flood_msgs), 0);
+    assert_eq!(count_umac_floor_released(&flood_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&flood_msgs), 0);
+
+    let occupied_ids = cmce_debug_active_call_ids(&mut test);
+    assert!(
+        occupied_ids.contains(&call_id),
+        "large late-PTT flood must not evict the pending group release call id"
+    );
+}
+
+#[test]
 fn test_group_release_pending_rejects_network_speaker_change_without_floor_signalling() {
     debug::setup_logging_verbose();
 
