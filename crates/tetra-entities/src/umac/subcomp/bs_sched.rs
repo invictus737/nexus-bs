@@ -176,6 +176,23 @@ enum StealingSchedPriority {
     FloorWithdraw,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum DlBackpressurePriority {
+    Ordinary,
+    GrantOrAck,
+    ChannelAllocation,
+    ListenerFloorGrant,
+    PositiveFloorGrant,
+    FloorWithdraw,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FloorWithdrawKey {
+    addr: TetraAddress,
+    call_id: u16,
+    pdu_type: CmcePduTypeDl,
+}
+
 /// Delivery state for GSSI-addressed signalling while members use Energy Economy.
 ///
 /// ETSI EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6 require the BS to account for
@@ -872,7 +889,12 @@ impl BsChannelScheduler {
             addr
         );
         let elem = DlSchedElem::RandomAccessAck(addr);
-        self.push_sched_queue_bounded(slot, elem, "dltx_queues:dl_enqueue_random_access_ack");
+        self.push_sched_queue_with_cap(
+            slot,
+            elem,
+            MAX_PENDING_RA_ACKS_PER_TIMESLOT,
+            "dltx_queues:dl_enqueue_random_access_ack",
+        );
     }
 
     fn common_control_downlink_timeslots() -> [u8; NUM_TIMESLOTS] {
@@ -886,16 +908,32 @@ impl BsChannelScheduler {
     }
 
     fn elem_protected_from_backpressure(elem: &DlSchedElem) -> bool {
-        matches!(
-            elem,
-            DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_)
-        ) || Self::elem_has_channel_allocation(elem)
-            || Self::elem_has_integrated_grant_or_ack(elem)
-            || matches!(
-                elem,
-                DlSchedElem::Stealing(..)
-                    if Self::stealing_sched_priority(elem) > StealingSchedPriority::Ordinary
-            )
+        Self::elem_backpressure_priority(elem) > DlBackpressurePriority::Ordinary
+    }
+
+    fn elem_backpressure_priority(elem: &DlSchedElem) -> DlBackpressurePriority {
+        if let DlSchedElem::Stealing(..) = elem {
+            return match Self::stealing_sched_priority(elem) {
+                StealingSchedPriority::Ordinary => DlBackpressurePriority::Ordinary,
+                StealingSchedPriority::ChannelAllocation => DlBackpressurePriority::ChannelAllocation,
+                StealingSchedPriority::ListenerFloorGrant => DlBackpressurePriority::ListenerFloorGrant,
+                StealingSchedPriority::PositiveFloorGrant => DlBackpressurePriority::PositiveFloorGrant,
+                StealingSchedPriority::FloorWithdraw => DlBackpressurePriority::FloorWithdraw,
+            };
+        }
+
+        if Self::elem_has_channel_allocation(elem) {
+            return DlBackpressurePriority::ChannelAllocation;
+        }
+
+        if Self::elem_has_integrated_grant_or_ack(elem) {
+            return DlBackpressurePriority::GrantOrAck;
+        }
+
+        match elem {
+            DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_) => DlBackpressurePriority::GrantOrAck,
+            _ => DlBackpressurePriority::Ordinary,
+        }
     }
 
     fn mark_sched_elem_discarded_if_reported(elem: DlSchedElem) {
@@ -915,22 +953,78 @@ impl BsChannelScheduler {
 
     fn enforce_sched_queue_cap(queue: &mut Vec<DlSchedElem>, cap: usize, label: &str) {
         while queue.len() > cap {
-            let Some(pos) = queue.iter().position(|elem| !Self::elem_protected_from_backpressure(elem)) else {
+            let protected_drop = queue
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, elem)| Self::elem_backpressure_priority(elem))
+                .map(|(index, elem)| (index, Self::elem_backpressure_priority(elem)));
+            let Some((pos, priority)) = protected_drop else {
+                return;
+            };
+
+            if priority > DlBackpressurePriority::Ordinary {
                 tracing::warn!(
-                    "UMAC scheduler: {} has {} protected element(s), exceeding local cap {}",
+                    "UMAC scheduler: {} has {} protected element(s), discarding oldest {:?} element to preserve local cap {}",
                     label,
                     queue.len(),
+                    priority,
                     cap
                 );
-                break;
-            };
+            } else {
+                tracing::warn!(
+                    "UMAC scheduler: discarding queued downlink element from {} because queue length exceeded cap {}",
+                    label,
+                    cap
+                );
+            }
             let elem = queue.remove(pos);
-            tracing::warn!(
-                "UMAC scheduler: discarding queued downlink element from {} because queue length exceeded cap {}",
-                label,
-                cap
-            );
             Self::mark_sched_elem_discarded_if_reported(elem);
+        }
+    }
+
+    fn floor_withdraw_key(elem: &DlSchedElem) -> Option<FloorWithdrawKey> {
+        let DlSchedElem::Stealing(block, fallback_addr, _, _) = elem else {
+            return None;
+        };
+        let mut mac_probe = BitBuffer::from_bitbuffer(block);
+        let resource = MacResource::from_bitbuf(&mut mac_probe).ok()?;
+        let addr = resource.addr.unwrap_or(*fallback_addr);
+        let mac_payload = BitBuffer::from_bitbuffer_pos(&mac_probe);
+        let mut cmce_payload = Self::cmce_dl_payload_from_tma_sdu(&mac_payload)?;
+        let pdu_type = cmce_payload
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())?;
+
+        match pdu_type {
+            CmcePduTypeDl::DTxCeased | CmcePduTypeDl::DTxInterrupt => {
+                let call_id = cmce_payload.read_field(14, "call_identifier").ok()? as u16;
+                Some(FloorWithdrawKey { addr, call_id, pdu_type })
+            }
+            _ => None,
+        }
+    }
+
+    fn coalesce_floor_withdraw(queue: &mut Vec<DlSchedElem>, elem: &DlSchedElem, label: &str) {
+        let Some(incoming_key) = Self::floor_withdraw_key(elem) else {
+            return;
+        };
+
+        let mut idx = 0;
+        while idx < queue.len() {
+            if Self::floor_withdraw_key(&queue[idx]) == Some(incoming_key) {
+                let old = queue.remove(idx);
+                tracing::debug!(
+                    "UMAC scheduler: coalescing older {:?} floor-control for call_id={} addr={} in {}",
+                    incoming_key.pdu_type,
+                    incoming_key.call_id,
+                    incoming_key.addr,
+                    label
+                );
+                Self::mark_sched_elem_discarded_if_reported(old);
+            } else {
+                idx += 1;
+            }
         }
     }
 
@@ -989,14 +1083,20 @@ impl BsChannelScheduler {
         }
     }
 
-    fn push_sched_queue_bounded(&mut self, slot: usize, elem: DlSchedElem, label: &str) {
+    fn push_sched_queue_with_cap(&mut self, slot: usize, elem: DlSchedElem, cap: usize, label: &str) {
+        Self::coalesce_floor_withdraw(&mut self.dltx_queues[slot], &elem, label);
         if let Some(elem) = Self::coalesce_ready_grant_or_ack(&mut self.dltx_queues[slot], elem) {
             self.dltx_queues[slot].push(elem);
         }
-        Self::enforce_sched_queue_cap(&mut self.dltx_queues[slot], MAX_DLSCHED_ELEMS_PER_TIMESLOT, label);
+        Self::enforce_sched_queue_cap(&mut self.dltx_queues[slot], cap, label);
+    }
+
+    fn push_sched_queue_bounded(&mut self, slot: usize, elem: DlSchedElem, label: &str) {
+        self.push_sched_queue_with_cap(slot, elem, MAX_DLSCHED_ELEMS_PER_TIMESLOT, label);
     }
 
     fn push_next_slot_queue_bounded(&mut self, elem: DlSchedElem, label: &str) {
+        Self::coalesce_floor_withdraw(&mut self.dltx_next_slot_queue, &elem, label);
         self.dltx_next_slot_queue.push(elem);
         Self::enforce_sched_queue_cap(&mut self.dltx_next_slot_queue, MAX_DLSCHED_NEXT_SLOT_ELEMS, label);
     }
@@ -3096,7 +3196,7 @@ mod tests {
     };
 
     use tetra_pdus::{
-        cmce::pdus::d_tx_interrupt::DTxInterrupt,
+        cmce::pdus::{d_tx_ceased::DTxCeased, d_tx_interrupt::DTxInterrupt},
         mle::{
             fields::bs_service_details::BsServiceDetails,
             pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
@@ -3413,6 +3513,21 @@ mod tests {
         test_cmce_stch_block(addr, sdu, ul_dl_assigned)
     }
 
+    fn test_d_tx_ceased_stch_block(addr: TetraAddress, call_identifier: u16, ul_dl_assigned: UlDlAssignment) -> BitBuffer {
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        DTxCeased {
+            call_identifier,
+            transmission_request_permission: false,
+            notification_indicator: None,
+            facility: None,
+            dm_ms_address: None,
+            proprietary: None,
+        }
+        .to_bitbuf(&mut sdu)
+        .expect("serialize compact D-TX CEASED");
+        test_cmce_stch_block(addr, sdu, ul_dl_assigned)
+    }
+
     fn test_ordinary_resource_for_issi(issi: u32, sdu_bits: usize) -> (MacResource, BitBuffer) {
         let (mut pdu, sdu) = test_resource_for_issi(issi, sdu_bits);
         pdu.random_access_flag = false;
@@ -3520,6 +3635,104 @@ mod tests {
                 .iter()
                 .any(|elem| matches!(elem, DlSchedElem::Grant(addr, _, _) if *addr == grant_addr)),
             "critical grant must survive downlink queue backpressure"
+        );
+    }
+
+    #[test]
+    fn test_floor_withdraw_duplicate_coalesces_and_keeps_latest_reporter() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let gssi = TetraAddress::new(226_333, SsiType::Gssi);
+        let old_reporter = TxReporter::new_unacked();
+        let latest_reporter = TxReporter::new_unacked();
+
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_ceased_stch_block(gssi, 7, UlDlAssignment::Dl),
+            gssi,
+            Some(old_reporter.clone()),
+        );
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_ceased_stch_block(gssi, 7, UlDlAssignment::Dl),
+            gssi,
+            Some(latest_reporter.clone()),
+        );
+
+        // Local UMAC robustness guard: repeated same-call group floor withdraw
+        // PDUs should not occupy multiple protected slots while the assigned
+        // channel drains. This preserves the newest reporter and marks the
+        // older duplicate as locally discarded.
+        assert_eq!(sched.dltx_queues[traffic_ts as usize - 1].len(), 1);
+        assert_eq!(old_reporter.get_state(), TxState::Discarded);
+        assert_eq!(latest_reporter.get_state(), TxState::Pending);
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let (_tch, stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let stch = stch.expect("coalesced floor withdraw should remain queued");
+        let mut parsed = BitBuffer::from_bitbuffer(&stch);
+        let resource = MacResource::from_bitbuf(&mut parsed).expect("selected STCH should carry MAC-RESOURCE");
+        assert_eq!(resource.addr.map(|addr| addr.ssi), Some(gssi.ssi));
+        let ceased = DTxCeased::from_bitbuf(&mut parsed).expect("selected STCH should carry D-TX CEASED");
+        assert_eq!(ceased.call_identifier, 7);
+        assert_eq!(latest_reporter.get_state(), TxState::Transmitted);
+    }
+
+    #[test]
+    fn test_protected_floor_withdraw_backlog_stays_bounded_and_retains_newest() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let first_reporter = TxReporter::new_unacked();
+        for offset in 0..MAX_DLSCHED_ELEMS_PER_TIMESLOT {
+            let addr = TetraAddress::issi(2_260_000 + offset as u32);
+            let reporter = (offset == 0).then(|| first_reporter.clone());
+            sched.dl_enqueue_stealing(
+                traffic_ts,
+                test_d_tx_ceased_stch_block(addr, offset as u16, UlDlAssignment::Dl),
+                addr,
+                reporter,
+            );
+        }
+
+        let latest_addr = TetraAddress::new(226_333, SsiType::Gssi);
+        let latest_reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_ceased_stch_block(latest_addr, 0x1234, UlDlAssignment::Dl),
+            latest_addr,
+            Some(latest_reporter.clone()),
+        );
+
+        // EN 300 392-2 clauses 14.5.2.2.1 and 23.5 make floor-withdraw STCH
+        // time critical, but the local scheduler still has to stay bounded in
+        // a pathological storm. When every queued item is protected, the oldest
+        // lowest-priority protected element is discarded and the newest floor
+        // withdraw remains queued.
+        assert_eq!(sched.dltx_queues[traffic_ts as usize - 1].len(), MAX_DLSCHED_ELEMS_PER_TIMESLOT);
+        assert_eq!(first_reporter.get_state(), TxState::Discarded);
+        assert_eq!(latest_reporter.get_state(), TxState::Pending);
+        assert!(
+            sched.dltx_queues[traffic_ts as usize - 1]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, reporter, _)
+                    if *addr == latest_addr && reporter.as_ref().is_some_and(|r| r.shares_state_with(&latest_reporter)))),
+            "newest protected floor withdraw should remain queued after cap enforcement"
         );
     }
 

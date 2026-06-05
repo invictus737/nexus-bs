@@ -6539,3 +6539,54 @@ Next non-repeating execution:
 2. Harden UMAC protected queue caps so protected-only floor-control storms cannot grow past scheduler limits.
 3. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state.
 4. Add stress-aftercare regression: large group storm then simple private simplex and duplex still work.
+
+## 2026-06-05 - UMAC protected floor-control queue cap
+
+Component in simple technical terms:
+
+- UMAC/MAC is the radio scheduler. It takes CMCE floor-control messages and decides which STCH/FACCH block is sent over the air first.
+- `D-TX CEASED` and `D-TX INTERRUPT` are floor-withdraw messages: they tell terminals that transmit permission is no longer held by the old speaker.
+- Random-access ACKs are separate MAC acknowledgements for uplink access and keep their own local cap.
+
+Problem fixed:
+
+- The scheduler already capped ordinary downlink queues, but if every queued item was classified as protected it logged a warning and allowed the queue to remain above the cap.
+- In a pathological large-group floor-control storm, protected-only STCH/FACCH entries could therefore grow past `MAX_DLSCHED_ELEMS_PER_TIMESLOT`.
+- UMAC now assigns each queued element a local backpressure priority and still enforces a hard cap when all items are protected.
+- Ordinary items are still discarded first; if no ordinary item exists, the oldest lowest-priority protected item is discarded and reported.
+- Repeated same-call/same-address floor-withdraw STCH entries are coalesced so only the newest duplicate remains queued.
+- `RandomAccessAck` keeps its existing 8192-entry RA-specific cap instead of being forced into the 4096 STCH/FACCH cap, preserving the large random-access churn behavior already tested.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: floor-control permission/withdrawal semantics for group calls.
+- EN 300 392-2 clause 21.4.3.1: MAC random access acknowledgement behavior.
+- EN 300 392-2 clauses 23.5 and 23.5.2.2.1: assigned-channel STCH/FACCH signalling and slot grants.
+- This patch is local scheduler backpressure policy over standard PDUs; it is clause-scoped engineering evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `DlBackpressurePriority` for local queue shedding order.
+  - Added `FloorWithdrawKey` and duplicate coalescing for `D-TX CEASED`/`D-TX INTERRUPT` STCH/FACCH entries with the same address, call id, and PDU type.
+  - Changed protected-only cap enforcement from warning-only to bounded discard of the oldest lowest-priority protected element.
+  - Added a configurable internal push helper so `RandomAccessAck` can retain the existing 8192 RA cap while normal scheduler queues remain capped at 4096.
+  - Added tests for duplicate floor-withdraw coalescing, protected-only floor-withdraw backlog bounding, and preservation of the existing RA ACK 8192 cap.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/src/umac/subcomp/bs_sched.rs` -> pass.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_floor_withdraw_duplicate_coalesces_and_keeps_latest_reporter --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_protected_floor_withdraw_backlog_stays_bounded_and_retains_newest --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched::tests::test_pending_random_access_ack_queue_is_bounded_for_large_group_churn --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 72 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 62 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add full FIFO drain regression for a 4096-member GSSI.
+2. Add restart recovery large-cache pacing test for 4096 cached ISSIs.
+3. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state.
+4. Add stress-aftercare regression: large group storm then simple private simplex and duplex still work.
