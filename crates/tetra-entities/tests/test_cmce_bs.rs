@@ -5264,6 +5264,68 @@ fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
         "FIFO handoff must not skip to later large-group requesters"
     );
     assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+
+    let mut current_fifo_speaker = second_queued_requester;
+    for expected_next_speaker in (first_issi + 3)..(first_issi + member_count) {
+        test.submit_message(build_u_tx_ceased_msg(current_fifo_speaker, call_id));
+        test.run_stack(Some(1));
+        let drain_msgs = test.dump_sinks();
+        let drain_grants: Vec<_> = drain_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(
+            drain_grants.len(),
+            2,
+            "FIFO drain should emit one requester grant and one GSSI listener grant for expected ISSI {expected_next_speaker}"
+        );
+        let requester_grant = drain_grants
+            .iter()
+            .find(|(prim, grant)| {
+                prim.main_address == TetraAddress::issi(expected_next_speaker)
+                    && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+            })
+            .expect("next FIFO requester should receive the floor during full drain");
+        assert_d_tx_granted_facch_allocation(
+            requester_grant.0,
+            &requester_grant.1,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Both,
+            "large group full FIFO drain requester handoff",
+        );
+        assert!(
+            drain_grants.iter().any(|(prim, grant)| {
+                prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+                    && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+            }),
+            "full FIFO drain should notify listeners once via GSSI"
+        );
+        assert!(
+            drain_grants
+                .iter()
+                .all(|(_, grant)| grant.transmission_grant != TransmissionGrant::NotGranted.into_raw() as u8),
+            "accepted FIFO waiters must not degrade to NotGranted during full drain"
+        );
+        assert_eq!(count_d_releases(&drain_msgs), 0);
+        assert_eq!(count_d_tx_ceased(&drain_msgs), 0);
+        assert_eq!(count_umac_call_ended_or_close(&drain_msgs), 0);
+        assert_eq!(count_umac_floor_released(&drain_msgs), 0);
+        assert_eq!(count_umac_floor_granted(&drain_msgs), 1);
+        current_fifo_speaker = expected_next_speaker;
+    }
+
+    test.submit_message(build_u_tx_ceased_msg(current_fifo_speaker, call_id));
+    test.run_stack(Some(1));
+    let final_ceased_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_granted(&final_ceased_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&final_ceased_msgs), 1);
+    assert_eq!(count_umac_floor_released(&final_ceased_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&final_ceased_msgs), 0);
 }
 
 #[test]

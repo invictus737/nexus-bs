@@ -6590,3 +6590,46 @@ Next non-repeating execution:
 2. Add restart recovery large-cache pacing test for 4096 cached ISSIs.
 3. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state.
 4. Add stress-aftercare regression: large group storm then simple private simplex and duplex still work.
+
+## 2026-06-05 - Full 4096-waiter group FIFO drain evidence
+
+Component in simple technical terms:
+
+- CMCE group floor FIFO is the ordered waiting list for group PTT requests while another terminal is speaking.
+- A full FIFO drain means each queued ISSI receives the floor exactly in accepted order as the previous speaker sends `U-TX CEASED`.
+- The listener notification remains one GSSI-addressed `D-TX GRANTED(GrantedToOtherUser)`, not one message per terminal.
+
+Problem fixed:
+
+- Previous large-group tests proved 4096 waiters could be queued and that the first/second handoff stayed FIFO.
+- They did not prove that all accepted waiters could drain in order until the queue was empty.
+- The 4096-member FIFO test now drains every accepted waiter to completion and verifies each handoff.
+- After the last queued waiter ceases, CMCE enters hangtime with one `D-TX CEASED` and one UMAC floor release instead of emitting another stale grant.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: SwMI group floor-control responses and queued/granted turn taking.
+- EN 300 392-2 clause 23.5: assigned-channel signalling carries the floor-control messages.
+- The 4096 FIFO length is Nexus-BS local SwMI policy and test evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Extended `test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters`.
+  - After first and second handoff checks, the test now drains all remaining queued ISSIs from `first_issi + 3` through the final member.
+  - Each drain step requires exactly one individual `Granted` response, exactly one GSSI `GrantedToOtherUser` listener response, no `NotGranted`, no release/close, and exactly one UMAC floor grant.
+  - Final no-waiter cease requires `D-TX CEASED` and UMAC floor release, proving stale FIFO state is empty.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 150 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add restart recovery large-cache pacing test for 4096 cached ISSIs.
+2. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state.
+3. Add stress-aftercare regression: large group storm then simple private simplex and duplex still work.
