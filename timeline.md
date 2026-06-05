@@ -6141,3 +6141,48 @@ Next non-repeating execution:
 2. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
 3. Re-run targeted UMAC large EG7/group tests before next field deploy.
 4. Continue network-origin call-id wrap regressions for group/private call starts.
+
+## 2026-06-05 19:18:13 EEST - UMAC grant/RA ACK coalescing bounds 4096-requester bursts
+
+User goal:
+
+- Group/PTT robustness must scale to thousands of terminals without internal scheduler queues growing beyond local caps.
+- Random-access acknowledgement plus slot grant must remain coherent for each requester while staying bounded under 4096 simultaneous requesters.
+
+Component in simple technical terms:
+
+- UMAC scheduler owns the downlink MAC-RESOURCE queue that carries slot grants and random-access ACK flags.
+- Before this patch, `Grant` and `RandomAccessAck` were both protected from backpressure, so 4096 requesters could create 8192 protected queue elements before later integration collapsed them.
+- The scheduler now coalesces ready grant/ACK pairs for the same address into one minimal MAC-RESOURCE at enqueue time, preserving the final over-air fields while keeping transient queue length bounded.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 21.4.3.1: `random_access_flag` acknowledges successful random access for the addressed MS.
+- EN 300 392-2 clause 23.5.2.2.2: slot grant signalling must remain coherent with the addressed MS and uplink reservation.
+- EN 300 392-2 clause 23.5 covers the MAC downlink control path carrying these MAC-RESOURCEs.
+- The queue cap is local robustness hardening; this is not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added enqueue-time coalescing for ready `Grant`/`RandomAccessAck` elements targeting the same `TetraAddress`.
+  - Merges either order: grant then ACK, ACK then grant, or either into an existing MAC-RESOURCE.
+  - Preserves usage marker and grant fields while setting `random_access_flag`.
+  - Updated `test_mass_random_access_grant_ack_integration_uses_one_resource_per_issi` from 2048 to 4096 requesters and asserts the transient queue stays at 4096, not 8192.
+  - Updated `test_dl_grant_and_ack_integration` to expect early coalescing into the existing MAC-RESOURCE.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --lib test_mass_random_access_grant_ack_integration_uses_one_resource_per_issi --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib umac::subcomp::bs_sched --locked` -> 68 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 59 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this UMAC bounded grant/RA ACK coalescing patch.
+2. Continue cross-layer UMAC test for large group PTT storm prioritizing requester grant with preserved RA ACK.
+3. Continue SDS/WAP accepted-vs-transmitted observability and global ingress pressure tests.
+4. Continue network-origin call-id wrap regressions for group/private starts.

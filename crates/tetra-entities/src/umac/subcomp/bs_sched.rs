@@ -931,8 +931,65 @@ impl BsChannelScheduler {
         }
     }
 
+    fn coalesce_ready_grant_or_ack(queue: &mut [DlSchedElem], elem: DlSchedElem) -> Option<DlSchedElem> {
+        match elem {
+            DlSchedElem::Grant(addr, grant, usage_marker) => {
+                for queued in queue.iter_mut().rev() {
+                    match queued {
+                        DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr) => {
+                            pdu.slot_granting_element = Some(grant);
+                            if pdu.usage_marker.is_none() {
+                                pdu.usage_marker = usage_marker;
+                            }
+                            return None;
+                        }
+                        DlSchedElem::RandomAccessAck(ack_addr) if *ack_addr == addr => {
+                            let mut pdu = Self::dl_make_minimal_resource(&addr, Some(grant), true);
+                            pdu.usage_marker = usage_marker;
+                            *queued = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, None);
+                            return None;
+                        }
+                        DlSchedElem::Grant(grant_addr, queued_grant, queued_marker) if *grant_addr == addr => {
+                            *queued_grant = grant;
+                            if queued_marker.is_none() {
+                                *queued_marker = usage_marker;
+                            }
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(DlSchedElem::Grant(addr, grant, usage_marker))
+            }
+            DlSchedElem::RandomAccessAck(addr) => {
+                for queued in queue.iter_mut().rev() {
+                    match queued {
+                        DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr) => {
+                            pdu.random_access_flag = true;
+                            return None;
+                        }
+                        DlSchedElem::Grant(grant_addr, grant, usage_marker) if *grant_addr == addr => {
+                            let mut pdu = Self::dl_make_minimal_resource(&addr, Some(grant.clone()), true);
+                            pdu.usage_marker = *usage_marker;
+                            *queued = DlSchedElem::Resource(pdu, BitBuffer::new(0), None, None);
+                            return None;
+                        }
+                        DlSchedElem::RandomAccessAck(ack_addr) if *ack_addr == addr => {
+                            return None;
+                        }
+                        _ => {}
+                    }
+                }
+                Some(DlSchedElem::RandomAccessAck(addr))
+            }
+            elem => Some(elem),
+        }
+    }
+
     fn push_sched_queue_bounded(&mut self, slot: usize, elem: DlSchedElem, label: &str) {
-        self.dltx_queues[slot].push(elem);
+        if let Some(elem) = Self::coalesce_ready_grant_or_ack(&mut self.dltx_queues[slot], elem) {
+            self.dltx_queues[slot].push(elem);
+        }
         Self::enforce_sched_queue_cap(&mut self.dltx_queues[slot], MAX_DLSCHED_ELEMS_PER_TIMESLOT, label);
     }
 
@@ -5967,7 +6024,11 @@ mod tests {
         sched.dump_ul_schedule(true);
         sched.dump_dl_queue();
 
-        assert!(sched.dltx_queues[ts.t as usize - 1].len() == 3);
+        assert_eq!(
+            sched.dltx_queues[ts.t as usize - 1].len(),
+            1,
+            "ready grant and ACK should coalesce into the existing MAC-RESOURCE before integration"
+        );
 
         tracing::info!("Integrating queue");
         let subscribers = SubscriberRegistry::new();
@@ -6017,18 +6078,22 @@ mod tests {
     fn test_mass_random_access_grant_ack_integration_uses_one_resource_per_issi() {
         let mut sched = get_testing_slotter();
         let ts = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
-        let member_count = 2048;
+        let member_count = MAX_DLSCHED_ELEMS_PER_TIMESLOT;
         let grant = BasicSlotgrant {
             capacity_allocation: BasicSlotgrantCapAlloc::FirstSubslotGranted,
             granting_delay: BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity,
         };
 
         for offset in 0..member_count {
-            let addr = TetraAddress::issi(70_000 + offset);
+            let addr = TetraAddress::issi(70_000 + offset as u32);
             sched.dl_enqueue_grant(ts.t, addr, grant.clone(), None);
             sched.dl_enqueue_random_access_ack(ts.t, addr);
         }
-        assert_eq!(sched.dltx_queues[ts.t as usize - 1].len(), member_count as usize * 2);
+        assert_eq!(
+            sched.dltx_queues[ts.t as usize - 1].len(),
+            member_count,
+            "4096 grant+RA pairs must coalesce before integration instead of creating 8192 protected queue entries"
+        );
 
         let subscribers = SubscriberRegistry::new();
         let energy_saving = HashMap::new();
@@ -6039,7 +6104,7 @@ mod tests {
         // A mass access burst should collapse to one MAC-RESOURCE per ISSI,
         // not leave independent ACK/grant queue entries behind.
         let queue = &sched.dltx_queues[ts.t as usize - 1];
-        assert_eq!(queue.len(), member_count as usize);
+        assert_eq!(queue.len(), member_count);
         assert!(
             queue
                 .iter()
