@@ -3219,6 +3219,18 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_browser_coalesces_station_event_rendering() {
+        let dashboard = render_product_template(crate::net_dashboard::html::DASHBOARD_HTML);
+
+        assert!(dashboard.contains("let stationRenderQueued=false;"));
+        assert!(dashboard.contains("function scheduleRenderStations()"));
+        assert!(dashboard.contains("window.requestAnimationFrame||((fn)=>setTimeout(fn,16))"));
+        assert!(dashboard.contains("schedule(()=>{stationRenderQueued=false;renderStations();});"));
+        assert!(dashboard.contains("ensureMsEntry(msg.issi)._last_seen_ts=Date.now();\n      scheduleRenderStations();break;"));
+        assert!(dashboard.contains("e._last_seen_ts=Date.now();}\n      scheduleRenderStations();break;"));
+    }
+
+    #[test]
     fn cpu_descriptor_detects_raspberry_pi_zero_2_w_cortex_a53() {
         let cpuinfo = r#"processor	: 0
 BogoMIPS	: 38.40

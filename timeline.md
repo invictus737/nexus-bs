@@ -7042,3 +7042,42 @@ Next non-repeating execution:
 1. Coalesce/limit browser station rendering for 10k MS snapshots so UI remains responsive.
 2. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
 3. Add SDS/status aftercare under large registered MS set.
+
+## 2026-06-05 21:49 EEST - Dashboard station render coalescing
+
+Component in simple technical terms:
+
+- The browser dashboard keeps a local station table and redraws it when MS registration, RSSI, group, or Energy Economy telemetry arrives.
+- With thousands of terminals, many station events can arrive in one browser frame. Redrawing the whole table for every single event can freeze or lag the UI.
+
+Problem covered:
+
+- Station-state updates are still applied immediately, but table rendering is now coalesced with `requestAnimationFrame`.
+- Multiple MS events in the same browser frame produce one station-table redraw.
+- A `setTimeout(..., 16)` fallback keeps compatibility if `requestAnimationFrame` is unavailable.
+
+ETSI clause scope:
+
+- This is dashboard/browser scalability, not an ETSI air-interface behaviour change.
+- It supports reliable operator visibility for clause-scoped MM/CMCE/UMAC events without changing TETRA PDUs.
+
+Patch summary:
+
+- `crates/tetra-entities/src/net_dashboard/html.rs`
+  - Added `scheduleRenderStations()`.
+  - Changed MS event handlers (`ms_registered`, `ms_deregistered`, `ms_rssi`, `ms_groups`, `ms_groups_detach`, `ms_groups_all`, `ms_energy_saving`) to schedule one station redraw instead of rendering immediately.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added `dashboard_browser_coalesces_station_event_rendering` string regression.
+
+Verification:
+
+- `cargo test -p tetra-entities dashboard_browser_coalesces_station_event_rendering --locked` -> 1 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/src/net_dashboard/server.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+2. Add SDS/status aftercare under large registered MS set.
+3. Continue telemetry channel policy review; keep core telemetry lossless unless a protocol-safe coalescing layer is added.

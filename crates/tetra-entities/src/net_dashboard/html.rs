@@ -2872,21 +2872,21 @@ function handleMsg(msg){
       setBrewStatus(!!msg.connected,msg.brew_version||0);break;
     case 'ms_registered':
       ensureMsEntry(msg.issi)._last_seen_ts=Date.now();
-      renderStations();break;
+      scheduleRenderStations();break;
     case 'ms_deregistered':
-      delete state.ms[msg.issi];renderStations();break;
+      delete state.ms[msg.issi];scheduleRenderStations();break;
     case 'ms_rssi':
       if(state.ms[msg.issi]){state.ms[msg.issi].rssi_dbfs=msg.rssi_dbfs;state.ms[msg.issi]._last_seen_ts=Date.now();}
-      renderStations();break;
+      scheduleRenderStations();break;
     case 'ms_groups':
       if((msg.groups||[]).length){const e=ensureMsEntry(msg.issi);const cur=new Set(e.groups||[]);(msg.groups||[]).forEach(g=>cur.add(g));e.groups=[...cur];}
-      renderStations();break;
+      scheduleRenderStations();break;
     case 'ms_groups_detach':
       if(state.ms[msg.issi]){const rem=new Set(msg.groups||[]);state.ms[msg.issi].groups=(state.ms[msg.issi].groups||[]).filter(g=>!rem.has(g));}
-      renderStations();break;
+      scheduleRenderStations();break;
     case 'ms_groups_all':
       if(state.ms[msg.issi]||(msg.groups||[]).length)ensureMsEntry(msg.issi).groups=msg.groups||[];
-      renderStations();break;
+      scheduleRenderStations();break;
     case 'call_started':
       state.calls[msg.call_id]={...msg,started_at:Date.now()};
       if(msg.last_heard)pushLastHeard(msg.last_heard);
@@ -2908,7 +2908,7 @@ function handleMsg(msg){
       renderCalls();break;
     case 'ms_energy_saving':
       {const e=ensureMsEntry(msg.issi);e.energy_saving_mode=msg.mode;e.energy_saving_frame=msg.frame??null;e.energy_saving_multiframe=msg.multiframe??null;e._last_seen_ts=Date.now();}
-      renderStations();break;
+      scheduleRenderStations();break;
     case 'last_heard':
       pushLastHeard({issi:msg.issi,activity:msg.activity,dest:msg.dest,ts:new Date().toTimeString().slice(0,8)});
       renderLastHeard();break;
@@ -2958,6 +2958,13 @@ function activityBadge(activity){
 function rssiColor(v){if(v==null)return'var(--text3)';if(v>-20)return'var(--accent)';if(v>-30)return'var(--accent2)';if(v>-40)return'var(--warn)';return'var(--danger)';}
 function rssiPct(v){if(v==null)return 0;return Math.max(0,Math.min(100,(v+60)/50*100));}
 function escHtml(s){return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+let stationRenderQueued=false;
+function scheduleRenderStations(){
+  if(stationRenderQueued)return;
+  stationRenderQueued=true;
+  const schedule=window.requestAnimationFrame||((fn)=>setTimeout(fn,16));
+  schedule(()=>{stationRenderQueued=false;renderStations();});
+}
 function renderAll(){renderStations();renderCalls();renderLastHeard();updateTsBlocks();}
 
 // ── TS Visualizer ─────────────────────────────────────────────────────────
