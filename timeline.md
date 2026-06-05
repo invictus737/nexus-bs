@@ -6919,3 +6919,47 @@ Next non-repeating execution:
 1. Add UMAC over-cap protected-control evidence: all-protected backlog must preserve requester/listener/floor-withdraw semantics or fail with explicit telemetry.
 2. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
 3. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+
+## 2026-06-05 21:40 EEST - UMAC protected floor-control admission over backlog
+
+Component in simple technical terms:
+
+- UMAC is the radio scheduler and MAC admission layer. CMCE decides floor-control, but UMAC must still admit and report those TM-SDUs under queue pressure.
+- TMA report tracking is bounded locally so thousands of pending downlinks cannot grow memory without limit.
+- Not all protected floor-control messages have equal urgency: listener floor notifications are important, but requester positive grants and floor withdrawal/ceased signalling are more urgent.
+
+Problem covered:
+
+- Existing UMAC tests covered lower-priority busy/denial backlogs and 4096-member mixed EG7/StayAlive storms.
+- The audit gap was a protected backlog: the queue is full of floor-control listener grants, then more urgent floor-control arrives.
+- New test fills the pending TMA report cap with GSSI `GrantedToOtherUser` listener grants, then submits:
+  - an ISSI positive `D-TX GRANTED` with uplink allocation;
+  - a GSSI `D-TX CEASED` floor-withdrawal PDU.
+- UMAC must keep the pending report count bounded, admit both more urgent floor-control requests, and emit explicit `FragmentationFailure` TMA reports for the evicted lower-priority listener grants.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1: group floor-control grant/ceased semantics.
+- EN 300 392-2 clause 20.4.1.1.3: TMA-REPORT indication for MAC transfer outcome.
+- EN 300 392-2 clause 23.5: assigned-channel FACCH/STCH delivery of floor-control signalling.
+- This is bounded admission/robustness evidence around standard PDUs, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `DTxCeased` import and `d_tx_ceased_sdu` helper.
+  - Added `test_tma_report_cap_admits_higher_priority_floor_control_over_protected_backlog`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_tma_report_cap_admits_higher_priority_floor_control_over_protected_backlog --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 64 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/tests/test_umac_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.
+2. Add long-run no-terminal-loss model test: repeated attach/affiliate/EG7/PTT cycles must leave subscriber/group registries coherent.
+3. Continue dashboard/telemetry scaling work: bounded client queues and coalesced station rendering for 10k MS snapshots.

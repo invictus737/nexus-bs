@@ -9,6 +9,7 @@ use tetra_core::{
 use tetra_entities::lmac::components::{errorcontrol, scrambler};
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::cmce::enums::transmission_grant::TransmissionGrant;
+use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
@@ -438,6 +439,22 @@ fn d_tx_granted_sdu(call_id: u16, transmission_grant: TransmissionGrant) -> BitB
     }
     .to_bitbuf(&mut sdu)
     .expect("serialize D-TX GRANTED");
+    sdu.seek(0);
+    sdu
+}
+
+fn d_tx_ceased_sdu(call_id: u16) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(40);
+    DTxCeased {
+        call_identifier: call_id,
+        transmission_request_permission: false,
+        notification_indicator: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("serialize D-TX CEASED");
     sdu.seek(0);
     sdu
 }
@@ -2150,6 +2167,136 @@ fn test_tma_report_tracking_is_bounded_under_stalled_downlink_completion() {
     assert!(
         tma_report_for_handle(&sink_msgs, base_handle).is_none(),
         "requests inside the cap should remain pending until transmitted, cancelled, discarded, or timeout guarded"
+    );
+}
+
+#[test]
+fn test_tma_report_cap_admits_higher_priority_floor_control_over_protected_backlog() {
+    debug::setup_logging_verbose();
+
+    let call_id = 6;
+    let traffic_ts = 2;
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let listener_base_handle = 100_000;
+    let positive_handle = 200_000;
+    let floor_withdraw_handle = 200_001;
+    let requester_issi = 2_260_082;
+    let gssi = 226_333;
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    let cap = {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.debug_max_pending_tma_reports_for_test()
+    };
+
+    let make_floor_tma = |req_handle: i32, pdu: BitBuffer, main_address: TetraAddress, chan_alloc: Option<CmceChanAllocReq>| -> SapMsg {
+        SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle,
+                pdu,
+                main_address,
+                endpoint_id: 0,
+                pdu_prio: 0,
+                stealing_permission: true,
+                subscriber_class: 0,
+                air_interface_encryption: None,
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc,
+                tx_reporter: None,
+            }),
+        }
+    };
+
+    let listener_alloc = Some(CmceChanAllocReq {
+        usage: Some(6),
+        timeslots,
+        alloc_type: ChanAllocType::Replace,
+        ul_dl_assigned: UlDlAssignment::Dl,
+        carrier: None,
+    });
+    for offset in 0..cap {
+        test.submit_message(make_floor_tma(
+            listener_base_handle + offset as i32,
+            d_tx_granted_sdu(call_id, TransmissionGrant::GrantedToOtherUser),
+            TetraAddress::new(gssi, SsiType::Gssi),
+            listener_alloc.clone(),
+        ));
+    }
+
+    let positive_alloc = Some(CmceChanAllocReq {
+        usage: Some(6),
+        timeslots,
+        alloc_type: ChanAllocType::Replace,
+        ul_dl_assigned: UlDlAssignment::Both,
+        carrier: None,
+    });
+    test.submit_message(make_floor_tma(
+        positive_handle,
+        d_tx_granted_sdu(call_id, TransmissionGrant::Granted),
+        TetraAddress::issi(requester_issi),
+        positive_alloc,
+    ));
+    test.submit_message(make_floor_tma(
+        floor_withdraw_handle,
+        d_tx_ceased_sdu(call_id),
+        TetraAddress::new(gssi, SsiType::Gssi),
+        None,
+    ));
+
+    test.deliver_all_messages();
+    let sink_msgs = test.dump_sinks();
+
+    let pending_count = {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.debug_pending_tma_report_count_for_test()
+    };
+    assert_eq!(pending_count, cap);
+
+    // EN 300 392-2 clause 14.5.2.2.1 floor-control notifications are all
+    // protected signalling, but they are not equally urgent. UMAC admission
+    // must preserve the requester positive grant and floor withdrawal by
+    // evicting lower-priority listener grants under the local pending-report
+    // cap, with explicit TMA failures for the evicted requests.
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, listener_base_handle),
+            Some(TmaReport::FragmentationFailure)
+        ),
+        "positive requester grant should evict the oldest lower-priority listener grant"
+    );
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, listener_base_handle + 1),
+            Some(TmaReport::FragmentationFailure)
+        ),
+        "floor withdrawal should evict the next lower-priority listener grant"
+    );
+    assert!(
+        tma_report_for_handle(&sink_msgs, positive_handle).is_none(),
+        "positive requester grant must remain pending, not fail admission"
+    );
+    assert!(
+        tma_report_for_handle(&sink_msgs, floor_withdraw_handle).is_none(),
+        "floor withdrawal must remain pending, not fail admission"
     );
 }
 
