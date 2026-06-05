@@ -51,6 +51,12 @@ pub struct MmBs {
     pending_swmi_group_transactions: HashMap<u32, PendingSwmiGroupTransaction>,
     pending_solicited_group_reports: HashMap<u32, TdmaTime>,
     restart_recovery: HashMap<u32, RestartRecoveryProbe>,
+    restart_recovery_due: BTreeSet<(i64, u32)>,
+    restart_recovery_clock: i64,
+    restart_recovery_last_tick: TdmaTime,
+    restart_recovery_clock_initialized: bool,
+    restart_recovery_next_command_due_tick: i64,
+    restart_recovery_sweep_spacing_ticks: i64,
     restart_recovery_cache_path: Option<String>,
     restart_recovery_cache: RestartRecoveryCache,
     restart_recovery_cache_dirty: bool,
@@ -62,7 +68,8 @@ pub struct MmBs {
 #[derive(Debug, Clone, Copy)]
 struct RestartRecoveryProbe {
     attempts: u8,
-    next_due: TdmaTime,
+    first_due_tick: i64,
+    next_due_tick: i64,
 }
 
 struct PendingEnergySavingAssignment {
@@ -175,13 +182,13 @@ impl MmBs {
 
     pub fn new(config: SharedConfig, telemetry: Option<TelemetrySink>, control: Option<ControlEndpoint>) -> Self {
         let client_mgr = MmClientMgr::new(telemetry.clone());
-        let restart_recovery_start = TdmaTime::default().add_timeslots(Self::RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS);
+        let restart_recovery_start_tick = Self::RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS as i64;
         let restart_recovery_cache_path = Self::subscriber_recovery_path(&config);
         let restart_recovery_cache = restart_recovery_cache_path
             .as_deref()
             .map(Self::read_restart_recovery_cache)
             .unwrap_or_default();
-        let restart_recovery = Self::load_restart_recovery_candidates(&config, &restart_recovery_cache)
+        let restart_recovery_entries: Vec<_> = Self::load_restart_recovery_candidates(&config, &restart_recovery_cache)
             .into_iter()
             .enumerate()
             .map(|(index, issi)| {
@@ -189,11 +196,21 @@ impl MmBs {
                     issi,
                     RestartRecoveryProbe {
                         attempts: 0,
-                        next_due: restart_recovery_start.add_timeslots(index as i32 * Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS),
+                        first_due_tick: restart_recovery_start_tick
+                            + index as i64 * Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS as i64,
+                        next_due_tick: restart_recovery_start_tick + index as i64 * Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS as i64,
                     },
                 )
             })
             .collect();
+        let restart_recovery_sweep_spacing_ticks = (restart_recovery_entries.len() as i64
+            * Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS as i64)
+            .max(Self::RESTART_RECOVERY_RETRY_TIMESLOTS as i64);
+        let restart_recovery_due = restart_recovery_entries
+            .iter()
+            .map(|(issi, probe)| (probe.next_due_tick, *issi))
+            .collect();
+        let restart_recovery = restart_recovery_entries.into_iter().collect();
         Self {
             config,
             telemetry,
@@ -204,6 +221,12 @@ impl MmBs {
             pending_swmi_group_transactions: HashMap::new(),
             pending_solicited_group_reports: HashMap::new(),
             restart_recovery,
+            restart_recovery_due,
+            restart_recovery_clock: 0,
+            restart_recovery_last_tick: TdmaTime::default(),
+            restart_recovery_clock_initialized: false,
+            restart_recovery_next_command_due_tick: restart_recovery_start_tick,
+            restart_recovery_sweep_spacing_ticks,
             restart_recovery_cache_path,
             restart_recovery_cache,
             restart_recovery_cache_dirty: false,
@@ -516,12 +539,44 @@ impl MmBs {
         self.current_restart_recovery_groups_for_client_with_remaining(issi, &[])
     }
 
+    fn remove_restart_recovery_probe(&mut self, issi: u32) -> Option<RestartRecoveryProbe> {
+        let probe = self.restart_recovery.remove(&issi)?;
+        self.restart_recovery_due.remove(&(probe.next_due_tick, issi));
+        Some(probe)
+    }
+
+    fn insert_restart_recovery_probe(&mut self, issi: u32, probe: RestartRecoveryProbe) {
+        self.restart_recovery_due.insert((probe.next_due_tick, issi));
+        self.restart_recovery.insert(issi, probe);
+    }
+
+    fn update_restart_recovery_clock(&mut self, ts: TdmaTime) {
+        if !self.restart_recovery_clock_initialized {
+            self.restart_recovery_last_tick = ts;
+            self.restart_recovery_clock_initialized = true;
+            return;
+        }
+
+        let elapsed = ts.diff(self.restart_recovery_last_tick);
+        if elapsed > 0 {
+            self.restart_recovery_clock += elapsed as i64;
+        } else if elapsed < 0 {
+            tracing::warn!(
+                "MM: restart recovery TDMA clock moved backwards from {} to {}; advancing local recovery clock by one tick",
+                self.restart_recovery_last_tick,
+                ts
+            );
+            self.restart_recovery_clock += 1;
+        }
+        self.restart_recovery_last_tick = ts;
+    }
+
     fn remember_restart_recovery_issi(&mut self, issi: u32) {
         self.remember_restart_recovery_issi_with_remaining(issi, &[]);
     }
 
     fn remember_restart_recovery_issi_with_remaining(&mut self, issi: u32, remaining_restart_group_refresh: &[(u32, GroupAttachmentInfo)]) {
-        self.restart_recovery.remove(&issi);
+        self.remove_restart_recovery_probe(issi);
         if !Self::restart_recovery_eligible(&self.config, issi) {
             return;
         }
@@ -539,7 +594,7 @@ impl MmBs {
     }
 
     fn forget_restart_recovery_issi(&mut self, issi: u32) {
-        self.restart_recovery.remove(&issi);
+        self.remove_restart_recovery_probe(issi);
         if self.sync_restart_recovery_cache_path().is_none() {
             return;
         }
@@ -657,21 +712,32 @@ impl MmBs {
         }
     }
 
-    fn tick_restart_recovery(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
+    fn tick_restart_recovery(&mut self, queue: &mut MessageQueue) {
         if self.restart_recovery.is_empty() || !self.config.config().cell.registration {
             return;
         }
+        let now_tick = self.restart_recovery_clock;
+        if now_tick < self.restart_recovery_next_command_due_tick {
+            return;
+        }
 
-        let mut done = Vec::new();
-        let mut commands = Vec::new();
-        let mut command_scheduled_this_tick = false;
-        for (&issi, probe) in self.restart_recovery.iter_mut() {
+        let mut command = None;
+        loop {
+            let Some((next_due_tick, issi)) = self.restart_recovery_due.iter().next().copied() else {
+                break;
+            };
+            if now_tick < next_due_tick {
+                break;
+            }
+            self.restart_recovery_due.remove(&(next_due_tick, issi));
+            let Some(mut probe) = self.restart_recovery.remove(&issi) else {
+                continue;
+            };
+
             if self.client_mgr.client_is_known(issi) {
-                done.push(issi);
                 continue;
             }
             if !Self::restart_recovery_eligible(&self.config, issi) {
-                done.push(issi);
                 continue;
             }
             if probe.attempts >= Self::RESTART_RECOVERY_MAX_ATTEMPTS {
@@ -680,14 +746,6 @@ impl MmBs {
                     issi,
                     probe.attempts
                 );
-                done.push(issi);
-                continue;
-            }
-            if ts.diff(probe.next_due) < 0 {
-                continue;
-            }
-            if command_scheduled_this_tick {
-                probe.next_due = ts.add_timeslots(Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS);
                 continue;
             }
 
@@ -697,16 +755,15 @@ impl MmBs {
                 Self::RESTART_RECOVERY_MAX_ATTEMPTS,
                 issi
             );
-            commands.push(issi);
-            command_scheduled_this_tick = true;
             probe.attempts = probe.attempts.saturating_add(1);
-            probe.next_due = ts.add_timeslots(Self::RESTART_RECOVERY_RETRY_TIMESLOTS);
+            probe.next_due_tick = probe.first_due_tick + probe.attempts as i64 * self.restart_recovery_sweep_spacing_ticks;
+            self.insert_restart_recovery_probe(issi, probe);
+            self.restart_recovery_next_command_due_tick = now_tick + Self::RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS as i64;
+            command = Some(issi);
+            break;
         }
 
-        for issi in done {
-            self.restart_recovery.remove(&issi);
-        }
-        for issi in commands {
+        if let Some(issi) = command {
             self.send_d_location_update_command(queue, issi, 0);
         }
     }
@@ -3868,6 +3925,7 @@ impl TetraEntityTrait for MmBs {
 
     fn tick_start(&mut self, queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
+        self.update_restart_recovery_clock(ts);
         self.sync_restart_recovery_cache_path();
         self.flush_restart_recovery_cache_if_due(false);
 
@@ -3884,7 +3942,7 @@ impl TetraEntityTrait for MmBs {
         self.expire_pending_energy_saving(ts);
         self.expire_pending_swmi_group_transactions(queue, ts);
         self.expire_pending_solicited_group_reports(queue, ts);
-        self.tick_restart_recovery(queue, ts);
+        self.tick_restart_recovery(queue);
 
         // Local periodic-registration watchdog. Do not call this T351:
         // EN 300 392-2 §16.11.1.1 defines T351 as the 10 s MS-side

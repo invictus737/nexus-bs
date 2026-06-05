@@ -6633,3 +6633,54 @@ Next non-repeating execution:
 1. Add restart recovery large-cache pacing test for 4096 cached ISSIs.
 2. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state.
 3. Add stress-aftercare regression: large group storm then simple private simplex and duplex still work.
+
+## 2026-06-05 21:04 EEST - MM restart recovery large-cache pacing and fairness
+
+Component in simple technical terms:
+
+- MM is the BS registration and affiliation controller: it remembers which ISSI is attached, which GSSI groups each terminal belongs to, and when a terminal is using energy economy.
+- Restart recovery is the BS-side procedure used after process restart to ask still-camped terminals to refresh registration and group state with `D-LOCATION UPDATE COMMAND`.
+- For thousands of terminals, this must be paced like a work queue: one terminal per configured interval, no first-frame burst, no retry loop that keeps hitting the first radios while later radios remain unprobed.
+
+Problem fixed:
+
+- `tick_restart_recovery()` previously stored probes in a `HashMap` and scanned every cached ISSI every TDMA tick.
+- The old one-command-per-tick guard prevented bursts, but retry due-times could collide with later first probes. If radios did not answer, an early ISSI retry could be selected before every cached ISSI had received one first command.
+- MM now keeps restart probes in two structures:
+  - `HashMap<ISSI, RestartRecoveryProbe>` for direct removal when a terminal successfully registers or is forgotten.
+  - `BTreeSet<(due_tick, ISSI)>` for deterministic ordered scheduling.
+- A local monotonic recovery clock is used instead of raw `TdmaTime` ordering, so scheduling remains stable across long-running BS time progression.
+- Retry timing is sweep-based: every cached ISSI receives its first probe before any retry from the first sweep is eligible.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4: SwMI-commanded registration via `D-LOCATION UPDATE COMMAND`, including group identity report request.
+- EN 300 392-2 clauses 16.8.0, 16.9.3.4, 16.10.23, and 16.10.35a: group identity state and coherent `DemandLocationUpdating` accept behavior after a BS-commanded update.
+- The startup guard, inter-ISSI spacing, and sweep fairness are Nexus-BS local RF robustness policy over standard MM PDUs. This is clause-scoped engineering evidence, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Added deterministic due-index scheduling for restart recovery probes.
+  - Added monotonic local restart recovery clock.
+  - Removed probes from both direct and due-index stores when registration succeeds or the ISSI is forgotten.
+  - Changed retry scheduling so retries occur in complete sweeps, preserving first-pass fairness for thousands of cached terminals.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added `test_restart_recovery_large_cache_paces_one_command_per_interval_and_restores_groups`.
+  - Added `test_restart_recovery_large_cache_first_sweep_reaches_every_issi_before_retry`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_large_cache_paces_one_command_per_interval_and_restores_groups --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs test_restart_recovery_large_cache_first_sweep_reaches_every_issi_before_retry --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 29 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/src/mm/mm_bs.rs crates/tetra-entities/tests/test_mm_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Add CMCE duplicate queued `U-TX DEMAND` idempotency regression for 4096-member GSSI: repeated PTT from the same waiting ISSI must produce one queued grant and then hand off to the next unique waiter.
+2. Add UMAC mixed EG7/StayAlive group floor-control stress test: requester positive grant and listener GSSI grant must survive queue pressure without unbounded growth.
+3. Extend restart/EG7 large-group recovery to dashboard/telemetry observable state.
+4. Add stress-aftercare regression: large group storm, then simple private simplex and duplex still work.

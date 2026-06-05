@@ -1,5 +1,7 @@
 mod common;
 
+use std::collections::BTreeSet;
+
 use tetra_config::bluestation::{CfgBrew, EnergySavingAssignment, StackConfig, StackMode, from_toml_str};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
@@ -4764,6 +4766,160 @@ fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
     assert_eq!(commands[0].0, seeded_issi);
     assert_eq!(commands[0].1, 0);
     assert!(commands[0].2.group_identity_report);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_large_cache_paces_one_command_per_interval_and_restores_groups() {
+    debug::setup_logging_verbose();
+    let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT;
+    let first_issi = 2_264_000_u32;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("large-paced-groups");
+    let cache: String = (0..member_count)
+        .map(|offset| format!("{} {}:0:0\n", first_issi + offset, gssi))
+        .collect();
+    std::fs::write(&path, cache).expect("failed to seed large recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    // EN 300 392-2 clause 16.4.4 permits SwMI-commanded registration with
+    // D-LOCATION UPDATE COMMAND. The inter-ISSI delay is Nexus-BS local RF
+    // robustness policy: after a BS restart, thousands of still-camped MSs must
+    // be re-probed one at a time, without creating a first-frame burst or
+    // dropping their previously accepted group affiliations.
+    test.run_stack(Some(72));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "large restart recovery must hold the startup guard before probing"
+    );
+
+    for offset in 0..member_count {
+        let issi = first_issi + offset;
+        test.run_stack(Some(1));
+        let command_msgs = test.dump_sinks();
+        let commands = location_update_command_details(&command_msgs);
+        assert_eq!(commands.len(), 1, "ISSI {issi} should receive exactly one restart command");
+        assert_eq!(commands[0].0, issi);
+        assert_eq!(commands[0].1, 0);
+        assert_eq!(commands[0].2, Layer2Service::Acknowledged);
+        assert!(commands[0].3.group_identity_report);
+
+        submit_location_update_with_groups_and_group_report_response(
+            &mut test,
+            issi,
+            LocationUpdateType::DemandLocationUpdating,
+            vec![gssi],
+            1,
+            0,
+        );
+        test.run_stack(Some(1));
+        let response_msgs = test.dump_sinks();
+        assert!(
+            contains_location_update_accept(&response_msgs),
+            "ISSI {issi} should complete commanded DemandLocationUpdating"
+        );
+        assert!(
+            !contains_location_update_command(&response_msgs),
+            "successful ISSI {issi} recovery response must remove the pending probe"
+        );
+
+        if offset + 1 < member_count {
+            test.run_stack(Some(70));
+            assert!(
+                location_update_commands(&test.dump_sinks()).is_empty(),
+                "large restart recovery must not send an early or burst command after ISSI {issi}"
+            );
+        }
+    }
+
+    let mut members = test.config.state_read().subscribers.group_members(gssi);
+    members.sort_unstable();
+    assert_eq!(members.len(), member_count as usize);
+    assert_eq!(members.first().copied(), Some(first_issi));
+    assert_eq!(members.last().copied(), Some(first_issi + member_count - 1));
+
+    test.run_stack(Some(144));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "all recovered ISSIs should be removed from the restart probe queue"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
+fn test_restart_recovery_large_cache_first_sweep_reaches_every_issi_before_retry() {
+    debug::setup_logging_verbose();
+    let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT + 1;
+    let first_issi = 2_264_000_u32;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("large-first-sweep");
+    let cache: String = (0..member_count)
+        .map(|offset| format!("{} {}:0:0\n", first_issi + offset, gssi))
+        .collect();
+    std::fs::write(&path, cache).expect("failed to seed large recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    test.run_stack(Some(72));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "large first sweep must keep the startup guard quiet"
+    );
+
+    let mut seen = BTreeSet::new();
+    for offset in 0..member_count {
+        let expected_issi = first_issi + offset;
+        test.run_stack(Some(1));
+        let command_msgs = test.dump_sinks();
+        let commands = location_update_command_details(&command_msgs);
+        assert_eq!(commands.len(), 1, "first sweep tick {offset} should emit exactly one command");
+        assert_eq!(commands[0].0, expected_issi);
+        assert_eq!(commands[0].1, 0);
+        assert_eq!(commands[0].2, Layer2Service::Acknowledged);
+        assert!(commands[0].3.group_identity_report);
+        assert!(
+            seen.insert(commands[0].0),
+            "ISSI {} was retried before every cached ISSI received a first probe",
+            commands[0].0
+        );
+
+        if offset + 1 < member_count {
+            test.run_stack(Some(71));
+            assert!(
+                location_update_commands(&test.dump_sinks()).is_empty(),
+                "first sweep must keep inter-ISSI spacing quiet after ISSI {}",
+                commands[0].0
+            );
+        }
+    }
+
+    assert_eq!(seen.len(), member_count as usize);
+    assert!(seen.contains(&first_issi));
+    assert!(seen.contains(&(first_issi + member_count - 1)));
+
+    test.run_stack(Some(72));
+    let retry_msgs = test.dump_sinks();
+    let retry_commands = location_update_command_details(&retry_msgs);
+    assert_eq!(retry_commands.len(), 1);
+    assert_eq!(retry_commands[0].0, first_issi);
+    assert!(retry_commands[0].3.group_identity_report);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
