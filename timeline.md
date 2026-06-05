@@ -1,5 +1,53 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 12:03:36 EEST - MM segmented cached restart scan-list refresh
+
+Context:
+
+- Previous restart recovery patch refreshed one cached group over air, but a large cached scan-list could restore more local GSSIs than were carried in one `D-ATTACH/DETACH GROUP IDENTITY`.
+- That could split BS and MS state: CMCE would think the terminal is affiliated to unsent groups while the terminal never received those group attachments after restart.
+
+Component explanation:
+
+- MM is Mobility Management: it owns restart recovery, group affiliation, SwMI group attach/detach, and the restart recovery cache.
+- A scan-list here means multiple cached GSSIs for one ISSI. It must be refreshed in bounded over-air batches without declaring unsent groups active locally.
+- CMCE is call control and depends on MM group affiliation events before it allows group PTT.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.8.0: attached group identities are valid when attached by SwMI and accepted by the MS, or when previous valid attachments remain in force.
+- Clause 16.8.1: infrastructure-initiated `D-ATTACH/DETACH GROUP IDENTITY` may add groups using amendment mode and ACK request.
+- Clause 16.8.5 / 16.11.1.3: each attach/detach transaction is bounded by T353.
+- Clause 16.8.6: avoid colliding group-report and attach/detach procedures.
+- Clauses 16.10.13, 16.10.14, 16.10.17, and 16.10.19: ACK request/type, amendment mode, lifetime, and class-of-usage fields.
+- This is clause-scoped engineering hardening, not formal TETRA certification.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Cached restart restore now restores only the batch that will be sent in the current SwMI `D-ATTACH/DETACH GROUP IDENTITY`.
+  - Remaining cached groups are held in the pending SwMI transaction and preserved in the recovery cache while the batch is waiting for ACK.
+  - When ACK arrives for a batch, MM restores and sends the next batch. If a batch is rejected or T353 expires, MM keeps the failure rollback/reprobe behavior and does not continue with remaining groups.
+  - `GroupIdentityDownlink` for restart refresh now uses the cached `GroupAttachmentInfo` directly, preserving lifetime/class per group.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added a 13-GSSI cached scan-list restart test: first refresh carries 12 groups, ACK triggers the final group refresh, unsent groups are not locally restored early, and the cache retains the full scan-list across the pending transaction.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 20 passed.
+- `cargo test -p tetra-entities --test test_mm_bs swmi_group_ack --locked` -> 12 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 123 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_ --locked` -> 50 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Commit this segmented scan-list restart refresh patch.
+2. Next MM restart hardening target: multi-ISSI restart recovery integration into CMCE group PTT, proving `2260082`, `2260616`, and `2260618` all re-affiliate to `226333` before first group call.
+3. Remote deploy remains dependent on SSH reachability to `chris@192.168.1.179`.
+
 ## 2026-06-05 11:52:03 EEST - MM cached restart group refresh over air, EG7 ordering, and failure rollback
 
 User report:

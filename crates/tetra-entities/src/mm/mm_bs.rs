@@ -76,6 +76,12 @@ struct PendingSwmiGroupTransaction {
     accepts_unrouted_ack_handle_zero: bool,
     rollback_unconfirmed_attachments_on_failure: bool,
     reprobe_group_report_on_failure: bool,
+    remaining_restart_group_refresh: Vec<(u32, GroupAttachmentInfo)>,
+}
+
+struct CachedRestartGroupRefresh {
+    groups: Vec<(u32, GroupAttachmentInfo)>,
+    remaining: Vec<(u32, GroupAttachmentInfo)>,
 }
 
 type RestartRecoveryCache = BTreeMap<u32, BTreeMap<u32, GroupAttachmentInfo>>;
@@ -432,6 +438,13 @@ impl MmBs {
                 cached_groups.insert(gssi, info);
             }
         }
+        if let Some(pending) = self.pending_swmi_group_transactions.get(&issi) {
+            for &(gssi, info) in &pending.remaining_restart_group_refresh {
+                if self.restart_recovery_group_allowed(gssi) {
+                    cached_groups.insert(gssi, info);
+                }
+            }
+        }
         cached_groups
     }
 
@@ -684,6 +697,7 @@ impl MmBs {
                 accepts_unrouted_ack_handle_zero: false,
                 rollback_unconfirmed_attachments_on_failure: false,
                 reprobe_group_report_on_failure: false,
+                remaining_restart_group_refresh: Vec::new(),
             },
         );
         true
@@ -1178,7 +1192,6 @@ impl MmBs {
         if !aff_groups.is_empty() {
             self.emit_subscriber_update(queue, issi, aff_groups, BrewSubscriberAction::Affiliate);
         }
-        self.remember_restart_recovery_issi(issi);
         if pending.rollback_unconfirmed_attachments_on_failure && had_deaff_groups {
             self.finish_swmi_group_failure_recovery(
                 queue,
@@ -1187,6 +1200,17 @@ impl MmBs {
                 Vec::new(),
                 "U-ATTACH/DETACH GROUP IDENTITY ACK rejected attachment",
             );
+            self.remember_restart_recovery_issi(issi);
+        } else if pending.rollback_unconfirmed_attachments_on_failure && !pending.remaining_restart_group_refresh.is_empty() {
+            let split_at = pending.remaining_restart_group_refresh.len().min(Self::MAX_GROUPS_PER_ATTACH);
+            let (next_batch, remaining) = pending.remaining_restart_group_refresh.split_at(split_at);
+            let next_refresh = self.restore_cached_restart_recovery_group_batch(queue, issi, next_batch);
+            if !next_refresh.is_empty() {
+                self.send_swmi_group_attach_refresh(queue, issi, &next_refresh, remaining.to_vec());
+            }
+            self.remember_restart_recovery_issi(issi);
+        } else {
+            self.remember_restart_recovery_issi(issi);
         }
     }
 
@@ -1247,14 +1271,42 @@ impl MmBs {
         true
     }
 
-    fn restore_cached_restart_recovery_groups(&mut self, queue: &mut MessageQueue, issi: u32) -> Vec<u32> {
-        let cached_groups = self.cached_restart_recovery_groups_for_issi(issi);
+    fn restore_cached_restart_recovery_groups(&mut self, queue: &mut MessageQueue, issi: u32) -> CachedRestartGroupRefresh {
+        let cached_groups: Vec<(u32, GroupAttachmentInfo)> = self.cached_restart_recovery_groups_for_issi(issi).into_iter().collect();
         if cached_groups.is_empty() {
-            return Vec::new();
+            return CachedRestartGroupRefresh {
+                groups: Vec::new(),
+                remaining: Vec::new(),
+            };
         }
 
+        if cached_groups.len() > Self::MAX_GROUPS_PER_ATTACH {
+            tracing::warn!(
+                "MM: cached restart recovery for ISSI {} has {} groups; sending SwMI refresh in {}-group batches",
+                issi,
+                cached_groups.len(),
+                Self::MAX_GROUPS_PER_ATTACH
+            );
+        }
+
+        let split_at = cached_groups.len().min(Self::MAX_GROUPS_PER_ATTACH);
+        let (batch, remaining) = cached_groups.split_at(split_at);
+        let groups = self.restore_cached_restart_recovery_group_batch(queue, issi, batch);
+
+        CachedRestartGroupRefresh {
+            groups,
+            remaining: remaining.to_vec(),
+        }
+    }
+
+    fn restore_cached_restart_recovery_group_batch(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        cached_groups: &[(u32, GroupAttachmentInfo)],
+    ) -> Vec<(u32, GroupAttachmentInfo)> {
         let mut restored_groups = Vec::new();
-        for (gssi, attachment_info) in cached_groups {
+        for &(gssi, attachment_info) in cached_groups {
             let shared_affiliated_before = self.config.state_read().subscribers.group_members(gssi).contains(&issi);
             match self.client_mgr.client_group_attach_with_info(issi, gssi, true, attachment_info) {
                 Ok(changed) => {
@@ -1262,7 +1314,7 @@ impl MmBs {
                         self.restore_shared_subscriber_registration_for_known_client(queue, issi);
                     }
                     if !shared_affiliated_before && self.config.state_write().subscribers.affiliate(issi, gssi) {
-                        restored_groups.push(gssi);
+                        restored_groups.push((gssi, attachment_info));
                     }
                 }
                 Err(err) => {
@@ -1272,12 +1324,13 @@ impl MmBs {
         }
 
         if !restored_groups.is_empty() {
+            let restored_gssis: Vec<u32> = restored_groups.iter().map(|(gssi, _)| *gssi).collect();
             tracing::info!(
                 "MM: restored cached restart group affiliation for ISSI {} groups={:?}",
                 issi,
-                restored_groups
+                restored_gssis
             );
-            self.emit_subscriber_update(queue, issi, restored_groups.clone(), BrewSubscriberAction::Affiliate);
+            self.emit_subscriber_update(queue, issi, restored_gssis, BrewSubscriberAction::Affiliate);
         }
 
         restored_groups
@@ -1866,7 +1919,10 @@ impl MmBs {
 
         // Process optional GroupIdentityLocationDemand field
         let _has_groups = pdu.group_identity_location_demand.is_some();
-        let mut cached_restart_group_refresh = Vec::new();
+        let mut cached_restart_group_refresh = CachedRestartGroupRefresh {
+            groups: Vec::new(),
+            remaining: Vec::new(),
+        };
         let gila = if let Some(gild) = pdu.group_identity_location_demand {
             let giu_for_mode = gild
                 .group_identity_uplink
@@ -2093,13 +2149,18 @@ impl MmBs {
         };
         queue.push_back(msg);
 
-        if !cached_restart_group_refresh.is_empty() {
+        if !cached_restart_group_refresh.groups.is_empty() {
             // EN 300 392-2 clause 16.8.1 gives the SwMI a separate
             // infrastructure-initiated group attach path. Use it after the
             // location update accept so a restarted terminal that came back
             // group-less receives an over-air GSSI refresh instead of only a
             // local CMCE/dashboard affiliation replay.
-            self.send_swmi_group_attach_refresh(queue, issi, &cached_restart_group_refresh);
+            self.send_swmi_group_attach_refresh(
+                queue,
+                issi,
+                &cached_restart_group_refresh.groups,
+                cached_restart_group_refresh.remaining,
+            );
         }
 
         // Send D-LOCATION-UPDATE-COMMAND to prompt a full re-registration (TEI +
@@ -2125,7 +2186,7 @@ impl MmBs {
         let has_groups = _has_groups || group_report_complete;
         let request_restart_group_report = is_new
             && !has_groups
-            && cached_restart_group_refresh.is_empty()
+            && cached_restart_group_refresh.groups.is_empty()
             && !was_solicited_group_report_pending
             && (pdu.location_update_type != LocationUpdateType::ItsiAttach || was_restart_recovery_candidate);
 
@@ -2934,7 +2995,13 @@ impl MmBs {
         });
     }
 
-    fn send_swmi_group_attach_refresh(&mut self, queue: &mut MessageQueue, issi: u32, groups: &[u32]) {
+    fn send_swmi_group_attach_refresh(
+        &mut self,
+        queue: &mut MessageQueue,
+        issi: u32,
+        groups: &[(u32, GroupAttachmentInfo)],
+        remaining_restart_group_refresh: Vec<(u32, GroupAttachmentInfo)>,
+    ) {
         if groups.is_empty() {
             return;
         }
@@ -2951,7 +3018,7 @@ impl MmBs {
             groups
         };
 
-        let group_identity_downlink = self.group_identity_downlink_for_reported_groups(issi, groups_to_send);
+        let group_identity_downlink = Self::group_identity_downlink_for_attachment_infos(groups_to_send);
         if group_identity_downlink.is_empty() {
             return;
         }
@@ -2979,7 +3046,7 @@ impl MmBs {
                 tracing::info!(
                     "MM: sending SwMI group attach refresh to ISSI {} for cached restart group(s) {:?}",
                     issi,
-                    groups_to_send
+                    groups_to_send.iter().map(|(gssi, _)| *gssi).collect::<Vec<u32>>()
                 );
                 self.pending_swmi_group_transactions.insert(
                     issi,
@@ -2995,6 +3062,7 @@ impl MmBs {
                         accepts_unrouted_ack_handle_zero: true,
                         rollback_unconfirmed_attachments_on_failure: true,
                         reprobe_group_report_on_failure: true,
+                        remaining_restart_group_refresh,
                     },
                 );
                 queue.push_back(SapMsg {
@@ -3018,7 +3086,7 @@ impl MmBs {
                 tracing::warn!(
                     "MM: failed serializing SwMI group attach refresh for ISSI {} groups={:?}: {:?}",
                     issi,
-                    groups_to_send,
+                    groups_to_send.iter().map(|(gssi, _)| *gssi).collect::<Vec<u32>>(),
                     err
                 );
             }
@@ -3193,27 +3261,31 @@ impl MmBs {
         self.client_mgr.client_group_attachment_info(issi, gssi).unwrap_or_default()
     }
 
-    fn group_identity_downlink_for_reported_groups(&self, issi: u32, groups: &[u32]) -> Vec<GroupIdentityDownlink> {
+    fn group_identity_downlink_for_attachment_infos(groups: &[(u32, GroupAttachmentInfo)]) -> Vec<GroupIdentityDownlink> {
         groups
             .iter()
-            .map(|&gssi| {
-                let attachment_info = self.group_attachment_info_for_report(issi, gssi);
-                GroupIdentityDownlink {
-                    group_identity_attachment: Some(GroupIdentityAttachment {
-                        // EN 300 392-2 clauses 16.8.4 and 16.10.19: group
-                        // report responses re-advertise valid downlink group
-                        // identities, so preserve the lifetime and class of
-                        // usage recorded when the group was attached.
-                        group_identity_attachment_lifetime: attachment_info.group_identity_attachment_lifetime,
-                        class_of_usage: attachment_info.class_of_usage,
-                    }),
-                    group_identity_detachment_uplink: None,
-                    gssi: Some(gssi),
-                    address_extension: None,
-                    vgssi: None,
-                }
+            .map(|&(gssi, attachment_info)| GroupIdentityDownlink {
+                group_identity_attachment: Some(GroupIdentityAttachment {
+                    // EN 300 392-2 clauses 16.8.4 and 16.10.19: preserve the
+                    // lifetime and class of usage recorded when the group was
+                    // attached or recovered.
+                    group_identity_attachment_lifetime: attachment_info.group_identity_attachment_lifetime,
+                    class_of_usage: attachment_info.class_of_usage,
+                }),
+                group_identity_detachment_uplink: None,
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
             })
             .collect()
+    }
+
+    fn group_identity_downlink_for_reported_groups(&self, issi: u32, groups: &[u32]) -> Vec<GroupIdentityDownlink> {
+        let groups_with_info: Vec<(u32, GroupAttachmentInfo)> = groups
+            .iter()
+            .map(|&gssi| (gssi, self.group_attachment_info_for_report(issi, gssi)))
+            .collect();
+        Self::group_identity_downlink_for_attachment_infos(&groups_with_info)
     }
 
     fn send_d_attach_detach_ack(&self, queue: &mut MessageQueue, issi: u32, handle: u32, groups: &[u32]) {

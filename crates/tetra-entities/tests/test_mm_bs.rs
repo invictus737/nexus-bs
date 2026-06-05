@@ -4998,6 +4998,93 @@ fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
 }
 
 #[test]
+fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let groups: Vec<u32> = (226300..=226312).collect();
+    let path = unique_restart_recovery_path("cached-scan-list-segments");
+    let cached_groups = groups.iter().map(|gssi| format!("{gssi}:0:4")).collect::<Vec<String>>().join(",");
+    std::fs::write(&path, format!("{issi} {cached_groups}\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.run_stack(Some(73));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None);
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+    let first_refreshes = swmi_group_attach_refresh_details(&demand_msgs);
+    assert_eq!(first_refreshes.len(), 1);
+    assert_eq!(
+        first_refreshes[0].groups,
+        groups[..12].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
+    );
+    assert_eq!(first_refreshes[0].layer2service, Layer2Service::Acknowledged);
+    assert_ne!(first_refreshes[0].handle, 0);
+
+    for gssi in &groups[..12] {
+        assert_eq!(
+            test.config.state_read().subscribers.group_members(*gssi),
+            vec![issi],
+            "first batch GSSI {gssi} should be provisionally restored"
+        );
+    }
+    assert!(
+        test.config.state_read().subscribers.group_members(groups[12]).is_empty(),
+        "unsent cached scan-list group must not be locally restored before its over-air refresh"
+    );
+    let cache_after_first = std::fs::read_to_string(&path).expect("pending segmented refresh should preserve cache");
+    for gssi in &groups {
+        assert!(
+            cache_after_first.lines().any(|line| line.contains(&gssi.to_string())),
+            "pending segmented refresh should keep cached GSSI {gssi}, got {cache_after_first:?}"
+        );
+    }
+
+    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
+    test.run_stack(Some(1));
+    let second_msgs = test.dump_sinks();
+    let second_refreshes = swmi_group_attach_refresh_details(&second_msgs);
+    assert_eq!(second_refreshes.len(), 1);
+    assert_eq!(second_refreshes[0].groups, vec![(groups[12], 0, 4)]);
+    assert!(
+        subscriber_updates(&second_msgs)
+            .iter()
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![groups[12]]),
+        "ACK for first scan-list batch should restore and advertise the next batch"
+    );
+    assert_eq!(test.config.state_read().subscribers.group_members(groups[12]), vec![issi]);
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
+
+    submit_swmi_group_ack(&mut test, issi, 0, false, vec![]);
+    test.run_stack(Some(1));
+    let final_ack_msgs = test.dump_sinks();
+    assert!(swmi_group_attach_refresh_details(&final_ack_msgs).is_empty());
+    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    for gssi in &groups {
+        assert_eq!(test.config.state_read().subscribers.group_members(*gssi), vec![issi]);
+    }
+
+    let cache = std::fs::read_to_string(&path).expect("segmented refresh should persist restored scan list");
+    for gssi in &groups {
+        assert!(
+            cache.lines().any(|line| line.contains(&gssi.to_string())),
+            "final segmented refresh cache should retain GSSI {gssi}, got {cache:?}"
+        );
+    }
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_group_refresh_reject_rolls_back_cached_affiliation_and_reprobes() {
     debug::setup_logging_verbose();
     let issi = 2260618;
@@ -5979,9 +6066,15 @@ fn extract_d_attach_detach_group_identities(msgs: &[SapMsg]) -> Vec<(DAttachDeta
         .collect()
 }
 
-fn assert_swmi_group_attach_refresh(msgs: &[SapMsg], gssi: u32, class_of_usage: u8, context: &str) {
-    let refreshes: Vec<(DAttachDetachGroupIdentity, Layer2Service, u32)> = msgs
-        .iter()
+#[derive(Debug, PartialEq)]
+struct SwmiGroupAttachRefreshDetails {
+    groups: Vec<(u32, u8, u8)>,
+    layer2service: Layer2Service,
+    handle: u32,
+}
+
+fn swmi_group_attach_refresh_details(msgs: &[SapMsg]) -> Vec<SwmiGroupAttachRefreshDetails> {
+    msgs.iter()
         .filter_map(|msg| match &msg.msg {
             SapMsgInner::LmmMleUnitdataReq(prim) => {
                 let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
@@ -5997,38 +6090,41 @@ fn assert_swmi_group_attach_refresh(msgs: &[SapMsg], gssi: u32, class_of_usage: 
                 && !pdu.group_identity_attach_detach_mode
                 && pdu.group_report_response.is_none()
         })
-        .collect();
+        .map(|(pdu, layer2service, handle)| SwmiGroupAttachRefreshDetails {
+            groups: pdu
+                .group_identity_downlink
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|group| {
+                    let attachment = group.group_identity_attachment?;
+                    Some((
+                        group.gssi?,
+                        attachment.group_identity_attachment_lifetime,
+                        attachment.class_of_usage,
+                    ))
+                })
+                .collect(),
+            layer2service,
+            handle,
+        })
+        .collect()
+}
+
+fn assert_swmi_group_attach_refresh(msgs: &[SapMsg], gssi: u32, class_of_usage: u8, context: &str) {
+    let refreshes = swmi_group_attach_refresh_details(msgs);
     assert_eq!(refreshes.len(), 1, "{context}: expected one SwMI group attach refresh");
 
-    let (refresh, layer2service, handle) = &refreshes[0];
+    let refresh = &refreshes[0];
     assert_ne!(
-        *handle, 0,
+        refresh.handle, 0,
         "{context}: SwMI group attach refresh should use a non-zero local downlink handle"
     );
     assert_eq!(
-        *layer2service,
+        refresh.layer2service,
         Layer2Service::Acknowledged,
         "{context}: SwMI group attach refresh should use acknowledged service"
     );
-    let groups = refresh
-        .group_identity_downlink
-        .as_ref()
-        .expect("SwMI group attach refresh should carry group identities");
-    assert_eq!(groups.len(), 1, "{context}: expected one refreshed cached group");
-    assert_eq!(groups[0].gssi, Some(gssi), "{context}: refreshed GSSI");
-    assert!(groups[0].group_identity_detachment_uplink.is_none());
-    let attachment = groups[0]
-        .group_identity_attachment
-        .as_ref()
-        .expect("refreshed group should carry attachment information");
-    assert_eq!(
-        attachment.group_identity_attachment_lifetime, 0,
-        "{context}: cached restart group refresh should keep persistent attachment lifetime"
-    );
-    assert_eq!(
-        attachment.class_of_usage, class_of_usage,
-        "{context}: cached restart group refresh should preserve class of usage"
-    );
+    assert_eq!(refresh.groups, vec![(gssi, 0, class_of_usage)], "{context}: refreshed cached group");
 }
 
 fn extract_d_mm_status(msgs: &[SapMsg]) -> DMmStatus {
