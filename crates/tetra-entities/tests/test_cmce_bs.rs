@@ -5282,6 +5282,7 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
     let first_issi = 760_000_u32;
     let current_speaker = first_issi;
     let first_waiter = first_issi + 1;
+    let second_waiter = first_issi + 2;
     let overflow_waiter = first_issi + member_count - 1;
     for offset in 0..member_count {
         let issi = first_issi + offset;
@@ -5291,7 +5292,7 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
     test.run_stack(Some((member_count as usize * 2) + 16));
     let _ = test.dump_sinks();
 
-    let (call_id, _active_ts, _active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
 
     for issi in (first_issi + 1)..(first_issi + member_count) {
         test.submit_message(build_u_tx_demand_msg(issi, call_id));
@@ -5341,6 +5342,68 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
         .expect("overflow denial must not disturb the head of the FIFO");
     assert_eq!(first_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
     assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+
+    // Once the head waiter is granted, the bounded FIFO has capacity again.
+    // A previously denied requester may retry and enter the tail, but it must
+    // not jump ahead of already queued affiliated users.
+    test.submit_message(build_u_tx_demand_msg(overflow_waiter, call_id));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    let retry_grant = retry_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(overflow_waiter))
+        .expect("overflow requester should be allowed to retry after one FIFO slot frees");
+    assert_eq!(
+        retry_grant.1.transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8,
+        "overflow retry should enter the tail once FIFO capacity is available"
+    );
+    assert_d_tx_granted_facch_allocation(
+        retry_grant.0,
+        &retry_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "large group overflow retry queued at FIFO tail",
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(first_waiter, call_id));
+    test.run_stack(Some(1));
+    let second_handoff_msgs = test.dump_sinks();
+    let second_handoff_grants: Vec<_> = second_handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let second_handoff = second_handoff_grants
+        .iter()
+        .find(|(prim, grant)| {
+            prim.main_address == TetraAddress::issi(second_waiter)
+                && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+        })
+        .expect("overflow retry must not jump ahead of the original FIFO tail");
+    assert_d_tx_granted_facch_allocation(
+        second_handoff.0,
+        &second_handoff.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "large group overflow retry preserves FIFO order",
+    );
+    assert!(
+        second_handoff_grants.iter().all(|(prim, grant)| {
+            prim.main_address != TetraAddress::issi(overflow_waiter)
+                || grant.transmission_grant != TransmissionGrant::Granted.into_raw() as u8
+        }),
+        "overflow retry must wait behind the already queued FIFO users"
+    );
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
 }
 
 #[test]

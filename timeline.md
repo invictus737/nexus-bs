@@ -6497,3 +6497,45 @@ Next non-repeating execution:
 2. Add overflow retry regression: 4097th waiter receives `NotGranted`, then after one FIFO slot frees the same ISSI can retry and enters the tail without corrupting order.
 3. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state so "attached but No Group" is covered beyond internal registry state.
 4. Add stress-aftercare regression: large group storm then simple private simplex and duplex still setup, grant floor, and release cleanly.
+
+## 2026-06-05 - Bounded FIFO overflow retry order
+
+Component in simple technical terms:
+
+- CMCE owns the group PTT waiting list.
+- A full FIFO means Nexus-BS has accepted the maximum local number of waiting speakers for one group call.
+- `NotGranted` for an over-cap requester is a temporary local admission response, not a permanent ban.
+
+Problem fixed:
+
+- The previous overflow test proved the 4097th waiter received `D-TX GRANTED(NotGranted)` and that the first queued waiter still got the next floor.
+- It did not prove what happens when the denied terminal retries after capacity is available again.
+- The test now verifies that after one queued waiter is granted, the previously denied ISSI can retry and receives `RequestQueued`.
+- It also verifies the retry enters the FIFO tail and does not jump ahead of already accepted waiters.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 allows the SwMI response to a group `U-TX DEMAND` to be `Granted`, `RequestQueued`, or `NotGranted`.
+- The 4096 waiter cap and tail retry policy are Nexus-BS local SwMI admission policy over the standard floor-control states.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Extended `test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters`.
+  - After FIFO overflow denial, the current speaker ceases, the first accepted waiter gets `Granted`, and the overflow ISSI retries.
+  - The retry receives `RequestQueued` with DL-only allocation, then the next original FIFO waiter receives `Granted` before the retry.
+
+Verification:
+
+- `rustfmt --edition 2024 crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 150 passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Add full FIFO drain regression for a 4096-member GSSI.
+2. Harden UMAC protected queue caps so protected-only floor-control storms cannot grow past scheduler limits.
+3. Extend restart/EG7 large-group recovery to observable dashboard/telemetry state.
+4. Add stress-aftercare regression: large group storm then simple private simplex and duplex still work.
