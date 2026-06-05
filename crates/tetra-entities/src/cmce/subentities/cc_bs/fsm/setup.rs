@@ -80,24 +80,24 @@ impl CcBsSubentity {
             return;
         }
 
-        if let Some((&active_call_id, active_call)) = self.active_calls.iter().find(|(_, call)| call.dest_gssi == dest_gssi) {
-            if self.pending_group_releases.contains_key(&active_call_id) {
-                tracing::info!(
-                    "CMCE: rejecting U-SETUP from issi={} to gssi={} while call_id={} is releasing",
+        let same_gssi_active_call_id = self.active_calls.iter().find_map(|(&call_id, call)| {
+            (call.dest_gssi == dest_gssi && !self.pending_group_releases.contains_key(&call_id)).then_some(call_id)
+        });
+
+        let same_gssi_pending_release_call_id = self.active_calls.iter().find_map(|(&call_id, call)| {
+            (call.dest_gssi == dest_gssi && self.pending_group_releases.contains_key(&call_id)).then_some(call_id)
+        });
+
+        if let Some(active_call_id) = same_gssi_active_call_id {
+            let Some(active_call) = self.active_calls.get(&active_call_id) else {
+                tracing::warn!(
+                    "CMCE: same-GSSI active call_id={} disappeared while handling U-SETUP from issi={} to gssi={}",
+                    active_call_id,
                     calling_party.ssi,
-                    dest_gssi,
-                    active_call_id
-                );
-                Self::reject_u_setup_before_call_id(
-                    queue,
-                    calling_party,
-                    ul_handle,
-                    ul_link_id,
-                    ul_endpoint_id,
-                    DisconnectCause::RequestedServiceNotAvailable,
+                    dest_gssi
                 );
                 return;
-            }
+            };
 
             if !self.subscriber_affiliated_to_group(calling_party.ssi, dest_gssi) {
                 tracing::info!(
@@ -193,6 +193,19 @@ impl CcBsSubentity {
                 );
             }
             return;
+        } else if let Some(pending_call_id) = same_gssi_pending_release_call_id {
+            tracing::info!(
+                "CMCE: accepting new U-SETUP from issi={} to gssi={} while stale call_id={} release drains",
+                calling_party.ssi,
+                dest_gssi,
+                pending_call_id
+            );
+            // EN 300 392-2 clause 14.5.2.3 clears the old group call with
+            // D-RELEASE, while clause 14.5.2.1 permits a later normal setup
+            // for the same GSSI. Keep the stale release on its old assigned
+            // channel until its reporter/guard completes, so EG subscribers
+            // are not assumed to receive D-RELEASE immediately and the stale
+            // D-RELEASE is not sent over the fresh call's allocation.
         }
 
         // Allocate circuit (DL+UL for group call)

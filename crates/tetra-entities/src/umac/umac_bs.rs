@@ -63,6 +63,11 @@ pub struct UmacBs {
     /// Timestamp of last received UL voice frame per timeslot (0-indexed: ts1..ts4).
     /// Used to detect UL inactivity when a radio disappears mid-transmission.
     last_ul_voice: [Option<TdmaTime>; 4],
+    /// Raw NormalTrainSeq2 Block2 TCH/S from LMAC, held until same-burst STCH
+    /// floor-control signalling has drained through CMCE. This preserves valid
+    /// non-stolen half-slot speech without letting stale audio race ahead of a
+    /// U-TX CEASED/FloorReleased event.
+    pending_raw_tch_s_block2: [Option<PendingRawTchSHalfSlot>; 4],
     /// Current ISSI allowed to send U-plane signalling on each assigned UL
     /// timeslot. MAC-U-SIGNAL has no address field, so STCH signalling such
     /// as U-TX DEMAND / U-TX CEASED must inherit the speaker identity from
@@ -82,6 +87,16 @@ struct PendingStch {
 struct PendingTmaReport {
     req_handle: Todo,
     tx_reporter: TxReporter,
+}
+
+struct PendingRawTchSHalfSlot {
+    ul_ts: u8,
+    dl_target_ts: u8,
+    block_num: PhyBlockNum,
+    type5_bits: Vec<u8>,
+    received_at: TdmaTime,
+    speaker_addr: Option<TetraAddress>,
+    peer_ts: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -110,6 +125,7 @@ impl UmacBs {
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             pending_tma_reports: Vec::new(),
             last_ul_voice: [None; 4],
+            pending_raw_tch_s_block2: [None, None, None, None],
             current_ul_speaker: [None; 4],
             active_energy_saving_suspensions: HashMap::new(),
         }
@@ -220,6 +236,164 @@ impl UmacBs {
             return None;
         }
         self.current_ul_speaker[ts as usize - 1]
+    }
+
+    fn discard_pending_raw_tch_s_involving(&mut self, ts: u8, reason: &str) {
+        if !(1..=4).contains(&ts) {
+            return;
+        }
+        for pending in &mut self.pending_raw_tch_s_block2 {
+            let should_discard = pending.as_ref().is_some_and(|raw| raw.ul_ts == ts || raw.dl_target_ts == ts);
+            if should_discard {
+                if let Some(raw) = pending.take() {
+                    tracing::info!(
+                        "UMAC: dropped deferred raw TCH/S {:?} ul_ts={} dl_ts={} received_at={} because {}",
+                        raw.block_num,
+                        raw.ul_ts,
+                        raw.dl_target_ts,
+                        raw.received_at,
+                        reason
+                    );
+                }
+            }
+        }
+    }
+
+    fn defer_raw_tch_s_half_slot(&mut self, ul_ts: u8, dl_target_ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
+        let idx = ul_ts as usize - 1;
+        if let Some(old) = self.pending_raw_tch_s_block2[idx].take() {
+            tracing::warn!(
+                "UMAC: replacing unflushed raw TCH/S {:?} ul_ts={} dl_ts={} received_at={}; dropping old half-slot",
+                old.block_num,
+                old.ul_ts,
+                old.dl_target_ts,
+                old.received_at
+            );
+        }
+        self.pending_raw_tch_s_block2[idx] = Some(PendingRawTchSHalfSlot {
+            ul_ts,
+            dl_target_ts,
+            block_num,
+            type5_bits,
+            received_at: self.dltime,
+            speaker_addr: self.current_ul_signal_addr(ul_ts),
+            peer_ts: self.channel_scheduler.ul_circuit_peer_ts(ul_ts),
+        });
+    }
+
+    fn flush_pending_raw_tch_s_half_slots(&mut self) {
+        for idx in 0..self.pending_raw_tch_s_block2.len() {
+            let Some(raw) = self.pending_raw_tch_s_block2[idx].take() else {
+                continue;
+            };
+            self.flush_pending_raw_tch_s_half_slot(raw);
+        }
+    }
+
+    fn flush_pending_raw_tch_s_half_slot(&mut self, raw: PendingRawTchSHalfSlot) {
+        use tetra_saps::control::call_control::CircuitDlMediaSource;
+
+        if !self.channel_scheduler.circuit_is_active(Direction::Ul, raw.ul_ts) {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because UL circuit is inactive",
+                raw.block_num,
+                raw.ul_ts
+            );
+            return;
+        }
+        if self.channel_scheduler.is_hangtime(raw.ul_ts) {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because UL floor is in hangtime",
+                raw.block_num,
+                raw.ul_ts
+            );
+            return;
+        }
+        if raw.speaker_addr.is_some() && self.current_ul_signal_addr(raw.ul_ts) != raw.speaker_addr {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because the current speaker changed from {:?} to {:?}",
+                raw.block_num,
+                raw.ul_ts,
+                raw.speaker_addr,
+                self.current_ul_signal_addr(raw.ul_ts)
+            );
+            return;
+        }
+
+        let current_peer_ts = self.channel_scheduler.ul_circuit_peer_ts(raw.ul_ts);
+        if current_peer_ts != raw.peer_ts {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because peer_ts changed from {:?} to {:?}",
+                raw.block_num,
+                raw.ul_ts,
+                raw.peer_ts,
+                current_peer_ts
+            );
+            return;
+        }
+
+        let dl_target_ts = match current_peer_ts {
+            Some(peer_ts) => peer_ts,
+            None => {
+                if self.channel_scheduler.ul_circuit_dl_media_source(raw.ul_ts) == CircuitDlMediaSource::SwMI {
+                    tracing::debug!(
+                        "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because SwMI supplies DL media",
+                        raw.block_num,
+                        raw.ul_ts
+                    );
+                    return;
+                }
+                raw.ul_ts
+            }
+        };
+        if dl_target_ts != raw.dl_target_ts {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because DL target changed from {} to {}",
+                raw.block_num,
+                raw.ul_ts,
+                raw.dl_target_ts,
+                dl_target_ts
+            );
+            return;
+        }
+        if self.channel_scheduler.is_hangtime(dl_target_ts) {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} dl_ts={} because DL target is in hangtime",
+                raw.block_num,
+                raw.ul_ts,
+                dl_target_ts
+            );
+            return;
+        }
+        if !self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
+            tracing::debug!(
+                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} dl_ts={} because DL circuit is inactive",
+                raw.block_num,
+                raw.ul_ts,
+                dl_target_ts
+            );
+            return;
+        }
+
+        tracing::debug!(
+            "UMAC voice route: UL ts={} deferred raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} received_at={} media_source={:?}",
+            raw.ul_ts,
+            raw.block_num,
+            raw.type5_bits.len(),
+            dl_target_ts,
+            current_peer_ts,
+            raw.received_at,
+            self.channel_scheduler.ul_circuit_dl_media_source(raw.ul_ts)
+        );
+        self.channel_scheduler
+            .dl_schedule_raw_tch_s_half_slot(dl_target_ts, raw.block_num, raw.type5_bits);
+        self.last_ul_voice[raw.ul_ts as usize - 1] = Some(raw.received_at);
+        if let Some(peer_ts) = current_peer_ts
+            && (1..=4).contains(&peer_ts)
+            && self.channel_scheduler.circuit_is_active(Direction::Ul, peer_ts)
+        {
+            self.last_ul_voice[peer_ts as usize - 1] = Some(raw.received_at);
+        }
     }
 
     fn floor_media_timeslots(&self, ts: u8) -> [Option<u8>; 2] {
@@ -1865,7 +2039,7 @@ impl UmacBs {
                     match accepted_media {
                         AcceptedUlMedia::RawTchSHalfSlot { block_num, type5_bits } => {
                             tracing::debug!(
-                                "UMAC voice route: UL ts={} raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} media_source={:?}",
+                                "UMAC voice route: UL ts={} deferring raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} media_source={:?}",
                                 ts,
                                 block_num,
                                 type5_bits.len(),
@@ -1873,9 +2047,14 @@ impl UmacBs {
                                 self.channel_scheduler.ul_circuit_peer_ts(ts),
                                 self.channel_scheduler.ul_circuit_dl_media_source(ts)
                             );
-                            self.channel_scheduler
-                                .dl_schedule_raw_tch_s_half_slot(dl_target_ts, block_num, type5_bits);
-                            delivered_media = true;
+                            // EN 300 392-2 clause 23.5 permits STCH/FACCH in
+                            // one half-slot while TCH/S remains in the other,
+                            // and clause 23.8.5 requires preserving a valid
+                            // non-stolen TCH/S half-slot. Defer raw Block2
+                            // until same-burst STCH has drained through CMCE,
+                            // so U-TX CEASED/FloorReleased cannot race stale
+                            // speech into the downlink scheduler.
+                            self.defer_raw_tch_s_half_slot(ts, dl_target_ts, block_num, type5_bits);
                         }
                         AcceptedUlMedia::AcElp {
                             original_bits,
@@ -1992,6 +2171,7 @@ impl UmacBs {
         };
         let ts = circuit.ts;
         let dir = circuit.direction;
+        self.discard_pending_raw_tch_s_involving(ts, "new circuit open/replacement");
 
         // Direction::Both needs to be split into separate DL and UL operations
         // because the UMAC circuit manager tracks them independently.
@@ -2062,6 +2242,7 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
+        self.discard_pending_raw_tch_s_involving(ts, "circuit close");
 
         // Direction::Both needs to be split into separate DL and UL close operations
         let dirs: Vec<Direction> = match dir {
@@ -2155,6 +2336,7 @@ impl UmacBs {
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
             CallControl::FloorReleased { ts, .. } => {
                 for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                    self.discard_pending_raw_tch_s_involving(floor_ts, "floor released; U-plane enters hangtime");
                     self.channel_scheduler
                         .clear_dl_media_queue(floor_ts, "floor released; U-plane enters hangtime");
                     self.channel_scheduler.set_hangtime(floor_ts, true);
@@ -2172,6 +2354,7 @@ impl UmacBs {
                 ts,
             } => {
                 for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                    self.discard_pending_raw_tch_s_involving(floor_ts, "new floor grant; discard previous speaker media");
                     self.channel_scheduler
                         .clear_dl_media_queue(floor_ts, "new floor grant; discard previous speaker media");
                     self.channel_scheduler.set_hangtime(floor_ts, false);
@@ -2204,6 +2387,7 @@ impl UmacBs {
             }
             CallControl::CallEnded { ts, .. } => {
                 for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                    self.discard_pending_raw_tch_s_involving(floor_ts, "call ended");
                     self.channel_scheduler.clear_dl_media_queue(floor_ts, "call ended");
                     self.channel_scheduler.set_hangtime(floor_ts, false);
                     self.last_ul_voice[floor_ts as usize - 1] = None;
@@ -2287,6 +2471,8 @@ impl TetraEntityTrait for UmacBs {
 
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);
+
+        self.flush_pending_raw_tch_s_half_slots();
 
         // Collect/construct traffic that should be sent down to the LMAC
         // This is basically the _previous_ timeslot

@@ -1,5 +1,62 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-05 09:49:05 EEST - Group restart grant and raw Block2 same-burst floor-release hardening
+
+Live problem targeted:
+
+- Latest restart log showed group PTT/service-unavailable symptoms after a previous same-GSSI group call was still draining `D-RELEASE`.
+- Concrete log pattern: new `U-SETUP` for GSSI `226333` from `2260616` arrived while the stale call release was pending; old CMCE logic rejected it with `RequestedServiceNotAvailable`.
+- User also reported intermittent static/no voice on the other station during group/PTT transitions. UMAC/LMAC audit found a narrow race where `NormalTrainSeq2` Block1 STCH can carry `U-TX CEASED` while Block2 is still accepted as raw TCH/S before CMCE floor release reaches UMAC.
+- EG7 note: the current latest restart log shows `2260616` requested `Eg7`, but Nexus-BS accepted/configured `Eg3` on air. True EG7 field testing requires the BS energy-saving config to assign EG7; terminal-side preference alone is not what the current SwMI advertises.
+
+Components, simple technical meaning:
+
+- CMCE: call control and PTT/floor logic. It decides `D-CALL PROCEEDING`, `D-CONNECT`, `D-SETUP`, `D-TX GRANTED`, `D-TX CEASED`, and `D-RELEASE`.
+- UMAC: MAC scheduler/media router. It receives voice from LMAC, applies active circuit/floor state, and schedules DL TCH/S or FACCH/STCH signalling.
+- LMAC: lower MAC burst classifier. It decides whether a burst half is `STCH` signalling or `TCH/S` speech before passing it upward.
+- MM/EG: mobility/energy-economy negotiation. It assigns StayAlive/EG1..EG7 and the frame/multiframe where sleeping terminals should listen.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.1: normal group call setup after a later `U-SETUP`.
+- EN 300 392-2 clause 14.5.2.3: old group call release with `D-RELEASE` must drain independently.
+- EN 300 392-2 clause 23.5: FACCH/STCH stealing and traffic/signalling half-slot distinction.
+- EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5: valid non-stolen TCH/S half-slot timing/position must be preserved; stale or floor-released media must not be fabricated as clean speech.
+- EN 300 392-2 clauses 16.7.1, 16.10.9, 16.10.10, 23.5.2.2.7, 23.7.6, and T.210 remain the active scope for EG3/EG7 scheduler safety. This is engineering hardening, not formal certification evidence.
+
+Patch implemented:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Same-GSSI `U-SETUP` now ignores stale pending-release calls when deciding whether an active call already exists.
+  - If only a pending-release call exists for the same GSSI, CMCE starts a fresh group call instead of sending service-unavailable `D-RELEASE`.
+  - The stale pending release remains tied to its original assigned channel and closes only when its reporter/guard completes.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Raw `NormalTrainSeq2` Block2 TCH/S is now deferred in UMAC until same-burst STCH/CMCE floor-control has drained.
+  - `FloorReleased`, `FloorGranted`, `CallEnded`, circuit close, and replacement open discard deferred stale raw media before it can enter the DL scheduler.
+  - Valid raw Block2 is still preserved and emitted after the deferral window when the UL/DL circuit is active, not in hangtime, and speaker/peer routing still matches.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added/regressed same-GSSI pending-release restart coverage with fresh call id, fresh traffic allocation, no service-unavailable `D-RELEASE`, and old release closing only its old slot.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs raw_block2 --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_release_pending --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 51 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 129 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 8 passed.
+- `cargo test -p tetra-entities --test test_mm_bs energy --locked` -> 29 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Run final focused tests once more after commit/deploy build.
+2. Deploy direct with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+3. Retest group GSSI `226333`: first PTT immediately after prior call release/hangtime must grant on first try, not second try, and no `RequestedServiceNotAvailable` should appear for same-GSSI replacement setup.
+4. Retest static/no-voice: alternating group PTT should not transmit raw Block2 after `U-TX CEASED`/`D-TX CEASED`.
+5. If true EG7 field test is desired, set the BS config to assign EG7 and verify attach accept advertises `EnergySavingInformation { energy_saving_mode: Eg7, ... }`; otherwise current on-air behavior remains EG3 despite terminal request.
+
 ## 2026-06-05 01:23:50 EEST - LMAC first private-simplex TCH/S recovery before traffic marker
 
 Live problem targeted:

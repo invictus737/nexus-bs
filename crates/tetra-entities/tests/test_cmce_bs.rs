@@ -4,7 +4,7 @@ use tetra_config::bluestation::{CfgBrew, StackMode, from_toml_str};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
-use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
+use tetra_core::{BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
 use tetra_pdus::cmce::enums::call_timeout::CallTimeout;
 use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
 use tetra_pdus::cmce::enums::cmce_pdu_type_ul::CmcePduTypeUl;
@@ -3377,6 +3377,117 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
 }
 
 #[test]
+fn test_group_u_setup_same_gssi_during_pending_release_starts_fresh_call() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let (old_call_id, old_ts, old_usage) = start_group_call_with_circuit(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, old_call_id));
+    test.run_stack(Some(1));
+    let mut release_msgs = test.dump_sinks();
+    let old_release_reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(old_release_reporters.len(), 1, "old group D-RELEASE should be pending on FACCH");
+    assert_eq!(old_release_reporters[0].get_state(), TxState::Pending);
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "old release must still be in the pending-release guard before replacement setup"
+    );
+
+    // EN 300 392-2 clause 14.5.2.3 covers release of the old group call, and
+    // clause 14.5.2.1 covers the next normal group setup. A stale local
+    // D-RELEASE delivery guard for the same GSSI must not turn the first
+    // replacement U-SETUP into RequestedServiceNotAvailable.
+    test.submit_message(build_u_setup_msg(TEST_CALLED_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let replacement_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_releases(&replacement_msgs),
+        0,
+        "same-GSSI replacement setup during pending release must not emit service-unavailable D-RELEASE"
+    );
+    assert_eq!(count_d_call_proceedings(&replacement_msgs), 1);
+    assert_eq!(count_d_connects(&replacement_msgs), 1);
+    assert_eq!(count_d_setups(&replacement_msgs), 1);
+    assert_eq!(
+        count_umac_open(&replacement_msgs),
+        1,
+        "replacement setup should open a fresh group circuit"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&replacement_msgs),
+        0,
+        "stale pending release must stay on its old circuit while replacement setup starts"
+    );
+    let replacement_circuit = replacement_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .expect("replacement setup should open a fresh group circuit");
+    assert_ne!(
+        replacement_circuit.ts, old_ts,
+        "replacement call must not reuse the old pending-release traffic slot"
+    );
+    assert_ne!(
+        replacement_circuit.usage, old_usage,
+        "replacement call must not reuse the old pending-release usage marker"
+    );
+
+    let new_call_id = first_d_setup_call_id(&replacement_msgs);
+    assert_ne!(new_call_id, old_call_id, "replacement setup should allocate a fresh group call id");
+
+    let replacement_setup = replacement_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("replacement setup should emit D-SETUP");
+    assert_eq!(replacement_setup.0.main_address, TetraAddress::new(TEST_GSSI, SsiType::Gssi));
+    assert_eq!(replacement_setup.1.call_identifier, new_call_id);
+    assert_eq!(replacement_setup.1.calling_party_address_ssi, Some(TEST_CALLED_ISSI));
+
+    old_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let old_release_closed_msgs = test.dump_sinks();
+    assert!(
+        old_release_closed_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::Close(Direction::Both, ts)) if *ts == old_ts
+        )),
+        "old D-RELEASE reporter completion should close the old traffic slot"
+    );
+    assert!(
+        old_release_closed_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }) if *call_id == old_call_id && *ts == old_ts
+        )),
+        "old D-RELEASE reporter completion should end only the old call"
+    );
+    assert!(
+        !old_release_closed_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, .. }) if *call_id == new_call_id
+        )),
+        "old D-RELEASE reporter completion must not close the fresh replacement call"
+    );
+    assert_eq!(count_d_releases(&old_release_closed_msgs), 0);
+}
+
+#[test]
 fn test_group_preemptive_u_setup_default_off_rejects_without_circuit() {
     debug::setup_logging_verbose();
 
@@ -4943,7 +5054,7 @@ fn test_group_release_pending_ignores_duplicate_release_without_extra_signalling
 }
 
 #[test]
-fn test_group_release_pending_rejects_same_gssi_restart_without_second_circuit() {
+fn test_group_release_pending_allows_same_gssi_restart_while_old_release_drains() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -4955,7 +5066,7 @@ fn test_group_release_pending_rejects_same_gssi_restart_without_second_circuit()
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
-    let call_id = start_group_call(&mut test);
+    let (call_id, old_ts, _old_usage) = start_group_call_with_circuit(&mut test);
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
@@ -4963,43 +5074,42 @@ fn test_group_release_pending_rejects_same_gssi_restart_without_second_circuit()
     assert_eq!(count_d_releases(&release_msgs), 2);
     assert_eq!(count_umac_call_ended_or_close(&release_msgs), 0);
 
-    // EN 300 392-2 clause 14.5.2.3.2 says the SwMI sends D-RELEASE and
-    // subsequently releases the call. While the local FACCH D-RELEASE is still
-    // draining, keep the call occupied so a same-GSSI restart cannot allocate
-    // a second traffic circuit over the pending release.
+    // EN 300 392-2 clause 14.5.2.3 clears the old group call with D-RELEASE,
+    // and clause 14.5.2.1 permits the next normal group setup. While the
+    // local FACCH D-RELEASE is still draining, a same-GSSI restart must not be
+    // rejected as unsupported or inherit stale release state.
     test.submit_message(build_u_setup_msg(TEST_CALLED_ISSI, TEST_GSSI));
     test.run_stack(Some(1));
     let restart_msgs = test.dump_sinks();
 
-    let releases: Vec<_> = restart_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(releases.len(), 1, "same-GSSI restart should receive one direct D-RELEASE");
-    let (release_prim, release) = &releases[0];
     assert_eq!(
-        release.call_identifier, 0,
-        "restart rejection before a new SwMI call identity exists must use the dummy call identity"
+        count_d_releases(&restart_msgs),
+        0,
+        "same-GSSI restart during stale pending release must not receive service-unavailable D-RELEASE"
     );
-    assert_ne!(
-        release.call_identifier, call_id,
-        "restart rejection must not release the still-pending group call"
-    );
-    assert_eq!(release.disconnect_cause, DisconnectCause::RequestedServiceNotAvailable);
-    assert_eq!(release_prim.main_address.ssi, TEST_CALLED_ISSI);
-    assert_eq!(release_prim.main_address.ssi_type, SsiType::Issi);
-    assert!(release_prim.chan_alloc.is_none());
-
-    assert_eq!(count_d_setups(&restart_msgs), 0, "restart must not send a new group D-SETUP");
-    assert_eq!(count_umac_open(&restart_msgs), 0, "restart must not open a second circuit");
+    assert_eq!(count_d_call_proceedings(&restart_msgs), 1);
+    assert_eq!(count_d_connects(&restart_msgs), 1);
+    assert_eq!(count_d_setups(&restart_msgs), 1, "restart should send a fresh group D-SETUP");
+    assert_eq!(count_umac_open(&restart_msgs), 1, "restart should open one replacement circuit");
     assert_eq!(
         count_umac_call_ended_or_close(&restart_msgs),
         0,
-        "restart rejection must not close the pending release early"
+        "restart must not close the stale pending-release circuit before D-RELEASE reporter/guard completion"
     );
+    let replacement_circuit = restart_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .expect("restart should open one replacement circuit");
+    assert_ne!(
+        replacement_circuit.ts, old_ts,
+        "restart must use a different traffic slot from the pending release"
+    );
+
+    let new_call_id = first_d_setup_call_id(&restart_msgs);
+    assert_ne!(new_call_id, call_id, "restart should allocate a fresh group call id");
 }
 
 #[test]
