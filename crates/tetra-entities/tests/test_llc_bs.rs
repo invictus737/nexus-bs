@@ -459,6 +459,13 @@ fn take_tma_req_reporter_for_endpoint(msgs: &mut [SapMsg], endpoint_id: u32) -> 
         .expect("expected TMA-UNITDATA request with TxReporter for endpoint")
 }
 
+fn attach_tl_data_req_reporter(msg: &mut SapMsg, reporter: TxReporter) {
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut msg.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.tx_reporter = Some(reporter);
+}
+
 fn llc_pdu_type(msg: &SapMsg) -> Option<LlcPduType> {
     let SapMsgInner::TmaUnitdataReq(prim) = &msg.msg else {
         return None;
@@ -2127,10 +2134,13 @@ fn test_bl_ack_fcs_failure_still_acknowledges_downlink_but_drops_response_payloa
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 183;
+    let service_reporter = TxReporter::new();
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2155,7 +2165,8 @@ fn test_bl_ack_fcs_failure_still_acknowledges_downlink_but_drops_response_payloa
     assert_eq!(conf.req_handle, req_handle);
     assert_eq!(conf.report, TLA_REPORT_SUCCESSFUL_TRANSFER);
     assert!(conf.tl_sdu.is_none(), "bad FCS response payload must be dropped");
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
     assert!(
         !sink_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
         "bad FCS response payload must not be delivered as TL-DATA.ind"
@@ -2168,10 +2179,13 @@ fn test_bl_adata_fcs_failure_processes_nr_but_does_not_ack_or_deliver_bad_ns() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 184;
+    let service_reporter = TxReporter::new();
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle_timeslot(addr, req_handle, 3));
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 3);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2195,7 +2209,8 @@ fn test_bl_adata_fcs_failure_processes_nr_but_does_not_ack_or_deliver_bad_ns() {
         .expect("BL-ADATA N(R) should still confirm the downlink transfer");
     assert_eq!(conf.req_handle, req_handle);
     assert_eq!(conf.report, TLA_REPORT_SUCCESSFUL_TRANSFER);
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
     assert!(
         !sink_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
         "bad FCS BL-ADATA payload must not be delivered"
@@ -2315,6 +2330,7 @@ fn test_pending_ack_falls_back_to_bl_ack_when_bl_adata_exceeds_single_mac_resour
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 212;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 4, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
@@ -2325,7 +2341,9 @@ fn test_pending_ack_falls_back_to_bl_ack_when_bl_adata_exceeds_single_mac_resour
     // 22.3.2.3(d) requires a standalone BL-ACK and separate BL-DATA instead
     // of handing oversized BL-ADATA to MAC fragmentation.
     test.submit_message(build_bl_data_ind(addr, 1));
-    test.submit_message(build_tl_data_req_with_payload_handle_timeslot(addr, &[0xA5; 25], req_handle, 2));
+    let mut req = build_tl_data_req_with_payload_handle_timeslot(addr, &[0xA5; 25], req_handle, 2);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut sink_msgs = test.dump_sinks();
 
@@ -2362,7 +2380,8 @@ fn test_pending_ack_falls_back_to_bl_ack_when_bl_adata_exceeds_single_mac_resour
                 && prim.report == TLA_REPORT_SUCCESSFUL_TRANSFER)),
         "fallback BL-DATA must remain in acknowledged-transfer state and confirm on peer BL-ACK"
     );
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]
@@ -2370,11 +2389,14 @@ fn test_pending_ack_is_not_consumed_by_bl_adata_when_same_link_transfer_is_block
     debug::setup_logging_verbose();
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 4, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle_timeslot(addr, 301, 2));
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, 301, 2);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     assert_eq!(
@@ -2436,7 +2458,8 @@ fn test_pending_ack_is_not_consumed_by_bl_adata_when_same_link_transfer_is_block
         after_first_ack_msgs.iter().all(|msg| llc_pdu_type(msg) != Some(LlcPduType::BlAck)),
         "already-sent ACK must not be emitted a second time"
     );
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]
@@ -2507,11 +2530,14 @@ fn test_tma_success_report_marks_bl_data_transmitted_and_allows_ack() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 77;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2520,11 +2546,13 @@ fn test_tma_success_report_marks_bl_data_transmitted_and_allows_ack() {
     test.submit_message(build_tma_report_ind(req_handle, TmaReport::SuccessReservedOrStealing));
     test.run_stack(Some(1));
     assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Transmitted);
 
     test.submit_message(build_bl_ack_ind(addr, 0));
     test.run_stack(Some(1));
     let _ = test.dump_sinks();
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]
@@ -2533,11 +2561,14 @@ fn test_matching_bl_ack_without_payload_emits_tl_data_confirm() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 93;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2563,7 +2594,8 @@ fn test_matching_bl_ack_without_payload_emits_tl_data_confirm() {
         !sink_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
         "matching BL-ACK without payload must not be reported as TL-DATA.ind"
     );
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]
@@ -2572,17 +2604,20 @@ fn test_matching_bl_ack_reconciles_tx_reporter_before_periodic_tick() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 94;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
     reporter.mark_transmitted();
 
-    // EN 300 392-2 clause 22.3.2.3(f,k): a peer BL-ACK can arrive after
+    // EN 300 392-2 clause 22.3.2.3(f,j): a peer BL-ACK can arrive after
     // UMAC has completed BL-DATA transmission but before LLC's periodic
     // retransmission scan has observed TxReporter. ACK processing must first
     // reconcile that TxReporter completion, then accept the matching N(R).
@@ -2604,10 +2639,60 @@ fn test_matching_bl_ack_reconciles_tx_reporter_before_periodic_tick() {
         .expect("matching BL-ACK after TxReporter completion should produce TL-DATA.conf");
     assert_eq!(conf.req_handle, req_handle);
     assert_eq!(conf.report, TLA_REPORT_SUCCESSFUL_TRANSFER);
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
     assert!(
         sink_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
         "matching early BL-ACK must not requeue the acknowledged BL-DATA"
+    );
+}
+
+#[test]
+fn test_matching_bl_ack_before_local_umac_completion_completes_transfer_without_retransmit() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 95;
+    let service_reporter = TxReporter::new();
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut initial_msgs = test.dump_sinks();
+    let reporter = take_first_tma_req_reporter(&mut initial_msgs);
+    assert_eq!(reporter.get_state(), TxState::Pending);
+
+    // EN 300 392-2 clause 22.3.2.3(j): a matching BL-ACK acknowledges the
+    // BL-DATA transfer. In production the uplink ACK can be decoded before the
+    // asynchronous local UMAC completion reporter is observed; accepting that
+    // matching ACK avoids a duplicate acknowledged downlink PDU during CMCE
+    // call setup while preserving N(R) validation.
+    test.submit_message(build_bl_ack_ind(addr, 0));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        find_tla_report(&sink_msgs, req_handle, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION),
+        "matching BL-ACK must synthesize the first-complete TL-REPORT when it beats local UMAC completion"
+    );
+    let conf = sink_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::TlaTlDataConfBl(prim) if prim.main_address == addr => Some(prim),
+            _ => None,
+        })
+        .expect("matching BL-ACK before local UMAC completion should produce TL-DATA.conf");
+    assert_eq!(conf.req_handle, req_handle);
+    assert_eq!(conf.report, TLA_REPORT_SUCCESSFUL_TRANSFER);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
+    assert!(
+        sink_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "matching BL-ACK before local UMAC completion must not requeue or retransmit the acknowledged BL-DATA"
     );
 }
 
@@ -2653,16 +2738,41 @@ fn test_unexpected_bl_ack_with_payload_is_delivered_as_tl_data_ind() {
 }
 
 #[test]
+fn test_unexpected_empty_bl_ack_without_outstanding_downlink_is_noop() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    // EN 300 392-2 clause 22.3.2.3(j): when no TL-SDU is waiting for
+    // retransmission and the BL-ACK carries no optional TL-SDU, there is no
+    // downlink state to mutate and nothing to deliver upward.
+    test.submit_message(build_bl_ack_ind(addr, 0));
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        sink_msgs.is_empty(),
+        "empty BL-ACK without an outstanding downlink must not confirm, retry, or deliver data"
+    );
+}
+
+#[test]
 fn test_wrong_bl_ack_with_payload_retries_and_delivers_payload_as_tl_data_ind() {
     debug::setup_logging_verbose();
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 94;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2675,10 +2785,12 @@ fn test_wrong_bl_ack_with_payload_retries_and_delivers_payload_as_tl_data_ind() 
     // TL-SDU is nevertheless delivered using TL-DATA.ind.
     test.submit_message(build_bl_ack_ind_with_payload(addr, 1, &[0xA5]));
     test.run_stack(Some(1));
-    let sink_msgs = test.dump_sinks();
+    let mut sink_msgs = test.dump_sinks();
 
     let retry_ns: Vec<u8> = sink_msgs.iter().filter_map(bl_data_ns).collect();
     assert_eq!(retry_ns, vec![0], "wrong BL-ACK should retry the original N(S)");
+    let retry_reporter = take_first_tma_req_reporter(&mut sink_msgs);
+    assert_eq!(retry_reporter.get_state(), TxState::Pending);
     let data_ind = sink_msgs
         .iter()
         .find_map(|msg| match &msg.msg {
@@ -2698,7 +2810,8 @@ fn test_wrong_bl_ack_with_payload_retries_and_delivers_payload_as_tl_data_ind() 
         !sink_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TlaTlDataConfBl(_))),
         "wrong BL-ACK payload must not confirm the transfer"
     );
-    assert_eq!(reporter.get_state(), TxState::Pending);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Transmitted);
 }
 
 #[test]
@@ -2706,11 +2819,14 @@ fn test_wrong_bl_adata_retransmission_piggybacks_ack_for_contained_ns() {
     debug::setup_logging_verbose();
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req(addr));
+    let mut req = build_tl_data_req(addr);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2724,7 +2840,7 @@ fn test_wrong_bl_adata_retransmission_piggybacks_ack_for_contained_ns() {
     // be folded into that retry as BL-ADATA at MAC-ready time.
     test.submit_message(build_bl_adata_ind_with_payload_and_fcs(addr, 1, 1, &[0xA5], false));
     test.run_stack(Some(1));
-    let sink_msgs = test.dump_sinks();
+    let mut sink_msgs = test.dump_sinks();
 
     let data_ind = sink_msgs
         .iter()
@@ -2750,6 +2866,8 @@ fn test_wrong_bl_adata_retransmission_piggybacks_ack_for_contained_ns() {
         vec![(1, 0)],
         "retry should piggyback ACK for contained N(S)=1 while retransmitting original N(S)=0"
     );
+    let retry_reporter = take_first_tma_req_reporter(&mut sink_msgs);
+    assert_eq!(retry_reporter.get_state(), TxState::Pending);
     assert!(
         sink_msgs.iter().filter_map(bl_data_ns).collect::<Vec<_>>().is_empty(),
         "retry should not be emitted as standalone BL-DATA when BL-ADATA fits"
@@ -2758,7 +2876,8 @@ fn test_wrong_bl_adata_retransmission_piggybacks_ack_for_contained_ns() {
         !sink_msgs.iter().any(|msg| llc_pdu_type(msg) == Some(LlcPduType::BlAck)),
         "contained N(S) ACK should be consumed by retry BL-ADATA, not sent separately"
     );
-    assert_eq!(reporter.get_state(), TxState::Pending);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Transmitted);
 }
 
 #[test]
@@ -2801,11 +2920,14 @@ fn test_bl_data_fragmentation_failure_retries_immediately_with_same_ns() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 188;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let initial_ns: Vec<u8> = initial_msgs.iter().filter_map(bl_data_ns).collect();
@@ -2823,7 +2945,52 @@ fn test_bl_data_fragmentation_failure_retries_immediately_with_same_ns() {
         !find_tla_report(&retry_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
         "first fragmentation failure must keep the TL-SDU while N.252 permits"
     );
-    assert_eq!(reporter.get_state(), TxState::Pending);
+    assert_eq!(reporter.get_state(), TxState::Discarded);
+    assert_eq!(service_reporter.get_state(), TxState::Pending);
+}
+
+#[test]
+fn test_bl_data_fragmentation_failure_retries_with_fresh_mac_reporter_and_pending_service_reporter() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 1881;
+    let service_reporter = TxReporter::new();
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut initial_msgs = test.dump_sinks();
+    let first_mac_reporter = take_first_tma_req_reporter(&mut initial_msgs);
+    assert_eq!(first_mac_reporter.get_state(), TxState::Pending);
+    assert_eq!(service_reporter.get_state(), TxState::Pending);
+    assert!(
+        !first_mac_reporter.shares_state_with(&service_reporter),
+        "acknowledged BL-DATA must not reuse the service reporter as the per-attempt MAC reporter"
+    );
+
+    // EN 300 392-2 clause 22.3.2.3(h): a fragmentation failure retries the
+    // stored TL-SDU while N.252 permits. The failed MAC attempt is discarded,
+    // but the service-level SDS/LLC transaction remains pending.
+    test.submit_message(build_tma_report_ind(req_handle, TmaReport::FragmentationFailure));
+    test.run_stack(Some(1));
+    let mut retry_msgs = test.dump_sinks();
+    assert_eq!(first_mac_reporter.get_state(), TxState::Discarded);
+    assert_eq!(service_reporter.get_state(), TxState::Pending);
+    assert!(
+        !find_tla_report(&retry_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "first fragmentation failure must not fail the service reporter while retry is still allowed"
+    );
+
+    let retry_mac_reporter = take_first_tma_req_reporter(&mut retry_msgs);
+    assert_eq!(retry_mac_reporter.get_state(), TxState::Pending);
+    assert!(!retry_mac_reporter.shares_state_with(&first_mac_reporter));
+    assert!(!retry_mac_reporter.shares_state_with(&service_reporter));
 }
 
 #[test]
@@ -2863,6 +3030,74 @@ fn test_bl_data_fragmentation_failure_exhaustion_reports_failed_transfer() {
         !failed_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
         "no further BL-DATA retransmission may be queued after N.252 fragmentation exhaustion"
     );
+}
+
+#[test]
+fn test_bl_data_t251_exhaustion_after_complete_transmission_marks_service_reporter_lost() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 1891;
+    let service_reporter = TxReporter::new();
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut initial_msgs = test.dump_sinks();
+    let mut mac_reporter = take_first_tma_req_reporter(&mut initial_msgs);
+    mac_reporter.mark_transmitted();
+
+    test.run_stack(Some(1));
+    let first_complete_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&first_complete_msgs, req_handle, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION),
+        "first complete MAC transmission should surface to the service reporter"
+    );
+    assert_eq!(service_reporter.get_state(), TxState::Transmitted);
+
+    for attempt in 1..=N252_BL_MAX_TLSDU_RETRANSMITS_ACKED {
+        let mut retry_msgs = Vec::new();
+        for _ in 0..32 {
+            test.run_stack(Some(1));
+            retry_msgs.extend(test.dump_sinks());
+            if retry_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))) {
+                break;
+            }
+        }
+        assert!(
+            !find_tla_report(&retry_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+            "T.251 retry attempt {attempt} must not fail before N.252 is exceeded"
+        );
+        mac_reporter = take_first_tma_req_reporter(&mut retry_msgs);
+        mac_reporter.mark_transmitted();
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        assert_eq!(service_reporter.get_state(), TxState::Transmitted);
+    }
+
+    let mut failed_msgs = Vec::new();
+    for _ in 0..32 {
+        test.run_stack(Some(1));
+        failed_msgs.extend(test.dump_sinks());
+        if find_tla_report(&failed_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER) {
+            break;
+        }
+    }
+
+    assert!(
+        find_tla_report(&failed_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "T.251/N.252 exhaustion after complete transmission should fail the transfer"
+    );
+    assert_eq!(
+        service_reporter.get_state(),
+        TxState::Lost,
+        "after at least one complete MAC transmission, no peer BL-ACK means Lost, not Discarded"
+    );
+    assert_eq!(mac_reporter.get_state(), TxState::Transmitted);
 }
 
 #[test]
@@ -2959,11 +3194,14 @@ fn test_t251_retransmission_exhaustion_emits_failed_transfer_report() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 95;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let mut reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -2989,7 +3227,67 @@ fn test_t251_retransmission_exhaustion_emits_failed_transfer_report() {
         !final_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
         "no further BL-DATA retransmission may be queued after N.252 exhaustion"
     );
-    assert_eq!(reporter.get_state(), TxState::Lost);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Lost);
+}
+
+#[test]
+fn test_channel_allocation_t251_exhaustion_keeps_late_ack_grace() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2260616, SsiType::Issi);
+    let req_handle = 951;
+    let service_reporter = TxReporter::new();
+    let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 2);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut initial_msgs = test.dump_sinks();
+    let mut reporter = take_first_tma_req_reporter(&mut initial_msgs);
+    reporter.mark_transmitted();
+
+    for attempt in 1..=N252_BL_MAX_TLSDU_RETRANSMITS_ACKED {
+        test.run_stack(Some(20));
+        let mut retry_msgs = test.dump_sinks();
+        let retry_ns: Vec<u8> = retry_msgs.iter().filter_map(bl_data_ns).collect();
+        assert_eq!(
+            retry_ns,
+            vec![0],
+            "channel-allocation retry attempt {attempt} should retain the original N(S)"
+        );
+        reporter = take_first_tma_req_reporter(&mut retry_msgs);
+        reporter.mark_transmitted();
+    }
+
+    test.run_stack(Some(20));
+    let grace_msgs = test.dump_sinks();
+    assert!(
+        !find_tla_report(&grace_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "EN 300 392-2 Annex D.4 channel-allocation setup keeps a bounded late-ACK grace before failing"
+    );
+    assert!(
+        grace_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "late-ACK grace must not queue extra retransmissions after N.252 is exhausted"
+    );
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Transmitted);
+
+    test.submit_message(build_bl_ack_ind(addr, 0));
+    test.run_stack(Some(1));
+    let ack_msgs = test.dump_sinks();
+    assert!(
+        ack_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::TlaTlDataConfBl(prim)
+                if prim.req_handle == req_handle && prim.report == TLA_REPORT_SUCCESSFUL_TRANSFER
+        )),
+        "a matching BL-ACK inside the channel-allocation grace should still confirm the TL-DATA transfer"
+    );
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]
@@ -3003,7 +3301,14 @@ fn test_t251_retry_waits_until_four_target_signalling_frames() {
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle_timeslot(addr, req_handle, target_timeslot));
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, target_timeslot);
+    if let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg {
+        // This test is about assigned-channel recovery timing. The first
+        // non-stealing late-assignment D-CONNECT ACK path intentionally waits
+        // for BL-ACK on the current control channel.
+        prim.stealing_permission = true;
+    }
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -3144,11 +3449,14 @@ fn test_wrong_bl_ack_before_first_complete_is_ignored_and_keeps_pending_transfer
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 191;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -3190,7 +3498,8 @@ fn test_wrong_bl_ack_before_first_complete_is_ignored_and_keeps_pending_transfer
         )),
         "matching ACK after premature wrong ACK should confirm the TL-DATA request"
     );
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]
@@ -3199,11 +3508,14 @@ fn test_wrong_bl_ack_exhaustion_reports_failed_transfer_and_drops_pending() {
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
     let req_handle = 190;
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_handle(addr, req_handle));
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let mut reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -3232,7 +3544,7 @@ fn test_wrong_bl_ack_exhaustion_reports_failed_transfer_and_drops_pending() {
     test.run_stack(Some(1));
     let failed_msgs = test.dump_sinks();
 
-    // EN 300 392-2 clause 22.3.2.3(k): if BL-ACK N(R) does not equal V(S),
+    // EN 300 392-2 clause 22.3.2.3(j): if BL-ACK N(R) does not equal V(S),
     // LLC retransmits while N.252 permits, then reports failed transfer and
     // discards the TL-SDU from the sending buffer.
     assert!(
@@ -3243,7 +3555,8 @@ fn test_wrong_bl_ack_exhaustion_reports_failed_transfer_and_drops_pending() {
         !failed_msgs.iter().any(|msg| matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
         "no further BL-DATA retransmission may be queued after wrong-ACK N.252 exhaustion"
     );
-    assert_eq!(reporter.get_state(), TxState::Lost);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Lost);
 
     test.submit_message(build_bl_ack_ind(addr, 1));
     test.run_stack(Some(1));
@@ -3258,11 +3571,14 @@ fn test_bl_ack_with_response_payload_acknowledges_downlink_and_delivers_tl_data_
     debug::setup_logging_verbose();
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req(addr));
+    let mut req = build_tl_data_req(addr);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -3284,7 +3600,8 @@ fn test_bl_ack_with_response_payload_acknowledges_downlink_and_delivers_tl_data_
     test.run_stack(Some(1));
     let sink_msgs = test.dump_sinks();
 
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 
     let data_conf = sink_msgs
         .iter()
@@ -3316,11 +3633,14 @@ fn test_bl_ack_with_short_response_payload_delivers_tl_data_conf_bits() {
     debug::setup_logging_verbose();
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let service_reporter = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req(addr));
+    let mut req = build_tl_data_req(addr);
+    attach_tl_data_req_reporter(&mut req, service_reporter.clone());
+    test.submit_message(req);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter = take_first_tma_req_reporter(&mut initial_msgs);
@@ -3343,7 +3663,8 @@ fn test_bl_ack_with_short_response_payload_delivers_tl_data_conf_bits() {
     test.run_stack(Some(1));
     let sink_msgs = test.dump_sinks();
 
-    assert_eq!(reporter.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
     let data_conf = sink_msgs
         .iter()
         .find_map(|msg| match &msg.msg {
@@ -3957,12 +4278,18 @@ fn test_bl_ack_matches_endpoint_scoped_expected_ack() {
     debug::setup_logging_verbose();
 
     let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let service_reporter_ep1 = TxReporter::new();
+    let service_reporter_ep2 = TxReporter::new();
     let dltime = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
     test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
 
-    test.submit_message(build_tl_data_req_with_endpoint_handle(addr, 1, 201));
-    test.submit_message(build_tl_data_req_with_endpoint_handle(addr, 2, 202));
+    let mut req_ep1 = build_tl_data_req_with_endpoint_handle(addr, 1, 201);
+    attach_tl_data_req_reporter(&mut req_ep1, service_reporter_ep1.clone());
+    let mut req_ep2 = build_tl_data_req_with_endpoint_handle(addr, 2, 202);
+    attach_tl_data_req_reporter(&mut req_ep2, service_reporter_ep2.clone());
+    test.submit_message(req_ep1);
+    test.submit_message(req_ep2);
     test.run_stack(Some(1));
     let mut initial_msgs = test.dump_sinks();
     let reporter_ep1 = take_tma_req_reporter_for_endpoint(&mut initial_msgs, 1);
@@ -3986,7 +4313,9 @@ fn test_bl_ack_matches_endpoint_scoped_expected_ack() {
     assert_eq!(conf.endpoint_id, 2);
     assert_eq!(conf.req_handle, 202);
     assert_eq!(reporter_ep1.get_state(), TxState::Transmitted);
-    assert_eq!(reporter_ep2.get_state(), TxState::Acknowledged);
+    assert_eq!(reporter_ep2.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter_ep1.get_state(), TxState::Transmitted);
+    assert_eq!(service_reporter_ep2.get_state(), TxState::Acknowledged);
 }
 
 #[test]

@@ -255,9 +255,15 @@ pub(super) enum IndividualCallState {
     IncomingAlerting,
     /// Incoming call setup is waiting for backhaul/network confirmation.
     IncomingSetupWaitNetworkAck,
+    /// Called MS has sent U-CONNECT; SwMI has opened the assigned bearer and
+    /// is waiting for L2 ACK of D-CONNECT ACKNOWLEDGE before notifying caller.
+    CalledConnectAckPending,
+    /// Called leg acknowledged D-CONNECT ACKNOWLEDGE; SwMI is waiting for L2
+    /// ACK of caller D-CONNECT before the individual call becomes active.
+    CallerConnectAckPending,
     /// Call is established.
     Active,
-    /// D-DISCONNECT was sent to one party; EN 300 392-2 14.7.1.6 expects U-RELEASE.
+    /// D-DISCONNECT was sent to one party; EN 300 392-2 clause 14.5.1.3.3 expects U-RELEASE.
     DisconnectPending {
         awaiting_release_from: u32,
         release_to_issi: u32,
@@ -321,7 +327,11 @@ impl IndividualCall {
     pub(super) fn is_alerted(&self) -> bool {
         matches!(
             self.state,
-            IndividualCallState::IncomingAlerting | IndividualCallState::IncomingSetupWaitNetworkAck | IndividualCallState::Active
+            IndividualCallState::IncomingAlerting
+                | IndividualCallState::IncomingSetupWaitNetworkAck
+                | IndividualCallState::CalledConnectAckPending
+                | IndividualCallState::CallerConnectAckPending
+                | IndividualCallState::Active
         )
     }
 
@@ -347,6 +357,40 @@ impl IndividualCall {
             self.state,
             IndividualCallState::Active | IndividualCallState::DisconnectPending { .. }
         )
+    }
+
+    #[inline]
+    pub(super) fn has_assigned_circuit(&self) -> bool {
+        matches!(
+            self.state,
+            IndividualCallState::CalledConnectAckPending
+                | IndividualCallState::CallerConnectAckPending
+                | IndividualCallState::Active
+                | IndividualCallState::DisconnectPending { .. }
+        )
+    }
+
+    #[inline]
+    pub(super) fn is_connect_ack_pending(&self) -> bool {
+        matches!(
+            self.state,
+            IndividualCallState::CalledConnectAckPending | IndividualCallState::CallerConnectAckPending
+        )
+    }
+
+    pub(super) fn mark_called_connect_ack_pending(&mut self) {
+        if matches!(
+            self.state,
+            IndividualCallState::CallSetupPending | IndividualCallState::IncomingSetupPending | IndividualCallState::IncomingAlerting
+        ) {
+            self.state = IndividualCallState::CalledConnectAckPending;
+        }
+    }
+
+    pub(super) fn mark_caller_connect_ack_pending(&mut self) {
+        if matches!(self.state, IndividualCallState::CalledConnectAckPending) {
+            self.state = IndividualCallState::CallerConnectAckPending;
+        }
     }
 
     pub(super) fn activate(&mut self, now: TdmaTime) {

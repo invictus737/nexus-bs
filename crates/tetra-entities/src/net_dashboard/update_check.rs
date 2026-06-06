@@ -24,7 +24,7 @@ struct SemVer {
 }
 
 impl SemVer {
-    /// Parse a version from a string like "v0.1.55", "0.1.55", or "v0.1.55-gabc123".
+    /// Parse a version from a string like "v0.1.56", "0.1.56", or "v0.1.56-gabc123".
     /// Leading 'v'/'V' is optional; anything after the patch (a '-' or '+' suffix) is
     /// ignored. Returns None if the major.minor.patch core can't be parsed.
     fn parse(s: &str) -> Option<Self> {
@@ -43,7 +43,7 @@ impl SemVer {
 /// Result of an update check, serialised to JSON for the dashboard.
 #[derive(Debug, Clone)]
 pub struct UpdateCheck {
-    /// Locally built version string (as-is, e.g. "v0.1.55-gabc123").
+    /// Locally built version string (as-is, e.g. "v0.1.56-gabc123").
     pub current: String,
     /// Latest release tag from GitHub, if the check succeeded.
     pub latest: Option<String>,

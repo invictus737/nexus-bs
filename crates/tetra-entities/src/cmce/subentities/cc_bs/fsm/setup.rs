@@ -713,7 +713,7 @@ impl CcBsSubentity {
         };
 
         tracing::info!(
-            "rx_u_setup_p2p: call from ISSI {} to ISSI {} -> call_id={} ts(call)={} usage(call)={} ts(called)={} usage(called)={}",
+            "CMCE: rx_u_setup_p2p call from ISSI {} to ISSI {} -> call_id={} ts(call)={} usage(call)={} ts(called)={} usage(called)={}",
             calling_party.ssi,
             called_addr.ssi,
             call_id,
@@ -773,13 +773,14 @@ impl CcBsSubentity {
         };
         tracing::debug!("-> {:?}", d_setup);
 
+        let initial_setup_reporter = TxReporter::new_unacked();
         self.cached_setups.insert(
             call_id,
             CachedSetup {
                 pdu: d_setup,
                 dest_addr: called_addr,
                 resend: true,
-                last_resend_reporter: None,
+                last_resend_reporter: Some(initial_setup_reporter.clone()),
                 is_individual: true,
             },
         );
@@ -788,7 +789,17 @@ impl CcBsSubentity {
         let mut setup_sdu = BitBuffer::new_autoexpand(80);
         d_setup_ref.to_bitbuf(&mut setup_sdu).expect("Failed to serialize DSetup");
         setup_sdu.seek(0);
-        let setup_msg = Self::build_sapmsg(setup_sdu, None, called_addr, Layer2Service::Unacknowledged, None);
+        // EN 300 392-2 clause 14.5.1.1.1 requires the SwMI to deliver
+        // D-SETUP to the called MS before U-CONNECT can arrive. Track this
+        // first MCCH transfer so local EE retries do not duplicate it while MAC
+        // still has the request pending for the called MS's receive window.
+        let setup_msg = Self::build_sapmsg(
+            setup_sdu,
+            None,
+            called_addr,
+            Layer2Service::Unacknowledged,
+            Some(initial_setup_reporter),
+        );
         queue.push_back(setup_msg);
 
         if let Err(err) = self.fsm_individual_create_setup_call(

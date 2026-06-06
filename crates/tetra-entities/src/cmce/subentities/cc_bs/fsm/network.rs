@@ -1,5 +1,13 @@
 use super::*;
 
+const NETWORK_INDIVIDUAL_CONNECT_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * 18 * 4;
+
+#[derive(Clone, Copy)]
+enum PendingNetworkConnectAction {
+    Complete,
+    Fail,
+}
+
 impl CcBsSubentity {
     /// EN 300 392-2 table 14.46 defines call priority 12..=15 as
     /// pre-emptive priorities, with 15 as emergency.
@@ -74,6 +82,121 @@ impl CcBsSubentity {
                     ts,
                 }),
             });
+        }
+    }
+
+    fn push_network_circuit_media_ready(queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call_id: u16, ts: u8) {
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady { brew_uuid, call_id, ts }),
+        });
+    }
+
+    fn complete_pending_network_individual_connect(&mut self, queue: &mut MessageQueue, pending: PendingNetworkIndividualConnect) {
+        let Some(call_snapshot) = self.individual_calls.get(&pending.call_id).cloned() else {
+            tracing::debug!(
+                "CMCE: Brew private connect call_id={} disappeared before media-ready completion",
+                pending.call_id
+            );
+            return;
+        };
+
+        // EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 define the local MS
+        // state change on D-CONNECT ACKNOWLEDGE/D-CONNECT. Annex D.4's
+        // conservative direct-setup example waits for the local L2 ACK before
+        // authorizing the opposite side to send first traffic. For Brew-bridged
+        // private calls, Brew is that opposite side.
+        if let Err(err) = self.fsm_individual_transition_to_active(pending.call_id) {
+            match err {
+                IndividualTransitionError::UnknownCall(_) => {
+                    tracing::warn!("CMCE: Brew private connect activation unknown call_id={}", pending.call_id);
+                }
+                IndividualTransitionError::InvalidTransition { state, .. } => {
+                    tracing::warn!(
+                        "CMCE: Brew private connect activation rejected call_id={} from state {:?}",
+                        pending.call_id,
+                        state
+                    );
+                }
+                IndividualTransitionError::MissingBrewUuid(_)
+                | IndividualTransitionError::DuplicateCall(_)
+                | IndividualTransitionError::NotBrewOriginated(_)
+                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
+            }
+        }
+
+        self.apply_brew_simplex_initial_floor(
+            queue,
+            pending.call_id,
+            pending.local_addr,
+            pending.peer_addr,
+            pending.ts,
+            pending.simplex_duplex,
+            pending.grant,
+        );
+
+        if pending.kind == PendingNetworkIndividualConnectKind::LocalCallerDConnect {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                    brew_uuid: pending.brew_uuid,
+                    grant: pending.grant.into_raw() as u8,
+                    permission: pending.permission,
+                }),
+            });
+        }
+
+        Self::push_network_circuit_media_ready(queue, pending.brew_uuid, pending.call_id, pending.ts);
+
+        tracing::info!(
+            "CMCE: Brew private connect media-ready after local L2 ACK call_id={} uuid={} local_issi={} peer_issi={} kind={:?}",
+            pending.call_id,
+            pending.brew_uuid,
+            pending.local_addr.ssi,
+            pending.peer_addr.ssi,
+            pending.kind
+        );
+
+        let _ = call_snapshot;
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn drain_pending_network_individual_connects(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<(u16, PendingNetworkConnectAction)> = self
+            .pending_network_individual_connects
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.reporter.is_acknowledged() {
+                    Some((call_id, PendingNetworkConnectAction::Complete))
+                } else if pending.reporter.is_in_final_state()
+                    || pending.started_at.age(self.dltime) >= NETWORK_INDIVIDUAL_CONNECT_PENDING_TIMEOUT_TIMESLOTS
+                {
+                    Some((call_id, PendingNetworkConnectAction::Fail))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (call_id, action) in ready {
+            let Some(pending) = self.pending_network_individual_connects.remove(&call_id) else {
+                continue;
+            };
+            match action {
+                PendingNetworkConnectAction::Complete => self.complete_pending_network_individual_connect(queue, pending),
+                PendingNetworkConnectAction::Fail => {
+                    tracing::warn!(
+                        "CMCE: Brew private connect local RF leg did not receive L2 ACK for call_id={} uuid={} kind={:?}; releasing",
+                        pending.call_id,
+                        pending.brew_uuid,
+                        pending.kind
+                    );
+                    self.release_individual_call(queue, pending.call_id, DisconnectCause::AcknowledgedServiceNotComplete);
+                }
+            }
         }
     }
 
@@ -420,6 +543,7 @@ impl CcBsSubentity {
         d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
         connect_sdu.seek(0);
 
+        let reporter = TxReporter::new();
         let connect_msg = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -429,7 +553,7 @@ impl CcBsSubentity {
                 handle: call.calling_handle,
                 endpoint_id: call.calling_endpoint_id,
                 link_id: call.calling_link_id,
-                layer2service: Layer2Service::Unacknowledged,
+                layer2service: Layer2Service::Acknowledged,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -437,7 +561,7 @@ impl CcBsSubentity {
                 unacked_bl_repetitions: None,
                 chan_alloc: Some(chan_alloc_calling),
                 main_address: call.calling_addr,
-                tx_reporter: None,
+                tx_reporter: Some(reporter.clone()),
             }),
         };
         queue.push_back(connect_msg);
@@ -456,56 +580,22 @@ impl CcBsSubentity {
         };
         Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.calling_addr));
 
-        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
-            match err {
-                IndividualTransitionError::UnknownCall(_) => {
-                    tracing::warn!("CMCE: Brew connect request activation unknown call_id={}", call_id);
-                }
-                IndividualTransitionError::InvalidTransition { state, .. } => {
-                    tracing::warn!(
-                        "CMCE: Brew connect request activation rejected call_id={} from state {:?}",
-                        call_id,
-                        state
-                    );
-                }
-                IndividualTransitionError::MissingBrewUuid(_)
-                | IndividualTransitionError::DuplicateCall(_)
-                | IndividualTransitionError::NotBrewOriginated(_)
-                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
-            }
-        }
-
-        self.apply_brew_simplex_initial_floor(
-            queue,
+        self.pending_network_individual_connects.insert(
             call_id,
-            call.calling_addr,
-            call.called_addr,
-            call.calling_ts,
-            call.simplex_duplex,
-            grant_enum,
-        );
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
-                brew_uuid,
-                grant: grant_enum.into_raw() as u8,
-                permission: call_info.permission,
-            }),
-        });
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
+            PendingNetworkIndividualConnect {
+                reporter,
                 brew_uuid,
                 call_id,
                 ts: call.calling_ts,
-            }),
-        });
+                local_addr: call.calling_addr,
+                peer_addr: call.called_addr,
+                simplex_duplex: call.simplex_duplex,
+                grant: grant_enum,
+                permission: call_info.permission,
+                started_at: self.dltime,
+                kind: PendingNetworkIndividualConnectKind::LocalCallerDConnect,
+            },
+        );
     }
 
     /// Handle network circuit connect confirm (Brew -> local calling MS).
@@ -587,6 +677,7 @@ impl CcBsSubentity {
             .expect("Failed to serialize DConnectAcknowledge");
         ack_sdu.seek(0);
 
+        let reporter = TxReporter::new();
         let ack_msg = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -596,7 +687,7 @@ impl CcBsSubentity {
                 handle: called_handle,
                 endpoint_id: called_endpoint_id,
                 link_id: called_link_id,
-                layer2service: Layer2Service::Unacknowledged,
+                layer2service: Layer2Service::Acknowledged,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
@@ -604,7 +695,7 @@ impl CcBsSubentity {
                 unacked_bl_repetitions: None,
                 chan_alloc: Some(chan_alloc_called),
                 main_address: call.called_addr,
-                tx_reporter: None,
+                tx_reporter: Some(reporter.clone()),
             }),
         };
         queue.push_back(ack_msg);
@@ -634,45 +725,22 @@ impl CcBsSubentity {
         };
         Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.called_addr));
 
-        if let Err(err) = self.fsm_individual_transition_to_active(call_id) {
-            match err {
-                IndividualTransitionError::UnknownCall(_) => {
-                    tracing::warn!("CMCE: Brew connect confirm activation unknown call_id={}", call_id);
-                }
-                IndividualTransitionError::InvalidTransition { state, .. } => {
-                    tracing::warn!(
-                        "CMCE: Brew connect confirm activation rejected call_id={} from state {:?}",
-                        call_id,
-                        state
-                    );
-                }
-                IndividualTransitionError::MissingBrewUuid(_)
-                | IndividualTransitionError::DuplicateCall(_)
-                | IndividualTransitionError::NotBrewOriginated(_)
-                | IndividualTransitionError::ConnectRequestAlreadySent(_) => {}
-            }
-        }
-
-        self.apply_brew_simplex_initial_floor(
-            queue,
+        self.pending_network_individual_connects.insert(
             call_id,
-            call.called_addr,
-            call.calling_addr,
-            call.called_ts,
-            call.simplex_duplex,
-            grant_enum,
-        );
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
+            PendingNetworkIndividualConnect {
+                reporter,
                 brew_uuid,
                 call_id,
                 ts: call.called_ts,
-            }),
-        });
+                local_addr: call.called_addr,
+                peer_addr: call.calling_addr,
+                simplex_duplex: call.simplex_duplex,
+                grant: grant_enum,
+                permission,
+                started_at: self.dltime,
+                kind: PendingNetworkIndividualConnectKind::LocalCalledDConnectAck,
+            },
+        );
     }
 
     /// Handle network-initiated group call start.

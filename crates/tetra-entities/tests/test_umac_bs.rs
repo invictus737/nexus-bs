@@ -8,12 +8,17 @@ use tetra_core::{
 };
 use tetra_entities::lmac::components::{errorcontrol, scrambler};
 use tetra_entities::umac::umac_bs::UmacBs;
-use tetra_pdus::cmce::enums::transmission_grant::TransmissionGrant;
+use tetra_pdus::cmce::enums::{call_timeout::CallTimeout, transmission_grant::TransmissionGrant};
+use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
+use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
+use tetra_pdus::llc::pdus::bl_ack::BlAck;
+use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::umac::enums::basic_slotgrant_cap_alloc::BasicSlotgrantCapAlloc;
+use tetra_pdus::umac::enums::basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay;
 use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
@@ -23,6 +28,7 @@ use tetra_pdus::umac::pdus::mac_u_blck::MacUBlck;
 use tetra_pdus::umac::pdus::mac_u_signal::MacUSignal;
 use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
+use tetra_saps::control::enums::communication_type::CommunicationType;
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -469,6 +475,15 @@ fn llc_wrapped_cmce_sdu(mut cmce_sdu: BitBuffer) -> BitBuffer {
     sdu
 }
 
+fn llc_wrapped_mle_sdu(payload_bits: usize) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(16 + payload_bits);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
+    sdu.write_bits(MleProtocolDiscriminator::Mle.into_raw(), 3);
+    sdu.write_zeroes(payload_bits);
+    sdu.seek(0);
+    sdu
+}
+
 fn private_call_open_msg_with_peer(active_issi: u32, peer_issi: u32, ts: u8, peer_ts: u8) -> SapMsg {
     SapMsg {
         sap: Sap::Control,
@@ -618,6 +633,21 @@ fn mac_u_signal_pdu_for_test(second_half_stolen: bool) -> BitBuffer {
     pdu
 }
 
+fn mac_u_signal_bl_ack_pdu_for_test(nr: u8) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(16);
+    MacUSignal { second_half_stolen: false }.to_bitbuf(&mut pdu);
+    BlAck { has_fcs: false, nr }.to_bitbuf(&mut pdu);
+    pdu.seek(0);
+    pdu
+}
+
+fn bl_ack_tma_sdu_for_test(nr: u8) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(8);
+    BlAck { has_fcs: false, nr }.to_bitbuf(&mut pdu);
+    pdu.seek(0);
+    pdu
+}
+
 fn submit_stch_mac_u_signal(test: &mut ComponentTest) {
     submit_stch_mac_u_signal_with_second_half(test, false);
 }
@@ -629,6 +659,22 @@ fn submit_stch_mac_u_signal_with_second_half(test: &mut ComponentTest, second_ha
         dest: TetraEntity::Umac,
         msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
             pdu: mac_u_signal_pdu_for_test(second_half_stolen),
+            block_num: PhyBlockNum::Block1,
+            logical_channel: LogicalChannel::Stch,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NAN,
+        }),
+    });
+}
+
+fn submit_stch_mac_u_signal_bl_ack(test: &mut ComponentTest, nr: u8) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: mac_u_signal_bl_ack_pdu_for_test(nr),
             block_num: PhyBlockNum::Block1,
             logical_channel: LogicalChannel::Stch,
             crc_pass: true,
@@ -837,6 +883,49 @@ fn test_group_floor_grant_purges_stale_raw_block2_but_allows_new_media() {
 }
 
 #[test]
+fn test_group_floor_grant_preserves_first_hangtime_requester_raw_block2() {
+    debug::setup_logging_verbose();
+
+    let gssi = 226333;
+    let first_speaker = 2260616;
+    let mtp3550_issi = 2260082;
+    let call_id = 78;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let first_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 13 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, first_raw_block2.clone());
+    test.run_stack(Some(12));
+    let first_observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        first_observed.iter().any(|bits| bits == &first_raw_block2),
+        "test setup should prove the initial group speaker media is routed before hangtime"
+    );
+
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let early_mtp3550_block2: Vec<u8> = (0..216).map(|idx| ((idx * 17 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, early_mtp3550_block2.clone());
+    test.submit_message(floor_granted_msg(call_id, mtp3550_issi, gssi, traffic_ts));
+    test.run_stack(Some(12));
+
+    let observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &early_mtp3550_block2),
+        "EN 300 392-2 clauses 14.5.2.2.1, 23.5 and 23.8.5: first group TCH/S Block2 from ISSI 2260082 must survive the hangtime-to-D-TX-GRANTED transition; observed {} candidates",
+        observed.len()
+    );
+}
+
+#[test]
 fn test_group_floor_handoff_reopens_ul_traffic_for_lmac_tch_s_decode() {
     debug::setup_logging_verbose();
 
@@ -950,7 +1039,7 @@ fn test_private_simplex_ul_voice_loopback_preserves_tch_s_bits() {
 }
 
 #[test]
-fn test_private_simplex_initial_floor_routes_without_extra_floor_grant() {
+fn test_private_simplex_pre_floor_voice_waits_for_floor_granted() {
     debug::setup_logging_verbose();
 
     let caller_issi = 0x3231;
@@ -965,14 +1054,24 @@ fn test_private_simplex_initial_floor_routes_without_extra_floor_grant() {
 
     let ul_bits = acelp_test_bits();
     submit_ul_voice_frame(&mut test, traffic_ts, ul_bits.clone());
+    test.run_stack(Some(2));
+
+    let pre_floor_msgs = test.dump_sinks();
+    let pre_floor_tch = collect_dl_tch_bits(&pre_floor_msgs, traffic_ts);
+    assert!(
+        pre_floor_tch.iter().all(|bits| bits != &ul_bits),
+        "EN 300 392-2 Annex D.4 and clause 14.5.1.2.1: private-simplex Open creates the bearer, but must not route first TCH/S before CMCE FloorGranted identifies the authorized speaker"
+    );
+
+    test.submit_message(floor_granted_msg(1, caller_issi, called_issi, traffic_ts));
     test.run_stack(Some(12));
 
-    let msgs = test.dump_sinks();
+    let post_floor_msgs = test.dump_sinks();
     assert_dl_tch_contains_bits(
-        &msgs,
+        &post_floor_msgs,
         traffic_ts,
         &ul_bits,
-        "EN 300 392-2 clauses 14.5.1.2.1 and 23.5.2.2.1: initial private simplex floor opened by D-CONNECT must route the first TCH/S burst before any later D-TX GRANTED",
+        "EN 300 392-2 Annex D.4 plus clauses 14.5.1.2.1 and 23.5.2.2.1: after called-leg L2 ACK lets CMCE issue FloorGranted, the retained first private-simplex TCH/S burst must route",
     );
 }
 
@@ -1036,6 +1135,226 @@ fn test_private_simplex_cross_route_floor_grant_keeps_new_peer_audio() {
     assert!(
         observed.iter().any(|bits| bits == &fresh_raw_block2),
         "EN 300 392-2 clauses 14.5.1.2.1 b) and 23.5: private simplex P2P on separate assigned timeslots must cross-route the granted speaker's TCH/S to the peer DL timeslot"
+    );
+}
+
+#[test]
+fn test_private_simplex_floor_grant_preserves_first_requester_raw_block2() {
+    debug::setup_logging_verbose();
+
+    let hytera_issi = 2_260_616;
+    let mxp600_issi = 2_260_618;
+    let hytera_ts = 2;
+    let mxp600_ts = 3;
+    let call_id = 55;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg_with_peer(hytera_issi, mxp600_issi, hytera_ts, mxp600_ts));
+    test.submit_message(private_call_open_msg_with_peer(mxp600_issi, hytera_issi, mxp600_ts, hytera_ts));
+    test.submit_message(floor_granted_msg(call_id, mxp600_issi, hytera_issi, mxp600_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let first_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 13 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, hytera_ts, first_raw_block2.clone());
+    test.submit_message(floor_granted_msg(call_id, hytera_issi, mxp600_issi, hytera_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.run_stack(Some(12));
+    let msgs = test.dump_sinks();
+    let observed = collect_dl_raw_tch_block2_bits(&msgs, mxp600_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &first_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 23.5 and 23.8.5: a private-simplex FloorGranted must not purge the first valid requester TCH/S Block2 while clearing stale previous-speaker media; observed {} candidates",
+        observed.len()
+    );
+}
+
+#[test]
+fn test_private_simplex_shared_ts_floor_grant_preserves_first_requester_raw_block2() {
+    debug::setup_logging_verbose();
+
+    let hytera_issi = 2_260_616;
+    let mxp600_issi = 2_260_618;
+    let traffic_ts = 2;
+    let call_id = 56;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(hytera_issi, mxp600_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, mxp600_issi, hytera_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let first_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 17 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, first_raw_block2.clone());
+    test.submit_message(floor_granted_msg(call_id, hytera_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.run_stack(Some(12));
+    let observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &first_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2, 23.5 and 23.8.5: private simplex on one shared assigned timeslot must not tag the first requester TCH/S Block2 with the previous floor holder and purge it during D-TX GRANTED; observed {} candidates",
+        observed.len()
+    );
+}
+
+#[test]
+fn test_private_simplex_same_speaker_raw_block2_reentry_survives_hangtime() {
+    debug::setup_logging_verbose();
+
+    let mtp3550_issi = 2_260_082;
+    let mxp600_issi = 2_260_618;
+    let traffic_ts = 2;
+    let call_id = 57;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(mtp3550_issi, mxp600_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, mtp3550_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let first_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 19 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, first_raw_block2.clone());
+    test.run_stack(Some(12));
+    let first_observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        first_observed.iter().any(|bits| bits == &first_raw_block2),
+        "test setup should prove the initial Motorola private-simplex speaker media is routed before hangtime"
+    );
+
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let reentry_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 23 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, reentry_raw_block2.clone());
+    test.submit_message(floor_granted_msg(call_id, mtp3550_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.run_stack(Some(12));
+    let observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &reentry_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2, 23.5 and 23.8.5: private-simplex raw TCH/S Block2 from the same ISSI must survive the hangtime-to-D-TX-GRANTED transition; observed {} candidates",
+        observed.len()
+    );
+}
+
+#[test]
+fn test_private_simplex_raw_block2_waits_for_delayed_floor_grant() {
+    debug::setup_logging_verbose();
+
+    let mtp3550_issi = 2_260_082;
+    let mxp600_issi = 2_260_618;
+    let traffic_ts = 2;
+    let call_id = 58;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(mtp3550_issi, mxp600_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, mtp3550_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let early_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 29 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, early_raw_block2.clone());
+    test.run_stack(Some(2));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_granted_msg(call_id, mtp3550_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(12));
+    let observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &early_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2, 23.5 and 23.8.5: private-simplex raw TCH/S received just before the internal FloorGranted must be retained briefly and routed after the grant; observed {} candidates",
+        observed.len()
+    );
+}
+
+#[test]
+fn test_private_simplex_acelp_waits_for_delayed_floor_grant() {
+    debug::setup_logging_verbose();
+
+    let hytera_issi = 2_260_616;
+    let mxp600_issi = 2_260_618;
+    let traffic_ts = 2;
+    let call_id = 59;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(hytera_issi, mxp600_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, hytera_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let early_acelp = acelp_test_bits();
+    submit_ul_voice_frame(&mut test, traffic_ts, early_acelp.clone());
+    test.run_stack(Some(2));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_granted_msg(call_id, hytera_issi, mxp600_issi, traffic_ts));
+    test.run_stack(Some(12));
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        traffic_ts,
+        &early_acelp,
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2, 23.5 and 23.8.5: private-simplex ACELP TCH/S received just before the internal FloorGranted must be retained briefly and routed after the grant",
+    );
+}
+
+#[test]
+fn test_private_simplex_deferred_media_expires_without_floor_grant() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 2_260_616;
+    let called_issi = 2_260_618;
+    let traffic_ts = 2;
+    let call_id = 60;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(private_call_open_msg(caller_issi, called_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, caller_issi, called_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let stale_raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 31 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, stale_raw_block2.clone());
+    test.run_stack(Some(24));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_granted_msg(call_id, caller_issi, called_issi, traffic_ts));
+    test.run_stack(Some(12));
+    let observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        observed.iter().all(|bits| bits != &stale_raw_block2),
+        "EN 300 392-2 clauses 14.5.1.2.1 e) and 14.5.1.4.2: stale private TCH/S must not be replayed after the bounded hangtime guard expires"
     );
 }
 
@@ -1110,7 +1429,7 @@ fn test_private_duplex_ul_voice_cross_route_preserves_tch_s_bits() {
 }
 
 #[test]
-fn test_stch_mac_u_signal_uses_current_ul_speaker_from_private_open_circuit() {
+fn test_stch_mac_u_signal_waits_for_private_floor_granted() {
     debug::setup_logging_verbose();
 
     let caller_issi = 0x3101;
@@ -1125,10 +1444,81 @@ fn test_stch_mac_u_signal_uses_current_ul_speaker_from_private_open_circuit() {
     test.run_stack(Some(1));
 
     let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
+    assert!(
+        addresses.is_empty(),
+        "EN 300 392-2 clauses 14.5.1.2.1 and 14.5.1.4: private-simplex Open only establishes the bearer; FloorGranted authorizes the U-plane speaker"
+    );
+
+    let mut granted_test = ComponentTest::new(StackMode::Bs, Some(start));
+    granted_test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+    granted_test.submit_message(private_call_open_msg(caller_issi, called_issi, traffic_ts));
+    granted_test.submit_message(floor_granted_msg(1, caller_issi, called_issi, traffic_ts));
+    submit_stch_mac_u_signal(&mut granted_test);
+    granted_test.run_stack(Some(1));
+
+    let addresses = tma_unitdata_ind_addresses(&granted_test.dump_sinks());
     assert_eq!(
         addresses,
         vec![TetraAddress::issi(caller_issi)],
-        "EN 300 392-2 clauses 21.4.5 and 14.5.1.2.1 require STCH U-plane signalling to inherit the current private-call speaker, not ISSI 0"
+        "EN 300 392-2 clauses 21.4.5 and 14.5.1.2.1 require STCH U-plane signalling to inherit the FloorGranted private-call speaker, not ISSI 0"
+    );
+}
+
+#[test]
+fn test_stch_bl_ack_before_private_floor_granted_uses_called_primary() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 2_260_616;
+    let called_issi = 2_260_618;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    // CMCE seeds the called ISSI as primary on same-timeslot private simplex
+    // when the called leg must acknowledge D-CONNECT ACK before caller
+    // authorization (EN 300 392-2 Annex D.4).
+    test.submit_message(private_call_open_msg(called_issi, caller_issi, traffic_ts));
+    submit_stch_mac_u_signal_bl_ack(&mut test, 1);
+    test.run_stack(Some(1));
+
+    let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
+    assert_eq!(
+        addresses,
+        vec![TetraAddress::issi(called_issi)],
+        "EN 300 392-2 Annex D.4 and clauses 21.4.5/22.3.2.3: called-leg BL-ACK on assigned-channel STCH must reach LLC before FloorGranted"
+    );
+}
+
+#[test]
+fn test_private_simplex_open_replacement_clears_stale_ul_speaker_before_floor() {
+    debug::setup_logging_verbose();
+
+    let old_caller_issi = 0x4101;
+    let old_called_issi = 0x4102;
+    let new_called_issi = 0x4202;
+    let new_caller_issi = 0x4201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    test.submit_message(private_call_open_msg(old_caller_issi, old_called_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(1, old_caller_issi, old_called_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    // New Annex D.4 private setup replaces the same assigned channel. Before
+    // CMCE sends FloorGranted for the new call, ordinary addressless STCH must
+    // not inherit the stale speaker from the old call.
+    test.submit_message(private_call_open_msg(new_called_issi, new_caller_issi, traffic_ts));
+    submit_stch_mac_u_signal(&mut test);
+    test.run_stack(Some(1));
+
+    let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
+    assert!(
+        addresses.is_empty(),
+        "EN 300 392-2 clauses 14.5.1.2.1 and 21.4.5: a replaced private-simplex bearer must clear stale UL speaker state until the new FloorGranted arrives"
     );
 }
 
@@ -1222,10 +1612,9 @@ fn test_stch_mac_u_signal_ignores_floor_granted_for_non_participant_private_spea
     test.run_stack(Some(1));
 
     let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
-    assert_eq!(
-        addresses,
-        vec![TetraAddress::issi(caller_issi)],
-        "EN 300 392-2 clauses 14.5.1.2.1 and 21.4.5: STCH private-call signalling has no SSI field, so UMAC must not let a non-participant FloorGranted rewrite the inferred speaker"
+    assert!(
+        addresses.is_empty(),
+        "EN 300 392-2 clauses 14.5.1.2.1 and 21.4.5: STCH private-call signalling has no SSI field, so an invalid non-participant FloorGranted must not create or rewrite a private speaker"
     );
 }
 
@@ -1258,6 +1647,7 @@ fn test_stch_mac_u_signal_second_half_stolen_forwards_first_half_and_marks_lmac_
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc, TetraEntity::Lmac]);
 
     test.submit_message(private_call_open_msg(caller_issi, called_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(1, caller_issi, called_issi, traffic_ts));
     submit_stch_mac_u_signal_with_second_half(&mut test, true);
     test.run_stack(Some(1));
 
@@ -1939,13 +2329,17 @@ fn build_tma_cancel_req(req_handle: i32) -> SapMsg {
 }
 
 fn build_tma_unitdata_req(req_handle: i32, target_issi: u32) -> SapMsg {
+    build_tma_unitdata_req_with_payload(req_handle, target_issi, BitBuffer::from_bitstr("10101010"), None)
+}
+
+fn build_tma_unitdata_req_with_payload(req_handle: i32, target_issi: u32, pdu: BitBuffer, tx_reporter: Option<TxReporter>) -> SapMsg {
     SapMsg {
         sap: Sap::TmaSap,
         src: TetraEntity::Llc,
         dest: TetraEntity::Umac,
         msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
             req_handle,
-            pdu: BitBuffer::from_bitstr("10101010"),
+            pdu,
             main_address: TetraAddress::issi(target_issi),
             endpoint_id: 1,
             pdu_prio: 0,
@@ -1955,9 +2349,42 @@ fn build_tma_unitdata_req(req_handle: i32, target_issi: u32) -> SapMsg {
             stealing_repeats_flag: None,
             data_category: None,
             chan_alloc: None,
-            tx_reporter: None,
+            tx_reporter,
         }),
     }
+}
+
+fn build_p2p_d_setup_tma_req(req_handle: i32, calling_issi: u32, called_issi: u32, tx_reporter: TxReporter) -> SapMsg {
+    let mut cmce_sdu = BitBuffer::new_autoexpand(96);
+    DSetup {
+        call_identifier: 6,
+        call_time_out: CallTimeout::T60s,
+        hook_method_selection: false,
+        simplex_duplex_selection: false,
+        basic_service_information: BasicServiceInformation {
+            circuit_mode_type: CircuitModeType::TchS,
+            encryption_flag: false,
+            communication_type: CommunicationType::P2p,
+            slots_per_frame: None,
+            speech_service: Some(0),
+        },
+        transmission_grant: TransmissionGrant::NotGranted,
+        transmission_request_permission: false,
+        call_priority: 0,
+        notification_indicator: None,
+        temporary_address: None,
+        calling_party_address_ssi: Some(calling_issi),
+        calling_party_extension: None,
+        external_subscriber_number: None,
+        facility: None,
+        dm_ms_address: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut cmce_sdu)
+    .expect("serialize P2P D-SETUP");
+    cmce_sdu.seek(0);
+
+    build_tma_unitdata_req_with_payload(req_handle, called_issi, llc_wrapped_cmce_sdu(cmce_sdu), Some(tx_reporter))
 }
 
 #[test]
@@ -1993,7 +2420,7 @@ fn test_unsolicited_issi_downlink_does_not_set_random_access_ack_flag() {
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
 
     test.submit_message(test_sapmsg);
-    test.run_stack(Some(8));
+    test.run_stack(Some(80));
     let sink_msgs = test.dump_sinks();
     let mac_resource =
         first_mac_resource_for_addr(&sink_msgs, TetraAddress::issi(target_issi)).expect("expected MAC-RESOURCE addressed to target ISSI");
@@ -2001,6 +2428,253 @@ fn test_unsolicited_issi_downlink_does_not_set_random_access_ack_flag() {
     assert!(
         !mac_resource.random_access_flag,
         "EN 300 392-2 clause 21.4.3.1 random_access_flag must only acknowledge actual random access"
+    );
+}
+
+#[test]
+fn test_acked_channel_allocation_tma_carries_current_channel_ack_grant() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 0x3318;
+    let mut llc_pdu = BitBuffer::new_autoexpand(16);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut llc_pdu);
+    llc_pdu.write_bits(0b101010, 6);
+    llc_pdu.seek(0);
+
+    let mut assigned = [false; 4];
+    assigned[1] = true;
+    let test_prim = TmaUnitdataReq {
+        req_handle: 33,
+        pdu: llc_pdu,
+        main_address: TetraAddress::issi(target_issi),
+        endpoint_id: 1,
+        pdu_prio: 6,
+        stealing_permission: false,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(4),
+            timeslots: assigned,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: None,
+        }),
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(test_prim),
+    });
+    test.run_stack(Some(12));
+
+    let sink_msgs = test.dump_sinks();
+    let mac_resource = first_mac_resource_for_addr(&sink_msgs, TetraAddress::issi(target_issi))
+        .expect("acknowledged channel-allocation transfer should emit MAC-RESOURCE");
+    assert!(
+        mac_resource.chan_alloc_element.is_some(),
+        "sanity check: test vector must carry a channel allocation"
+    );
+    assert_eq!(
+        mac_resource.pos_of_grant, 0,
+        "EN 300 392-2 23.5.4.3 permits the BL-ACK slot grant on the current MCCH before the channel change"
+    );
+    let slot_grant = mac_resource
+        .slot_granting_element
+        .expect("acknowledged channel-allocation transfer must grant an uplink subslot for BL-ACK");
+    assert!(
+        matches!(
+            slot_grant.capacity_allocation,
+            BasicSlotgrantCapAlloc::FirstSubslotGranted | BasicSlotgrantCapAlloc::SecondSubslotGranted
+        ),
+        "a BL-ACK fits in one reserved subslot"
+    );
+    assert_ne!(
+        slot_grant.granting_delay,
+        BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage,
+        "D-CONNECT ACK/D-CONNECT setup progress must carry a real ACK opportunity"
+    );
+}
+
+#[test]
+fn test_acked_channel_allocation_stealing_tma_uses_assigned_channel_stch() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 2_260_082;
+    let called_issi = 2_260_618;
+    let traffic_ts = 2;
+    let req_handle = 34;
+    let mut llc_pdu = BitBuffer::new_autoexpand(24);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut llc_pdu);
+    llc_pdu.write_bits(0b10101010, 8);
+    llc_pdu.seek(0);
+
+    let mut assigned = [false; 4];
+    assigned[traffic_ts as usize - 1] = true;
+    let tx_reporter = TxReporter::new_unacked();
+    let test_prim = TmaUnitdataReq {
+        req_handle,
+        pdu: llc_pdu,
+        main_address: TetraAddress::issi(called_issi),
+        endpoint_id: 1,
+        pdu_prio: 6,
+        stealing_permission: true,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(4),
+            timeslots: assigned,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: None,
+        }),
+        tx_reporter: Some(tx_reporter.clone()),
+    };
+
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(private_call_open_msg(called_issi, caller_issi, traffic_ts));
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(test_prim),
+    });
+    test.run_stack(Some(4));
+
+    let sink_msgs = test.dump_sinks();
+    let stch_resource = mac_resources_for_addr(&sink_msgs, TetraAddress::issi(called_issi))
+        .into_iter()
+        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_some())
+        .map(|(_, resource)| resource)
+        .expect("assigned-channel recovery should emit STCH MAC-RESOURCE to called ISSI");
+    assert_eq!(
+        stch_resource
+            .chan_alloc_element
+            .as_ref()
+            .expect("STCH recovery must preserve channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    assert_eq!(
+        stch_resource.usage_marker,
+        Some(4),
+        "EN 300 392-2 clauses 14.5.3.1, 23.5 and 23.8.2.2: assigned-channel D-CONNECT ACK recovery must carry the traffic usage marker on STCH"
+    );
+    assert_eq!(tx_reporter.get_state(), TxState::Transmitted);
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, req_handle),
+            Some(TmaReport::SuccessReservedOrStealing)
+        ),
+        "complete assigned-channel STCH recovery should report reserved/stealing success"
+    );
+}
+
+#[test]
+fn test_assigned_channel_stch_recovery_survives_frame_18_gap() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 2_260_618;
+    let called_issi = 2_260_082;
+    let traffic_ts = 2;
+    let req_handle = 35;
+    let mut llc_pdu = BitBuffer::new_autoexpand(24);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut llc_pdu);
+    llc_pdu.write_bits(0b10101010, 8);
+    llc_pdu.seek(0);
+
+    let mut assigned = [false; 4];
+    assigned[traffic_ts as usize - 1] = true;
+    let tx_reporter = TxReporter::new_unacked();
+    let test_prim = TmaUnitdataReq {
+        req_handle,
+        pdu: llc_pdu,
+        main_address: TetraAddress::issi(called_issi),
+        endpoint_id: 1,
+        pdu_prio: 6,
+        stealing_permission: true,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(4),
+            timeslots: assigned,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: None,
+        }),
+        tx_reporter: Some(tx_reporter.clone()),
+    };
+
+    // MACSCHED_TX_AHEAD is one timeslot, so starting at f=18,t=1 makes the
+    // first finalized target f=18,t=2: the observed P2P TS2 recovery boundary.
+    let start = TdmaTime { h: 0, m: 1, f: 18, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(private_call_open_msg(called_issi, caller_issi, traffic_ts));
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(test_prim),
+    });
+
+    test.run_stack(Some(1));
+    let frame18_msgs = test.dump_sinks();
+    assert!(
+        mac_resources_for_addr(&frame18_msgs, TetraAddress::issi(called_issi))
+            .into_iter()
+            .all(|(logical_channel, _)| logical_channel != LogicalChannel::Stch),
+        "EN 300 392-2 fixed frame-18 handling must not emit assigned-channel STCH on f=18 TS2 without frame-18 receive support"
+    );
+    assert_eq!(
+        tx_reporter.get_state(),
+        TxState::Pending,
+        "queued assigned-channel recovery must survive the frame-18 traffic gap without a false transmission report"
+    );
+    assert!(
+        tma_report_for_handle(&frame18_msgs, req_handle).is_none(),
+        "UMAC must not report STCH recovery success until the queued block is actually emitted"
+    );
+
+    test.run_stack(Some(4));
+    let recovery_msgs = test.dump_sinks();
+    let stch_resource = mac_resources_for_addr(&recovery_msgs, TetraAddress::issi(called_issi))
+        .into_iter()
+        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_some())
+        .map(|(_, resource)| resource)
+        .expect("assigned-channel recovery should be retained and emitted on the next legal TS2 traffic opportunity");
+    assert_eq!(
+        stch_resource
+            .chan_alloc_element
+            .as_ref()
+            .expect("retained STCH recovery must preserve channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    assert_eq!(
+        stch_resource.usage_marker,
+        Some(4),
+        "retained D-CONNECT ACK recovery must keep the assigned traffic usage marker"
+    );
+    assert_eq!(tx_reporter.get_state(), TxState::Transmitted);
+    assert!(
+        matches!(
+            tma_report_for_handle(&recovery_msgs, req_handle),
+            Some(TmaReport::SuccessReservedOrStealing)
+        ),
+        "UMAC should report success once the retained STCH recovery reaches the legal traffic slot"
     );
 }
 
@@ -2167,6 +2841,179 @@ fn test_tma_report_tracking_is_bounded_under_stalled_downlink_completion() {
     assert!(
         tma_report_for_handle(&sink_msgs, base_handle).is_none(),
         "requests inside the cap should remain pending until transmitted, cancelled, discarded, or timeout guarded"
+    );
+}
+
+#[test]
+fn test_tma_report_timeout_cancels_queued_mac_resource() {
+    debug::setup_logging_verbose();
+
+    let target_handle = 30_100;
+    let trigger_handle = 30_101;
+    let target_issi = 2_260_618;
+    let trigger_issi = 2_260_619;
+    let start = TdmaTime::default().add_timeslots(2);
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(build_tma_unitdata_req(target_handle, target_issi));
+    test.deliver_all_messages();
+
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        assert_eq!(umac.debug_pending_tma_report_count_for_test(), 1);
+        let timeout = umac.debug_tma_report_pending_timeout_timeslots_for_test();
+        umac.debug_force_pending_tma_report_age_for_test(timeout + 1);
+    }
+
+    // Processing a new request drains timed-out retained reports before the
+    // scheduler gets another chance to emit the old one. EN 300 392-2 clause
+    // 20.4.1.1.3 reports the failed TMA request; the matching queued RF
+    // message must be cancelled as part of the same local failure handling.
+    test.submit_message(build_tma_unitdata_req(trigger_handle, trigger_issi));
+    test.deliver_all_messages();
+    let timeout_msgs = test.dump_sinks();
+    assert!(
+        matches!(
+            tma_report_for_handle(&timeout_msgs, target_handle),
+            Some(TmaReport::FragmentationFailure)
+        ),
+        "timed-out TMA request should report MAC fragmentation failure"
+    );
+    assert!(
+        first_mac_resource_for_addr(&timeout_msgs, TetraAddress::issi(target_issi)).is_none(),
+        "draining the timeout must not itself transmit the stale target request"
+    );
+
+    test.run_stack(Some(8));
+    let later_msgs = test.dump_sinks();
+    assert!(
+        first_mac_resource_for_addr(&later_msgs, TetraAddress::issi(target_issi)).is_none(),
+        "a TMA request reported failed must not remain queued for delayed RF transmission"
+    );
+    assert!(
+        first_mac_resource_for_addr(&later_msgs, TetraAddress::issi(trigger_issi)).is_some(),
+        "sanity check: later non-timed-out TMA traffic should still transmit normally"
+    );
+}
+
+#[test]
+fn test_standalone_ack_only_bl_ack_without_reporter_does_not_retain_tma_report() {
+    debug::setup_logging_verbose();
+
+    let req_handle = 30_150;
+    let target_issi = 2_260_620;
+    let start = TdmaTime::default().add_timeslots(2);
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(build_tma_unitdata_req_with_payload(
+        req_handle,
+        target_issi,
+        bl_ack_tma_sdu_for_test(0),
+        None,
+    ));
+    test.deliver_all_messages();
+
+    let pending_count = {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.debug_pending_tma_report_count_for_test()
+    };
+    assert_eq!(
+        pending_count, 0,
+        "standalone ACK-only BL-ACK has no service reporter and must not retain local pending TMA state"
+    );
+
+    test.run_stack(Some(8));
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        tma_report_for_handle(&sink_msgs, req_handle).is_none(),
+        "ACK-only BL-ACK without a TxReporter must not synthesize a later TMA report"
+    );
+}
+
+#[test]
+fn test_eg7_p2p_d_setup_preempts_ordinary_backlog_at_receive_window() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let receive_window = TdmaTime { h: 0, m: 1, f: 3, t: 1 };
+    let calling_issi = 2_260_082;
+    let called_issi = 2_260_618;
+    let ordinary_issi = 9_000_001;
+    let d_setup_handle = 30_202;
+    let d_setup_reporter = TxReporter::new_unacked();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    {
+        let mut state = test.config.state_write();
+        state.energy_saving.insert(
+            called_issi,
+            EnergySavingAssignment {
+                mode: 7,
+                frame: Some(receive_window.f),
+                multiframe: Some(receive_window.m),
+                awake_until: None,
+                suspension_count: 0,
+            },
+        );
+    }
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(build_tma_unitdata_req_with_payload(
+        30_201,
+        ordinary_issi,
+        BitBuffer::from_bitstr(&alternating_bits(4096)),
+        None,
+    ));
+    test.submit_message(build_p2p_d_setup_tma_req(
+        d_setup_handle,
+        calling_issi,
+        called_issi,
+        d_setup_reporter.clone(),
+    ));
+
+    test.run_stack(Some(5));
+    let sink_msgs = test.dump_sinks();
+    let receive_window_pdus = downlink_mac_pdus_at(&sink_msgs, receive_window);
+    let first_resource = receive_window_pdus
+        .iter()
+        .find_map(|pdu| match pdu {
+            DownlinkMacPdu::Resource(LogicalChannel::SchF, resource) => Some(resource),
+            _ => None,
+        })
+        .unwrap_or_else(|| {
+            panic!("expected a SCH/F MAC-RESOURCE at the EG7 receive window {receive_window}; observed {receive_window_pdus:?}")
+        });
+
+    assert!(
+        first_resource
+            .addr
+            .is_some_and(|addr| mac_resource_matches_addr(addr, TetraAddress::issi(called_issi))),
+        "EN 300 392-2 clauses 14.5.1.1.1 and 23.5.2.2.7: once the EG7 called MS is listening, P2P D-SETUP must preempt ordinary SCH/F backlog; observed first resource {first_resource:?}"
+    );
+    assert_eq!(
+        d_setup_reporter.get_state(),
+        TxState::Transmitted,
+        "D-SETUP reporter should complete when the MAC-RESOURCE is emitted at the called MS receive window"
+    );
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, d_setup_handle),
+            Some(TmaReport::SuccessReservedOrStealing)
+        ),
+        "complete D-SETUP transmission should emit TMA success before the local pending-report guard"
     );
 }
 
@@ -2459,6 +3306,57 @@ fn test_tma_unitdata_scheduler_discard_emits_fragmentation_failure_report() {
 }
 
 #[test]
+fn test_dl_circuit_close_discards_pending_stch_stealing_reporter() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 30135;
+    let peer_issi = 30136;
+    let req_handle = 52;
+    let reporter = TxReporter::new_unacked();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(private_call_open_msg(target_issi, peer_issi, 2));
+    test.deliver_all_messages();
+
+    let mut stealing_req =
+        build_tma_unitdata_req_with_payload(req_handle, target_issi, BitBuffer::from_bitstr("10101010"), Some(reporter.clone()));
+    let SapMsgInner::TmaUnitdataReq(prim) = &mut stealing_req.msg else {
+        panic!("expected TMA-UNITDATA.req");
+    };
+    prim.stealing_permission = true;
+    prim.pdu_prio = 5;
+
+    test.submit_message(stealing_req);
+    test.deliver_all_messages();
+    assert_eq!(
+        reporter.get_state(),
+        TxState::Pending,
+        "test setup should leave the STCH stealing block queued but not yet emitted"
+    );
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Close(Direction::Dl, 2)),
+    });
+    test.deliver_all_messages();
+    assert_eq!(
+        reporter.get_state(),
+        TxState::Discarded,
+        "closing the DL circuit must discard queued STCH stealing instead of leaving it for pending-report timeout"
+    );
+
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        matches!(tma_report_for_handle(&sink_msgs, req_handle), Some(TmaReport::FragmentationFailure)),
+        "discarded queued STCH stealing should surface as the standard MAC fragmentation failure report"
+    );
+}
+
+#[test]
 fn test_all_ones_broadcast_fragments_wait_for_full_active_eg_batch_without_t210() {
     debug::setup_logging_verbose();
 
@@ -2577,6 +3475,75 @@ fn test_all_ones_broadcast_fragments_wait_for_full_active_eg_batch_without_t210(
             "EN 300 392-2 clause 23.7.6 excludes all-ones broadcast from T.210 suspension"
         );
     }
+}
+
+#[test]
+fn test_all_ones_mle_bl_udata_reports_success_after_active_eg_batch() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime { t: 3, f: 2, m: 1, h: 0 };
+    let req_handle = 58;
+    let all_ones_gssi = 0xFF_FFFF;
+    let issi = 1401;
+    let tx_reporter = TxReporter::new_unacked();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    {
+        let mut state = test.config.state_write();
+        state.subscribers.register(issi);
+        state.energy_saving.insert(
+            issi,
+            EnergySavingAssignment {
+                mode: 1,
+                frame: Some(3),
+                multiframe: Some(1),
+                awake_until: None,
+                suspension_count: 0,
+            },
+        );
+    }
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle,
+            pdu: llc_wrapped_mle_sdu(75),
+            main_address: TetraAddress::new(all_ones_gssi, SsiType::Gssi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: Some(tx_reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(8));
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        downlink_mac_pdus_at(&sink_msgs, TdmaTime { t: 1, f: 3, m: 1, h: 0 })
+            .iter()
+            .any(|pdu| matches!(
+                pdu,
+                DownlinkMacPdu::Resource(LogicalChannel::SchF, resource)
+                    if resource.addr.is_some_and(|addr| addr.ssi == all_ones_gssi)
+            )),
+        "all-ones MLE BL-UDATA should transmit in the active EG receive frame"
+    );
+    assert_eq!(tx_reporter.get_state(), TxState::Transmitted);
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, req_handle),
+            Some(TmaReport::SuccessReservedOrStealing)
+        ),
+        "EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.4.1 require a complete-transmission report after the BL-UDATA MAC request is sent"
+    );
 }
 
 #[test]
@@ -2999,7 +3966,9 @@ fn test_private_floor_grant_stch_carries_preserved_random_access_ack() {
 
     let ack_only = resources
         .iter()
-        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_none())
+        .find(|(logical_channel, resource)| {
+            *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_none() && resource.usage_marker.is_none()
+        })
         .expect("expected first ACK-only STCH for the requester");
     assert!(
         ack_only.1.random_access_flag,
@@ -3009,25 +3978,25 @@ fn test_private_floor_grant_stch_carries_preserved_random_access_ack() {
     let grant = resources
         .iter()
         .find(|(logical_channel, resource)| {
-            *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_some()
+            *logical_channel == LogicalChannel::Stch
+                && resource.chan_alloc_element.is_none()
+                && resource.random_access_flag
+                && resource.usage_marker == Some(5)
         })
-        .unwrap_or_else(|| panic!(
-            "expected D-TX GRANTED STCH with channel allocation; ack_reporter={:?}; grant_reporter={:?}; resources={resources:?}; all_pdus={all_pdus:?}",
-            ack_reporter.get_state(),
-            grant_reporter.get_state()
-        ));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected private D-TX GRANTED STCH without redundant MAC channel allocation; ack_reporter={:?}; grant_reporter={:?}; resources={resources:?}; all_pdus={all_pdus:?}",
+                ack_reporter.get_state(),
+                grant_reporter.get_state()
+            )
+        });
     assert!(
         grant.1.random_access_flag,
         "EN 300 392-2 clauses 21.4.3.1, 14.5.1.2.1 b) and 23.5.2.2.1: the private-call floor grant STCH should carry the random-access ACK that lets the requesting MS continue onto the assigned channel"
     );
-    assert_eq!(
-        grant
-            .1
-            .chan_alloc_element
-            .as_ref()
-            .expect("grant should keep channel allocation")
-            .ul_dl_assigned,
-        UlDlAssignment::Both
+    assert!(
+        grant.1.chan_alloc_element.is_none(),
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2 and 23.5: when the private traffic channel is already assigned, D-TX GRANTED may switch U-plane without repeating a MAC channel allocation"
     );
 }
 

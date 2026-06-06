@@ -3064,10 +3064,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.55"));
+        assert!(rendered.contains("Nexus-BS v0.1.56"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.55"));
+        assert!(rendered.contains("Nexus-BS/v0.1.56"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -3122,9 +3122,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.55");
-        assert_eq!(product.version_tag, "v0.1.55");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.55");
+        assert_eq!(product.version, "0.1.56");
+        assert_eq!(product.version_tag, "v0.1.56");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.56");
     }
 
     #[test]

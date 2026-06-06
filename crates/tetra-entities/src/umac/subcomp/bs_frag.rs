@@ -253,7 +253,12 @@ impl BsFragger {
         if self.is_fully_transmitted
             && let Some(tx_reporter) = &self.tx_reporter
         {
-            tx_reporter.mark_transmitted();
+            if !tx_reporter.try_mark_transmitted() {
+                tracing::debug!(
+                    "BsFragger: ignoring late complete-transmission report for reporter already in {:?}",
+                    tx_reporter.get_state()
+                );
+            }
         }
 
         self.is_fully_transmitted
@@ -264,9 +269,8 @@ impl Drop for BsFragger {
     fn drop(&mut self) {
         if !self.is_fully_transmitted
             && let Some(tx_reporter) = &self.tx_reporter
-            && tx_reporter.get_state() == tetra_core::TxState::Pending
         {
-            tx_reporter.mark_discarded();
+            tx_reporter.try_mark_discarded();
         }
     }
 }
@@ -463,6 +467,34 @@ mod tests {
         assert!(
             reconstructed.starts_with(vec),
             "Original vec should be contained in reconstructed string"
+        );
+    }
+
+    #[test]
+    fn test_late_fragment_completion_after_discard_is_ignored() {
+        debug::setup_logging_verbose();
+        let vec = "01010110010011000010101010010010110101010110010011001011111110101011001010010110111001011111111111100010011000000011010011001110010111110010100100010111010110000010010001101000011000000111101011010001001111001110110100000101010111110100010000100101001100011110010111001010101001110110111010001001101101111100111001000001111100101010000010111";
+        let pdu = get_default_resource();
+        let sdu = BitBuffer::from_bitstr(vec);
+        let reporter = TxReporter::new_unacked();
+        let mut fragger = BsFragger::new(pdu, sdu, Some(reporter.clone()));
+
+        let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+        let done = fragger.get_next_chunk(&mut mac_block);
+        assert!(!done, "sanity check: the test vector must fragment");
+        reporter.mark_discarded();
+
+        for _ in 0..4 {
+            let mut mac_block = BitBuffer::new(SCH_HD_CAP);
+            if fragger.get_next_chunk(&mut mac_block) {
+                break;
+            }
+        }
+
+        assert_eq!(
+            reporter.get_state(),
+            TxState::Discarded,
+            "a stale MAC-END completion after local discard must not resurrect or panic the reporter"
         );
     }
 

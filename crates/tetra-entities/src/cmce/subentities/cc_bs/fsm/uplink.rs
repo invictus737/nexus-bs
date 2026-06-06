@@ -508,6 +508,7 @@ impl CcBsSubentity {
             // the already assigned traffic channel remains valid for FACCH and
             // receive audio; UMAC's FloorGranted control gates the active UL
             // speaker by ISSI.
+            self.cancel_matching_individual_tx_ceased_tail_drain(call_id, requesting_party.ssi);
             if let Some(c) = self.individual_calls.get_mut(&call_id) {
                 c.set_floor_holder(requesting_party.ssi);
             }
@@ -727,9 +728,15 @@ impl CcBsSubentity {
         let call_id = pdu.call_identifier;
         let disconnect_cause = pdu.disconnect_cause;
 
-        tracing::info!("U-RELEASE: call_id={} cause={}", call_id, disconnect_cause);
+        tracing::info!("U-RELEASE: call_id={} from ISSI {} cause={}", call_id, sender.ssi, disconnect_cause);
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
-            tracing::info!("U-RELEASE (individual) call_id={} cause={}", call_id, disconnect_cause);
+            tracing::info!(
+                "U-RELEASE (individual) call_id={} from ISSI {} state={:?} cause={}",
+                call_id,
+                sender.ssi,
+                call_snapshot.state,
+                disconnect_cause
+            );
             if let Some((pending_cause, release_to_issi)) =
                 self.take_individual_disconnect_delivery_release_if_awaited_by(call_id, sender.ssi)
             {
@@ -831,7 +838,13 @@ impl CcBsSubentity {
         let disconnect_cause = pdu.disconnect_cause;
 
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
-            tracing::info!("U-DISCONNECT (individual) call_id={} cause={}", call_id, disconnect_cause);
+            tracing::info!(
+                "U-DISCONNECT (individual) call_id={} from ISSI {} state={:?} cause={}",
+                call_id,
+                sender.ssi,
+                call_snapshot.state,
+                disconnect_cause
+            );
             if matches!(call_snapshot.state, IndividualCallState::DisconnectPending { .. }) {
                 tracing::debug!(
                     "U-DISCONNECT ignored for pending individual disconnect call_id={} from ISSI {}; expected U-RELEASE response to D-DISCONNECT",
@@ -867,32 +880,13 @@ impl CcBsSubentity {
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
                 if !call_snapshot.simplex_duplex {
-                    let caller_clearing_called_peer =
-                        sender.ssi == call_snapshot.calling_addr.ssi && peer_issi == call_snapshot.called_addr.ssi;
-                    let peer_clear = if caller_clearing_called_peer || call_snapshot.peer_is_current_or_last_floor_holder(peer_issi) {
-                        // EN 300 392-2 clause 14.5.1.3.1 allows the SwMI to
-                        // inform the other individual-call MS by D-RELEASE as
-                        // an alternative to D-DISCONNECT. For local simplex
-                        // MO private calls, clear the called MS with a SwMI
-                        // end-call D-RELEASE instead of making it enter a
-                        // D-DISCONNECT -> U-RELEASE response exchange while
-                        // the traffic bearer is draining.
-                        IndividualDisconnectPeerClear::Release
-                    } else {
-                        IndividualDisconnectPeerClear::Disconnect
-                    };
-                    let peer_disconnect_cause = match peer_clear {
-                        IndividualDisconnectPeerClear::Release => DisconnectCause::SwmiRequestedDisconnection,
-                        IndividualDisconnectPeerClear::Disconnect => disconnect_cause,
-                    };
-                    self.begin_individual_disconnect_tail_drain(
-                        call_id,
-                        sender,
-                        peer_issi,
-                        disconnect_cause,
-                        peer_disconnect_cause,
-                        peer_clear,
-                    );
+                    // EN 300 392-2 clauses 14.5.1.3.1 and 14.5.1.3.3:
+                    // the MS that sends U-DISCONNECT waits for D-RELEASE;
+                    // the SwMI may inform the peer by D-RELEASE or
+                    // D-DISCONNECT. Local simplex uses peer D-RELEASE after
+                    // the bearer tail drain because D-RELEASE is final and
+                    // expects no peer U-RELEASE response.
+                    self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause);
                     return;
                 }
                 if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {
@@ -904,6 +898,18 @@ impl CcBsSubentity {
             }
 
             self.release_individual_call(queue, call_id, disconnect_cause);
+            return;
+        }
+
+        if self.send_pending_individual_release_direct_ack(
+            queue,
+            call_id,
+            sender,
+            ul_handle,
+            ul_link_id,
+            ul_endpoint_id,
+            "late U-DISCONNECT",
+        ) {
             return;
         }
 

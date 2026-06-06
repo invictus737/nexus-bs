@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.55 example configuration
+# Nexus-BS v0.1.56 example configuration
 #
 # This file is intentionally valid as-is so it can be parsed by tests and used
 # as a clean starting point. Before transmitting, edit frequencies, MCC/MNC,
@@ -38,7 +38,7 @@ service_name = "nexus-bs"
 
 [phy_io]
 
-# RF backend. Nexus-BS v0.1.55 supports the direct SoapySDR backend here.
+# RF backend. Nexus-BS v0.1.56 supports the direct SoapySDR backend here.
 # Keep this value exactly as shown unless a new backend is implemented.
 backend = "SoapySdr"
 
@@ -116,30 +116,22 @@ location_area = 2
 colour_code = 1
 
 # IANA timezone for time broadcasting via D-NWRK-BROADCAST. When set, the BS will
-# broadcast UTC time and local time offset once per hyperframe (~61s) so that
+# broadcast UTC time and local time offset twice per hyperframe (~30.6s) so that
 # radios can synchronize their clocks. Daylight saving time is handled automatically.
 # timezone = "Europe/Bucharest"
 
-# Local SSI ranges for this cell. Traffic for these ranges will not leave the cell.
-# Overrides any settings in the brew section, if enabled.
-# Incoming brew traffic on these ranges will also be rejected.
+# Local SSI/GSSI exceptions for this cell. Traffic for these SSIs/GSSIs will not
+# leave the cell. Overrides any settings in the brew section, if enabled.
+# Incoming brew traffic on these values will also be rejected.
 # The end of the range is INCLUSIVE — the end number IS in the range.
 local_ssi_ranges = [
-    [0, 90],
-    # Lab/demo ISSIs used by Nexus-BS private-call and WAP SDS tests.
-    # Keep only ranges that you are authorized to serve locally.
-    [2260000, 2269999],
+    [1, 90],
+    [226333, 226333],
 ]
 
-# Optional restart recovery seed list. After Nexus-BS restarts, MM sends
-# D-LOCATION-UPDATE-COMMAND to these local ISSIs so radios that are still
-# camped on the cell re-register and refresh group affiliations.
-# The runtime cache also remembers successfully registered local ISSIs.
-restart_recovery_issis = [
-    2260082,
-    2260616,
-    2260618,
-]
+# Optional restart recovery seed list. Normally omit this: Nexus-BS auto-manages
+# a volatile subscriber cache beside the runtime config and probes previously
+# attached terminals after service restart without static ISSI entries.
 
 # Optional GSSI provisioning policy for MM group attachment.
 # Leave commented to accept dynamic scan-list groups from radios.
@@ -255,7 +247,7 @@ energy_saving_mode = "eg3"
 # [cell_info.home_mode_display]
 # source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
 # interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
-# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text; 220/0xDC vendor allowed)
+# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text)
 # text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
 # text = "Nexus-BS"               # Text shown on radio display
 ###############################################################################
@@ -271,7 +263,7 @@ energy_saving_mode = "eg3"
 # [cell_info.sds_broadcast]
 # source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
 # interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
-# protocol_id = 220               # SDS-TL transport PID (default: 130/0x82; 220/0xDC vendor allowed)
+# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text)
 # text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
 # text = "Nexus-BS AUX"           # Text payload to broadcast
 ###############################################################################
@@ -279,12 +271,18 @@ energy_saving_mode = "eg3"
 ###############################################################################
 # WAP MVP OVER SDS
 #
-# Nexus-BS v0.1.55 includes a WAP MVP as an SDS Type4/WML delivery path driven
+# Nexus-BS v0.1.56 includes a WAP MVP as an SDS Type4/WML delivery path driven
 # by the control command, not as an always-on SNDCP/IP packet-data bearer.
 #
-# CLI examples, assuming the control endpoint is enabled:
-#   nexus-bs-control sendwap 16777215 2260082 false
-#   nexus-bs-control sendwapcolor 16777215 2260082 false
+# CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
+# nexus-bs-control@<user>.service endpoint is enabled:
+#   ./nexus-bs-control sendwap 16777215 2260618 false
+#   ./nexus-bs-control sendwapcolor 16777215 2260618 false
+#
+# Advanced override variables for non-default service users/runtimes:
+#   NEXUS_BS_USER=<user>
+#   NEXUS_BS_RUN_DIR=/run/nexus-bs-<user>
+#   NEXUS_BS_CONTROL_FIFO=/run/nexus-bs-<user>/control.commands
 #
 # Default WML page text:
 #   Hello! You are running Nexus-BS. Gretings and 73! from Chris YO3TCO!
@@ -380,7 +378,7 @@ bind = "0.0.0.0"
 # password = "change-this-before-exposing-the-dashboard"
 #
 # OPTIONAL: reserved path to the Nexus-BS git source directory for future OTA
-# update support. OTA update is disabled in Nexus-BS v0.1.55, and the dashboard
+# update support. OTA update is disabled in Nexus-BS v0.1.56, and the dashboard
 # button is grayed out. Keep this unset unless you are testing OTA code locally.
 # source_dir = "/opt/nexus-bs"
 

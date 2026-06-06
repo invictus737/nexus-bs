@@ -159,6 +159,13 @@ pub struct BrewEntity {
 }
 
 impl BrewEntity {
+    fn brew_routable_groups(&self, groups: impl IntoIterator<Item = u32>) -> Vec<u32> {
+        groups
+            .into_iter()
+            .filter(|gssi| super::is_brew_gssi_routable(&self.config, *gssi))
+            .collect()
+    }
+
     /// Create a new BrewEntity with the given transport.
     ///
     /// The transport is moved into a worker thread. Any [`NetworkTransport`]
@@ -463,15 +470,15 @@ impl BrewEntity {
     fn handle_subscriber_update(&mut self, update: MmSubscriberUpdate) {
         let issi = update.issi;
         let groups = update.groups;
-        let routable = super::is_brew_issi_routable(&self.config, issi);
+        let issi_routable = super::is_brew_issi_routable(&self.config, issi);
 
         match update.action {
             BrewSubscriberAction::Register => {
                 self.subscriber_groups.entry(issi).or_insert_with(HashSet::new);
-                if routable && self.connected {
+                if issi_routable && self.connected {
                     tracing::info!("BrewEntity: subscriber register issi={} → REGISTER", issi);
                     let _ = self.command_sender.send(BrewCommand::RegisterSubscriber { issi });
-                } else if !routable {
+                } else if !issi_routable {
                     tracing::debug!("BrewEntity: subscriber register issi={} (filtered, not sent to Brew)", issi);
                 } else {
                     // routable but disconnected — affiliations replayed on reconnect via resync
@@ -484,38 +491,48 @@ impl BrewEntity {
                     .remove(&issi)
                     .map(|g| g.into_iter().collect())
                     .unwrap_or_default();
-                if routable && self.connected {
+                let existing_groups = self.brew_routable_groups(existing_groups);
+                let had_group_subscription = !existing_groups.is_empty();
+                if (issi_routable || had_group_subscription) && self.connected {
                     tracing::info!("BrewEntity: subscriber deregister issi={} → DEAFFILIATE + DEREGISTER", issi);
-                    if !existing_groups.is_empty() {
+                    if had_group_subscription {
                         let _ = self.command_sender.send(BrewCommand::DeaffiliateGroups {
                             issi,
                             groups: existing_groups,
                         });
                     }
                     let _ = self.command_sender.send(BrewCommand::DeregisterSubscriber { issi });
-                } else if !routable {
+                } else if !issi_routable {
                     tracing::debug!("BrewEntity: subscriber deregister issi={} (filtered, not sent to Brew)", issi);
                 } else {
                     tracing::debug!("BrewEntity: subscriber deregister issi={} cached while Brew disconnected", issi);
                 }
             }
             BrewSubscriberAction::Affiliate => {
+                let routable_groups = self.brew_routable_groups(groups);
                 let entry = self.subscriber_groups.entry(issi).or_insert_with(HashSet::new);
                 let mut new_groups = Vec::new();
-                for gssi in groups {
+                for gssi in routable_groups {
                     if entry.insert(gssi) {
                         new_groups.push(gssi);
                     }
                 }
-                if !new_groups.is_empty() && routable && self.connected {
-                    tracing::info!("BrewEntity: affiliate issi={} → AFFILIATE groups={:?}", issi, new_groups);
+                if !new_groups.is_empty() && self.connected {
+                    if issi_routable {
+                        tracing::info!("BrewEntity: affiliate issi={} → AFFILIATE groups={:?}", issi, new_groups);
+                    } else {
+                        // Interconnect policy, not an ETSI air-interface rule:
+                        // local_ssi_ranges keeps private ISSI calls local, but a
+                        // local MS may still subscribe the cell to Brew-routable
+                        // talkgroups such as GSSI 91.
+                        tracing::info!(
+                            "BrewEntity: local ISSI {} group-subscribe → REGISTER + AFFILIATE groups={:?}",
+                            issi,
+                            new_groups
+                        );
+                        let _ = self.command_sender.send(BrewCommand::RegisterSubscriber { issi });
+                    }
                     let _ = self.command_sender.send(BrewCommand::AffiliateGroups { issi, groups: new_groups });
-                } else if !new_groups.is_empty() && !routable {
-                    tracing::debug!(
-                        "BrewEntity: affiliate issi={} groups={:?} (filtered, not sent to Brew)",
-                        issi,
-                        new_groups
-                    );
                 } else if !new_groups.is_empty() {
                     tracing::debug!(
                         "BrewEntity: affiliate issi={} groups={:?} cached until Brew reconnect",
@@ -533,18 +550,13 @@ impl BrewEntity {
                         }
                     }
                 }
-                if !removed_groups.is_empty() && routable && self.connected {
+                let removed_groups = self.brew_routable_groups(removed_groups);
+                if !removed_groups.is_empty() && self.connected {
                     tracing::info!("BrewEntity: deaffiliate issi={} → DEAFFILIATE groups={:?}", issi, removed_groups);
                     let _ = self.command_sender.send(BrewCommand::DeaffiliateGroups {
                         issi,
                         groups: removed_groups,
                     });
-                } else if !removed_groups.is_empty() && !routable {
-                    tracing::debug!(
-                        "BrewEntity: deaffiliate issi={} groups={:?} (filtered, not sent to Brew)",
-                        issi,
-                        removed_groups
-                    );
                 } else if !removed_groups.is_empty() {
                     tracing::debug!(
                         "BrewEntity: deaffiliate issi={} groups={:?} cached while Brew disconnected",
@@ -564,15 +576,15 @@ impl BrewEntity {
 
     fn resync_subscribers(&self) {
         for (issi, groups) in &self.subscriber_groups {
-            if !super::is_brew_issi_routable(&self.config, *issi) {
+            let gssi_list = self.brew_routable_groups(groups.iter().copied());
+            if !super::is_brew_issi_routable(&self.config, *issi) && gssi_list.is_empty() {
                 tracing::debug!("BrewEntity: resync skipping issi={} (filtered)", issi);
                 continue;
             }
             let _ = self.command_sender.send(BrewCommand::RegisterSubscriber { issi: *issi });
-            if groups.is_empty() {
+            if gssi_list.is_empty() {
                 tracing::info!("BrewEntity: resync issi={} — registered, no group affiliations", issi);
             } else {
-                let gssi_list: Vec<u32> = groups.iter().copied().collect();
                 tracing::info!(
                     "BrewEntity: resync issi={} — registered, affiliating {} groups: {:?}",
                     issi,
@@ -1344,11 +1356,8 @@ impl BrewEntity {
             }
         }
 
-        if !super::is_brew_issi_routable(&self.config, source_issi) {
-            tracing::debug!(
-                "BrewEntity: suppressing GROUP_TX for source_issi={} (filtered, not sent to Brew)",
-                source_issi
-            );
+        if !super::is_brew_gssi_routable(&self.config, dest_gssi) {
+            tracing::debug!("BrewEntity: suppressing GROUP_TX for gssi={} (not Brew-routable)", dest_gssi);
             return;
         }
 
@@ -1772,8 +1781,84 @@ impl BrewEntity {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
+    use crossbeam_channel::{Receiver, unbounded};
+    use tetra_config::bluestation::{SharedConfig, from_toml_str};
+    use tetra_core::{TdmaTime, TxReporter};
+    use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+
     use super::BrewEntity;
-    use tetra_core::TxReporter;
+    use crate::net_brew::worker::{BrewCommand, BrewEvent};
+
+    fn brew_test_config() -> SharedConfig {
+        let toml = format!(
+            "{}\n\n[brew]\nhost = \"core.tetrapack.online\"\nport = 443\ntls = true\nusername = 226008230\npassword = \"test\"\n",
+            include_str!("../../../../example_config/config.toml")
+        );
+        let cfg = from_toml_str(&toml).expect("brew test config parses");
+        SharedConfig::from_parts(cfg, None)
+    }
+
+    fn brew_entity_without_worker() -> (BrewEntity, Receiver<BrewCommand>) {
+        let config = brew_test_config();
+        let (_event_sender, event_receiver) = unbounded::<BrewEvent>();
+        let (command_sender, command_receiver) = unbounded::<BrewCommand>();
+        let brew_config = config.config().brew.clone().expect("brew config");
+
+        (
+            BrewEntity {
+                config,
+                brew_config,
+                dltime: TdmaTime::default(),
+                event_receiver,
+                command_sender,
+                active_calls: HashMap::new(),
+                dl_jitter: HashMap::new(),
+                draining_jitter: HashMap::new(),
+                hanging_calls: HashMap::new(),
+                ul_forwarded: HashMap::new(),
+                subscriber_groups: HashMap::new(),
+                connected: true,
+                telemetry_sink: None,
+                rssi_last_sent: HashMap::new(),
+                pending_sds_reports: HashMap::new(),
+                worker_handle: None,
+            },
+            command_receiver,
+        )
+    }
+
+    fn subscriber_update(issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) -> MmSubscriberUpdate {
+        MmSubscriberUpdate { issi, groups, action }
+    }
+
+    fn assert_register(cmd: BrewCommand, expected_issi: u32) {
+        match cmd {
+            BrewCommand::RegisterSubscriber { issi } => assert_eq!(issi, expected_issi),
+            other => panic!("expected RegisterSubscriber, got {other:?}"),
+        }
+    }
+
+    fn assert_affiliate(cmd: BrewCommand, expected_issi: u32, expected_groups: &[u32]) {
+        match cmd {
+            BrewCommand::AffiliateGroups { issi, groups } => {
+                assert_eq!(issi, expected_issi);
+                assert_eq!(groups, expected_groups);
+            }
+            other => panic!("expected AffiliateGroups, got {other:?}"),
+        }
+    }
+
+    fn assert_deaffiliate(cmd: BrewCommand, expected_issi: u32, expected_groups: &[u32]) {
+        match cmd {
+            BrewCommand::DeaffiliateGroups { issi, groups } => {
+                assert_eq!(issi, expected_issi);
+                assert_eq!(groups, expected_groups);
+            }
+            other => panic!("expected DeaffiliateGroups, got {other:?}"),
+        }
+    }
 
     #[test]
     fn sds_type4_rejects_length_indicator_above_etsi_limit() {
@@ -1875,6 +1960,91 @@ mod tests {
         lost.mark_transmitted();
         lost.mark_lost();
         assert_eq!(BrewEntity::sds_report_status_for_reporter(&lost), Some(1));
+    }
+
+    #[test]
+    fn runtime_issi_registers_and_subscribes_brew_routable_group() {
+        let (mut entity, rx) = brew_entity_without_worker();
+
+        entity.handle_subscriber_update(subscriber_update(2260616, Vec::new(), BrewSubscriberAction::Register));
+        assert_register(
+            rx.try_recv()
+                .expect("runtime subscriber register is forwarded for Brew interconnect"),
+            2260616,
+        );
+
+        entity.handle_subscriber_update(subscriber_update(2260616, vec![91], BrewSubscriberAction::Affiliate));
+
+        assert_affiliate(rx.try_recv().expect("runtime subscriber affiliates GSSI"), 2260616, &[91]);
+        assert!(rx.try_recv().is_err(), "only REGISTER then AFFILIATE expected");
+    }
+
+    #[test]
+    fn runtime_issi_group_subscription_deaffiliates_and_deregisters() {
+        let (mut entity, rx) = brew_entity_without_worker();
+
+        entity.handle_subscriber_update(subscriber_update(2260616, Vec::new(), BrewSubscriberAction::Register));
+        assert_register(rx.try_recv().expect("initial register"), 2260616);
+
+        entity.handle_subscriber_update(subscriber_update(2260616, vec![91], BrewSubscriberAction::Affiliate));
+        assert_affiliate(rx.try_recv().expect("initial affiliate"), 2260616, &[91]);
+
+        entity.handle_subscriber_update(subscriber_update(2260616, vec![91], BrewSubscriberAction::Deaffiliate));
+        assert_deaffiliate(rx.try_recv().expect("runtime group deaffiliate"), 2260616, &[91]);
+
+        entity.handle_subscriber_update(subscriber_update(2260616, vec![91], BrewSubscriberAction::Affiliate));
+        assert_affiliate(rx.try_recv().expect("second affiliate"), 2260616, &[91]);
+
+        entity.handle_subscriber_update(subscriber_update(2260616, Vec::new(), BrewSubscriberAction::Deregister));
+        assert_deaffiliate(rx.try_recv().expect("deregister deaffiliates active groups"), 2260616, &[91]);
+        match rx.try_recv().expect("deregister unregisters local group subscriber") {
+            BrewCommand::DeregisterSubscriber { issi } => assert_eq!(issi, 2260616),
+            other => panic!("expected DeregisterSubscriber, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resync_replays_runtime_issi_group_subscription() {
+        let (mut entity, rx) = brew_entity_without_worker();
+        entity.subscriber_groups.insert(2260616, HashSet::from([91]));
+
+        entity.resync_subscribers();
+
+        assert_register(rx.try_recv().expect("resync register"), 2260616);
+        assert_affiliate(rx.try_recv().expect("resync affiliate"), 2260616, &[91]);
+        assert!(rx.try_recv().is_err(), "only resync REGISTER + AFFILIATE expected");
+    }
+
+    #[test]
+    fn local_private_issi_group_tx_uses_gssi_routing_policy() {
+        let (mut entity, rx) = brew_entity_without_worker();
+
+        entity.handle_local_call_start(7, 2260616, 91, 2);
+
+        match rx.try_recv().expect("GSSI 91 GROUP_TX must be forwarded") {
+            BrewCommand::SendGroupTx {
+                source_issi,
+                dest_gssi,
+                priority,
+                service,
+                ..
+            } => {
+                assert_eq!(source_issi, 2260616);
+                assert_eq!(dest_gssi, 91);
+                assert_eq!(priority, 0);
+                assert_eq!(service, 0);
+            }
+            other => panic!("expected SendGroupTx, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_group_range_still_suppresses_group_tx_to_brew() {
+        let (mut entity, rx) = brew_entity_without_worker();
+
+        entity.handle_local_call_start(7, 2260616, 90, 2);
+
+        assert!(rx.try_recv().is_err(), "GSSI 90 is local by config and must not be sent to Brew");
     }
 }
 

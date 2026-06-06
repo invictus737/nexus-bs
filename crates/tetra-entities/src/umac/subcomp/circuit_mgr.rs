@@ -1,14 +1,42 @@
 use std::collections::VecDeque;
 
-use tetra_core::{Direction, PhyBlockNum};
+use tetra_core::{Direction, PhyBlockNum, TetraAddress};
 use tetra_saps::control::call_control::Circuit;
 
 pub const MAX_TX_DATA_BLOCKS_PER_TIMESLOT: usize = 18;
 
 #[derive(Debug)]
 pub enum CircuitTxBlock {
-    AcElp(Vec<u8>),
-    RawTchSHalfSlot { block_num: PhyBlockNum, type5_bits: Vec<u8> },
+    AcElp {
+        source_ul_ts: Option<u8>,
+        speaker_addr: Option<TetraAddress>,
+        block: Vec<u8>,
+    },
+    RawTchSHalfSlot {
+        source_ul_ts: Option<u8>,
+        speaker_addr: Option<TetraAddress>,
+        block_num: PhyBlockNum,
+        type5_bits: Vec<u8>,
+    },
+}
+
+impl CircuitTxBlock {
+    fn matches_source(&self, source_ul_ts: u8, source_addr: TetraAddress) -> bool {
+        let (block_source_ul_ts, speaker_addr) = match self {
+            Self::AcElp {
+                source_ul_ts,
+                speaker_addr,
+                ..
+            }
+            | Self::RawTchSHalfSlot {
+                source_ul_ts,
+                speaker_addr,
+                ..
+            } => (*source_ul_ts, *speaker_addr),
+        };
+
+        block_source_ul_ts == Some(source_ul_ts) && speaker_addr.is_none_or(|addr| addr == source_addr)
+    }
 }
 
 pub struct CircuitMgr {
@@ -125,6 +153,14 @@ impl CircuitMgr {
 
     /// Put a block in the queue for transmission on an associated channel
     pub fn put_block(&mut self, ts: u8, block: Vec<u8>) {
+        self.put_block_with_source(ts, None, None, block);
+    }
+
+    pub fn put_block_from_ul(&mut self, ts: u8, source_ul_ts: u8, speaker_addr: Option<TetraAddress>, block: Vec<u8>) {
+        self.put_block_with_source(ts, Some(source_ul_ts), speaker_addr, block);
+    }
+
+    fn put_block_with_source(&mut self, ts: u8, source_ul_ts: Option<u8>, speaker_addr: Option<TetraAddress>, block: Vec<u8>) {
         if !(1..=4).contains(&ts) {
             tracing::error!("CircuitMgr::put_block on invalid timeslot {}", ts);
             return;
@@ -133,10 +169,40 @@ impl CircuitMgr {
             tracing::warn!("CircuitMgr::put_block on inactive circuit {:?} {}", Direction::Dl, ts);
             return;
         }
-        self.push_tx_data_bounded(ts, CircuitTxBlock::AcElp(block), "ACELP");
+        self.push_tx_data_bounded(
+            ts,
+            CircuitTxBlock::AcElp {
+                source_ul_ts,
+                speaker_addr,
+                block,
+            },
+            "ACELP",
+        );
     }
 
     pub fn put_raw_tch_s_half_slot(&mut self, ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
+        self.put_raw_tch_s_half_slot_with_source(ts, None, None, block_num, type5_bits);
+    }
+
+    pub fn put_raw_tch_s_half_slot_from_ul(
+        &mut self,
+        ts: u8,
+        source_ul_ts: u8,
+        speaker_addr: Option<TetraAddress>,
+        block_num: PhyBlockNum,
+        type5_bits: Vec<u8>,
+    ) {
+        self.put_raw_tch_s_half_slot_with_source(ts, Some(source_ul_ts), speaker_addr, block_num, type5_bits);
+    }
+
+    fn put_raw_tch_s_half_slot_with_source(
+        &mut self,
+        ts: u8,
+        source_ul_ts: Option<u8>,
+        speaker_addr: Option<TetraAddress>,
+        block_num: PhyBlockNum,
+        type5_bits: Vec<u8>,
+    ) {
         if !(1..=4).contains(&ts) {
             tracing::error!("CircuitMgr::put_raw_tch_s_half_slot on invalid timeslot {}", ts);
             return;
@@ -145,7 +211,16 @@ impl CircuitMgr {
             tracing::warn!("CircuitMgr::put_raw_tch_s_half_slot on inactive circuit {:?} {}", Direction::Dl, ts);
             return;
         }
-        self.push_tx_data_bounded(ts, CircuitTxBlock::RawTchSHalfSlot { block_num, type5_bits }, "raw TCH/S");
+        self.push_tx_data_bounded(
+            ts,
+            CircuitTxBlock::RawTchSHalfSlot {
+                source_ul_ts,
+                speaker_addr,
+                block_num,
+                type5_bits,
+            },
+            "raw TCH/S",
+        );
     }
 
     fn push_tx_data_bounded(&mut self, ts: u8, block: CircuitTxBlock, label: &str) {
@@ -171,6 +246,17 @@ impl CircuitMgr {
         let dropped = queue.len();
         queue.clear();
         dropped
+    }
+
+    pub fn clear_tx_data_except_source(&mut self, ts: u8, source_ul_ts: u8, source_addr: TetraAddress) -> usize {
+        if !(1..=4).contains(&ts) {
+            tracing::warn!("CircuitMgr::clear_tx_data_except_source on invalid timeslot {}", ts);
+            return 0;
+        }
+        let queue = &mut self.tx_data[ts as usize - 1];
+        let before = queue.len();
+        queue.retain(|block| block.matches_source(source_ul_ts, source_addr));
+        before - queue.len()
     }
 
     /// Take a to-be-transmitted block from the queue
@@ -215,7 +301,9 @@ mod tests {
 
         assert_eq!(circuits.tx_data[1].len(), MAX_TX_DATA_BLOCKS_PER_TIMESLOT);
         match circuits.take_block(2).expect("bounded queue should retain latest ACELP blocks") {
-            CircuitTxBlock::AcElp(block) => assert_eq!(block, vec![3], "oldest overfed ACELP frames should be dropped before newer speech"),
+            CircuitTxBlock::AcElp { block, .. } => {
+                assert_eq!(block, vec![3], "oldest overfed ACELP frames should be dropped before newer speech")
+            }
             other => panic!("expected ACELP block, got {other:?}"),
         }
     }

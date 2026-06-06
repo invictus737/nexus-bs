@@ -1,5 +1,1083 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 01:46 EEST - Nexus-BS v0.1.56 release bump and private-simplex setup-floor correction
+
+Component in simple technical terms:
+
+- CMCE private-call setup is the BS logic that opens a private simplex call between two ISSIs.
+- `D-CONNECT ACKNOWLEDGE` is sent to the called radio; `D-CONNECT` is sent to the calling radio.
+- Their `transmission_grant` fields are not just cosmetic status: in private simplex they identify the setup-phase party allowed to transmit.
+- UMAC `FloorGranted` is the internal BS media scheduler command that opens the uplink speech path for the selected ISSI.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 require the setup connect PDUs to indicate which party may transmit.
+- EN 300 392-2 clause 14.5.1.2.1 b) treats this setup response as the initial transmit-permission path during setup; later in-call floor changes remain under `U-TX DEMAND` / `D-TX GRANTED`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- Bumped Nexus-BS crate, dashboard, control, telemetry, user-agent, docs, example config, and systemd text from `v0.1.55` to `v0.1.56`.
+- Restored setup grant polarity for private simplex:
+  - called-first: called `D-CONNECT ACKNOWLEDGE = Granted`, caller `D-CONNECT = GrantedToOtherUser`;
+  - caller-first: called `D-CONNECT ACKNOWLEDGE = GrantedToOtherUser`, caller `D-CONNECT = Granted`.
+- After the caller `D-CONNECT` is L2-ACKed, CMCE now seeds exactly one setup-time UMAC `FloorGranted` for the ISSI selected by the ETSI setup grant.
+- U-plane media is still blocked until both private-call setup legs have completed, so the BS does not open speech before caller-side setup delivery.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 168 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo test -p tetra-core --locked` -> 47 passed.
+- `cargo test -p tetra-entities net_control --locked` -> 22 passed.
+- `cargo test -p tetra-entities net_telemetry --locked` -> 8 passed, 5 ignored.
+- `cargo test -p tetra-entities net_dashboard --locked` -> 53 passed.
+- `cargo check -p tetra-core -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Commit the v0.1.56 release state.
+- Deploy direct to `/home/chris/nexus-bs` using local build only.
+- Clean volatile journal and request one structured private simplex test before reading logs.
+
+## 2026-06-07 01:42 EEST - Private simplex NotGranted regression reverted, setup floor still gated
+
+Component in simple technical terms:
+
+- CMCE private-call setup sends `D-CONNECT ACKNOWLEDGE` to the called radio and `D-CONNECT` to the caller.
+- The `transmission_grant` field is terminal-facing call-control state. Motorola MXP600 uses it to decide whether the private call identifier is valid/usable.
+- UMAC `FloorGranted` is internal BS scheduler state. It decides when Nexus-BS starts accepting/looping speech for one ISSI.
+
+RF regression found:
+
+- The previous patch made both simplex connect PDUs `TransmissionGrant::NotGranted`.
+- Live RF immediately proved this is not acceptable for Motorola MXP600:
+  - `2260616 -> 2260618`, call_id `4`.
+  - Called `D-CONNECT ACKNOWLEDGE` was L2-ACKed.
+  - Caller `D-CONNECT` was L2-ACKed.
+  - `2260618` then sent `U-DISCONNECT cause=InvalidCallIdentifier`.
+- A second attempt, call_id `5`, also completed silent setup but produced no useful `U-TX DEMAND`; the assigned channel later hit UL inactivity.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 say `D-CONNECT ACKNOWLEDGE` / `D-CONNECT` shall indicate which party is permitted to transmit.
+- EN 300 392-2 table 14.80 defines `Granted`, `NotGranted`, `RequestQueued`, and `GrantedToOtherUser`.
+- EN 300 392-2 clause 14.5.1.2.1 keeps later in-call transmit permission under `U-TX DEMAND` / `D-TX GRANTED`.
+- This patch restores the terminal-facing setup grant polarity but does not restore automatic BS UMAC floor seeding.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Restored simplex setup grant polarity:
+    - called-first: called `D-CONNECT ACKNOWLEDGE = Granted`, caller `D-CONNECT = GrantedToOtherUser`;
+    - caller-first: called `D-CONNECT ACKNOWLEDGE = GrantedToOtherUser`, caller `D-CONNECT = Granted`.
+  - Kept the internal `UMAC FloorGranted` withheld after caller `D-CONNECT` L2 ACK.
+  - The first BS media floor still requires explicit `U-TX DEMAND`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P tests to assert restored setup grants and zero setup-time UMAC floor.
+  - Kept explicit first-PTT tests proving `U-TX DEMAND` produces `D-TX GRANTED` to both parties and one UMAC floor.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `git diff --check` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs private_simplex --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 168 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo check -p tetra-entities --locked` passed.
+
+Next RF gate:
+
+- Deploy directly to testing and clean journal.
+- Test `2260616 -> 2260618` private simplex again.
+- Expected improvement versus failed `NotGranted` build: no `U-DISCONNECT InvalidCallIdentifier` from `2260618`.
+- Expected improvement versus setup-floor build: no log line `setup grant seeds initial floor` and no setup-time UMAC `FloorGranted` before real `U-TX DEMAND`.
+
+## 2026-06-07 01:33 EEST - Private simplex silent setup restored after RF static/no-voice report
+
+Component in simple technical terms:
+
+- CMCE individual call control is the BS private-call state machine: it sets up the call, tells both radios the call is active, handles PTT requests, and clears the call.
+- `D-CONNECT ACKNOWLEDGE` and `D-CONNECT` are call-control messages to the called and calling radios. Their `transmission_grant` field can switch a real radio's U-plane/audio path on.
+- UMAC `FloorGranted` is the internal scheduler command that actually names the ISSI allowed to send uplink speech on the assigned traffic channel.
+
+Issue covered:
+
+- RF test confirmed a remaining regression: the first PTT used to initiate a private simplex call opened the called-side audio channel with no voice/static.
+- Logs showed why: Nexus-BS sent setup `TransmissionGrant::Granted` / `GrantedToOtherUser` and emitted setup-time UMAC `FloorGranted` before any explicit `U-TX DEMAND`.
+- That made setup behave like an audio floor, while the desired real-terminal behavior is silent call opening/acceptance and voice only after a participant presses PTT inside the established call.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 allow `D-CONNECT ACKNOWLEDGE` / `D-CONNECT` to complete setup with transmission not granted, provided the MS is allowed to request transmission permission.
+- EN 300 392-2 clause 14.5.1.2.1 says the SwMI fully controls which MS may transmit; during call progress the MS requests permission with `U-TX DEMAND` and the SwMI answers with `D-TX GRANTED`.
+- EN 300 392-2 clause 14.5.1.4.1 says `Granted` / `GrantedToOtherUser` switch U-plane on; `NotGranted` keeps it off.
+- EN 300 392-2 table 14.81 value `0` means the MS is allowed to request transmission permission.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Private simplex `D-CONNECT ACKNOWLEDGE` and caller `D-CONNECT` now use `TransmissionGrant::NotGranted` with request permission allowed.
+  - Caller `D-CONNECT` L2 ACK still activates the private call, but no setup-time UMAC `FloorGranted` is emitted.
+  - First U-plane/audio floor now comes only from explicit participant `U-TX DEMAND`, which sends `D-TX GRANTED` to both private-call parties and then UMAC `FloorGranted`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated direct local P2P tests to assert silent setup: zero UMAC floor grants through `D-CONNECT` completion.
+  - Added/kept explicit first-PTT guards proving `U-TX DEMAND` after connect opens exactly one floor and notifies both radios.
+  - Kept Brew private-call tests separate because that path is network-origin/local media behavior and was not the RF failure under test.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `git diff --check` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs private_simplex --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 168 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo check -p tetra-entities --locked` passed.
+
+Next RF gate:
+
+- Deploy latest build directly to testing.
+- Clean volatile journal.
+- Test `2260616 -> 2260618` local private simplex.
+- Expected log shape:
+  - `D-CONNECT ACKNOWLEDGE` to `2260618` with `TransmissionGrant::NotGranted`.
+  - `D-CONNECT` to `2260616` with `TransmissionGrant::NotGranted`.
+  - no setup-time `private-simplex ... setup grant seeds initial floor` log and no UMAC `FloorGranted` until `U-TX DEMAND`.
+  - first real PTT after call establishment shows `U-TX DEMAND`, two `D-TX GRANTED` PDUs, and one UMAC `FloorGranted`.
+- Required RF result: first initiating PTT opens the private call silently on the other terminal, with no static/no-voice audio channel; voice starts only on the accepted/next PTT, release still shows proper call ended/disconnected state, and no BS/terminal crash.
+
+## 2026-06-07 01:16 EEST - RF P2P simplex log gate after setup-grant deploy
+
+Component in simple technical terms:
+
+- CMCE individual call control is the BS logic that accepts a private call setup, tells each terminal its role, handles PTT turns, and clears the call.
+- UMAC floor control is the radio scheduler part that gives one terminal permission to send speech on the assigned traffic channel.
+- `speech_present=true` in scheduler logs means the traffic channel is carrying detected speech frames, not only signalling.
+
+RF test observed:
+
+- Test route: local P2P simplex `2260616 -> 2260618`, call_id `7`.
+- Setup order matched the intended clause-scoped path:
+  - `U-SETUP` from `2260616` to `2260618`.
+  - Called leg `D-CONNECT ACKNOWLEDGE` to `2260618` with `TransmissionGrant::Granted`.
+  - Caller leg `D-CONNECT` to `2260616` with `TransmissionGrant::GrantedToOtherUser`.
+  - Call activation waited until caller `D-CONNECT` L2 ACK, then seeded initial UMAC floor for called ISSI `2260618`.
+- First seeded floor timed out on local UL inactivity after about 3 seconds with no uplink speech, before the first explicit `U-TX DEMAND`.
+- Later PTT turns from both `2260618` and `2260616` produced `U-TX DEMAND`, UMAC `FloorGranted`, `speech_present=true`, and tail-drained `D-TX CEASED`.
+- Call close from `2260616` produced `U-DISCONNECT` and `D-RELEASE` with `UserRequestedDisconnection` to both legs.
+- Service remained running: no Nexus-BS restart, no `No Answer`, no `Network trouble`, no `InvalidCallIdentifier`, no `PTT denied` in this P2P log window.
+
+Interpretation:
+
+- CMCE setup/release is improved and log-coherent for this RF gate.
+- Remaining ambiguity is subjective terminal behavior during the first seeded called-party floor: the log shows no uplink speech until the later explicit `U-TX DEMAND`; this may be normal if the called MS did not press PTT inside the initial floor window, but it must be confirmed from the radios before closing the P2P item.
+- No new protocol patch should be made from this log alone. Next action is to ask for the terminal symptom, then test reverse direction if audio/release was OK.
+
+## 2026-06-07 01:05 EEST - Private simplex setup grant restored for local P2P, pending RF deploy
+
+Component in simple technical terms:
+
+- CMCE CC_BS individual call is the BS private-call control state machine: it owns `U-SETUP`, `D-SETUP`, `U-CONNECT`, `D-CONNECT ACKNOWLEDGE`, `D-CONNECT`, PTT floor, and release.
+- UMAC FloorGranted is the internal radio scheduler command that names the ISSI currently allowed to send speech on the assigned traffic channel.
+- LLC BL-ACK is the layer-2 proof that a terminal received an acknowledged downlink call-control PDU.
+
+Issue covered:
+
+- Live RF for `2260616 -> 2260618` failed after setup: logs showed called `D-CONNECT ACKNOWLEDGE` was BL-ACKed, caller `D-CONNECT` was BL-ACKed, then the call became active with no `U-TX DEMAND` and timed out on UL inactivity.
+- The previous "no setup floor until U-TX DEMAND" rule was too strict for the first setup-phase transmit permission. It made local P2P differ from the already-working Brew private path.
+- Agent review confirmed the current no-floor UMAC state can drop assigned-channel `MAC-U-SIGNAL` before CMCE if no current speaker is known.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2: `D-CONNECT ACKNOWLEDGE` and `D-CONNECT` shall indicate which party is permitted to transmit.
+- EN 300 392-2 clause 14.5.1.2.1 b): during call setup, the response to the initial request to transmit is handled by clauses 14.5.1.1.1 and 14.5.1.1.2; later call-in-progress requests use `U-TX DEMAND -> D-TX GRANTED`.
+- EN 300 392-2 clause 14.5.1.4.1: `TransmissionGrant::Granted` switches U-plane on for transmit and `GrantedToOtherUser` switches U-plane on for receive.
+- EN 300 392-2 table 14.74: `request_to_transmit_send_data = 1` means the other MS may transmit/send data for on/off-hook setup.
+- EN 300 392-2 table 14.81: `transmission_request_permission = 0` still allows later transmit requests.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Added private setup grant derivation from the cached U-SETUP method/request bit.
+  - For simplex caller-first: called `D-CONNECT ACKNOWLEDGE = GrantedToOtherUser`, caller `D-CONNECT = Granted`.
+  - For simplex called-first: called `D-CONNECT ACKNOWLEDGE = Granted`, caller `D-CONNECT = GrantedToOtherUser`.
+  - After caller `D-CONNECT` L2 ACK, CMCE marks the call active and emits one UMAC `FloorGranted` for the setup-granted speaker.
+  - No unsolicited `D-TX GRANTED` is sent; `D-TX GRANTED` remains only for later `U-TX DEMAND`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated local P2P direct setup tests to assert setup-derived initial floor after the caller `D-CONNECT` L2 ACK.
+  - Preserved guards that no floor is emitted before called `D-CONNECT ACKNOWLEDGE` BL-ACK and caller `D-CONNECT` L2 ACK.
+  - Added/updated called-first hook coverage so `D-CONNECT ACKNOWLEDGE` grants the called MS and `D-CONNECT` puts the caller in receive mode.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs private_simplex --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 168 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_llc_bs matching_bl_ack --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 85 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Deploy directly to testing.
+- Clean journal.
+- Test one local P2P simplex call `2260616 -> 2260618`.
+- Expected log shape: called `D-CONNECT ACKNOWLEDGE` grant is `Granted` only for called-first setup or `GrantedToOtherUser` for caller-first setup; caller `D-CONNECT` carries the opposite grant; after caller L2 ACK, log must show `setup grant seeds initial floor speaker ISSI ...` and UMAC `FloorGranted`.
+- If RF still fails with no first audio, inspect UMAC assigned-channel `MAC-U-SIGNAL` drop path next, not CMCE grant fields.
+
+## 2026-06-06 20:35 EEST - Private P2P connect ACK state hardening, no RF deploy
+
+Component in simple technical terms:
+
+- CMCE CC_BS individual call is the BS private-call state machine for caller ISSI, called ISSI, setup, PTT floor, and release.
+- LLC ACK is the terminal's lower-layer confirmation that a critical call-control PDU was received, not just locally queued/transmitted by the BS.
+- `D-CONNECT ACKNOWLEDGE` completes the called leg after `U-CONNECT`; `D-CONNECT` completes the caller leg; simplex audio remains off until `U-TX DEMAND` receives `D-TX GRANTED`.
+
+Issue covered:
+
+- Live RF showed `Invalid number` / `Number busy` after the previous no-early-audio patch, and then a BS service crash was reported before a new deploy could be made.
+- Local and agent review found the direct local P2P path activated the call when caller `D-CONNECT` was locally transmitted, before the caller L2 ACK proved the caller recognized the call identifier.
+- That could make a caller `U-DISCONNECT(InvalidCallIdentifier)` during caller connect setup look like an established-call teardown, prematurely clear the called leg, and leave late `U-CONNECT` / next setup as busy.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2: called `U-CONNECT` is completed by `D-CONNECT ACKNOWLEDGE`, and caller setup is completed by `D-CONNECT`.
+- EN 300 392-2 clause 14.5.1.2.1: simplex private transmit permission remains SwMI-controlled; the MS must use `U-TX DEMAND` and receive `D-TX GRANTED` before U-plane speech.
+- EN 300 392-2 clause 14.5.1.4.1: `TransmissionGrant::NotGranted` keeps U-plane off at setup, even when request permission is allowed.
+- EN 300 392-2 clauses 14.5.1.3.1 through 14.5.1.3.3: setup abort/reject/no-answer/busy/invalid cases are cleared with `D-RELEASE`; established peer `D-DISCONNECT` remains only for states where the MS is known to recognize the call id and a `U-RELEASE` response is expected.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - Added `CalledConnectAckPending` and `CallerConnectAckPending` states.
+  - Added assigned-circuit/connect-pending helpers so setup-with-bearer is not confused with fully active call state.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Caller `D-CONNECT` now completes only after L2 ACK, not local transmission.
+  - `U-CONNECT` duplicates in connect-ACK pending state are absorbed.
+  - Call activation still emits no implicit simplex floor; first audio remains `U-TX DEMAND -> D-TX GRANTED`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - `U-DISCONNECT` / `U-RELEASE` logs now include sender ISSI and individual-call state.
+  - Late `U-DISCONNECT` for a pending release repeats direct `D-RELEASE` instead of becoming unknown-call noise.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added connect-abort release path: caller leg is released on direct/current signalling; called leg uses assigned-channel `D-RELEASE` only after called connect ACK was L2-ACKed.
+  - Pending-release late `U-ALERT` / `U-CONNECT` / `U-DISCONNECT` can be absorbed with direct `D-RELEASE`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Extended caller `D-CONNECT` no-L2-ACK test so premature `U-TX DEMAND` produces no `D-TX GRANTED` and no UMAC floor.
+  - Added regression for caller `U-DISCONNECT(InvalidCallIdentifier)` during `CallerConnectAckPending`: no `D-DISCONNECT`, no floor, correct `D-RELEASE`, and fresh setup is not left busy.
+  - Added setup-phase cause preservation coverage for `CallRejectedByTheCalledParty`, `CalledPartyBusy`, `ExpiryOfTimer`, and `InvalidCallIdentifier`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_d_connect_transmitted_without_l2_ack_does_not_seed_initial_floor --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_caller_invalid_call_identifier_during_caller_connect_ack_pending_releases_without_active_teardown --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_setup_phase_reject_busy_and_no_answer_causes_are_preserved --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 167 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 34 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Deploy / RF status:
+
+- Not deployed. User is not near TetraHS/Pi, so continue locally only.
+- SSH to `chris@192.168.1.179` was unavailable from the current network; no RF log read or remote restart was performed.
+
+Host cleanup:
+
+- `/private/tmp` was full because old Nexus-BS/FlowStation Cargo/Zig target directories consumed about 28G.
+- Removed only enumerated temporary target/cache directories under `/private/tmp`; the repo was not touched.
+- Free space improved from 1.8 GiB to 29 GiB; `/private/tmp` now reports about 52M used.
+
+## 2026-06-06 19:15 EEST - Private simplex setup keeps U-plane off until U-TX DEMAND
+
+Component in simple technical terms:
+
+- CMCE CC_BS is the BS call-control finite-state machine for private calls.
+- `D-CONNECT ACKNOWLEDGE` tells the called terminal that the private call setup completed.
+- `D-CONNECT` tells the calling terminal that the private call setup completed.
+- `UMAC FloorGranted` is the internal scheduler command that allows one ISSI to transmit audio on the assigned bearer.
+- This patch separates "call active on signalling" from "audio floor active".
+
+Issue covered:
+
+- RF test after the previous deploy still showed `No Answer` at final clear.
+- More importantly, live logs for `2260616 -> 2260618` showed the BS sent called-leg `D-CONNECT ACKNOWLEDGE` with `TransmissionGrant::Granted`, then emitted `initial private-simplex FloorGranted` for `2260618` before any `U-TX DEMAND`.
+- The called Motorola opened receive/transmit U-plane and produced static/no voice before the user accepted/talked with PTT.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2: if transmission is not granted in `D-CONNECT ACKNOWLEDGE` / `D-CONNECT` but request permission is allowed, the MS follows the transmission control procedure.
+- EN 300 392-2 clause 14.5.1.2.1: SwMI fully controls which MS may transmit; an MS must request and receive permission before U-plane transmission.
+- EN 300 392-2 clause 14.5.1.4.1: `TransmissionGrant::Granted` switches U-plane on for transmit; `GrantedToOtherUser` switches U-plane on for receive; other grant values keep U-plane off.
+- EN 300 392-2 table 14.74: U-SETUP `request to transmit/send data` value 1 requests that the other MS may transmit/send data, but this is now treated as setup preference, not as an implicit UMAC floor grant.
+- EN 300 392-2 table 14.81: `transmission_request_permission = 0` means the MS may request transmission permission.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Private simplex `D-CONNECT ACKNOWLEDGE` and `D-CONNECT` now use `TransmissionGrant::NotGranted` with request permission allowed.
+  - Caller `D-CONNECT` local transmission activates the private call but no longer emits an implicit `FloorGranted`.
+  - First audio floor now comes only from a participant `U-TX DEMAND`, which receives `D-TX GRANTED` and then `UMAC FloorGranted`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated private simplex connect tests to assert zero setup-time floor grants.
+  - Added/updated hook called-first regression coverage so the called MS gets floor only after its explicit `U-TX DEMAND`.
+  - Updated P2P fixtures so tests that need an active speaker now simulate the first PTT explicitly.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 79 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs mxp600 --locked` -> 2 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Deploy status:
+
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Running service: `nexus-bs@chris.service`, `MainPID=51128`, active since `2026-06-06 19:14:28 EEST`.
+- Deployed binary SHA: `6a9add61ea5b57b8531ad722f6f2ec25e3e141ac6b81cfefc0da88a6921580b0`.
+- Journal was rotated/vacuumed after deploy for a clean RF gate; immediate post-clean read returned no entries.
+
+Next RF gate:
+
+1. Clean logs and restart Nexus-BS after deploy.
+2. User performs private simplex `2260616 -> 2260618`.
+3. Expected setup path:
+   - `D-CONNECT ACKNOWLEDGE` to `2260618` with `TransmissionGrant::NotGranted`.
+   - `D-CONNECT` to `2260616` with `TransmissionGrant::NotGranted`.
+   - no `initial private-simplex FloorGranted` before `U-TX DEMAND`.
+   - first `U-TX DEMAND` from the terminal that presses PTT receives `D-TX GRANTED`, and only then UMAC emits `FloorGranted`.
+4. Required RF result for success: no static/no-voice channel opened before accepted PTT, no terminal-visible `PTT denied` in the established call, no false `No Answer` at normal close, and no Motorola soft reboot.
+
+## 2026-06-06 12:31 EEST - Network time broadcast freshness patch staged locally
+
+Component in simple technical terms:
+
+- MLE builds `D-NWRK-BROADCAST`, the broadcast PDU that can carry TETRA network time.
+- LLC wraps that MLE PDU into BL-UDATA and can repeat the same TL-SDU when `N.253` is left as default.
+- For a clock PDU, repeating an old encoded timestamp can make a terminal display stale time even if the original timestamp was correct.
+
+Issue covered:
+
+- Field observation: a Motorola terminal clock appeared about two minutes behind while Nexus-BS was broadcasting time.
+- Decoding the live log value `0x67164C18D7FF` from `12:17:12 EEST` showed the PDU itself encoded `2026-06-06T09:17:12Z` plus `UTC+3`, so no fixed offset was found in the encoder.
+- The likely freshness risk was LLC repeating the same encoded `D-NWRK-BROADCAST` TL-SDU via the default unacknowledged repeat policy.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 18.4.1.4.1 / table 18.2: `D-NWRK-BROADCAST` may carry optional TETRA network time.
+- EN 300 392-2 clause 18.5.24 / table 18.100: TETRA network time contains UTC time, local offset, year, and reserved bits.
+- EN 300 392-2 clause 22.3.2.4.1: BL-UDATA transmissions are repeated `N.253 + 1` times. For clock freshness, Nexus-BS now explicitly uses `N.253 = 0`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch staged locally:
+
+- `crates/tetra-entities/src/mle/components/broadcast.rs`: `D-NWRK-BROADCAST` now sends `n_tlsdu_repeats = Some(0)` so each encoded timestamp has one LLC transmission.
+- `crates/tetra-entities/tests/test_mle_bs.rs`: added regression test for fresh single-transmission network-time broadcast.
+- `example_config/config.toml`: corrected the timezone comment from once per hyperframe to twice per hyperframe, approximately every 30.6 seconds.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mle_bs network_time --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib network_time --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_mle_bs --locked` -> 28 passed.
+- `cargo check -p tetra-entities --locked` -> passed.
+- `git diff --check -- crates/tetra-entities/src/mle/components/broadcast.rs crates/tetra-entities/tests/test_mle_bs.rs example_config/config.toml` -> passed.
+
+Deploy status:
+
+- Not deployed yet. The running RF test gate still uses the already deployed P2P close fix from `12:17:28 EEST`.
+- Deploy this time-broadcast freshness patch only after the current P2P close RF test/log read is complete, or after explicitly opening a new RF gate.
+
+## 2026-06-06 12:22 EEST - P2P established-call close normalized to D-DISCONNECT peer handshake
+
+Component in simple technical terms:
+
+- CMCE private-call control decides what each terminal receives when a simplex private call is closed.
+- The terminal that presses red sends `U-DISCONNECT` and expects `D-RELEASE`.
+- The other terminal is still a peer in an already established call, so Nexus-BS clears it with `D-DISCONNECT` and waits for its `U-RELEASE` before closing the bearer.
+
+Issue covered:
+
+- Live private simplex close could leave the Motorola peer showing `Not Answered` even after a call with working voice.
+- The old compatibility branch could clear the peer with `D-RELEASE`, which is ETSI-permitted but can look like a setup/no-answer result on real terminals.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: after `U-DISCONNECT`, the disconnecting MS waits for `D-RELEASE`; SwMI should inform the other MS of clearance by `D-DISCONNECT` or `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: `D-DISCONNECT` requires the MS to respond with `U-RELEASE`; `D-RELEASE` requires no MS response.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- Active local simplex private `U-DISCONNECT` now always sends prompt assigned-channel `D-RELEASE` to the initiating MS and tail-drained assigned-channel `D-DISCONNECT` to the peer.
+- Removed the dead peer `D-RELEASE` tail-drain branch so future patches cannot accidentally reintroduce the `Not Answered`-prone close route.
+- Fallback remains separate: if `D-DISCONNECT` delivery is discarded or locally times out, CMCE may use peer `D-RELEASE` as a bounded recovery path rather than keeping a bearer pinned forever.
+
+Verification so far:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 84 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 80 passed.
+- `cargo check -p tetra-entities --locked` -> passed.
+- `git diff --check` -> passed.
+
+Deploy:
+
+- Ran `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh` after local verification.
+- Local ARM64 release build passed.
+- Deployed binary SHA-256: `dbfae8a6f26b5c5bda55538ca2cf53463e35ded4f2c49cc0a214d4000580040b`.
+- Service: `nexus-bs@chris.service`.
+- Restart timestamp: `Sat 2026-06-06 12:17:28 EEST`.
+- PID after restart: `47700`.
+- Journal rotated/vacuumed for the RF gate at `2026-06-06T12:17:48+03:00`; `journalctl -u nexus-bs@chris.service -n 8` returned `-- No entries --`.
+
+Next RF gate:
+
+- Controlled RF scenario: `2260616 -> 2260618`, allow normal voice, let `2260618` speak last, then close from `2260616` with red key. Expected result: `2260618` should show normal end call, not `Not Answered` or reboot.
+- After user confirms test completion, read journal since `2026-06-06 12:17:48 EEST`.
+
+## 2026-06-06 12:10 EEST - Current P2P handoff and release-review priority
+
+Current status:
+
+- P2P has improved through current-channel setup, stale TMA cancellation, EG7 D-SETUP prioritization, and called `D-CONNECT ACKNOWLEDGE` recovery work.
+- Latest user priority: private-call close/release still leaves the terminal/UI showing `Not Answered`; treat close semantics as the active blocker, not initial setup.
+- Active review scope is CMCE private-call release under EN 300 392-2 clause 14.5.1.3.
+- Practical scale target is 100 simultaneous terminals. Do not spend time on broad thousand-terminal refactors before the core RF call paths are stable.
+- This remains clause-scoped engineering evidence only. Do not claim formal ETSI/TETRA certification.
+
+Next RF gate:
+
+- Before any next RF test, the assistant must ask the user explicitly and name the exact controlled P2P scenario and log window to use.
+- Next investigation should inspect close/release logs, confirm which `U-` and `D-` release/clearing PDUs are observed, and verify the terminal-facing `Not Answered` result against clause 14.5.1.3.
+- Protocol-source follow-up remains allowed under the standing law: identify the ETSI clause first, make a focused patch, test locally, deploy locally built binaries only, then gate RF with an explicit user prompt.
+
+## 2026-06-06 10:39 EEST - EG energy-economy frame-18 starvation audit verified
+
+Component in simple technical terms:
+
+- MM negotiates Energy Economy mode with the terminal and chooses the frame/multiframe start point carried in MM signalling.
+- UMAC consumes that start point and decides when a sleeping terminal is expected to listen for downlink signalling.
+- LMAC/scheduler support is currently not a full all-slot frame-18 receive model, so MM/UMAC must not create EG receive cycles that require frame 18.
+
+Audit result:
+
+- No new protocol patch was required in this step: the current worktree already contains the frame-18 protection.
+- `crates/tetra-entities/src/mm/mm_bs.rs` chooses an EG start point whose full recurring receive cycle does not include frame 18, and falls back to `StayAlive` if a safe start point cannot be allocated.
+- `crates/tetra-entities/src/umac/umac_bs.rs` rejects TLMC Energy Economy start points whose recurring cycle would require unsupported frame-18 receive behaviour.
+- `crates/tetra-entities/tests/test_mm_bs.rs` and `crates/tetra-entities/tests/test_umac_bs.rs` contain focused regression tests for this path.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 16.7.1 and 16.10.10: Energy Economy mode/start point are negotiated and carried by MM.
+- EN 300 392-2 clause 23.7.6 and table 23.9: the energy-economy start point plus EG sleep duration defines the recurring receive cycle.
+- EN 300 392-2 clause 23.5.2.2.7: BS downlink scheduling should account for energy economy reception opportunities.
+- Timer T.210: after signalling/activity, the MS remains awake before returning to the sleep cycle.
+- This is clause-scoped engineering evidence, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs frame_18 --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_umac_bs frame_18 --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_mm_bs energy_saving --locked` -> 27 passed.
+
+Runtime observation:
+
+- Live service `nexus-bs@chris.service` remains active from restart `2026-06-06 10:36:50 EEST`.
+- Fresh post-deploy log scan showed only energy-saving negotiation warnings, including T352 expiry for BS-initiated EG assignment; no new P2P RF test has appeared yet after the latest deploy.
+
+## 2026-06-06 10:37 EEST - P2P current-channel setup deployed, clean RF log ready
+
+Component in simple technical terms:
+
+- CMCE is the private-call controller: it sends the called `D-CONNECT ACKNOWLEDGE`, waits for the called lower-layer ACK, then sends caller `D-CONNECT` and opens the first simplex floor.
+- LLC is the reliability layer: its acknowledged basic link and `TxReporter` prove whether the called radio acknowledged the setup PDU.
+- UMAC/LMAC are the radio scheduler/executor: they decide whether signalling is current-channel common signalling or assigned-channel STCH/FACCH and then put it on RF.
+
+Deploy evidence:
+
+- Local tests/build/deploy were run with `RUN_TESTS=1 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Deployed commit label: `332fa519`.
+- Remote binary SHA256: `f629ed1db0736b994a7f8b12f580c1250b24ee91d5c1547b2a05b27cf3191436`.
+- Remote path: `/home/chris/nexus-bs/nexus-bs`.
+- Service: `nexus-bs@chris.service`.
+- Restart timestamp: `2026-06-06 10:36:50 EEST`.
+- Main PID after restart: `46624`.
+- Post-deploy journal was rotated/vacuumed; `journalctl -u nexus-bs@chris.service -n 8` returned `-- No entries --`, so the next RF test can be read cleanly.
+
+Verification gate before deploy:
+
+- `cargo test -p tetra-entities --test test_cmce_bs repeated_group_u_setup --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 33 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+- `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` -> pass.
+
+ETSI clause scope:
+
+- Same clause-scoped behavior as the `10:29 EEST` patch below: EN 300 392-2 clauses 14.5.1.1.1, 14.5.1.1.2, 14.5.3.1, 23.5.4.3.1, and 23.8.2.2 note 3.
+- This is a deployed engineering compliance-hardening step, not formal ETSI/TETRA certification.
+
+Next RF gate:
+
+- Retest `2260082 -> 2260618` and inspect fresh logs for: called `D-CONNECT ACKNOWLEDGE`, called L2 ACK received, caller `D-CONNECT`, initial `FloorGranted`, and voice on first/repeated PTT.
+- If the called ACK still fails, do not guess another CMCE sequence; inspect UMAC/LLC ACK subslot, reporter correlation, and EG7 receive-window coverage first.
+
+## 2026-06-06 10:29 EEST - P2P called-leg D-CONNECT ACK current-channel setup patch
+
+Component in simple technical terms:
+
+- CMCE/CC individual call is the private-call controller. It sends `D-CONNECT ACKNOWLEDGE` to the called MS after `U-CONNECT`, waits for that lower-layer ACK, then sends `D-CONNECT` to the caller and only then seeds the initial simplex floor.
+- LLC acknowledged basic link is the reliability layer. Its `TxReporter` is the local proof that the called MS acknowledged the setup PDU.
+- UMAC/MAC is the radio scheduler. `stealing_permission=false` keeps this setup PDU on the normal current-channel signalling path; `stealing_permission=true` would put it on assigned-channel STCH/FACCH stealing.
+
+Issue covered:
+
+- Live RF P2P `2260082 -> 2260618` failed twice after restart `2026-06-06 09:54:18 EEST`.
+- Both attempts sent called-leg `D-CONNECT ACKNOWLEDGE` to `2260618`, then LLC exhausted retransmissions without receiving the called L2 ACK.
+- The current code had encoded the first called-leg `D-CONNECT ACKNOWLEDGE` as `stealing_permission=true`, making the authoritative setup PDU assigned-channel STCH/FACCH even before the BS had proof that the called MS had moved correctly.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.1.1 requires `D-CONNECT ACKNOWLEDGE` after the called MS `U-CONNECT` and requires it to indicate which party may transmit.
+- EN 300 392-2 clause 14.5.3.1 allows late traffic-channel assignment in `D-CONNECT` and `D-CONNECT ACKNOWLEDGE`; for late assignment the caller remains on the control channel until instructed to move.
+- EN 300 392-2 clause 23.5.4.3.1 says that for acknowledged service with channel allocation that the MS may reject, the BS should grant the L2 ACK subslot on the current channel, because a grant only on the allocated channel is unusable if the MS does not move.
+- EN 300 392-2 clause 23.8.2.2 note 3 covers the ACK-missing ambiguity: if the BS does not receive the expected ACK for a message giving receive authorization, it cannot know whether the MS is in signalling or traffic mode, so recovery must be ambiguity-safe.
+- Annex D.4 remains informative ordering evidence only: wait for called-leg ACK before caller authorization. It is not a mandate that the first called `D-CONNECT ACKNOWLEDGE` be STCH-only.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Kept the called-first gate: caller `D-CONNECT` and initial `FloorGranted` still wait for called-leg L2 ACK.
+  - Changed the first called `D-CONNECT ACKNOWLEDGE` to `stealing_permission=false`.
+  - Kept `Layer2Service::Acknowledged`, `chan_alloc=Some(Both)`, target called ISSI, and `TxReporter`.
+  - Updated comments to cite clauses 14.5.1.1.1, 14.5.1.1.2, 14.5.3.1, 23.5.4.3.1, and 23.8.2.2.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P setup assertions so the first called `D-CONNECT ACKNOWLEDGE` must be acknowledged current-channel signalling with channel allocation, not STCH-only stealing.
+  - Verified test-first: this test failed before the production patch at `test_cmce_bs.rs:9086`.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Renamed/reworded the STCH priority unit test as explicit channel-allocation STCH recovery, not first-path P2P setup evidence.
+  - Kept STCH recovery priority intact for ambiguity-safe recovery paths.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked`
+  - Before patch: failed on the new `!stealing_permission` assertion.
+  - After patch: passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_stch_bl_ack_before_private_floor_granted_uses_called_primary --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo test -p tetra-entities --lib test_explicit_channel_allocation_stch_recovery_preempts_ack_only_facch --locked` -> 1 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `rustfmt --edition 2024 --check crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs crates/tetra-entities/src/umac/subcomp/bs_sched.rs crates/tetra-entities/tests/test_cmce_bs.rs` -> pass.
+- `git diff --check` -> pass.
+
+Limits and next execution:
+
+- This is a clause-scoped engineering patch, not formal ETSI/TETRA certification.
+- It has not yet been deployed or RF-retested.
+- Next live gate: deploy locally built binary only, then retest `2260082 -> 2260618` and confirm log sequence:
+  - `D-CONNECT ACKNOWLEDGE` to `2260618`;
+  - called L2 ACK received;
+  - caller `D-CONNECT`;
+  - initial `FloorGranted`;
+  - first and repeated PTT carry voice.
+- If called ACK still fails, inspect UMAC/LLC reporter-order, endpoint correlation, and EG7 sleep coverage before any further CMCE sequencing patch.
+
+## 2026-06-06 10:23 EEST - P2P private simplex ETSI re-audit, no speculative patch
+
+Component in simple technical terms:
+
+- CMCE/CC individual call is the private-call controller. It decides when the called MS receives `D-CONNECT ACKNOWLEDGE`, when the caller receives `D-CONNECT`, who gets the first simplex transmit permission, and how release is signalled.
+- LLC acknowledged basic link is the layer-2 reliability mechanism. For this bug, its `TxReporter` is the local proof that the called MS acknowledged the downlink `D-CONNECT ACKNOWLEDGE`.
+- UMAC/MAC owns the radio path: MCCH/SCH-F common signalling, assigned-channel FACCH/STCH stealing, EG listen windows, and TCH/S speech routing.
+- `FloorGranted` is Nexus-BS internal CMCE -> UMAC control. It must not be emitted before call-control setup has enough ETSI/lower-layer evidence.
+
+Live RF evidence:
+
+- Latest restart log from `nexus-bs@chris.service` was read from `2026-06-06 09:54:18 EEST`.
+- Test `2260082 -> 2260618` failed twice at `09:59:39` and `09:59:47`.
+- Both attempts reached `U-SETUP` and opened the private same-timeslot bearer on `ts=2`.
+- CMCE sent `D-CONNECT ACKNOWLEDGE` to called ISSI `2260618` with `TransmissionGrant::GrantedToOtherUser`.
+- LLC retransmitted the acknowledged transfer to `2260618` until exhaustion.
+- CMCE never logged `called D-CONNECT ACK L2 ACK received`; it released setup with `AcknowledgedServiceNotComplete`.
+- Therefore the current blocking failure is before caller `D-CONNECT` and before first voice/floor; this specific failure is a called-leg ACK delivery/correlation problem, not yet a media/floor bug.
+
+ETSI clause scope reloaded:
+
+- EN 300 392-2 clause 14.5.1.1.1: for direct incoming individual call setup, called MS sends `U-CONNECT`, then SwMI returns `D-CONNECT ACKNOWLEDGE`; the PDU indicates which party may transmit.
+- EN 300 392-2 clause 14.5.1.1.2: caller receives `D-CONNECT`; it carries call identifier, service/floor information, and any channel allocation.
+- EN 300 392-2 clause 14.5.1.2.1: in simplex, SwMI fully controls transmit permission; an MS may not begin U-plane transmit without permission.
+- EN 300 392-2 clause 14.5.1.4.1: `D-CONNECT` and `D-CONNECT ACKNOWLEDGE` with `transmission granted` or `transmission granted to another user` switch U-plane on for transmit or receive respectively.
+- EN 300 392-2 clause 14.5.3.1: late assignment individual call may assign traffic channel only after `U-CONNECT`; caller remains on the control channel until told to move.
+- EN 300 392-2 clause 23.5.4.3.1: for acknowledged service, when a channel allocation may be rejected, the BS should grant the L2 ACK subslot on the current channel; granting only on the allocated channel can lose the ACK if the MS does not move.
+- EN 300 392-2 clause 23.8.2.2 note 3: if the BS does not receive expected L2 ACK for a message giving/withdrawing receive authorization, it cannot know whether the MS is in signalling mode or traffic mode; retransmission must be interpretable in that ambiguity.
+- EN 300 392-2 clause 23.8.4.1.1: uplink C-plane STCH uses `MAC-DATA`/`MAC-END`; `MAC-U-SIGNAL` is U-plane signalling and must not be used as the only C-plane ACK model.
+- EN 300 392-2 Annex D is informative. D.4 is a useful example for waiting on called-leg ACK before caller authorization, but it is not a normative mandate for an STCH-only first `D-CONNECT ACKNOWLEDGE` implementation.
+
+Swarm conclusion:
+
+- All agents were closed after read-only audit.
+- The previous "conservative route" was incomplete: the ordering `called D-CONNECT ACKNOWLEDGE -> called L2 ACK -> caller D-CONNECT` remains defensible, but the current transport assumption `stealing_permission=true` / assigned-channel STCH for the first called ACK is not confirmed by ETSI as mandatory and is contradicted by the RF failure.
+- Existing tests that assert `stealing_permission=true` for the first called `D-CONNECT ACKNOWLEDGE` are now suspect because they encode an implementation assumption, not clause-scoped proof.
+- No protocol patch was made in this entry.
+
+Concrete test-first fix plan:
+
+1. Add a failing CMCE/UMAC/LLC integration test for called-leg `D-CONNECT ACKNOWLEDGE` delivery where the first authoritative PDU is sent as late-assignment common signalling with channel allocation and an acknowledged-service reporter, not as STCH-only traffic stealing. Expected gate: no caller `D-CONNECT` and no `FloorGranted` until the called reporter is acknowledged.
+2. Add a full-path ACK-correlation test for same-timeslot private simplex: called ISSI primary before floor, BL-ACK from called on assigned channel, reporter becomes acknowledged, then caller `D-CONNECT` and initial `FloorGranted` are emitted exactly once.
+3. Add an EG7 called-leg test: if a terminal is really in EG7, opening an assigned private bearer must suspend/cover sleep correctly so the setup ACK path is not starved by the 2-second CMCE guard. If `T352 expired ... keeping StayAlive`, the RF precondition is not EG7.
+4. Add reporter-order regression: ACK arriving before MAC complete must not falsely confirm, but a valid ACK after transmitted state must confirm the pending called-leg reporter.
+5. Only after a failing test identifies the layer, patch narrowly:
+   - likely CMCE change: first called `D-CONNECT ACKNOWLEDGE` uses current-channel/common signalling path with channel allocation; no initial STCH-only assumption;
+   - possible UMAC/LLC change: fix ACK endpoint/address correlation if the new full-path test proves misattribution;
+   - possible EG change: keep both private participants awake/scheduled during setup if the EG7 test proves starvation.
+6. After setup succeeds locally, re-run live RF matrix: `2260082 -> 2260618`, `2260618 -> 2260082`, `2260616 -> 2260618`, with first PTT voice, repeated same-speaker PTT, opposite-speaker PTT, and release by both sides.
+
+Guardrails:
+
+- Do not implement D.5 fast-path as default. It can lose first traffic if the called MS misses `D-CONNECT ACKNOWLEDGE`.
+- Do not claim formal certification. This remains clause-scoped engineering evidence until official conformance evidence exists.
+- Do not deploy another P2P protocol build until at least the called-leg ACK test and relevant targeted tests pass locally.
+
+## 2026-06-06 03:25 EEST - Flat-folder WAP control wrapper deployed and live-smoked
+
+Component in simple technical terms:
+
+- `nexus-bs-control` is the user-facing CLI wrapper that writes a complete operator command line into the volatile systemd FIFO.
+- `nexus-bs-control-service` is the long-running local websocket bridge that parses that line and forwards a `SendRawSds` command to the running BS.
+- CMCE/SDS is the TETRA short-data layer that accepts the raw SDS Type4 payload and emits the WAP MVP as `D-SDS-DATA`.
+
+Issue covered:
+
+- The final flat install folder `/home/chris/nexus-bs` had `nexus-bs`, `nexus-bs-control-service`, and `config.toml`, but no `nexus-bs-control` wrapper.
+- The example config already documented `nexus-bs-control sendwap ...`, so a normal operator could not run the documented command from the final folder.
+
+Patch/deploy:
+
+- `scripts/nexus-bs-control`
+  - Added the canonical wrapper.
+  - It derives the service user from `NEXUS_BS_USER`, then `$USER`, then `id -un`.
+  - It writes to `/run/nexus-bs-USER/control.commands` by default.
+  - It supports overrides: `NEXUS_BS_RUN_DIR` and `NEXUS_BS_CONTROL_FIFO`.
+  - With arguments, it writes one newline-terminated command; without arguments, it forwards stdin.
+- `scripts/nexus-bs-control-command.sh`
+  - Kept as a compatibility alias that execs the canonical wrapper.
+- `contrib/systemd/nexus-bs-control@.service`
+  - Comment now points operators to the flat `/home/USER/nexus-bs/nexus-bs-control` wrapper.
+- `README.md` and `example_config/config.toml`
+  - Document the flat folder layout and WAP MVP command from `~/nexus-bs`.
+- Deployed only the wrapper to `/home/chris/nexus-bs/nexus-bs-control`; no Rust build was run on the Pi and no binary backup was created.
+- Remote wrapper SHA-256: `a4cbc12775c5324bedb69594ea2933f7e53185a9e4fa0284b8eedc213528987b`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 13.2 covers SDS services.
+- EN 300 392-2 clauses 13.3.3 and 14.8.52 define SDS Type4 user-defined data and the Type4 length/PID boundary.
+- EN 300 392-2 clause 29.4.1 and table 29.21 define WAP/WDP direct over SDS Type4 with PID `0x04`.
+- This patch is operator/runtime plumbing for an already clause-scoped SDS/WAP path; it is not a new TETRA PDU implementation and is not formal ETSI/TETRA certification.
+
+Verification:
+
+- Local shell checks:
+  - `sh -n scripts/nexus-bs-control` -> pass.
+  - `sh -n scripts/nexus-bs-control-command.sh` -> pass.
+  - Temp FIFO argument write produced `sendwap 16777215 2260618 false`.
+  - Temp FIFO stdin write produced `sendwapcolor 16777215 2260618 false`.
+- Local focused tests:
+  - `cargo test -p nexus-bs-control sendwap --locked` -> 7 passed.
+  - `cargo test -p tetra-entities --test test_sds_bs wap --locked` -> 12 passed.
+  - `cargo test -p tetra-entities --lib net_dashboard::server::tests::dashboard_wap_ws_dispatches_raw_type4_wap_sds --locked` -> 1 passed.
+  - `git diff --check` -> pass.
+- Remote runtime:
+  - Before deploy, `/home/chris/nexus-bs` lacked `nexus-bs-control`.
+  - After deploy, `/home/chris/nexus-bs/nexus-bs-control` is executable and hash-matches local wrapper.
+  - `nexus-bs-control@chris.service` and `nexus-bs@chris.service` were active.
+  - Remote command executed: `/home/chris/nexus-bs/nexus-bs-control sendwap 16777215 2260618 false`.
+  - `nexus-bs-control@chris.service` logged `command dispatched to 1 client(s)`.
+  - `nexus-bs-control@chris.service` logged `>> SendRawSds { handle: 2, source_ssi: 16777215, dest_ssi: 2260618, dest_is_group: false, sdti: 3, len_bits: 1984, payload[0]=4, ... }`.
+  - `nexus-bs@chris.service` logged `SDS: received raw from Control 2: 16777215 -> 2260618, type=ISSI, sdti=3, 1984 bits`.
+  - `nexus-bs-control@chris.service` logged `<< SendRawSdsResponse { handle: 2, success: true }`.
+
+Limit:
+
+- This proves the documented flat-folder operator command reaches the running BS and CMCE/SDS accepts the WAP Type4 payload.
+- It does not prove the terminal WAP browser rendered the page; that still requires operator observation on `2260618` or another target terminal.
+
+Next non-repeating execution:
+
+1. Ask operator to open the WAP browser on `2260618` and confirm whether the WML page is displayed/flashing.
+2. Continue live RF private simplex and group-call PTT validation on the current deployed BS.
+3. If terminal WAP rendering fails, inspect terminal expectations for direct WAP PID `0x04` versus WAP SDS-TL PID `0x84`, staying inside EN 300 392-2 table 29.21 and not advertising SNDCP/IP service.
+
+## 2026-06-06 03:15 EEST - WAP/SDS control FIFO bridge fixed and live WAP smoke accepted by CMCE
+
+Component in simple technical terms:
+
+- `nexus-bs-control@USER.service` is the local command bridge. A normal operator writes a line like `sendwap ...` into `/run/nexus-bs-USER/control.commands`.
+- `nexus-bs-control-service` parses that line and forwards a structured `SendRawSds` command over the local websocket to the running BS.
+- CMCE/SDS is the TETRA short-data component. It turns the raw WAP Type4 bytes into `D-SDS-DATA` for the target ISSI/GSSI.
+- The WAP MVP is not full SNDCP/IP WAP; it is WAP/WDP PID `0x04` over SDS Type4, carrying the compact Nexus-BS WML greeting page.
+
+Issue covered:
+
+- A live WAP send attempt through `/run/nexus-bs-chris/control.commands` initially produced no `SendRawSds` dispatch in the control-service journal.
+- The service template used `tail -n 0 -F` on a FIFO. For simple operator writes this is a fragile bridge and can make WAP/SDS appear submitted while no command reaches the control service.
+- A bad remote test write without a real newline also produced a malformed concatenated command (`falsensendwap`), which confirmed the command path must receive complete newline-terminated operator lines.
+
+Patch:
+
+- `contrib/systemd/nexus-bs-control@.service`
+  - Replaced the FIFO reader with `while true; do /bin/cat /run/nexus-bs-%i/control.commands; done | ...`.
+  - This keeps the service stdin open across short-lived FIFO writers and supports repeated simple operator commands without restarting the control websocket service.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 13.2 covers SDS services.
+- EN 300 392-2 clauses 13.3.3 and 14.8.52 define SDS Type4 user-defined data and its length/PID structure.
+- EN 300 392-2 clause 29.4.1 and table 29.21 define SDS-TL/WAP protocol identifiers; the WAP MVP uses direct WAP/WDP PID `0x04`.
+- EN 300 392-2 clause 29.3.3.8.2 is relevant for SDS-TL broadcast behaviour; this live smoke was an individual ISSI WAP SDS, not a broadcast.
+- The systemd FIFO patch is runtime plumbing, not a TETRA PDU change.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- Deployed the updated `nexus-bs-control@.service` to `/etc/systemd/system/nexus-bs-control@.service`, ran `systemctl daemon-reload`, and restarted `nexus-bs-control@chris.service`.
+- `nexus-bs@chris.service` stayed active and reconnected to the control websocket at `2026-06-06 03:12:41 EEST`.
+- Live WAP command sent after reconnect:
+  - `sendwap 16777215 2260618 false`
+  - control-service logged `command dispatched to 1 client(s)`.
+  - control-service logged `>> SendRawSds { handle: 1, source_ssi: 16777215, dest_ssi: 2260618, dest_is_group: false, sdti: 3, len_bits: 1984, payload[0]=4, ... }`.
+  - BS logged `SDS: received raw from Control 1: 16777215 -> 2260618, type=ISSI, sdti=3, 1984 bits`.
+  - control-service logged `<< SendRawSdsResponse { handle: 1, success: true }`.
+- Local focused tests:
+  - `cargo test -p nexus-bs-control sendwap --locked` -> 7 passed.
+  - `cargo test -p tetra-entities --test test_sds_bs wap --locked` -> 12 passed.
+  - `cargo test -p tetra-entities --lib net_dashboard::server::tests::dashboard_wap_ws_dispatches_raw_type4_wap_sds --locked` -> 1 passed.
+  - `cargo test -p tetra-entities --lib net_dashboard::server::tests::live_sds_post_rejects_wap_protocol_id_0x84 --locked` -> 1 passed.
+  - `git diff --check` -> pass.
+
+Limit:
+
+- This proves local operator command transport and CMCE/SDS acceptance of the WAP MVP payload.
+- It does not prove the terminal WAP browser displayed the page; that still requires the operator to open/observe the page on the target terminal.
+
+Next non-repeating execution:
+
+1. Ask operator to check WAP browser on `2260618` for the Nexus-BS greeting page after the `03:14:04` send, or trigger another send while the browser is open.
+2. Continue live RF validation for private simplex/group PTT after the `03:07:21` Annex D.4 deploy.
+3. Continue LLC acknowledged-path audit only where current tests do not already cover the claimed behaviour.
+
+## 2026-06-06 03:02 EEST - Annex D.4 Motorola-like private setup directive rechecked
+
+Component in simple technical terms:
+
+- CMCE/CC individual call is the private-call controller: it prepares the called MS, waits for lower-layer delivery proof, then authorizes the caller.
+- `D-CONNECT ACKNOWLEDGE` is sent to the called MS with channel allocation.
+- The L2 ACK through `TxReporter` is the local proof that the called MS received that command.
+- `D-CONNECT` to the caller and the initial simplex `FloorGranted` remain blocked until that called-leg ACK arrives.
+
+User directive checked:
+
+- Keep the conservative Annex D.4 order for Motorola-like terminals: called `D-CONNECT ACKNOWLEDGE`, wait for L2 ACK, then caller `D-CONNECT`.
+- No protocol code was changed in this entry because the current CMCE path already implements this order in `pending_individual_connect_acks`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 define the private individual-call setup/through-connect signalling.
+- EN 300 392-2 clause 14.5.1.2.1 keeps private-simplex transmit permission under SwMI control.
+- EN 300 392-2 Annex D.4 describes the conservative direct individual-call setup sequence: called `D-CONNECT ACKNOWLEDGE`, L2 ACK, then caller `D-CONNECT`.
+- EN 300 392-2 Annex D.5 is the faster alternative and warns that first traffic can be missed if the called MS misses `D-CONNECT ACKNOWLEDGE`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 72 passed.
+- Parallel QA agent found no direct local P2P path where caller `D-CONNECT` or initial UMAC `FloorGranted` is emitted before called `D-CONNECT ACKNOWLEDGE` L2 ACK.
+- QA explicitly classified Brew-routed P2P and ISSI 999 echo as non-Annex-D.4 exceptions because they are external/synthetic services, not direct setup toward a local called MS.
+- Integrated local verification before deploy:
+  - `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 33 passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs group --locked` -> 69 passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 72 passed.
+  - `cargo test -p tetra-entities --test test_umac_bs --locked` -> 71 passed.
+  - `cargo test -p tetra-entities --test test_lmac_bs tch_s --locked` -> 10 passed.
+  - `cargo test -p tetra-entities --test test_sds_bs status --locked` -> 50 passed.
+  - `cargo check -p tetra-entities --locked` -> pass.
+  - `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Built locally only with the AArch64 SoapySDR sysroot; no compile was run on `chris@192.168.1.179`.
+- Command shape: `cargo zigbuild --release -p nexus-bs -p nexus-bs-control --target aarch64-unknown-linux-gnu --locked`.
+- Deployed direct to flat `/home/chris/nexus-bs`, no binary backup, preserving existing `/home/chris/nexus-bs/config.toml`.
+- Local/remote SHA-256:
+  - `nexus-bs`: `481a3ae45f30a3b150aa9ee46e0f27b23cdfaa1304469a425229b04faa4aa259`.
+  - `nexus-bs-control-service`: `0c28160ac5928090ab5ee9fdf2eaae6f54e6776484043434e6dc423bf6dc81a9`.
+- Restarted `nexus-bs-control@chris.service` and `nexus-bs@chris.service`; both active from `2026-06-06 03:07:21 EEST`.
+- Startup evidence:
+  - Dashboard listening on `http://0.0.0.0:8080`.
+  - Control receiver listening on `127.0.0.1:9002` and websocket connected.
+  - Restart recovery armed for `{2260082, 2260616, 2260618}`.
+  - `2260616`, `2260618`, and `2260082` registered and affiliated to `[226333]`.
+  - Live config currently allocates EG7 to the three lab ISSIs.
+
+Next non-repeating execution:
+
+1. Live RF retest after `03:07:21`:
+   - private simplex `2260616 -> 2260618`, first PTT must carry voice after Motorola-like Annex D.4 setup;
+   - private simplex `2260082 -> 2260618`, repeated same-speaker PTT must carry voice;
+   - group `226333`, alternating PTT from all affiliated ISSIs must not produce `PTT denied`, `Service unavailable`, or static-only audio.
+2. Inspect only bounded journal slices after the test window and patch the first proven failing layer.
+
+## 2026-06-06 00:23:36 EEST - Private simplex same-speaker tail-drain stale release suppression
+
+User report context:
+
+- Live RF `2260082 -> 2260618`, both Motorola: first PTT from `2260082` had voice, later PTTs from the same ISSI lost voice.
+- After the UMAC hangtime/raw-media patch, agent CMCE audit found a second same-speaker race: a pending `U-TX CEASED` tail drain could later emit stale `D-TX CEASED` / `FloorReleased` after the same ISSI had already rekeyed and received a fresh `D-TX GRANTED`.
+
+Component explanation:
+
+- CMCE is the private-call floor-control layer. It translates `U-TX CEASED` and `U-TX DEMAND` into peer-facing `D-TX CEASED`/`D-TX GRANTED` and UMAC `FloorReleased`/`FloorGranted` controls.
+- The private-simplex TX-CEASED tail drain is a short local guard that lets FACCH/TCH tail timing drain before declaring the floor idle.
+- The bug was that a same-speaker rekey during that drain did not cancel the old drain, so the old drain could later switch U-plane off after a valid new grant.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b): `U-TX DEMAND` is answered by `D-TX GRANTED` when the SwMI grants the private-simplex floor.
+- EN 300 392-2 clause 14.5.1.2.1 e): `U-TX CEASED` may be followed by `D-TX CEASED` at end of transmission, but that stale indication must not override a later valid grant.
+- EN 300 392-2 clause 14.5.1.4.2: `D-TX GRANTED` and `D-TX CEASED` switch U-plane on/off; preserving ordering is required so a later grant is not undone by an older cease.
+- EN 300 392-2 clauses 23.5 and 23.8.5 cover the assigned-channel FACCH/STCH/TCH timing that the local tail-drain guard protects.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added `cancel_matching_individual_tx_ceased_tail_drain(call_id, sender_issi)`.
+  - It cancels only a pending TX-CEASED tail drain whose sender ISSI matches the newly granted requester.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Calls the cancellation helper on the positive private-simplex `U-TX DEMAND` grant path before setting the current floor holder.
+  - Different-speaker queued handoff semantics remain unchanged.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_simplex_p2p_same_speaker_rekey_during_tx_ceased_tail_suppresses_stale_floor_release` using `2260082 -> 2260618`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_simplex_p2p_same_speaker_rekey_during_tx_ceased_tail_suppresses_stale_floor_release --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 70 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 7 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 10 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Rebuild ARM64 locally and deploy direct to `/home/chris/nexus-bs`; the previous `00:20:45` deploy had only the UMAC patch, not this CMCE tail-drain fix.
+2. Restart `nexus-bs@chris.service` and `nexus-bs-control@chris.service`.
+3. Live retest `2260082 -> 2260618` with both patterns:
+   - Release, wait visible hangtime/idle, then rekey same `2260082`.
+   - Release and rekey quickly from same `2260082` before any long wait.
+4. Journal should show fresh `UMAC floor granted` and `UMAC voice route` for each rekey, with no stale `FloorReleased` / `D-TX CEASED` after the fresh grant.
+
+## 2026-06-06 00:18:56 EEST - Private simplex Motorola same-speaker hangtime media guard
+
+User report:
+
+- Live RF retest `2260082 -> 2260618`, both Motorola.
+- First PTT from `2260082` had voice.
+- Later PTTs from the same `2260082` showed private-call/floor behaviour but no voice.
+
+Component explanation:
+
+- CMCE is the call-control layer: it accepts `U-TX DEMAND`, sends `D-TX GRANTED`, and enters hangtime after `U-TX CEASED`.
+- UMAC is the MAC scheduler layer: it decides whether the assigned channel is in hangtime or traffic mode and routes valid TCH/S voice to the peer downlink.
+- LMAC already recovers the raw TCH/S burst after a late `Cp` marker. The remaining bug was UMAC dropping raw TCH/S Block2 immediately if it arrived while the private call was still marked hangtime, before CMCE's `FloorGranted` control message had cleared hangtime.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b): a later private-simplex `U-TX DEMAND` after `U-TX CEASED` is a fresh transmit request and, when accepted, is answered with `D-TX GRANTED`.
+- EN 300 392-2 clause 14.5.1.4.2: `D-TX GRANTED` switches U-plane transmit/receive state for the granted MS.
+- EN 300 392-2 clauses 23.5 and 23.8.5: FACCH/STCH stealing must not destroy a valid non-stolen TCH/S half-slot on an assigned traffic channel.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Moved the hangtime media gate after media classification.
+  - Added a narrow guard that defers only raw TCH/S Block2 for an already active private local circuit during hangtime.
+  - Group-call and ordinary ACELP media are still dropped during hangtime.
+  - If the expected `FloorGranted` does not arrive before flush, the deferred raw block is dropped by the existing hangtime checks.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_private_simplex_same_speaker_raw_block2_reentry_survives_hangtime` using field ISSIs `2260082` and `2260618`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs test_private_simplex_same_speaker_raw_block2_reentry_survives_hangtime --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 7 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_ul_raw_block2_is_dropped_during_hangtime --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 69 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Cross-build locally and deploy direct to `/home/chris/nexus-bs`; do not compile on Pi and do not create backup binaries.
+2. Restart `nexus-bs@chris.service`.
+3. Live retest `2260082 -> 2260618`: first PTT voice, release, second/third PTT from `2260082` must have voice.
+4. Inspect journal for `UMAC voice route` after each re-entry and absence of `UL inactivity timeout` for the granted speaker.
+
+## 2026-06-06 00:10:26 EEST - Private simplex same-speaker re-entry audio recovery
+
+User report:
+
+- Live RF test `2260082 -> 2260618`, both Motorola.
+- First PTT from `2260082` had voice.
+- Later PTTs from the same `2260082` showed normal private-call/floor UI but no voice before UL inactivity timeout.
+
+Component explanation:
+
+- CMCE is call control: it decides who has private simplex transmit permission and sends `D-TX GRANTED` / `D-TX CEASED`.
+- UMAC owns the assigned channel state: hangtime, active circuit, current floor speaker, and downlink routing of voice.
+- LMAC classifies raw radio bursts as control (`Cp`/SCH/STCH) or traffic (`Tp`/TCH/S). After hangtime, its per-timeslot uplink marker can lag the new floor grant by two timeslots.
+- The bug was in LMAC classification tolerance: after hangtime, a valid TCH/S burst arriving while the cached marker still said `Cp` was first tried as control and then discarded instead of being retried as TCH/S.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1: after `U-TX CEASED`, a later `U-TX DEMAND` from the same MS is a valid fresh request; if granted, SwMI sends `D-TX GRANTED` to the requester and informs the other MS.
+- EN 300 392-2 clause 14.5.1.4.2: `D-TX GRANTED` switches U-plane transmission/reception on according to the grant state.
+- EN 300 392-2 clauses 23.5.2.2.1, 23.8.4.1.4, 23.8.4.2.2, and 23.8.5: STCH/FACCH and TCH/S half-slot timing must be interpreted/preserved; a valid non-stolen TCH/S half-slot must not be lost only because local marker state is late.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - Renamed and widened the NUB fallback from `Unallocated` only to `Unallocated | Cp`.
+  - The fallback still runs only after control decoding fails CRC and only for TCH/S-compatible NUB shapes: `NormalTrainSeq1/Both` and `NormalTrainSeq2/Block2`.
+  - UMAC remains the final guard: media is dropped unless a matching non-hangtime active circuit/floor exists.
+- `crates/tetra-entities/tests/test_lmac_bs.rs`
+  - Added `bs_lmac_recovers_fullslot_tch_s_after_hangtime_cp_marker_lag`.
+  - Added `bs_lmac_recovers_seq2_block2_tch_s_after_hangtime_cp_marker_lag`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 6 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 69 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+- Cross-built locally with `cargo zigbuild --release -p nexus-bs -p nexus-bs-control --target aarch64-unknown-linux-gnu --locked`.
+- Deployed direct to `/home/chris/nexus-bs` on `chris@192.168.1.179`, no backup binaries.
+- Remote hashes:
+  - `nexus-bs`: `ff90d99a02fed8e57acafee7b248704a1b430246bd42b33206bf24e2b57ed0ea`.
+  - `nexus-bs-control-service`: `e398d0a3bf5e686ffbbbb25fa2513f31ced9bfd780ac0f99359b7621fc8c623f`.
+- Services active after restart at `2026-06-06 00:10:26 EEST`.
+- Restart recovery observed:
+  - `2260616` registered and affiliated `[226333]`.
+  - `2260618` registered and affiliated `[226333]`.
+  - `2260082` registered and affiliated `[226333]`.
+
+Next non-repeating execution:
+
+1. Live retest private simplex `2260082 -> 2260618`: first PTT voice, release, second and third PTT from same `2260082` must have voice before any UL inactivity timeout.
+2. Inspect `journalctl -u nexus-bs@chris.service --since '2026-06-06 00:10:26'` for `LMAC: retrying undecoded NUB as candidate TCH/S on non-traffic UL marker Cp`, `rx_blk_traffic`, `UMAC voice route`, and absence of `UL inactivity timeout`.
+3. Repeat with `2260616 -> 2260618` to cover Hytera-to-Motorola first-PTT and re-entry behavior.
+
+## 2026-06-05 22:33:00 EEST - Final Pi service layout rework to systemd volatile runtime
+
+User report:
+
+- Rework deployment to be simpler with systemd service management.
+- Logs must be volatile/circular because the Pi filesystem will be read-only/clean-boot.
+- The setup should work for normal users such as `chris`, `pi`, or `dennis`.
+- Remove/disable unnecessary Pi OS services such as Bluetooth, polkit, ModemManager, and swap where present.
+
+Component explanation:
+
+- Runtime orchestration is the operating-system layer that starts/stops Nexus-BS and keeps state in the right place. It is not TETRA protocol behavior.
+- `nexus-bs@USER.service` runs the TETRA base-station stack as that user. The editable `config.toml` lives in the same `~/nexus-bs` folder as the binaries, then the service copies it into `/run/nexus-bs-USER` before start so runtime cache files stay volatile.
+- `nexus-bs-control@USER.service` runs the local command bridge. Operator commands are written to a FIFO in `/run/nexus-bs-USER/control.commands`.
+- `journald` is the system log manager. With `Storage=volatile` and `RuntimeMax*` limits, logs stay in RAM and rotate by size.
+
+ETSI clause scope:
+
+- No ETSI EN 300 392-2 protocol field or PDU behavior was changed in this service-layout patch.
+- This supports long-running validation of group call, private call, SDS/WAP, and attach behavior but is not formal ETSI/TETRA certification.
+
+Patch:
+
+- Added `contrib/systemd/nexus-bs@.service`.
+- Added `contrib/systemd/nexus-bs-control@.service`.
+- Added `contrib/systemd/journald-nexus-bs-volatile.conf`.
+- Added `scripts/nexus-bs-control-command.sh`.
+- Marked `contrib/systemd/nexus-bs.service` as the legacy sample and pointed new deployments to the template units.
+- `tetra-core::debug` now honours `RUST_LOG` before falling back to the development default filter.
+- `MessageRouter::tick_start` moved the per-TDMA tick line from `info` to `trace`.
+
+Deployment verification on `chris@192.168.1.179`:
+
+- Final home layout is flat: `/home/chris/nexus-bs/nexus-bs`, `/home/chris/nexus-bs/nexus-bs-control-service`, `/home/chris/nexus-bs/config.toml`.
+- `nexus-bs@chris.service` and `nexus-bs-control@chris.service` are enabled and active.
+- Runtime files are volatile under `/run/nexus-bs-chris`: copied `config.toml`, `config.toml.subscribers`, and FIFO `control.commands`.
+- `RuntimeDirectoryPreserve=yes` keeps the shared FIFO/cache directory across BS/control restarts.
+- `journald` is configured volatile with `RuntimeMaxUse=64M`, `RuntimeMaxFileSize=8M`, `RuntimeMaxFiles=8`, `MaxRetentionSec=1day`.
+- `/var/log/journal` is absent; `/run/log/journal` is active.
+- Bluetooth, Avahi, polkit, and `dev-zram0.swap` are inactive/masked; `/proc/swaps` is empty.
+- Recent journal since the final restart has no `--- tick dl` or `rx_tpsap_prim got` flood.
+- No formal ETSI/TETRA certification is claimed.
+
+Next non-repeating execution:
+
+1. Run live RF validation for group call turn-taking, private simplex/duplex close, SDS, and WAP delivery using the deployed systemd service.
+2. If any PTT denied/static/no-answer issue appears, inspect `journalctl -u nexus-bs@chris.service --since <test-start>` and patch the relevant CMCE/UMAC/MM clause path with focused tests.
+
+## 2026-06-05 22:39:00 EEST - Live config HMD PID 220 display text
+
+User report:
+
+- Configure PID 220 so the terminal display shows `Nexus-BS`.
+
+Component explanation:
+
+- Home Mode Display is a periodic SDS Type4 broadcast generated by CMCE/SDS.
+- `protocol_id = 220` is SDS-TL PID `0xDC`, which is in the user-defined/vendor range; terminals that implement this display path may show the configured text.
+- This is config-only behavior, not a TETRA protocol code patch.
+
+ETSI clause scope:
+
+- EN 300 392-2 SDS-TL PID handling allows user-defined/vendor PIDs in this range; this config uses that path for a short text payload.
+- No formal ETSI/TETRA certification is claimed.
+
+Deployment verification on `chris@192.168.1.179`:
+
+- Added `[cell_info.home_mode_display]` to `/home/chris/nexus-bs/config.toml`.
+- Runtime copy `/run/nexus-bs-chris/config.toml` contains `protocol_id = 220`, `text_coding_scheme = "LATIN"`, `interval_multiframes = 96`, `text = "Nexus-BS"`.
+- Restarted `nexus-bs@chris.service`; service is active.
+- Journal confirms: `SDS: Home Mode Display broadcast ... protocol_id=220 ... text_coding_scheme=0x01`.
+
 ## 2026-06-05 17:11:23 EEST - CMCE shared registry fallback for restart-affiliated groups
 
 User report:
@@ -7131,6 +8209,60 @@ Next non-repeating execution:
 2. Add UMAC same-priority protected-control admission/coalescing evidence for over-cap floor-withdraw storms, especially when every queued element is already protected.
 3. Add operator-visible metrics or config documentation for hard local scale caps: CMCE floor FIFO 4096, UMAC pending TMA 4096, and RA ACK queue 8192.
 
+## 2026-06-05 22:49 EEST - WAP SDS live send exposed TxReporter late-completion crash
+
+Component in simple technical terms:
+
+- WAP MVP currently sends the Nexus-BS browser page as raw SDS Type4 payload.
+- CMCE/SDS builds `D-SDS-DATA`, LLC handles acknowledged BL-DATA delivery for ISSI targets, and UMAC/fragger/scheduler split large payloads into MAC fragments until MAC-END.
+- `TxReporter` is local bookkeeping shared by LLC and UMAC. It records whether a submitted downlink PDU is still pending, transmitted, discarded, lost, or acknowledged.
+
+Live issue covered:
+
+- Sent the WAP SDS page to ISSI `2260618` using `nexus-bs-control-command sendwap 16777215 2260618 false`.
+- Control accepted the command and BS logged `SDS: received raw from Control ... sdti=3, 1984 bits`.
+- The first live send then panicked with `TxReporter: invalid transition Pending -> Transmitted (actual state: Discarded)`.
+- Root cause: stale/late MAC completion can arrive through a cloned `TxReporter` after LLC/UMAC has already marked the request discarded due cancellation, timeout, or retry state. That must be a failed/late local report, not a process-fatal panic.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 13.2 covers SDS service scope.
+- EN 300 392-2 clause 20.4.1.1.3 covers MAC `TMA-REPORT` completion/failure reporting toward LLC.
+- EN 300 392-2 clause 22.3.2.3 covers LLC acknowledged BL-DATA retry/failure handling.
+- This patch does not change over-air SDS/CMCE PDUs or formal conformance status. It hardens local TxReporter state handling so late MAC reports cannot crash Nexus-BS.
+
+Patch summary:
+
+- `crates/tetra-core/src/tx_receipt.rs`
+  - Added non-panicking `try_mark_transmitted()` and `try_mark_discarded()` for asynchronous MAC/LLC report paths.
+  - Kept existing strict `mark_*()` methods and panic tests for code paths that require invariant checking.
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - Made LLC helper marking atomic with the new try-mark operations.
+- `crates/tetra-entities/src/umac/subcomp/bs_frag.rs`
+  - MAC fragment completion now ignores/logs a late complete report if the reporter is already final.
+  - Added regression test for MAC-END completion after local discard.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Group and stealing completion reports now tolerate late reporter state.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - TMA admission/timeout discard paths now use non-panicking pending-only discard.
+
+Verification:
+
+- `cargo test -p tetra-core tx_receipt --locked` -> 7 passed.
+- `cargo test -p tetra-entities --lib test_late_fragment_completion_after_discard_is_ignored --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_out_fragmented_resource --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs tma_report --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_sds_bs network_origin --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 80 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Cross-build Nexus-BS/control locally for aarch64 and deploy directly to `~/nexus-bs` on `chris@192.168.1.179`, no build on Pi and no backup binary.
+2. Restart `nexus-bs@chris.service`, resend WAP SDS to `2260618`, and check journal for `SendRawSdsResponse { success: true }` with no panic.
+3. Continue SDS/WAP accepted-vs-transmitted observability so operator UI distinguishes accepted command, MAC transmitted, failed transfer, and terminal ACK where available.
+
 ## 2026-06-05 22:03 EEST - Restart-recovery overdue sweep pacing
 
 Component in simple technical terms:
@@ -7166,3 +8298,2479 @@ Next non-repeating execution:
 1. Add UMAC same-priority protected-control admission/coalescing evidence for over-cap floor-withdraw storms, especially when every queued element is already protected.
 2. Add operator-visible metrics or config documentation for hard local scale caps: CMCE floor FIFO 4096, UMAC pending TMA 4096, and RA ACK queue 8192.
 3. Add cross-layer long-run SDS/status plus group/PTT aftercare in one runtime so data service storms cannot regress call-control floor handling.
+## 2026-06-06 00:42 EEST - Private simplex repeated Motorola PTT LMAC stolen-half scoping
+
+Component in simple technical terms:
+
+- LMAC is the lower MAC that decides whether an uplink burst half is traffic speech (`TCH/S`) or stolen signalling (`STCH`).
+- UMAC parses first-half STCH/MAC signalling and tells LMAC when the second half of the same burst is also stolen.
+- In private simplex, a Motorola can send `U-TX CEASED`, then later press PTT again on the same assigned timeslot; the later speech half-slot must not inherit an old stolen-half marker.
+
+Live issue covered:
+
+- User reported `2260082 -> 2260618`, both Motorola: first PTT from `2260082` had voice, but subsequent PTTs from `2260082` had no useful voice/static while signalling looked normal.
+- Fresh journal evidence for call_id `4` showed initial speech (`speech_present=true`), then `U-TX CEASED`, `D-TX CEASED`, a later `U-TX DEMAND`/`D-TX GRANTED`/`UMAC floor granted`, but no accepted uplink speech before `UL inactivity timeout`.
+- Patch scopes `blk2_stolen` to the exact uplink `TdmaTime`, preventing a stale STCH second-half indication from suppressing later valid `TCH/S` Block2 on private-simplex re-entry.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b/e covers private simplex `U-TX DEMAND`, `D-TX GRANTED`, and end-of-transmission `D-TX CEASED`.
+- EN 300 392-2 clause 21.4.5 covers STCH use and the second-half-stolen indication.
+- EN 300 392-2 clauses 23.8.4.2.2 and 23.8.5 require the BS to preserve valid non-stolen `TCH/S` half-slot speech instead of interpreting it as signalling.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - `TmvConfigureReq { blk2_stolen: Some(true) }` now carries the exact uplink `TdmaTime`.
+- `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - Replaced the global `blk2_stolen` bool with per-timeslot `Option<TdmaTime>`.
+  - LMAC applies the stolen second-half marker only to Block2 from the same received UL burst and clears stale markers.
+- `crates/tetra-entities/tests/test_lmac_bs.rs`
+  - Added `bs_lmac_ignores_stale_blk2_stolen_marker_for_later_tch_s_block2`.
+
+Verification:
+
+- `cargo fmt --check --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 7 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 70 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Next non-repeating execution:
+
+1. Cross-build locally and deploy direct to `/home/chris/nexus-bs`; do not compile on Pi and do not create backup binaries.
+2. Restart `nexus-bs@chris.service`.
+3. Retest `2260082 -> 2260618` with repeated PTT from `2260082`; expected post-fix log has `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, then accepted `TCH/S`/no `UL inactivity timeout`.
+
+## 2026-06-05 23:12 EEST - Private simplex first-PTT floor seeding and LLC reporter split completed
+
+Component in simple technical terms:
+
+- CMCE private call control decides who owns the simplex P2P transmit floor during setup.
+- UMAC uses that floor owner to accept and route the first TCH/S speech burst instead of treating it as unknown/static media.
+- LLC handles ACK/retry for SDS/WAP BL-DATA; its service reporter is the user-visible transfer result, while each MAC attempt gets its own reporter.
+
+Live issue covered:
+
+- User reported a private simplex P2P regression: first PTT opens the call but carries no voice; second PTT carries voice.
+- Root cause matched setup-time ordering: the internal UMAC `FloorGranted` must be seeded immediately after the traffic bearer opens and before `D-CONNECT` / `D-CONNECT-ACKNOWLEDGE` can let an MS send the first TCH/S burst.
+- Also completed the unfinished LLC split so SDS/WAP acknowledged transfers keep correct service-level `Transmitted -> Acknowledged/Lost` state while retries use fresh per-attempt MAC reporters.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 covers private call setup and initial simplex transmit permission.
+- EN 300 392-2 table 14.74 covers the `request_to_transmit_send_data` setup bit used to decide caller-first vs called-first initial floor.
+- EN 300 392-2 clauses 23.5 and 23.5.2.2.1 cover assigned-channel traffic/signalling handling used by UMAC to route TCH/S.
+- EN 300 392-2 clause 22.3.2.3 covers LLC acknowledged BL-DATA, T.251/N.252 retry, ACK, and failed-transfer handling.
+- This remains clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Moved private-simplex initial floor seeding before over-air connect PDUs.
+  - Kept simplex as one shared assigned bearer and did not add non-standard setup-time `D-TX GRANTED`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added direct FIFO `CmceBs` tests for `Open -> FloorGranted -> D-CONNECT/D-CONNECT-ACKNOWLEDGE` ordering.
+  - Covered both caller-first and called-MS-first hook setup cases.
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - Finished service reporter vs per-attempt MAC reporter split for acknowledged BL-DATA.
+  - Fresh MAC reporter is attached for each TMA attempt/retry; service reporter receives first-complete, ACK, and lost/failed state.
+- `crates/tetra-entities/tests/test_llc_bs.rs`
+  - Updated BL-DATA/BL-ADATA ACK, wrong-ACK, fragmentation, endpoint, and T.251 exhaustion tests to assert service reporter and MAC reporter states separately.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 69 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 82 passed.
+- `cargo test -p tetra-core tx_receipt --locked` -> 7 passed.
+- `cargo test -p tetra-entities --lib test_late_fragment_completion_after_discard_is_ignored --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_sds_bs network_origin --locked` -> 10 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Live deploy / runtime verification:
+
+- Built locally for `aarch64-unknown-linux-gnu` with the Nexus-BS cross-build environment; no build was run on Pi.
+- Deployed directly to `/home/chris/nexus-bs`, no backup binaries:
+  - `/home/chris/nexus-bs/nexus-bs` sha256 `8a3f8d05307d50ee196140d6975925d95fa562029c3202ceaf1bb6a43027ff0f`.
+  - `/home/chris/nexus-bs/nexus-bs-control-service` sha256 `d5dbaff8d4e6bac01c708ffa5e903759c47e466a207e5e16cbaac00ae0e1a17f`.
+- `nexus-bs@chris.service` and `nexus-bs-control@chris.service` restarted and reported `active`.
+- Restart recovery observed ISSIs `2260082`, `2260616`, and `2260618`; `2260618`, `2260616`, and `2260082` re-registered/affiliated to GSSI `226333`.
+- Sent WAP color SDS to ISSI `2260618`; control logged `SendRawSds`, CMCE logged raw SDS Type4 for `2260618`, and control returned `SendRawSdsResponse { success: true }`.
+- No `TxReporter` panic was observed after the WAP SDS send.
+
+Next non-repeating execution:
+
+1. Run live private simplex first-PTT retest and inspect the journal for `Simplex P2P ... initial floor_holder`, `UMAC floor granted`, and absence of first-burst static/no-voice symptoms.
+2. If first PTT is now clean, run a reverse-direction private simplex test and then a short GSSI PTT sequence to ensure group call floor handling did not regress.
+3. Continue with MM/EG7 restart-recovery and SDS/WAP long-run soak after voice basics are stable.
+
+## 2026-06-05 23:42 EEST - Private simplex first reverse-PTT media preservation
+
+Component in simple technical terms:
+
+- CMCE is the call-control layer. It decides which radio owns the private simplex PTT floor and sends `D-TX GRANTED`.
+- UMAC is the traffic scheduler. It receives CMCE `FloorGranted`, routes uplink TCH/S voice to the peer downlink timeslot, and clears stale audio when the speaker changes.
+- `CircuitMgr` is the small UMAC queue that holds speech blocks waiting to be transmitted on a downlink traffic slot.
+
+Live issue covered:
+
+- User reported Hytera `2260616` -> Motorola MXP600 `2260618`: first Hytera PTT makes the MXP600 beep twice and show `Private`, but no voice; second PTT carries voice.
+- The earlier setup-floor patch fixed initial call floor seeding. This report is the next path: called MS initially owns the simplex floor, then Hytera asks for floor with `U-TX DEMAND`.
+- The risk was that UMAC `FloorGranted` cleared both crossed P2P media queues before preserving media that had already arrived from the newly granted UL timeslot. That can erase the first valid TCH/S Block2 from the requester and leave only FACCH/STCH control on the peer downlink.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b) covers private simplex `U-TX DEMAND` / `D-TX GRANTED`; the SwMI grants one MS and informs the peer.
+- EN 300 392-2 clause 14.5.1.4.2 says `D-TX GRANTED` switches U-plane on for transmit or receive according to the grant.
+- EN 300 392-2 clauses 23.5, 23.8.4.2.2, and 23.8.5 allow FACCH/STCH stealing but require valid non-stolen TCH/S half-slot timing/order to be preserved by the BS.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/subcomp/circuit_mgr.rs`
+  - Added source metadata to queued DL speech blocks: source UL timeslot and optional speaker ISSI.
+  - Added `clear_tx_data_except_source()` so a private floor change can discard stale media while preserving media from the newly granted speaker.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Exposed source-aware DL media scheduling and source-aware queue clearing to UMAC.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Tags locally routed ACELP and raw TCH/S Block2 with source metadata.
+  - On private `FloorGranted`, validates the participant before clearing queues, sets the current source speaker, then clears only media that does not belong to the newly granted source.
+  - Group-call `FloorGranted` cleanup keeps the existing GSSI behavior.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_private_simplex_floor_grant_preserves_first_requester_raw_block2`, using lab-shaped ISSIs `2260616` and `2260618`.
+  - The regression submits the first requester raw Block2 before/around `FloorGranted` and proves it reaches the MXP600 peer DL slot instead of being purged.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_private_simplex_floor_grant_preserves_first_requester_raw_block2 --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 5 passed.
+- `cargo test -p tetra-entities --lib circuit_mgr --locked` -> 6 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 69 passed, no warnings after cleanup.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Cross-build locally and deploy direct to `~/nexus-bs` on `chris@192.168.1.179`; do not compile on Pi and do not create backup binaries.
+2. Restart `nexus-bs@chris.service`.
+3. Retest private simplex `2260616 -> 2260618`: first Hytera PTT should produce `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, and then TCH/S voice on the first attempt, without the two-beep/no-voice symptom.
+
+Deploy/runtime follow-up:
+
+- Built locally for `aarch64-unknown-linux-gnu`; no compile was run on Pi.
+- Deployed directly into flat final layout `/home/chris/nexus-bs`, no backup binaries:
+  - `/home/chris/nexus-bs/nexus-bs` sha256 `01c6d2822e8ac727593595bee7810f28bd607c6b339437cf17c6331e81604aee`.
+  - `/home/chris/nexus-bs/nexus-bs-control-service` sha256 `6f56ac2e660f1888ac3998fca34775d2415f917efd610f90aa8ce6ccbeeaa915`.
+- Restarted systemd services:
+  - `nexus-bs@chris.service` active, main PID `42312`.
+  - `nexus-bs-control@chris.service` active, control PID `42306`.
+- Fresh journal from restart `2026-06-05 23:46:25 EEST`:
+  - Build line: `Build: v0.1.55-332fa519-modified`.
+  - `2260616` registered and affiliated to group `[91]`.
+  - `2260618` registered and affiliated to group `[226333]`.
+  - `2260082` registered and affiliated to group `[226333]`.
+  - No post-deploy `PTT denied`, `Service unavailable`, `Unit Not Attached`, panic, or error appeared in the checked startup filter.
+
+Next live action:
+
+1. Operator should retest private simplex `2260616 -> 2260618`, first Hytera PTT.
+2. Inspect only journal entries after `2026-06-05 23:46:25 EEST` for `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, `UMAC voice route`, and `rx_blk_traffic`.
+3. For group-call validation, first move `2260616` back to GSSI `226333`; current startup affiliation shows `[91]`.
+
+## 2026-06-05 23:59 EEST - Private simplex shared-timeslot first requester media tag fix deployed
+
+Component in simple technical terms:
+
+- CMCE decides which private-call participant gets the simplex PTT floor and emits `D-TX GRANTED`.
+- UMAC tracks that floor and queues TCH/S speech blocks for the active traffic channel.
+- On one shared private-simplex timeslot, raw TCH/S does not contain an ISSI, so UMAC must not label the first requester speech half-slot with the previous floor holder before `FloorGranted` arrives.
+
+Live issue covered:
+
+- Live test `2260616 -> 2260618` still produced two MXP600 beeps and no voice on the first Hytera PTT on the previously deployed binary.
+- Journal evidence from call IDs 5 and 6 showed shared private-simplex bearer `peer_ts=None`, initial floor holder `2260618`, later `U-TX DEMAND` from `2260616`, immediate `UMAC floor granted`, then two FACCH/STCH frames with `speech_present=false` before speech appeared.
+- Patch prevents first requester media from being purged if raw Block2 arrives before `current_ul_speaker` is switched from the old floor holder on a shared private-simplex bearer.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b) requires an explicit `D-TX GRANTED` response to a private-simplex `U-TX DEMAND` and informs the other MS with "granted to another user".
+- EN 300 392-2 clause 14.5.1.4.2 switches U-plane transmit/receive according to `D-TX GRANTED`.
+- EN 300 392-2 clauses 23.5 and 23.8.5 cover assigned-channel FACCH/STCH stealing while preserving valid TCH/S half-slot media.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `ul_media_speaker_tag()`.
+  - For shared private-simplex bearers (`private_participant_scoped && peer_ts=None`), locally queued UL media is tagged by source timeslot but not by the current speaker ISSI, because the current speaker can still be the previous floor holder during the first requester media race.
+  - Cross-routed P2P and group bearers keep speaker tagging for stale-media filtering.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_private_simplex_shared_ts_floor_grant_preserves_first_requester_raw_block2` with field ISSIs `2260616` and `2260618`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_private_simplex_shared_ts_floor_grant_preserves_first_requester_raw_block2 --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_private_simplex_floor_grant_preserves_first_requester_raw_block2 --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 6 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 69 passed.
+- `cargo test -p tetra-entities --lib circuit_mgr --locked` -> 6 passed.
+- `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Built locally for `aarch64-unknown-linux-gnu`; no compile was run on Pi.
+- Deployed directly into flat final layout `/home/chris/nexus-bs`, no backup binaries:
+  - `/home/chris/nexus-bs/nexus-bs` sha256 `89538e2374a664fa25eb3e130631ed4375b8608ab29f9574b92a929f4b671cf8`.
+  - `/home/chris/nexus-bs/nexus-bs-control-service` sha256 `825fb34108f0fbd57255d02739e4549b92091c01184c1c7d4c2cc8ec1b11587a`.
+- Restarted with sudo systemd after normal user stop was blocked by masked polkit:
+  - `nexus-bs@chris.service` active.
+  - `nexus-bs-control@chris.service` active.
+- Fresh startup at `2026-06-05 23:58:54 EEST`:
+  - Build line `v0.1.55-332fa519-modified`.
+  - Restart recovery armed for `2260082`, `2260616`, `2260618`.
+  - `2260618`, `2260616`, and `2260082` registered; all observed on group `[226333]` after startup/recovery.
+
+Next non-repeating execution:
+
+1. Retest private simplex `2260616 -> 2260618`, first Hytera PTT, on the new post-23:58 deploy.
+2. Inspect journal after `2026-06-05 23:58:54 EEST` for `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, `speech_present`, raw TCH/S preservation, and absence/presence of two-beep/no-voice.
+3. If the MXP600 still hears two beeps with no voice, add a scheduler-level regression proving the first post-grant TCH/S Block2 is not starved by RA ACK plus requester/peer `D-TX GRANTED` STCH sequence.
+
+## 2026-06-06 00:50 EEST - Private simplex repeated Motorola PTT deployed
+
+Component in simple technical terms:
+
+- LMAC is the lower MAC that classifies each uplink burst half as speech (`TCH/S`) or stolen signalling (`STCH`).
+- UMAC is the upper MAC scheduler that grants the PTT floor and forwards accepted speech to the peer downlink.
+- CMCE is call control; for private simplex it processes `U-TX DEMAND`, sends `D-TX GRANTED`, and keeps the call/floor state coherent.
+
+Live issue covered:
+
+- User reported `2260082 -> 2260618`, both Motorola: the first PTT from `2260082` carried voice, but following PTTs from `2260082` had normal signalling and no useful voice/static.
+- The expected failure mode after `U-TX CEASED`/`D-TX CEASED` is a stale second-half-stolen marker incorrectly treating a later valid speech half-slot as signalling.
+- Patch scopes `blk2_stolen` to the exact uplink `TdmaTime` and clears stale markers before later `TCH/S` Block2 processing.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b/e covers private simplex `U-TX DEMAND`, `D-TX GRANTED`, `U-TX CEASED`, and `D-TX CEASED`.
+- EN 300 392-2 clause 21.4.5 covers stolen signalling channel handling and second-half-stolen indication.
+- EN 300 392-2 clauses 23.8.4.2.2 and 23.8.5 require preserving valid non-stolen `TCH/S` media timing/order instead of forwarding signalling bits as speech or suppressing speech.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo fmt --check --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 11 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 7 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 70 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- Local AArch64 build completed for `nexus-bs` and `nexus-bs-control-service`; no build was run on Pi.
+
+Deploy/runtime:
+
+- Deployed directly into flat final layout `/home/chris/nexus-bs`, no backup binaries:
+  - `/home/chris/nexus-bs/nexus-bs` sha256 `84555da3ac376ac5523084a10d8e8ae09407da206f446528077d078e2a155fb9`.
+  - `/home/chris/nexus-bs/nexus-bs-control-service` sha256 `df54f6383b8eaf5fd18aca8b41a4940491cedd2ed022855223accb0fafe3b7f9`.
+- Restarted systemd services:
+  - `nexus-bs-control@chris.service` active from `2026-06-06 00:46:50 EEST`.
+  - `nexus-bs@chris.service` active from `2026-06-06 00:46:51 EEST`.
+- Fresh startup journal:
+  - Build line `Build: v0.1.55-332fa519-modified`.
+  - Restart recovery armed for `{2260082, 2260616, 2260618}`.
+  - `2260616`, `2260618`, and `2260082` registered and affiliated to group `[226333]`.
+  - No post-restart `Unit Not Attached`, `PTT denied`, `Service unavailable`, panic, or error appeared in the checked startup filter.
+
+Next non-repeating execution:
+
+1. Retest private simplex `2260082 -> 2260618` on the post-`00:46:51 EEST` deploy; press PTT from `2260082` repeatedly in the same call.
+2. Inspect only journal after `2026-06-06 00:46:51 EEST` for `U-TX DEMAND`, `D-TX GRANTED`, `UMAC floor granted`, `rx_blk_traffic`, `UMAC voice route`, `lmac_bs: dropping stale blk2_stolen marker`, `UL inactivity timeout`, and any `PTT denied`.
+3. If repeated PTT from `2260082` still has static/no voice, capture the post-restart call log and distinguish stale STCH classification from downlink traffic queue starvation.
+
+## 2026-06-06 00:53 EEST - SDS/status reporter late-discard hardening
+
+Component in simple technical terms:
+
+- SDS-BS is the CMCE short data/status sub-entity for network-origin and mobile-origin SDS.
+- `TxReporter` is the small shared receipt object used by control/Brew/dashboard and lower layers to say whether one SDS/status request was transmitted, acknowledged, lost, or discarded.
+- A local reject path must fail a pending SDS/status request, but it must not panic if an async air-delivery path has already completed the same receipt.
+
+Issue covered:
+
+- Existing UMAC/LLC paths already use non-panicking `try_mark_*` reporter completion for late async reports.
+- SDS/status local reject paths still used strict `mark_discarded()`.
+- If a stale cloned reporter reached a local reject path after the same handle was already marked transmitted, Nexus-BS could panic instead of preserving the earlier transfer result.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 13.3.2.2 defines one `TNSDS-REPORT` transfer result for the handle belonging to a `TNSDS-UNITDATA` or `TNSDS-STATUS` request.
+- EN 300 392-2 clause 18.3.5.3.1 maps higher-layer requests through MLE/LLC reporting and confirms/failed reports.
+- This patch is internal report-state robustness for SDS/status; it does not change over-air `D-SDS-DATA`, `D-STATUS`, `U-SDS-DATA`, or `U-STATUS` encoding.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/sds_bs.rs`
+  - `discard_status_reporter()` now uses `try_mark_discarded()`.
+  - `discard_sds_reporter()` now uses `try_mark_discarded()`.
+  - Pending requests still become `Discarded`; late discards after `Transmitted`/final state are ignored.
+- `crates/tetra-entities/tests/test_sds_bs.rs`
+  - Added late-discard regression for network-origin SDS data.
+  - Added late-discard regression for network-origin SDS status.
+
+Verification:
+
+- `cargo fmt --check --package tetra-entities` -> pass.
+- `cargo test -p tetra-entities --test test_sds_bs late_discard --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_sds_bs raw_sds --locked` -> 20 passed.
+- `cargo test -p tetra-entities --test test_sds_bs network_origin --locked` -> 11 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+- `cargo test -p tetra-entities --test test_sds_bs --locked` -> 121 passed.
+
+Deploy/runtime:
+
+- Not deployed yet. The active BS remains the post-`2026-06-06 00:46:51 EEST` private-simplex test build so live `2260082 -> 2260618` repeated-PTT validation is not interrupted.
+
+Next non-repeating execution:
+
+1. Keep the current BS running for the private simplex repeated-PTT retest.
+2. Include the SDS/status reporter hardening in the next AArch64 build/deploy after the current P2P voice retest window.
+3. Continue LLC report observability so control/dashboard can distinguish command accepted, over-air transmitted, acknowledged, lost, and locally discarded.
+
+## 2026-06-06 00:58 EEST - LLC acknowledged-transfer late-loss reporter hardening
+
+Component in simple technical terms:
+
+- `TxReporter` is the shared transmit receipt used by MAC/LLC/control code.
+- LLC basic-link acknowledged transfer sends a `BL-DATA`/`BL-ADATA`, reports first complete transmission, waits for `BL-ACK`, and finally marks the service request as acknowledged or lost.
+- The service-level reporter and per-MAC-attempt reporter are deliberately separate so retries do not reset the user-visible SDS/MM/CMCE request state.
+
+Issue covered:
+
+- Existing code already had non-panicking `try_mark_transmitted()` and `try_mark_discarded()` for async MAC/LLC report paths.
+- The failure side for an already-transmitted acknowledged TL-SDU still used strict `mark_lost()`.
+- A late T.251 expiry, wrong-ACK exhaustion, fragmentation exhaustion, or MAC failure observed after another async path completed the reporter could panic instead of preserving one final transfer result.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 22.3.2.3(f) defines first complete transmission reporting and T.251 start for acknowledged BL-DATA/BL-ADATA.
+- EN 300 392-2 clause 22.3.2.3(g/h/i/k) defines failed-transfer handling for MAC failure, fragmentation failure, T.251 expiry, and wrong `BL-ACK N(R)`.
+- EN 300 392-2 Annex A.1 defines T.251 in downlink signalling frames.
+- This patch is internal reporter-state robustness; it does not change over-air LLC PDU encoding or sequence numbering.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch summary:
+
+- `crates/tetra-core/src/tx_receipt.rs`
+  - Added `TxReporter::try_mark_lost()` for non-panicking `Transmitted -> Lost`.
+  - Added tests for normal lost marking and late lost after acknowledgement.
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - `mark_ack_service_failed()` now uses `try_mark_discarded()` / `try_mark_lost()` instead of strict final-state transitions.
+  - Pending transfers still become `Discarded`; transmitted ACK-wait transfers still become `Lost`; already-final transfers are left alone.
+
+Verification:
+
+- `cargo test -p tetra-core tx_receipt --locked` -> 9 passed.
+- `cargo test -p tetra-entities --test test_llc_bs random_access_failure --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_llc_bs wrong_bl_ack --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 82 passed.
+- `cargo fmt --check --package tetra-core --package tetra-entities` -> pass.
+- `cargo check -p tetra-core -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Not deployed yet. The active BS remains the post-`2026-06-06 00:46:51 EEST` private-simplex test build so live `2260082 -> 2260618` repeated-PTT validation is not interrupted.
+
+Next non-repeating execution:
+
+1. Keep current live BS untouched for the P2P repeated-PTT test unless the user requests deployment.
+2. Include SDS/status reporter hardening and LLC late-loss hardening in the next local AArch64 build/deploy.
+3. Continue with LLC report observability and per-link admission/backpressure after voice retest evidence is collected.
+
+## 2026-06-06 01:17 EEST - Private simplex first/repeated PTT media guard
+
+Component in simple technical terms:
+
+- CMCE is call control: it decides which terminal owns private-call PTT/floor and emits the standardized grant/ceased messages.
+- UMAC is the upper MAC scheduler: it turns CMCE floor state into assigned-channel traffic, STCH/FACCH signalling, and TCH/S speech toward the peer terminal.
+- TCH/S is the radio speech channel. STCH/FACCH is signalling that can steal part of a traffic burst, for example to carry floor control.
+
+Live issue covered:
+
+- User reported Motorola still beep-beep/signalling on private simplex, but the first/repeated PTT from the terminal sometimes carried no useful voice.
+- Audit found a race where valid private-call speech from LMAC could arrive during the short hangtime window before the internal UMAC `FloorGranted` event was processed.
+- Old UMAC handling kept only one raw Block2 and dropped it on the next tick if the floor was still in hangtime; ACELP full-slot speech had no equivalent deferral path.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Replaced the single pending raw Block2 slot with a bounded per-timeslot pending private UL media queue.
+  - Supports both raw TCH/S Block2 and ACELP full-slot speech.
+  - Applies only to private participant-scoped, non-SwMI media paths; group-call hangtime media is still dropped.
+  - Retains media only briefly while UL/DL floor is still in hangtime, then flushes immediately after private `FloorGranted`.
+  - Drops pending media on circuit replacement/close, `FloorReleased`, `CallEnded`, source/peer change, inactive circuit, SwMI media source, or TTL expiry.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added delayed private raw Block2 floor-grant regression.
+  - Added delayed private ACELP floor-grant regression.
+  - Added stale private media expiry regression.
+- `README.md` and `example_config/config.toml`
+  - Normal HMD/SDS examples now show PID 130 text only; PID 220/0xDC is no longer advertised in user-facing example config for HMD.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 b/e covers private simplex `U-TX DEMAND`, `D-TX GRANTED`, `U-TX CEASED`, and floor handoff.
+- EN 300 392-2 clause 14.5.1.4.2 covers lower-layer U-plane switching from CMCE transmission grants/ceased state.
+- EN 300 392-2 clause 23.5 covers assigned-channel signalling transfer.
+- EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 cover TCH/S half-slot/traffic preservation around stolen signalling.
+- The bounded queue and TTL are Nexus-BS implementation guards around that clause-scoped behavior. This is engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_ul_raw_block2_is_dropped_during_hangtime --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 70 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Not deployed yet in this entry. Local code is verified and ready for the next local AArch64 build/deploy batch.
+
+Next non-repeating execution:
+
+1. Build locally only for AArch64 using the Nexus-BS SoapySDR sysroot command; do not build on Pi.
+2. Deploy directly to `/home/chris/nexus-bs` flat layout, no backup binary.
+3. Restart `nexus-bs@chris.service` and `nexus-bs-control@chris.service`.
+4. Retest private simplex repeated PTT, especially `2260082 -> 2260618` and `2260616 -> 2260618`, and inspect post-restart logs for `UMAC voice route: deferred`, `D-TX GRANTED`, and absence of no-voice/static on first/repeated PTT.
+
+## 2026-06-06 01:31 EEST - Private simplex release duplicate D-RELEASE guard
+
+Component in simple technical terms:
+
+- CMCE release is the call-control part that ends an individual/private call when a terminal presses the red key or a timer expires.
+- FACCH/STCH release means `D-RELEASE` is sent on the already assigned traffic channel.
+- MCCH release means `D-RELEASE` is sent again on the common control channel.
+
+Live issue covered:
+
+- Post-deploy log from the live call `2260082 -> 2260618`, call_id `4`, showed `U-DISCONNECT` followed by two `D-RELEASE` logs with `UserRequestedDisconnection`, then peer clear followed by two more `D-RELEASE` logs with `SwmiRequestedDisconnection`.
+- The duplicates came from established-call release sending both assigned-channel FACCH/STCH and MCCH fallback copies for the same terminal leg.
+- This is suspicious for Motorola peer end-call behaviour because the same call clear can be seen more than once, and the peer can later see a second release cause.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Established individual-call `D-RELEASE` now sends one reporter-tracked FACCH/STCH release per selected terminal leg.
+  - Removed MCCH fallback copy for calls that already have an assigned traffic circuit.
+  - Setup-phase releases still use the existing MCCH repeated path because no assigned traffic circuit is established yet.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated established P2P release assertions to require one FACCH/STCH `D-RELEASE` per expected leg and no duplicate MCCH fallback.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1 defines the individual-call disconnect request path where the MS that sent `U-DISCONNECT` waits for `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.2 defines SwMI release of individual calls by `D-RELEASE`.
+- EN 300 392-2 clause 23.5 covers assigned-channel signalling transfer; an established assigned-channel MS should receive the call-clear control message on that assigned channel.
+- This patch removes a Nexus-BS duplicate-delivery fallback for established calls. It is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_u_disconnect --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 70 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Deploy/runtime:
+
+- Not deployed yet in this entry. Include in the next immediate local AArch64 build/deploy with the UMAC private-media guard.
+
+Next non-repeating execution:
+
+1. Run `git diff --check`.
+2. Build locally for AArch64.
+3. Deploy direct to `/home/chris/nexus-bs`, restart services, and retest private simplex end-call from both sides.
+4. In post-restart logs, confirm one `D-RELEASE` log per established release leg rather than FACCH+MCCH duplicate pairs.
+
+## 2026-06-06 02:10 EEST - Private direct setup Annex D.4 called-leg ACK guard
+
+Component in simple technical terms:
+
+- CMCE individual-call setup is the call-control part that turns `U-SETUP` and `U-CONNECT` into the downlink messages each terminal needs before voice may flow.
+- `D-CONNECT ACKNOWLEDGE` is the accept/through-connect command sent to the called terminal.
+- The L2 ACK is the lower-layer confirmation that the called terminal actually received that command.
+- `D-CONNECT` is the through-connect command sent to the calling terminal; after it, the caller may start using the traffic bearer according to the grant.
+
+Live issue covered:
+
+- Motorola-like terminals could show private-call screen/beeps but miss first speech if the caller side was authorized before the called side had confirmed `D-CONNECT ACKNOWLEDGE`.
+- This matches the risk described by EN 300 392-2 Annex D.5; Annex D.4 gives the conservative sequence that waits for the called MS acknowledgement first.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Direct local private setup now sends one acknowledged `D-CONNECT ACKNOWLEDGE` with channel allocation to the called MS first.
+  - CMCE stores a pending called-leg ACK state and sends caller `D-CONNECT` only after the `TxReporter` reaches L2 acknowledged.
+  - Initial private-simplex `FloorGranted` is also delayed until that called-leg ACK, so the first PTT floor is not released before the called MS is synchronized.
+  - A bounded retry/fail guard releases the setup if the called `D-CONNECT ACKNOWLEDGE` is not acknowledged after the configured attempts.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`, `shared.rs`, `timers.rs`
+  - Added pending called-leg ACK tracking and timer drain integration, cleaned on call release/cleanup.
+- `crates/tetra-config/src/bluestation/sec_cell.rs`, `parsing.rs`, `README.md`, `example_config/config.toml`, `tests/common/default_stack.rs`
+  - Removed the stale `private_simplex_force_caller_initial_floor` compatibility switch so private-simplex setup follows ETSI field semantics instead of a caller-first workaround.
+- `crates/tetra-pdus/src/cmce/pdus/d_connect.rs`, `d_connect_acknowledge.rs`, `d_setup.rs`, `d_tx_interrupt.rs`, `d_tx_wait.rs`
+  - Corrected comments for `transmission_request_permission`: raw bit `0`/`false` means allowed to request transmission; raw bit `1`/`true` means not allowed.
+  - Added bit-level tests for `D-CONNECT` and `D-CONNECT ACKNOWLEDGE` polarity.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Private simplex `Open` on one shared assigned channel now keeps bearer/participant/EG context but does not seed the current UL speaker.
+  - UMAC authorizes the private-simplex U-plane speaker only on CMCE `FloorGranted`, which now arrives after called `D-CONNECT ACKNOWLEDGE` L2 ACK in the direct setup path.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated private-call setup tests to check the two phases: called `D-CONNECT ACKNOWLEDGE` first, then caller `D-CONNECT` and initial floor after L2 ACK.
+  - Updated established network-origin private release expectation to one assigned-channel `D-RELEASE`, matching the duplicate-release guard.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added/updated STCH private signalling tests so private-simplex STCH is dropped before a valid floor and attributed only after `FloorGranted`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 require incoming/outgoing individual setup messages to indicate the party allowed to transmit.
+- EN 300 392-2 clause 14.5.1.2.1 keeps SwMI control of private-simplex transmit permission and request handling.
+- EN 300 392-2 clause 14.5.1.4 covers U-plane switching according to the transmit grant.
+- EN 300 392-2 tables 14.74 and 14.81 define the request-to-transmit and transmission-request-permission bit semantics.
+- EN 300 392-2 Annex D.4 is the informative conservative direct private setup sequence: `D-CONNECT ACKNOWLEDGE` to the called MS, wait for L2 ACK, then `D-CONNECT` to the calling MS.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo check -p tetra-config -p tetra-pdus -p tetra-entities --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 70 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs private --locked` -> 19 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 155 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 70 passed.
+- `cargo test -p tetra-config --lib bluestation::parsing --locked` -> 29 passed.
+- `cargo test -p tetra-pdus --lib d_connect --locked` -> 12 passed.
+
+Deploy/runtime:
+
+- Not deployed yet in this entry.
+- Local AArch64 release build completed for `nexus-bs` and `nexus-bs-control`; no build was run on Pi.
+- Next live test should focus on first PTT audio for `2260616 -> 2260618` and repeated Motorola-to-Motorola private-simplex PTT after the called-leg ACK guard is deployed.
+
+Next non-repeating execution:
+
+1. Run formatting and `git diff --check`.
+2. Build locally only for AArch64 using the Nexus-BS SoapySDR sysroot command.
+3. Deploy direct to `/home/chris/nexus-bs` flat layout, restart services, and retest first PTT audio plus private-call end-call from both sides.
+
+## 2026-06-06 02:20 EEST - UMAC TMA timeout context for live debugging
+
+Component in simple technical terms:
+
+- UMAC is the upper MAC scheduler: it converts LLC/MLE/CMCE downlink requests into MAC resources, STCH/FACCH stealing, fragments, and traffic bursts.
+- TMA is the MAC service boundary used by LLC for a `TMA-UNITDATA` request and the matching `TMA-REPORT`.
+- `TxReporter` is the local receipt object used to know whether the scheduled MAC item was transmitted, discarded, or left pending.
+
+Issue covered:
+
+- Live logs showed warnings like `UMAC: TMA report req_handle=42 timed out after local pending-report guard`.
+- The warning did not say whether the stalled request was `D-TX GRANTED`, `D-TX CEASED`, SDS/HMD, a channel allocation, or ordinary MM/CMCE data.
+- That made private/group-call debugging too slow because the handle alone is not enough after a busy run.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added retained context to each pending TMA report: target address, endpoint, PDU bit length, PDU priority, stealing flag, stealing-repeat flag, channel-allocation summary, admission priority, and detected CMCE downlink PDU type when present.
+  - Timeout, cap-drop, and priority-eviction warnings now include that context.
+  - The over-air MAC scheduling and the TMA report result values are unchanged.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 20.4.1.1.3 defines `TMA-REPORT` as the MAC progress/failure report for a `TMA-UNITDATA` request.
+- EN 300 392-2 clause 23.1.2.1.1 covers complete MAC PDU transmission reporting.
+- EN 300 392-2 clause 23.5 covers assigned-channel signalling/stealing such as `D-TX GRANTED` and `D-TX CEASED`.
+- This patch is observability for clause-scoped verification; it does not claim formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities --check` -> pass after formatting.
+- `cargo test -p tetra-entities --test test_umac_bs tma --locked` -> 7 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed before formatting rewrite.
+- `git diff --check` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs energy_saving_does_not_allocate_frame_18_start --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_sds_bs status --locked` -> 50 passed.
+
+Deploy/runtime:
+
+- Not deployed yet.
+- On the next live run, any future TMA pending-report timeout should identify whether the stalled item was floor control, SDS/HMD, channel allocation, or ordinary data.
+
+Next non-repeating execution:
+
+1. Run `git diff --check`.
+2. Run one combined focused verification batch for CMCE private setup, UMAC private-simplex, TMA reports, MM EG frame-18 guards, and SDS/status.
+3. Build locally only for AArch64 and deploy direct to `/home/chris/nexus-bs` when ready for the next live test.
+
+## 2026-06-06 02:31 EEST - Annex D.4 negative-path evidence for private direct setup
+
+Component in simple technical terms:
+
+- CMCE/CC individual-call setup is the call-control state machine for private calls.
+- `D-CONNECT ACKNOWLEDGE` prepares the called MS and carries the assigned-channel allocation.
+- The L2 ACK proves the called MS received that setup command; without it, the BS must not authorize the caller's first traffic burst.
+- UMAC `FloorGranted` is the internal switch that lets the traffic scheduler accept voice from the selected ISSI.
+
+Issue covered:
+
+- The direct local private setup logic already followed the conservative Annex D.4 order: called `D-CONNECT ACKNOWLEDGE`, wait for L2 ACK, then `FloorGranted` and caller `D-CONNECT`.
+- The remaining evidence gap was the negative path: if the called `D-CONNECT ACKNOWLEDGE` is lost or never L2-acknowledged, tests did not prove that CMCE keeps the caller blocked through retries and releases setup only after exhaustion.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added helper extraction for the called-leg `D-CONNECT ACKNOWLEDGE` `TxReporter`.
+  - Added `test_p2p_called_d_connect_ack_l2_loss_never_authorizes_caller_before_release`.
+  - The test drives three lost L2 ACK attempts and asserts:
+    - one called `D-CONNECT ACKNOWLEDGE` retry per attempt;
+    - no caller `D-CONNECT` before called L2 ACK;
+    - no UMAC `FloorGranted` before called L2 ACK;
+    - setup is released with `AcknowledgedServiceNotComplete` after retry exhaustion.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 define individual-call setup/accept signalling and the `D-CONNECT ACKNOWLEDGE` / `D-CONNECT` through-connect roles.
+- EN 300 392-2 clause 14.5.1.2.1 keeps private-simplex transmit permission under SwMI control.
+- EN 300 392-2 Annex D.4 describes the conservative direct individual-call setup method: send `D-CONNECT ACKNOWLEDGE` to the called MS, receive L2 ACK, then authorize the calling MS with `D-CONNECT`.
+- EN 300 392-2 Annex D.5 warns that the faster alternative can lose first traffic if the called MS misses `D-CONNECT ACKNOWLEDGE`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_called_d_connect_ack_l2_loss_never_authorizes_caller_before_release --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 71 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo fmt --package tetra-entities --check` -> pass.
+
+Deploy/runtime:
+
+- Not deployed in this entry. This patch is test/evidence only; no over-air behavior changed.
+
+Next non-repeating execution:
+
+1. Run `cargo check -p tetra-entities --locked` and `git diff --check`.
+2. Continue LLC acknowledged basic-link audit or build/deploy the current local release batch for live private-simplex retest.
+
+## 2026-06-06 02:38 EEST - Annex D.4 direct P2P setup policy extended to duplex evidence
+
+Component in simple technical terms:
+
+- CMCE/CC is the private-call controller. It decides when the called MS is ready and when the caller may receive `D-CONNECT`.
+- L2 ACK is the lower-layer proof that the radio actually received the `D-CONNECT ACKNOWLEDGE`.
+- Duplex private call has no simplex `FloorGranted`, but the caller still must not receive `D-CONNECT` before the called side is prepared.
+
+User directive implemented:
+
+- Keep the conservative Annex D.4 order for Motorola-like terminals: send `D-CONNECT ACKNOWLEDGE` to the called MS, wait for the L2 ACK, then send `D-CONNECT` to the caller.
+- The runtime CMCE path already used `pending_individual_connect_acks` for direct local P2P setup. This entry adds explicit duplex regression evidence so future edits cannot silently reintroduce the faster Annex D.5 order.
+
+Patch summary:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_p2p_duplex_u_connect_waits_for_called_l2_ack_before_caller_d_connect`.
+  - The test asserts:
+    - no caller `D-CONNECT` before the called `D-CONNECT ACKNOWLEDGE` L2 ACK;
+    - called `D-CONNECT ACKNOWLEDGE` uses `Layer2Service::Acknowledged`, has `tx_reporter`, and carries channel allocation;
+    - after called L2 ACK, exactly one caller `D-CONNECT` is sent with acknowledged service and channel allocation;
+    - no simplex `FloorGranted` is synthesized for duplex setup.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 define the called/calling individual-call through-connect signalling roles.
+- EN 300 392-2 Annex D.4 gives the conservative direct individual-call setup sequence: called `D-CONNECT ACKNOWLEDGE`, L2 ACK, then caller `D-CONNECT`.
+- EN 300 392-2 Annex D.5 warns that the faster alternative can lose first traffic if the called MS misses `D-CONNECT ACKNOWLEDGE`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_duplex_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 72 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 157 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Not deployed in this entry. Runtime behavior was already on the Annex D.4 pending-ACK path; this patch adds duplex regression coverage.
+
+Next non-repeating execution:
+
+1. Continue MM/group-affiliation restart robustness audit against EN 300 392-2 clauses 16.4/16.8/16.10.
+2. Then build locally and deploy the current batch for live private-call retest only after the full focused verification batch remains green.
+
+## 2026-06-06 02:46 EEST - Annex D.4 directive revalidated without protocol changes
+
+Component in simple technical terms:
+
+- CMCE/CC private call is the control layer that prepares both radios before voice traffic starts.
+- `D-CONNECT ACKNOWLEDGE` prepares the called radio; the L2 ACK proves that radio actually received that command.
+- `D-CONNECT` to the caller is the authorization that lets the caller side start the connected private call path.
+
+User directive checked:
+
+- Conservative Motorola-like sequence remains enforced: `D-CONNECT ACKNOWLEDGE` to the called MS, wait for L2 ACK, then `D-CONNECT` to the calling MS.
+- No protocol code was changed in this entry because the runtime path already uses `pending_individual_connect_acks` and `TxReporter` to block caller `D-CONNECT` until called-leg L2 ACK.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4 describes the conservative direct individual-call setup method: called `D-CONNECT ACKNOWLEDGE`, L2 ACK, then caller `D-CONNECT`.
+- EN 300 392-2 Annex D.5 describes the faster alternative and warns that first traffic can be missed if the called MS misses `D-CONNECT ACKNOWLEDGE`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 2 passed.
+
+Next non-repeating execution:
+
+1. Patch MM restart/group-affiliation pending-report handling so incomplete group reports do not publish a stable `registered + no groups` state.
+2. Verify against EN 300 392-2 clauses 16.4/16.8/16.10 and then rerun focused MM restart recovery tests.
+
+## 2026-06-06 02:52 EEST - MM restart recovery no longer publishes incomplete No Group state
+
+Component in simple technical terms:
+
+- MM BS is the base-station mobility manager. It decides whether an ISSI is registered and which GSSI groups it may listen to.
+- `D-LOCATION UPDATE COMMAND` with `group_identity_report=true` is the SwMI asking a terminal to refresh its group list after restart.
+- `group report complete` is the explicit terminal signal that the requested group report is finished; without it, a group-less `DemandLocationUpdating` is not proof that the terminal has no groups.
+
+Patch summary:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Added a narrow pending-report guard for `DemandLocationUpdating` responses that have no `group_identity_location_demand` and no `group_report_complete` while a SwMI-requested group report is pending.
+  - MM still accepts the radio internally and keeps it addressable for follow-up PDUs.
+  - Shared subscriber state and CMCE/Brew `Register` are deferred until a standardized completion arrives or cached groups are restored, avoiding a stable dashboard/CMCE `registered + No Group` state.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Updated restart-recovery follow-up tests so incomplete reports emit no stable Register.
+  - Verified that a subsequent `U-ATTACH/DETACH GROUP IDENTITY` report completion publishes `Register` first, then `Affiliate`.
+  - Kept explicit empty `group_report_complete` behavior authoritative: it still produces registered with no groups when the MS really reports no groups.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4 allows SwMI-initiated registration with `D-LOCATION UPDATE COMMAND` and defines the group-report expectation after `group_identity_report=true`.
+- EN 300 392-2 clause 16.8.3 covers infrastructure-initiated group reporting via `U-ATTACH/DETACH GROUP IDENTITY`.
+- EN 300 392-2 clause 16.10.27a defines the `group report complete` information element.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` -> 33 passed.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` -> 144 passed.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `git diff --check` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+
+Deploy/runtime:
+
+- Not deployed in this entry. Local code and tests are ready for the next controlled build/deploy batch.
+
+Next non-repeating execution:
+
+1. Continue group-call/PTT audio robustness audit across CMCE floor control and UMAC circuit media routing, especially Motorola MTP3550 repeated PTT static.
+2. Before deployment, rerun focused CMCE/UMAC private and group call suites, then build locally and deploy only the resulting Nexus-BS release binary/config to `/home/<user>/nexus-bs`.
+
+## 2026-06-06 02:58 EEST - Group-call first post-grant TCH/S preserved through hangtime
+
+Component in simple technical terms:
+
+- UMAC BS is the traffic scheduler between CMCE floor-control and LMAC voice bursts.
+- Hangtime is the short receive-only state after `D-TX CEASED`, where the group call stays allocated but nobody may transmit until SwMI grants a new floor.
+- TCH/S Block2 is the second half-slot speech payload; if it arrives in the same transition where `D-TX GRANTED` is being processed, dropping it can sound like accepted PTT with static/no voice.
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Generalized the short deferred UL media guard so group calls, not only private simplex, can retain valid TCH/S media received during hangtime when a matching `FloorGranted` immediately follows.
+  - Added `deferred_during_hangtime` tracking so group floor grant preserves only the media from the newly granted source/timeslot.
+  - Kept stale-media protection: `FloorReleased`, call end, circuit close, unmatched speaker, and no-grant hangtime still purge or expire deferred media.
+  - Flushes pending media after both private and group floor grants, once hangtime has been cleared.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_group_floor_grant_preserves_first_hangtime_requester_raw_block2`.
+  - The regression uses GSSI 226333 and Motorola-like ISSI 2260082: first speaker releases, 2260082 sends raw TCH/S Block2 just before `FloorGranted`, and the exact 216-bit speech half-slot must appear on DL after the grant.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 keeps group transmission permission under SwMI floor control.
+- EN 300 392-2 clause 23.5 permits FACCH/STCH signalling and traffic operation on the assigned channel during floor control.
+- EN 300 392-2 clause 23.8.5 requires TCH/S half-slot timing/content to be preserved once valid traffic is accepted.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs group_floor --locked` -> 6 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_umac_bs group_ul --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 71 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs tch_s --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` -> 69 passed.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Not deployed in this entry. The change is ready for the next controlled local build and live group-call retest.
+
+Next non-repeating execution:
+
+1. Run an integrated local verification batch that includes MM restart recovery, CMCE P2P/group, UMAC, LMAC, SDS/WAP smoke if time permits.
+2. Build locally and deploy the tested Nexus-BS binary/config to the flat `/home/<user>/nexus-bs` layout, then restart the BS for live tests.
+
+## 2026-06-06 03:19 EEST - Annex D.4 private-call setup sequence revalidated
+
+Component in simple technical terms:
+
+- CMCE BS is the call-control state machine for private calls.
+- LLC/L2 acknowledged service is the delivery confirmation path for an addressed downlink PDU.
+- UMAC is the traffic scheduler; it opens the assigned bearer and only routes the first simplex speaker after CMCE releases the floor.
+
+Annex D.4 implementation status:
+
+- Local ISSI-to-ISSI private call setup sends `D-CONNECT ACKNOWLEDGE` to the called MS first with `Layer2Service::Acknowledged`, channel allocation, and a `TxReporter`.
+- CMCE stores this reporter in `pending_individual_connect_acks` and keeps caller `D-CONNECT` blocked until the reporter reaches L2 acknowledged state.
+- If the called leg is lost or times out, CMCE retries the called `D-CONNECT ACKNOWLEDGE`; after retry exhaustion it releases setup and never authorizes the caller.
+- Only after the called L2 ACK does CMCE complete the setup by sending caller `D-CONNECT`; for simplex private calls it also synchronizes the initial UMAC `FloorGranted` state so first speech has a valid traffic owner.
+- Bypass audit: normal local private-call setup uses this path. Existing direct `D-CONNECT` builders outside this path are for group calls, echo service, or Brew/network-routed calls, not the Motorola-like local direct private setup path.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4 describes the conservative direct individual-call setup where the BS sends `D-CONNECT ACK` to the called MS and waits for the called MS layer-2 acknowledgement before authorizing the calling MS with `D-CONNECT`.
+- Annex D.5 is the faster alternative, but it can lose the first traffic if the called MS misses `D-CONNECT ACK`; we are keeping the conservative D.4 path for Motorola-like terminals.
+- EN 300 392-2 clause 14.5.1.2.1 remains the private-call floor-control scope for simplex PTT after setup.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_called_d_connect_ack_l2_loss_never_authorizes_caller_before_release --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simple_private_call_full_direct_setup_and_release_workflow --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 72 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs private --locked` -> 19 passed.
+
+Deploy/runtime:
+
+- No deploy was needed for this checkpoint because the requested Annex D.4 sequencing was already present in the current tree and had been deployed in the previous tested batch. If protocol code changes again, rebuild locally and redeploy the flat `/home/<user>/nexus-bs` binaries/config before live RF retest.
+
+Next non-repeating execution:
+
+1. Continue live RF validation for private simplex first-PTT audio and repeated same-speaker Motorola PTT on the currently deployed Annex D.4 build.
+2. Continue group-call alternating PTT robustness validation and inspect logs only from the current restart window after each real RF test.
+3. Finish the flat-folder `nexus-bs-control` operator wrapper mismatch so WAP/SDS test sending works from `/home/<user>/nexus-bs` with no subfolders.
+
+## 2026-06-06 03:31 EEST - Annex D.4 Motorola-like private-call gate rechecked
+
+Component in simple technical terms:
+
+- CMCE is the call-control state machine that decides when the private-call caller and called MS may move to the assigned channel.
+- LLC/L2 acknowledged service is the radio delivery confirmation path; CMCE must wait for it, not just for a local software queue.
+- UMAC is the traffic bearer/floor owner; for simplex it must not release the first speaker before the called leg is confirmed.
+
+Decision:
+
+- Keep the conservative Annex D.4 sequence for local ISSI-to-ISSI private calls: send `D-CONNECT ACKNOWLEDGE` with channel allocation to the called MS, wait for L2 ACK, then send `D-CONNECT` to the caller.
+- Keep Annex D.5 faster sequencing out of this path because Annex D.5 warns that the called MS may miss the first traffic if it misses `D-CONNECT ACK`.
+- No code patch was required in this step because `CcBsSubentity::send_private_called_d_connect_ack_waiting_for_l2_ack` and `drain_pending_individual_connect_acks` already implement this gate in the current tree.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_called_d_connect_ack_l2_loss_never_authorizes_caller_before_release --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex_initial_floor_routes_without_extra_floor_grant --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_duplex_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simple_private_call_full_direct_setup_and_release_workflow --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_hook_other_ms_initial_floor_precedes_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 72 passed.
+- `git diff --check` -> pass.
+
+## 2026-06-06 03:36 EEST - Annex D.4 private-simplex U-plane gate hardened
+
+Component in simple technical terms:
+
+- CMCE decides when the private caller is authorized by `D-CONNECT`.
+- UMAC owns the actual traffic bearer and current simplex speaker.
+- `CallControl::Open` now means "bearer exists"; `CallControl::FloorGranted` means "this ISSI may send voice".
+
+Patch summary:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added a private-simplex guard for a participant-scoped bearer with no peer timeslot and no current speaker.
+  - If UL speech arrives after `Open` but before `FloorGranted`, UMAC defers it briefly instead of routing it to DL.
+  - Deferred media is kept while no authorized speaker exists, then flushed after `FloorGranted`; stale media still expires under the existing bounded guard.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Reworked the old "Open routes initial floor" test into `test_private_simplex_pre_floor_voice_waits_for_floor_granted`.
+  - The test proves `Open` alone does not route private-simplex TCH/S, and the retained first burst routes after `FloorGranted`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_caller`.
+  - The test proves a merely transmitted called `D-CONNECT ACKNOWLEDGE` is not enough; caller `D-CONNECT` and UMAC floor stay blocked until L2 ACK.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4: conservative individual direct setup waits for the called MS layer-2 acknowledgement to `D-CONNECT ACK` before authorizing the calling MS with `D-CONNECT`.
+- EN 300 392-2 Annex D.5 remains deliberately not used here because the faster method can lose the first traffic if the called MS misses `D-CONNECT ACK`.
+- EN 300 392-2 clause 14.5.1.2.1: private-simplex transmission is governed by SwMI floor control; UMAC must not treat bearer open as speaker authorization.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_caller --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex_pre_floor_voice_waits_for_floor_granted --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 73 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 71 passed.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Rebuild locally and deploy the tested binary/config to the flat `/home/<user>/nexus-bs` layout.
+2. Live RF retest: Hytera 2260616 -> Motorola 2260618 first private-simplex PTT should no longer leak or lose audio before the Annex D.4 gate completes.
+3. Continue the separate audit for Brew/network-origin private-call paths; the current D.4 hardening is for local ISSI-to-ISSI setup.
+
+## 2026-06-06 03:39 EEST - Annex D.4 U-plane gate deployed to test BS
+
+Deploy summary:
+
+- Built locally for AArch64 with the Nexus-BS v0.1.55 SoapySDR cross-build command from memory.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Remote binary SHA-256: `4b8493e5135e462935a4248ff9c7c5a1042ad79abe75e65ed0b140d3d530b4fe`.
+- Restarted `nexus-bs@chris.service`; `nexus-bs@chris.service` and `nexus-bs-control@chris.service` are active.
+
+Post-start RF/runtime observations:
+
+- Startup build line: `Nexus-BS v0.1.55`, build `v0.1.55-332fa519-modified`.
+- Dashboard is listening on `http://0.0.0.0:8080`.
+- Restart recovery is armed for `{2260082, 2260616, 2260618}`.
+- After restart, local terminals registered and affiliated:
+  - `2260618` registered and affiliated to `[226333]`.
+  - `2260616` registered and affiliated to `[226333]`.
+  - `2260082` registered and affiliated to `[226333]`; then soft re-attach preserved `[226333]`.
+
+Next non-repeating execution:
+
+1. User RF retest: private simplex `2260616 -> 2260618`, first PTT, then repeated PTT from the Motorola side.
+2. If any first-PTT audio/beep/static issue remains, read only logs since `2026-06-06 03:38:51 EEST` and inspect CMCE `D-CONNECT ACK`/L2 ACK, UMAC `FloorGranted`, and TCH/S route events.
+
+## 2026-06-06 03:49 EEST - Annex D.4 Brew/private local RF ACK gate
+
+Component in simple technical terms:
+
+- CMCE controls private-call signalling: `D-CONNECT ACKNOWLEDGE` tells the called-side terminal the call is connected, and `D-CONNECT` tells the caller side.
+- MLE/LLC layer-2 ACK is the proof that the local terminal received the downlink connect PDU.
+- UMAC owns the traffic bearer and only starts private-simplex voice for a speaker after CMCE emits `FloorGranted`.
+- Brew is the IP/network side; for Brew-bridged private calls it must not receive media-ready/confirm before the local RF leg has acknowledged the connect PDU.
+
+Patch summary:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/network.rs`
+  - Changed Brew private-call local `D-CONNECT` and local `D-CONNECT ACKNOWLEDGE` deliveries from unacknowledged to `Layer2Service::Acknowledged` with `TxReporter`.
+  - Added pending Brew-private connect state and a timer drain that completes only after local L2 ACK.
+  - Delays UMAC `FloorGranted`, Brew `NetworkCircuitConnectConfirm`, and Brew `NetworkCircuitMediaReady` until the local RF leg is L2-acknowledged.
+  - Releases the private call with `AcknowledgedServiceNotComplete` if the local RF connect PDU reaches a final failed state or times out.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated Brew local-origin and network-origin private-simplex tests so initial floor/media are expected only after local L2 ACK.
+  - Added regression tests proving "transmitted but not L2-acknowledged" is not enough to open floor/media.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4: conservative individual direct setup waits for the called MS layer-2 acknowledgement to `D-CONNECT ACK` before authorizing the calling MS with `D-CONNECT`.
+- EN 300 392-2 Annex D.5: the faster alternative can lose initial traffic if the called MS misses `D-CONNECT ACK`; this patch deliberately follows the conservative D.4 gate for Motorola-like robustness.
+- EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2: `D-CONNECT ACKNOWLEDGE`/`D-CONNECT` carry the connect state, transmission grant, and channel allocation for private calls.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs local_origin_brew_private --locked` -> 3 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs network_origin_brew_private --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs network_origin_private --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 73 passed.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Rebuild locally for AArch64 with the memory command and deploy directly to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart BS and live RF retest first-PTT private simplex on `2260616 -> 2260618`, plus reverse direction and Motorola-to-Motorola repeated PTT.
+3. If first PTT still has beeps/no audio, inspect logs for local `D-CONNECT ACK`/`D-CONNECT` reporter state, actual L2 ACK arrival, and whether UMAC `FloorGranted` is emitted only after that ACK.
+
+## 2026-06-06 08:15 EEST - Annex D.4 Brew/private gate deployed to Nexus-BS test service
+
+Deploy summary:
+
+- Built locally for AArch64 with the Nexus-BS v0.1.55 SoapySDR cross-build command from memory.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Local and remote binary SHA-256: `652c441ef31670f5ac36ecc0c9ab53e97476f0822ea26ed1a5483815c1c25dab`.
+- Restarted `nexus-bs@chris.service`; `nexus-bs@chris.service` and `nexus-bs-control@chris.service` are active.
+- Dashboard is listening on `0.0.0.0:8080`; control service is listening on `127.0.0.1:9002`.
+
+Post-start observations:
+
+- Startup banner confirms `Nexus-BS v0.1.55`, build `v0.1.55-332fa519-modified`.
+- Brew/TetraPack transport connected and backhaul reached `CONNECTED`.
+- MM restart recovery armed only `{2260082}` in this run.
+- `2260082` re-registered and affiliated to `[226333]`; BS then attempted Eg7 assignment but T352 expired and kept `StayAlive`.
+- `2260616` and `2260618` did not appear in the bounded post-restart log window checked after deploy.
+- No formal certification claim; this deploy only carries the clause-scoped Annex D.4/Brew-private hardening described above.
+
+Next non-repeating execution:
+
+1. User RF retest: `2260616 -> 2260618` private simplex first PTT, reverse direction, and Motorola-to-Motorola repeated PTT.
+2. If `2260616`/`2260618` still show attached on terminal but not in BS logs, continue the restart-recovery/subscriber-state bug separately from the Annex D.4 first-PTT fix.
+3. If first PTT still beeps/no audio, inspect logs since `2026-06-06 08:15:15 EEST` for CMCE connect reporter ACK state, UMAC `FloorGranted`, and TCH/S route timing.
+
+## 2026-06-06 08:27 EEST - Annex D.4 conservative private-call sequence rechecked
+
+Component in simple technical terms:
+
+- CMCE is the call-control state machine for private/simplex and duplex calls.
+- L2 ACK is the radio-layer proof that the called terminal received `D-CONNECT ACKNOWLEDGE`.
+- UMAC floor control must not authorize first private-simplex voice before CMCE has that proof.
+
+Finding:
+
+- No new protocol patch was required in this step.
+- Current `CcBsSubentity::send_private_called_d_connect_ack_waiting_for_l2_ack` sends `D-CONNECT ACKNOWLEDGE` to the called ISSI using `Layer2Service::Acknowledged` and a `TxReporter`.
+- Current `drain_pending_individual_connect_acks` calls `complete_private_connect_after_called_ack` only when that reporter is L2-acknowledged.
+- Current `complete_private_connect_after_called_ack` then emits the caller-side `D-CONNECT` and only then releases the initial private-simplex `FloorGranted`.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4: for individual direct setup, the BS sends `D-CONNECT ACK` with channel allocation to the called MS, waits for layer-2 acknowledgement, then authorizes the calling MS with `D-CONNECT`.
+- EN 300 392-2 Annex D.5 was rechecked as the faster alternative; it explicitly risks the called MS missing the first traffic if it misses `D-CONNECT ACK`, so Nexus-BS keeps the conservative D.4 path for Motorola-like robustness.
+- This is clause-scoped engineering evidence only, not formal TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_caller --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_duplex_u_connect_waits_for_called_l2_ack_before_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex_pre_floor_voice_waits_for_floor_granted --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 73 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simple_private_call_full_direct_setup_and_release_workflow --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_hook_other_ms_initial_floor_precedes_caller_d_connect --locked` -> 1 passed.
+
+Next non-repeating execution:
+
+1. Live RF retest on the deployed binary: `2260616 -> 2260618`, called side ACK path, first PTT audio, then reverse/repeated Motorola PTT.
+2. If beeps/no-audio remain, read logs since the latest service restart and correlate `D-CONNECT ACK` reporter ACK, caller `D-CONNECT`, UMAC `FloorGranted`, and first TCH/S route timing.
+3. Continue separate hardening for long-running attach/group affiliation recovery and large-group floor robustness; do not mix those with the already verified Annex D.4 gate.
+
+## 2026-06-06 08:33 EEST - P2P log audit and LLC late-BL-ACK grace deployed
+
+Live log finding:
+
+- Read the complete `nexus-bs@chris.service` journal from the previous restart at `2026-06-06 08:15:15 EEST`.
+- Two local P2P setup failures were present:
+  - `08:21:33` / `08:22:02`: `2260616 -> 2260618`, call_id `4`.
+  - `08:22:12`: `2260618 -> 2260616`, call_id `5`.
+- In both cases CMCE followed the Annex D.4 order: opened the local UMAC bearer, sent called-side `D-CONNECT ACKNOWLEDGE`, and did not send caller `D-CONNECT` before L2 ACK.
+- The failure was in LLC acknowledged delivery: the called-side `D-CONNECT ACKNOWLEDGE` exhausted N.252 retransmissions before BL-ACK arrived.
+- For call_id `5`, the terminal BL-ACK arrived after release as `received unexpected ACK for SSI 2260616 endpoint 0 N(R) 0` at `08:22:15.579`, proving the BS deleted the acknowledged-transfer context too early for this Motorola/Hytera direct-setup timing.
+
+Component in simple technical terms:
+
+- LLC is the layer that numbers acknowledged BL-DATA with `N(S)` and waits for a matching BL-ACK `N(R)`.
+- CMCE depends on the LLC `TxReporter` to know when the called MS really received `D-CONNECT ACKNOWLEDGE`.
+- A channel allocation PDU can move the MS to an assigned channel, so an ACK may arrive slightly after the normal retransmission-exhaustion edge.
+
+Patch:
+
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - Added `t_retransmissions_exhausted` to retained acknowledged transfers.
+  - Added a bounded late-ACK grace of 18 signalling frames only for retained TMA requests carrying `chan_alloc`.
+  - During that grace, LLC does not queue more retransmissions and does not mark the service reporter lost.
+  - If the matching BL-ACK arrives during the grace, the existing transfer is confirmed normally; if the grace expires, LLC reports failed transfer as before.
+- `crates/tetra-entities/tests/test_llc_bs.rs`
+  - Added `test_channel_allocation_t251_exhaustion_keeps_late_ack_grace`.
+  - The regression proves a channel-allocation BL-DATA keeps original `N(S)` through N.252, avoids premature failed-transfer after exhaustion, and confirms on a late matching BL-ACK.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 22.3.2.3: acknowledged BL-DATA uses `N(S)`/`N(R)`, T.251, N.252, and BL-ACK confirmation/failure.
+- EN 300 392-2 Annex A.1: T.251 is counted in downlink signalling frames and assigned-channel monitoring can constrain when the MS can receive/control-signal.
+- EN 300 392-2 Annex D.4: direct individual setup with channel allocation waits for called-side L2 ACK before caller authorization; the BS can repeat `D-CONNECT ACK` and page/monitor the assigned slot until that L2 ACK is received.
+- This is clause-scoped engineering evidence plus a bounded interoperability guard for channel-allocation ACK timing, not formal ETSI/TETRA certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_llc_bs channel_allocation_t251 --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_llc_bs t251_retransmission_exhaustion_emits_failed_transfer_report --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_called_d_connect_ack_l2_loss_never_authorizes_caller_before_release --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 83 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 73 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `git diff --check` -> pass.
+
+Deploy/runtime:
+
+- Built locally only with the Nexus-BS AArch64 SoapySDR cross-build command.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Local and remote binary SHA-256: `251a541966cdc15f6136f0e7829291b8e6b1dae882bb9b84553e7828f1eec652`.
+- Restarted `nexus-bs@chris.service`; service is active from `2026-06-06 08:32:34 EEST`.
+- `nexus-bs-control@chris.service` stayed active.
+- Startup after deploy:
+  - Dashboard listening on `0.0.0.0:8080`.
+  - Brew/control transports connected.
+  - Restart recovery armed `{2260082, 2260616, 2260618}`.
+  - `2260618`, `2260082`, and `2260616` registered and affiliated to `[226333]` in the post-start window.
+
+Next non-repeating execution:
+
+1. Live RF retest on the deployed `08:32:34` build:
+   - `2260616 -> 2260618` private simplex first PTT.
+   - `2260618 -> 2260616` reverse private simplex.
+   - Repeat PTT after call setup to verify no static/no-audio regression.
+2. If P2P still fails, read logs only since `2026-06-06 08:32:34 EEST` and check for the new LLC line `retaining channel-allocation transfer for 18 signalling-frame late-ACK grace`, followed by BL-ACK success or grace expiry.
+3. Continue separate group-call and long-running affiliation robustness validation after the private setup ACK timing is confirmed live.
+
+## 2026-06-06 08:58 EEST - P2P Annex D.4 circular ACK path patched, pending deploy
+
+Live failure after the 08:32 deploy:
+
+- User retested P2P and reported failure.
+- Journal for `2260616 -> 2260618` call_id `4/5` showed CMCE opening TS2 and sending called-side `D-CONNECT ACKNOWLEDGE`, but no useful called BL-ACK reached LLC.
+- The earlier LLC late-ACK grace was active, but it could not help because the ACK was not delivered upward.
+
+Root cause:
+
+- UMAC opened the same-timeslot private simplex bearer with no current UL speaker, correctly blocking U-plane voice until `FloorGranted`.
+- The called MS BL-ACK for `D-CONNECT ACKNOWLEDGE` arrives as addressless MAC-U-SIGNAL on STCH.
+- UMAC was using the same `current_ul_speaker` guard for STCH signalling, so the called BL-ACK was dropped before LLC could confirm the pending `D-CONNECT ACK`.
+- That created a circular dependency: CMCE waits for BL-ACK before `FloorGranted`, while UMAC required `FloorGranted` before forwarding the BL-ACK.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added a pre-floor private-simplex exception only for LLC ACK responses (`BL-ACK`, `BL-ACK-FCS`, `BL-ADATA`, `BL-ADATA-FCS`).
+  - Before `FloorGranted`, addressless STCH ACKs are attributed to the private circuit primary ISSI, which CMCE already seeds as the called MS for Annex D.4 called-leg confirmation.
+  - Generic MAC-U-SIGNAL and voice remain blocked until `FloorGranted`.
+  - Tightened direct CMCE payload detection so a short LLC ACK is not misclassified as raw CMCE.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added UL circuit primary address accessor.
+  - Added higher STCH priority for CMCE channel-allocation payloads over ACK-only channel-allocation STCH.
+  - This makes setup-critical called `D-CONNECT ACKNOWLEDGE` preempt the 5-bit ACK-only FACCH block seen in the log.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Called-side `D-CONNECT ACKNOWLEDGE` with channel allocation now requests FACCH/STCH delivery for the assigned-channel leg while still waiting for L2 ACK before caller authorization.
+- Tests:
+  - Added UMAC regression for called BL-ACK before `FloorGranted`.
+  - Added scheduler regression for `D-CONNECT ACKNOWLEDGE` STCH priority over ACK-only FACCH.
+  - Updated CMCE p2p expectations for called `D-CONNECT ACKNOWLEDGE` FACCH/STCH delivery.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4: direct private call setup sends `D-CONNECT ACK` with channel allocation to the called MS and waits for called L2 ACK on the assigned channel before caller `D-CONNECT`.
+- EN 300 392-2 clauses 21.4.5 and 23.8.4.1.4: MAC-U-SIGNAL on STCH carries TM-SDU signalling without an SSI field, so the BS must bind it to the assigned-channel call context.
+- EN 300 392-2 clause 22.3.2.3: BL-ACK/BL-ADATA confirm acknowledged BL-DATA and must reach LLC with the correct basic-link address.
+- This is clause-scoped hardening evidence, not formal certification.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs stch_bl_ack_before_private_floor_granted --locked` -> 1 passed.
+- `cargo test -p tetra-entities --lib private_called_d_connect_ack_stch_preempts_ack_only_facch --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 73 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 83 passed.
+- `cargo test -p tetra-entities --test test_umac_bs stch --locked` -> 12 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Build locally for AArch64 with the Nexus-BS SoapySDR command.
+2. Deploy directly to `/home/chris/nexus-bs/nexus-bs` with no backup binary and restart `nexus-bs@chris.service`.
+3. Live retest:
+   - `2260616 -> 2260618`, first private simplex PTT.
+   - `2260618 -> 2260616`, reverse private simplex.
+   - Check logs for called `D-CONNECT ACK L2 ACK received`, caller `D-CONNECT`, `FloorGranted`, and no retry exhaustion.
+
+## 2026-06-06 09:05 EEST - P2P Annex D.4 ACK-path build deployed to live test BS
+
+Live failure confirmation before deploy:
+
+- User reported the latest P2P test still failed.
+- Logs since the `08:32:34 EEST` restart showed `2260616 -> 2260618`, `call_id=4`.
+- CMCE opened the private simplex bearer on TS2 and sent called-side `D-CONNECT ACKNOWLEDGE`, then waited for the called MS L2 ACK before caller `D-CONNECT`.
+- LLC exhausted retransmissions for SSI `2260618`; CMCE retried the called `D-CONNECT ACKNOWLEDGE` three times and released with `AcknowledgedServiceNotComplete`.
+- This matched the local root cause already patched: pre-floor private-simplex addressless STCH BL-ACK could be dropped before LLC saw it.
+
+Verification before deploy:
+
+- `cargo test -p tetra-entities --test test_umac_bs stch_bl_ack_before_private_floor_granted --locked` -> pass.
+- `cargo test -p tetra-entities --lib private_called_d_connect_ack_stch_preempts_ack_only_facch --locked` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> pass.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> pass.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> pass.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `git diff --check` -> pass.
+
+Deploy:
+
+- Built locally only with the Nexus-BS AArch64 SoapySDR cross-build command.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Local and remote binary SHA-256: `f55fc896a287ee7e2f77ffef4dcdd91c6eb477ede37eda9f88a1d1d10e5526ed`.
+- Restarted `nexus-bs@chris.service`; service active from `2026-06-06 09:02:42 EEST`.
+- Dashboard listening on `0.0.0.0:8080`.
+- Post-restart recovery registered and affiliated:
+  - `2260082 -> [226333]`
+  - `2260618 -> [226333]`
+  - `2260616 -> [226333]`
+- Updated `scripts/nexus-bs-test-deploy.sh` to deploy future builds to the flat final folder `/home/chris/nexus-bs/nexus-bs` and restart `nexus-bs@chris.service` instead of using the legacy test subfolder/pidfile flow.
+
+Next non-repeating execution:
+
+1. Live RF retest on the `09:02:42 EEST` build:
+   - `2260616 -> 2260618`, private simplex first PTT.
+   - `2260618 -> 2260616`, reverse private simplex first PTT.
+   - repeat PTT after setup in both directions.
+2. For each P2P attempt, check logs since `2026-06-06 09:02:42 EEST` for:
+   - `CMCE: called D-CONNECT ACK L2 ACK received`;
+   - caller-side `D-CONNECT`;
+   - `CallControl::FloorGranted` / `UMAC floor granted`;
+   - no `called D-CONNECT ACK did not receive L2 ACK`;
+   - no `AcknowledgedServiceNotComplete`.
+
+## 2026-06-06 09:31 EEST - P2P Annex D.4 caller D-CONNECT ACK gate patched, pending deploy
+
+Latest live RF report:
+
+- User reported another private simplex P2P failure after the `09:02:42 EEST` deploy.
+- Full journal since the `09:02:42 EEST` restart was read. The service banner still showed build `v0.1.55-332fa519-modified`; this was the earlier ACK-path build, not the new caller-side ACK gate.
+- No formal certification claim. This entry is clause-scoped hardening evidence only.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Split accepted local private-call setup into two L2 ACK gates:
+    1. send called MS `D-CONNECT ACKNOWLEDGE` with channel allocation;
+    2. wait called MS L2 ACK;
+    3. send caller MS `D-CONNECT` with channel allocation;
+    4. wait caller MS L2 ACK;
+    5. only then activate the individual call and emit initial private-simplex `FloorGranted` to UMAC.
+  - Added retry/guard handling for both called and caller connect messages.
+  - Duplicate `U-CONNECT` is ignored while either connect ACK gate is pending.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`
+  - Added pending caller-connect state.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Initializes and cleans up pending caller-connect state during release/deregistration paths.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Drains pending caller-connect ACK state from the CMCE timer tick.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P helpers and full setup/release workflow so an established private call means both called and caller connect messages were L2-acknowledged.
+  - Added/kept regressions proving caller `D-CONNECT` precedes initial floor and that a transmitted but unacknowledged caller `D-CONNECT` does not seed U-plane audio.
+
+Technical explanation:
+
+- CMCE is the call-control layer. It decides when a private call is actually connected.
+- UMAC is the radio bearer/floor layer. It should not pass private-simplex voice until CMCE says which ISSI owns the floor.
+- The field symptom `first PTT opens the private screen but no voice/beep` matches a race where UMAC floor could start before the caller radio had confirmed `D-CONNECT`.
+- This patch keeps the traffic bearer ready, but blocks the initial U-plane floor until both ETSI call-control connect legs have been confirmed at L2.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1, 14.5.1.1.2 and 14.5.1.2.1: private call setup/acceptance and simple private-call transmission grant semantics.
+- EN 300 392-2 Annex D.4: conservative direct private-call sequence with called-side `D-CONNECT ACKNOWLEDGE` before caller `D-CONNECT`.
+- EN 300 392-2 clause 22.3.2.3: acknowledged downlink delivery must be confirmed by L2 before treating the transfer as complete.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` -> 69 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `git diff --check` -> pass.
+
+Next non-repeating execution:
+
+1. Deploy direct to `/home/chris/nexus-bs/nexus-bs` with `scripts/nexus-bs-test-deploy.sh`; build locally only, no Pi compile, no backup binary.
+2. Record local and remote SHA-256 plus new `ActiveEnterTimestamp`.
+3. Confirm the startup log contains the new build and the service is `active`.
+4. Live RF retest:
+   - `2260616 -> 2260618`, private simplex first PTT.
+   - `2260618 -> 2260616`, reverse private simplex first PTT.
+   - repeated PTT in both directions.
+   - group `226333` alternating PTT after private retest.
+5. For every P2P attempt, inspect logs for:
+   - called `D-CONNECT ACK L2 ACK received`;
+   - caller `D-CONNECT L2 ACK received`;
+   - `FloorGranted` only after caller ACK;
+   - no connect ACK retry exhaustion;
+   - no `AcknowledgedServiceNotComplete`;
+   - no static-only audio after floor grant.
+
+## 2026-06-06 09:34 EEST - P2P caller D-CONNECT ACK gate deployed to live BS
+
+Deploy:
+
+- Built locally only with the Nexus-BS AArch64 SoapySDR cross-build command.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Local/remote binary SHA-256 verified by deploy script:
+  - `24a9335aa0c54eb8e6edc3068a821801154212ffe6f8dfce5eb08a211c389939`
+- Restarted `nexus-bs@chris.service`.
+- Service state after deploy:
+  - `ActiveState=active`
+  - `SubState=running`
+  - `MainPID=45745`
+  - `ActiveEnterTimestamp=Sat 2026-06-06 09:33:01 EEST`
+- Startup banner still shows `Build: v0.1.55-332fa519-modified` because this is the same git commit with a dirty worktree; the binary SHA above is the deploy identity for this stage.
+- Dashboard is listening on `0.0.0.0:8080`; Brew/control transports connected.
+
+Post-restart affiliation evidence:
+
+- `2260616` restored cached restart group affiliation and CMCE affiliated it to `[226333]`.
+- `2260082` registered and CMCE affiliated it to `[226333]`.
+- `2260618` registered and CMCE affiliated it to `[226333]`.
+- EG7 allocation is active in config for these terminals during this test window.
+
+Immediate RF validation required:
+
+1. `2260616 -> 2260618`, private simplex first PTT.
+2. `2260618 -> 2260616`, reverse private simplex first PTT.
+3. Repeat PTT both directions after call setup.
+4. Then group `226333` alternating PTT.
+5. If P2P still fails, inspect logs since `2026-06-06 09:33:01 EEST` for:
+   - whether called `D-CONNECT ACKNOWLEDGE` got L2 ACK;
+   - whether caller `D-CONNECT` got L2 ACK;
+   - whether `FloorGranted` occurs only after caller ACK;
+   - whether static/no-voice happens after both ACK gates are complete, which would move root cause from CMCE setup into UMAC/LMAC media routing.
+
+## 2026-06-06 09:38 EEST - P2P caller ACK gate removed; Annex D.4 scope corrected, pending redeploy
+
+Correction:
+
+- The `09:33:01 EEST` binary is superseded before RF validation.
+- Agent CMCE review caught that waiting for caller `D-CONNECT` L2 ACK before initial `FloorGranted` is not required by EN 300 392-2 Annex D.4 and can recreate the exact first-PTT/no-audio race:
+  - the caller MS may receive `D-CONNECT` and consider the private call ready;
+  - CMCE/UMAC would still suppress U-plane until the caller ACK reporter flipped.
+- Correct clause-scoped behavior for local direct private call:
+  1. called MS receives `D-CONNECT ACKNOWLEDGE` with channel allocation;
+  2. CMCE waits for called MS L2 ACK;
+  3. CMCE queues caller MS `D-CONNECT` with channel allocation;
+  4. CMCE immediately activates the individual call and emits initial `FloorGranted` after caller `D-CONNECT` is queued, without waiting for caller L2 ACK.
+- Caller `D-CONNECT` still uses `Layer2Service::Acknowledged`; LLC may retransmit it, but CMCE does not hold the first private-simplex floor on the caller ACK.
+
+Patch delta:
+
+- Removed `pending_individual_caller_connects` state and timer drain.
+- `complete_private_connect_after_called_ack()` now queues caller `D-CONNECT` and immediately enables initial private U-plane.
+- Tests now assert:
+  - caller `D-CONNECT` is blocked until called `D-CONNECT ACKNOWLEDGE` is L2-acknowledged;
+  - `FloorGranted` follows caller `D-CONNECT` in the same post-called-ACK phase;
+  - a later caller `D-CONNECT` L2 ACK does not emit duplicate floor.
+
+Verification after correction:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` -> 10 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `git diff --check` -> pass.
+
+Next:
+
+- Redeploy immediately; do not RF-test the `09:33:01 EEST` binary.
+- New RF test target will be the next restart timestamp and SHA.
+
+## 2026-06-06 09:40 EEST - Corrected Annex D.4 P2P setup deployed to live BS
+
+Deploy:
+
+- Built locally only with the Nexus-BS AArch64 SoapySDR cross-build command.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Local/remote binary SHA-256 verified by deploy script:
+  - `45ef1535c2bec273291117fe52a808ee5e96cb920b112a5765bf308d1e83e552`
+- Restarted `nexus-bs@chris.service`.
+- Service state after deploy:
+  - `ActiveState=active`
+  - `SubState=running`
+  - `MainPID=45915`
+  - `ActiveEnterTimestamp=Sat 2026-06-06 09:39:35 EEST`
+- Startup banner still shows `Build: v0.1.55-332fa519-modified`; use the SHA above to identify this corrected deploy.
+
+Post-restart affiliation evidence:
+
+- `2260616` restored cached restart group affiliation and CMCE affiliated it to `[226333]`.
+- `2260082` registered and CMCE affiliated it to `[226333]`.
+- `2260618` registered and CMCE affiliated it to `[226333]`.
+- EG7 allocation is active in config for this test window.
+
+RF validation target:
+
+1. Test `2260616 -> 2260618` private simplex first PTT.
+2. Test `2260618 -> 2260616` reverse private simplex first PTT.
+3. Repeat PTT both directions.
+4. Then test group `226333` alternating PTT.
+5. If P2P fails, inspect logs since `2026-06-06 09:39:35 EEST` for the corrected sequence:
+   - called `D-CONNECT ACK L2 ACK received`;
+   - caller `D-CONNECT queued`;
+   - `enabling initial private U-plane without waiting for caller L2 ACK`;
+   - initial `FloorGranted`;
+   - no `called D-CONNECT ACK did not receive L2 ACK`;
+   - no `AcknowledgedServiceNotComplete`.
+
+## 2026-06-06 09:53 EEST - P2P RF fail follow-up; UMAC direct D-TX CEASED classifier fixed, pending deploy
+
+Trigger:
+
+- User reported a fresh P2P RF test failed on the `09:39:35 EEST` live build.
+- Full journal from the latest restart showed attach/affiliation and SDS/Brew activity, but no clearly prefixed P2P CMCE setup lines in the visible window.
+
+Findings:
+
+- CMCE direct private setup already follows the corrected EN 300 392-2 Annex D.4 sequence:
+  1. called MS receives `D-CONNECT ACKNOWLEDGE` with channel allocation;
+  2. CMCE waits for called-leg L2 ACK;
+  3. CMCE queues caller `D-CONNECT`;
+  4. CMCE emits initial private-simplex `FloorGranted` immediately after caller `D-CONNECT` is queued, without waiting for caller L2 ACK.
+- The accepted local P2P setup log previously started with `rx_u_setup_p2p`, not `CMCE:`, and inbound `U-SETUP` was only DEBUG/TRACE. That made journal diagnosis too weak.
+- UMAC verification exposed a real floor-control priority bug:
+  - direct CMCE `D-TX CEASED` has 5-bit type `01001`;
+  - its first 4 bits are `0100`, which collide with LLC `BL-ADATA-FCS`;
+  - `cmce_dl_payload_from_tma_sdu()` rejected the direct floor-withdrawal SDU as LLC before checking the 5-bit CMCE floor-control PDU type;
+  - `D-TX CEASED` was therefore classified as `Ordinary` instead of `FloorWithdraw` under TMA pending-report pressure.
+- Clause scope: EN 300 392-2 clause 14.5.2.2.1 floor control, clause 23.5 STCH/FACCH delivery, and downlink CMCE floor-control PDUs `D-TX CEASED`, `D-TX GRANTED`, `D-TX INTERRUPT`.
+
+Patch:
+
+- `umac_bs.rs` TMA admission now accepts direct 5-bit CMCE `D-TX GRANTED`, `D-TX CEASED`, and `D-TX INTERRUPT` before applying the 4-bit LLC ACK/data rejection.
+- `bs_sched.rs` scheduler backpressure classification uses the same direct floor-control exception.
+- CMCE logging now emits:
+  - `CMCE: <- U-SETUP ...`
+  - `CMCE: rx_u_setup_p2p ...`
+  - `CMCE: initial private-simplex FloorGranted ...`
+
+Verification:
+
+- `cargo fmt --package tetra-entities --check` -> pass.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo check -p tetra-entities --locked` -> pass.
+- `git diff --check` -> pass.
+
+Next:
+
+- Deploy this stage directly to `/home/chris/nexus-bs/nexus-bs` with no backup binary.
+- After restart, RF test:
+  1. `2260616 -> 2260618` private simplex first PTT and repeated PTT;
+  2. `2260618 -> 2260616` reverse private simplex first PTT and repeated PTT;
+  3. `226333` group alternating PTT, including repeated `D-TX CEASED` / handoff.
+- If P2P still fails, inspect new logs for `CMCE: <- U-SETUP`, `CMCE: rx_u_setup_p2p`, called `D-CONNECT ACK L2 ACK received`, caller `D-CONNECT queued`, and `CMCE: initial private-simplex FloorGranted`.
+
+## 2026-06-06 09:56 EEST - UMAC floor-control fix deployed to live BS
+
+Deploy:
+
+- Built locally only with `scripts/nexus-bs-test-deploy.sh`; no Pi build.
+- Deployed directly, no backup binary, to `/home/chris/nexus-bs/nexus-bs`.
+- Remote binary SHA-256:
+  - `8b996549b57bf5a35c1c94d0ded1b27c68e13afbdc960de6a00f74d066a11579`
+- Restarted `nexus-bs@chris.service`.
+- Service state after deploy:
+  - `ActiveState=active`
+  - `SubState=running`
+  - `MainPID=46126`
+  - `ActiveEnterTimestamp=Sat 2026-06-06 09:54:18 EEST`
+- Startup banner still shows `Build: v0.1.55-332fa519-modified`; use the SHA above and restart timestamp to identify this stage.
+
+Post-restart evidence:
+
+- `2260616` restored cached restart group affiliation and CMCE affiliated it to `[226333]`.
+- `2260082` registered and CMCE affiliated it to `[226333]`.
+- `2260618` registered and CMCE affiliated it to `[226333]`.
+- BS-initiated EG7 assignment timed out on all three terminals:
+  - `2260616`: T352 expired at `09:54:49.585`, kept `StayAlive`.
+  - `2260082`: T352 expired at `09:54:49.981`, kept `StayAlive`.
+  - `2260618`: T352 expired at `09:54:51.115`, kept `StayAlive`.
+- For immediate P2P/group RF validation, terminals are therefore effectively StayAlive rather than active EG7.
+
+RF validation target:
+
+1. Test `2260616 -> 2260618` private simplex first PTT and repeated PTT.
+2. Test `2260618 -> 2260616` reverse private simplex first PTT and repeated PTT.
+3. Test `2260082 -> 2260618` repeated Motorola-to-Motorola PTT.
+4. Test group `226333` alternating PTT, including `2260082` repeated entries.
+5. If any call fails, inspect only logs since `2026-06-06 09:54:18 EEST` and correlate:
+   - `CMCE: <- U-SETUP`
+   - `CMCE: rx_u_setup_p2p`
+   - called `D-CONNECT ACK L2 ACK received`
+   - caller `D-CONNECT queued`
+   - `CMCE: initial private-simplex FloorGranted`
+   - `D-TX CEASED` / `D-TX GRANTED` TMA reports and UMAC floor handoff.
+
+## 2026-06-06 10:11 EEST - P2P 2260082 -> 2260618 called-leg ACK failure triage
+
+Trigger:
+
+- Live RF private simplex `2260082 -> 2260618` failed on the deployed stage from `2026-06-06 09:54:18 EEST`.
+- Log window `09:59:39..09:59:53 EEST` shows two setup attempts:
+  - `CMCE: <- U-SETUP from ISSI 2260082 called_party=Some(2260618) comm_type=P2p simplex=true hook=false priority=0`.
+  - CMCE opened a shared private simplex bearer on `ts=2` for `2260618` and `2260082`.
+  - CMCE sent called-leg `D-CONNECT ACKNOWLEDGE` to `2260618` with `TransmissionGrant::GrantedToOtherUser`.
+  - LLC retransmitted the acknowledged transfer to `2260618` until exhaustion.
+  - CMCE never observed the called-leg L2 ACK and released with `DisconnectCause::AcknowledgedServiceNotComplete`.
+
+ETSI basis checked:
+
+- EN 300 392-2 clause 14.5.1.1.1: called MS direct setup answers with `U-CONNECT` and expects `D-CONNECT ACKNOWLEDGE`; that PDU carries transmit permission.
+- EN 300 392-2 clause 14.5.1.1.2: caller receives `D-CONNECT`; that PDU carries transmit permission.
+- EN 300 392-2 clause 14.5.1.2.1: SwMI controls simplex transmit permission; normal direct setup grants the caller first unless the setup requests otherwise.
+- EN 300 392-2 clause 14.5.1.4.1: `D-CONNECT` / `D-CONNECT ACKNOWLEDGE` grant values switch U-plane on for transmit or receive.
+- EN 300 392-2 clause 14.5.3.1: late individual assignment may indicate traffic channels with `D-CONNECT` / `D-CONNECT ACKNOWLEDGE`; early/medium assigned channels start as FACCH until U-plane is switched on, and late assignment may switch U-plane when moving.
+- EN 300 392-2 clause 23.8.2.2: if BS does not receive the expected L2 ACK for a message giving/withdrawing traffic receive authorization, it cannot know whether the MS is in signalling or traffic mode; retransmission must be interpretable in that ambiguity.
+- EN 300 392-2 Annex D is informative. D.4 is still the conservative compatibility pattern: called `D-CONNECT ACK` with channel allocation first, wait for called L2 ACK, then authorize caller. D.5 is the faster path and explicitly risks first traffic loss if the called MS misses `D-CONNECT ACK`.
+
+Swarm read-only audit result:
+
+- ETSI agent: Annex D is informative, not mandatory, but D.4-style sequencing is a conservative terminal-compatible baseline.
+- CMCE architect: current STCH-only called `D-CONNECT ACKNOWLEDGE` before caller authorization is likely wrong for the RF failure; first authoritative called `D-CONNECT ACKNOWLEDGE` should be MCCH/SCH-F with channel allocation, with D.4-style dual recovery on retry if needed.
+- UMAC/LLC architect: the earlier suspected STCH speaker circular dependency is mostly refuted in current code because pre-floor ACK-carrying LLC PDUs have a narrow exception; remaining risks are wrong endpoint correlation and using the wrong MAC form for C-plane ACK tests.
+- QA: add failing tests before any behavior change; do not patch from RF observation alone.
+
+Patch gate:
+
+- Do not change caller `D-CONNECT` / initial `FloorGranted` ordering until a test proves a concrete defect there.
+- First local failing test target: called `D-CONNECT ACKNOWLEDGE` with channel allocation must be deliverable on a pre-traffic signalling path, not STCH-only, while caller `D-CONNECT` stays blocked until the called-leg L2 ACK.
+- Secondary local failing test target: if an assigned-channel L2 ACK is received before `FloorGranted`, UMAC/LLC must attribute it to called ISSI `2260618` and the same endpoint used by the pending acknowledged transfer.
+- Allowed behavior patch scope after failing test: CMCE/MLE/UMAC routing of called `D-CONNECT ACKNOWLEDGE` and its L2 ACK correlation only.
+- This is clause-scoped engineering evidence, not formal ETSI/TETRA certification.
+
+Next:
+
+1. Add a focused failing CMCE/UMAC test for MCCH/SCH-F first delivery of called `D-CONNECT ACKNOWLEDGE` with channel allocation and no premature caller authorization.
+2. Add or adjust an ACK-correlation test for pre-floor assigned-channel ACK from `2260618`, ensuring endpoint and LLC `N(R)` match the pending called-leg reporter.
+3. Patch only the proven layer.
+4. Verify with focused CMCE/UMAC/LLC tests, `cargo check -p tetra-entities --locked`, `cargo fmt --package tetra-entities --check`, and `git diff --check`.
+5. Deploy locally built binary only, then RF retest `2260082 -> 2260618` first PTT and repeated PTT.
+
+## 2026-06-06 10:54 EEST - P2P delayed U-CONNECT root cause: stale timed-out TMA request cancelled
+
+Trigger:
+
+- Live RF private simplex `2260082 -> 2260618` was tested after the current-channel setup patch.
+- Log evidence after restart `2026-06-06 10:36:50 EEST`:
+  - `10:41:13.397`: `U-SETUP` from `2260082` to `2260618`, `call_id=4`.
+  - No immediate `U-CONNECT`, `D-CONNECT ACKNOWLEDGE`, caller `D-CONNECT`, or initial `FloorGranted`.
+  - `10:41:43/44`: `UMAC: TMA report req_handle=18/19 timed out` for `addr=ISSI:2260618`, `cmce_pdu=Some(DSetup)`.
+  - `10:42:14/45`: repeated timeouts for the same D-SETUP retry path.
+  - `10:42:55/56`: `U-CONNECT for unknown call_id=4`, proving the called MS reacted after CMCE had already released the setup state.
+
+Confirmed cause:
+
+- UMAC `emit_completed_tma_reports()` reported `TmaReport::FragmentationFailure` after the local 30 s retained-report guard, but did not cancel the matching queued scheduler element.
+- A timed-out D-SETUP could therefore still be transmitted later on SCH/F, causing delayed terminal reaction to an already dead CMCE call.
+- This is an internal MAC consistency bug, not a vendor-specific call-control workaround.
+
+ETSI basis checked:
+
+- EN 300 392-2 clause 20.4.1.1.3: MAC reports complete or failed TMA-UNITDATA transfer to the upper layer using TMA-REPORT.
+- EN 300 392-2 clause 22.3.2.3: LLC/upper retry/failure handling depends on that MAC transfer result.
+- Once the local MAC reports the request failed, the same TM-SDU must not remain queued for later RF transmission under the same request context.
+
+Patch:
+
+- File: `crates/tetra-entities/src/umac/umac_bs.rs`.
+- On pending TMA report timeout, UMAC now calls `channel_scheduler.dl_cancel_by_reporter(&report.tx_reporter)` before emitting `FragmentationFailure`.
+- Timeout logs now include `cancelled_queued=N`.
+- Added debug-only test helpers for retained-report timeout simulation.
+
+Focused test:
+
+- File: `crates/tetra-entities/tests/test_umac_bs.rs`.
+- Added `test_tma_report_timeout_cancels_queued_mac_resource`.
+- The test forces a retained TMA request for ISSI `2260618` past the local guard, verifies `FragmentationFailure`, then advances UMAC and asserts no later MAC-RESOURCE for `2260618` appears.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_tma_report_timeout_cancels_queued_mac_resource --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` passed: 75 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_pending_setup_retry_is_reporter_throttled_before_timeout --locked` passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check -- crates/tetra-entities/src/umac/umac_bs.rs crates/tetra-entities/tests/test_umac_bs.rs` passed.
+
+Next RF gate:
+
+1. Deploy locally built `nexus-bs` to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service` and clear/vacuum volatile journal for a clean RF window.
+3. Ask user to perform one controlled P2P simplex call `2260082 -> 2260618`: first PTT short voice, wait, repeated PTT, close.
+4. Inspect logs specifically for `DSetup` timeout absence, prompt `U-CONNECT`, called `D-CONNECT ACK` L2 ACK, caller `D-CONNECT`, and initial `FloorGranted`.
+
+## 2026-06-06 10:57 EEST - P2P stale-TMA fix deployed, RF window opened
+
+Deploy:
+
+- Ran `RUN_TESTS=1 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Local verification inside deploy passed:
+  - `test_cmce_bs repeated_group_u_setup`: 3 passed.
+  - `test_cmce_bs`: 161 passed.
+  - `test_umac_bs`: 75 passed, including `test_tma_report_timeout_cancels_queued_mac_resource`.
+  - `test_mm_bs restart_recovery`: 33 passed.
+  - `cargo check -p tetra-entities --locked`: passed.
+  - local release build for `nexus-bs v0.1.55`: passed.
+- Deployed binary SHA-256: `b75b58f99cade0a31485c381b3a121bae0963c3911413767b35768896992a5ba`.
+- Service: `nexus-bs@chris.service`.
+- Restart timestamp: `Sat 2026-06-06 10:56:35 EEST`.
+- PID after restart: `46927`.
+
+Post-start attach state before RF:
+
+- `2260616`: T352 expired for BS-initiated EG assignment at `10:57:06`, kept `StayAlive`.
+- `2260618`: T352 expired for BS-initiated EG assignment at `10:57:08`, kept `StayAlive`.
+- `2260082`: T352 expired for BS-initiated EG assignment at `10:57:09`, kept `StayAlive`.
+
+RF test gate:
+
+- Volatile journal rotated/vacuumed again at `2026-06-06 10:57:45 EEST`.
+- User instructed to perform controlled private simplex `2260082 -> 2260618`, first PTT short voice, second PTT short voice, normal close.
+- Next read should inspect journal since `2026-06-06 10:57:45 EEST`.
+
+## 2026-06-06 11:18 EEST - P2P D-SETUP EG7 priority and duplicate setup suppression
+
+Trigger:
+
+- User ran clean RF P2P test after journal cleanup at `2026-06-06 11:04:32 EEST`; result: failed.
+- Log evidence:
+  - `11:04:41.849`: `U-SETUP` private simplex `2260082 -> 2260618`, `call_id=6`.
+  - No `U-CONNECT`, `D-CONNECT ACKNOWLEDGE`, caller `D-CONNECT`, or floor setup.
+  - `11:05:11`: user disconnected; CMCE emitted setup-phase `D-RELEASE` repeats because no traffic circuit existed.
+  - `11:05:12`: two `DSetup` TMA requests to ISSI `2260618` timed out with `cancelled_queued=1`.
+
+Confirmed cause:
+
+- The stale queued timeout bug was fixed, but the live setup still failed because the P2P `D-SETUP` was a normal MCCH/SCH-F TMA request with `chan_alloc=[none]`.
+- UMAC classified that non-stealing/no-chan-alloc `D-SETUP` as `Ordinary` even though `cmce_pdu=Some(DSetup)`.
+- Under EG7, `elem_is_ready_for_tx()` correctly waits for the called MS receive window, but at that window ordinary backlog/fragments could still be selected before the call setup.
+- CMCE also had two local ways to produce duplicate pending private `D-SETUP`: the generic `CircuitMgr` backup path and the dedicated EE retry path. The initial D-SETUP had no reporter in `cached.last_resend_reporter`, so retries did not know the first lower-layer delivery was still pending.
+
+ETSI basis checked:
+
+- EN 300 392-2 clause 14.5.1.1.1: the SwMI sends `D-SETUP` to the called MS; `U-CONNECT` cannot occur before the called MS receives setup.
+- EN 300 392-2 clause 14.5.1.1.2: caller-side progress follows the called-side response.
+- EN 300 392-2 clause 20.4.1.1.3: MAC reports TMA transfer completion/failure via TMA-REPORT.
+- EN 300 392-2 clauses 23.5.2.2.7 and 23.7.6: downlink must account for energy economy receive opportunities. The patch does not bypass EG gating; it only prioritizes call-control once the addressed MS can listen.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `TmaAdmissionPriority::CallControl`.
+  - Non-stealing CMCE `D-SETUP`, `D-RELEASE`, `D-CONNECT`, `D-CONNECT ACKNOWLEDGE`, etc. without channel allocation are no longer admitted as ordinary SDS/data.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added scheduler recognition for LLC-wrapped CMCE call-control resources.
+  - Ready call-control resources are selected after grants/ACKs/channel-allocation traffic but before ordinary resources and fragment backlog.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Initial private `D-SETUP` now carries a `TxReporter` and stores it in `cached.last_resend_reporter`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Generic circuit backup/late-entry `D-SETUP` is suppressed for individual calls; private setup retry remains owned by the dedicated EE retry path and is reporter-throttled.
+
+Focused tests:
+
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_eg7_p2p_d_setup_preempts_ordinary_backlog_at_receive_window`.
+  - Uses a real serialized `DSetup` wrapped in LLC BL-UDATA/CMCE, places the called ISSI in valid EG7, queues ordinary backlog first, then asserts `D-SETUP` is the first SCH/F MAC-RESOURCE at the EG7 receive frame and reports TMA success.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated pending setup retry coverage to `test_p2p_pending_setup_does_not_duplicate_while_initial_reporter_pending`.
+  - Asserts the initial private `D-SETUP` has a reporter and no generic backup/EE duplicate is sent while that reporter is pending.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_eg7_p2p_d_setup_preempts_ordinary_backlog_at_receive_window --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_p2p_pending_setup_does_not_duplicate_while_initial_reporter_pending --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` passed: 76 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 161 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check -- crates/tetra-entities/src/umac/umac_bs.rs crates/tetra-entities/src/umac/subcomp/bs_sched.rs crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs crates/tetra-entities/tests/test_umac_bs.rs crates/tetra-entities/tests/test_cmce_bs.rs` passed.
+
+Next RF gate:
+
+1. Deploy this local build to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Clear/vacuum volatile journal.
+4. Ask user to run one controlled P2P simplex call `2260082 -> 2260618`, with the called `2260618` still allowed to use EG7 if configured.
+5. Inspect for: no `DSetup` timeout, one initial D-SETUP delivery, prompt `U-CONNECT`, called ACK path, caller `D-CONNECT`, first PTT audio.
+
+Deploy:
+
+- Ran `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh` after local focused/full verification above.
+- Local release build for `nexus-bs v0.1.55` passed.
+- Deployed commit label: `332fa519`.
+- Deployed binary SHA-256: `b19cb7cee50f36d6a79798952776ed5d204a0fb2ce96d12245f0f4713c249c0d`.
+- Service: `nexus-bs@chris.service`.
+- Restart timestamp: `Sat 2026-06-06 11:19:45 EEST`.
+- PID after restart: `47225`.
+- Journal rotated/vacuumed for the RF gate at `2026-06-06T11:20:07+03:00`.
+- Next read should inspect journal since `2026-06-06 11:20:07 EEST`.
+
+## 2026-06-06 11:52 EEST - P2P called D-CONNECT ACK assigned-channel recovery
+
+Trigger:
+
+- User ran private simplex `2260082 -> 2260618` with three short PTT presses after the `11:19:45 EEST` deploy.
+- RF log since latest restart showed the setup now reached `U-CONNECT`, but the called leg did not L2-ACK `D-CONNECT ACKNOWLEDGE`.
+- Sequence observed:
+  - `11:20:56`: `U-SETUP` from `2260082` to `2260618`, `call_id=4`.
+  - `11:21:03`: UMAC circuit opened on TS2; CMCE sent called `D-CONNECT ACKNOWLEDGE`.
+  - LLC retransmitted BL-DATA to `2260618`, exhausted attempts, and CMCE released setup with `AcknowledgedServiceNotComplete`.
+- The failure point was not audio yet: caller `D-CONNECT` and initial private floor correctly remained blocked because the called `D-CONNECT ACKNOWLEDGE` lacked BL-ACK.
+
+ETSI basis checked:
+
+- EN 300 392-2 clause 14.5.1.1.1: after called `U-CONNECT`, the SwMI sends `D-CONNECT ACKNOWLEDGE` to the called MS.
+- Clause 14.5.3.1: late assignment individual call may indicate traffic channels in `D-CONNECT` and `D-CONNECT ACKNOWLEDGE`.
+- Clause 23.5.4.3.1 note 8: with L2 acknowledged service and channel allocation, the BS should grant current-channel ACK capacity when the MS may reject the allocation; in other cases grant on allocated channel may be appropriate.
+- Clause 23.8.2.2: assigned-channel STCH/FACCH carries signalling around switch-to-U-plane timing.
+- Annex D.4 remains informative ordering evidence: do not authorize the caller before the called leg is acknowledged. This patch is clause-scoped engineering evidence only, not formal certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Added explicit called `D-CONNECT ACKNOWLEDGE` delivery mode:
+    - first attempt: `CurrentChannel`, `Layer2Service::Acknowledged`, `stealing_permission=false`;
+    - retry after missing BL-ACK: `AssignedChannelRecovery`, same acknowledged service, `stealing_permission=true`, same channel allocation.
+  - Caller `D-CONNECT` and initial private floor remain blocked until called `D-CONNECT ACKNOWLEDGE` reporter reaches L2 acknowledged.
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - Non-stealing channel-allocation BL-DATA now expects peer BL-ACK on current control TS1.
+  - Stealing/recovery channel-allocation BL-DATA still expects peer BL-ACK on the assigned traffic timeslot.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Acknowledged channel-allocation TMA on the current channel receives an immediate current-channel BL-ACK grant.
+  - Assigned-channel recovery with `stealing_permission=true` is emitted as STCH/FACCH on the active traffic channel.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Fixed direct CMCE floor-control classification so `D-TX INTERRUPT` is recognized before LLC `BL-UDATA-FCS` ambiguity and preempts positive `D-TX GRANTED`.
+
+Focused tests added/updated:
+
+- `test_p2p_called_d_connect_ack_l2_loss_never_authorizes_caller_before_release`
+  - Proves first called `D-CONNECT ACKNOWLEDGE` is current-channel and retries switch to assigned-channel recovery while caller/floor remain blocked.
+- `test_acked_channel_allocation_tma_carries_current_channel_ack_grant`
+  - Proves current-channel acknowledged channel allocation carries a real BL-ACK grant.
+- `test_acked_channel_allocation_stealing_tma_uses_assigned_channel_stch`
+  - Proves assigned-channel recovery emits STCH MAC-RESOURCE with channel allocation and TMA success.
+- `acked_channel_allocation_sent_on_mcch_expects_peer_ack_on_current_channel`
+  - Proves LLC timeslot selection differs correctly between current-channel first attempt and assigned-channel recovery.
+- `test_preemptive_floor_interrupt_stch_stays_ahead_of_positive_grant`
+  - Proves `D-TX INTERRUPT` is not delayed behind `D-TX GRANTED`.
+
+Verification:
+
+- `cargo test -p tetra-entities --lib --locked` -> 255 passed, 5 ignored.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 78 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 83 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Operational target update:
+
+- User clarified the practical Nexus-BS target is 100 simultaneous terminals, not thousands.
+- Do not continue adding broad "thousands of terminals" refactors before core RF call paths are stable.
+- Existing large-storm tests may remain as regression/backpressure evidence, but the next cleanup should document a 100-terminal operational target and reduce or make explicit any internal caps that could hold excessive floor/PTT backlog ahead of real lab traffic.
+
+Next RF gate:
+
+1. Build locally and deploy directly to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Rotate/vacuum volatile journal.
+4. Ask user for one controlled P2P simplex test `2260082 -> 2260618`, first PTT short voice, then two more short PTT turns.
+5. Inspect for called `D-CONNECT ACKNOWLEDGE` first current-channel attempt, assigned-channel retry only if needed, caller `D-CONNECT`, initial `FloorGranted`, and first-PTT audio.
+
+Deploy:
+
+- Ran `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh` after local verification above.
+- Local release build for `nexus-bs v0.1.55` passed.
+- Deployed commit label: `332fa519`.
+- Deployed binary SHA-256: `395bcfe77c5939319191caed82c5a9eecd7b8826961a648523406383d185001f`.
+- Service: `nexus-bs@chris.service`.
+- Restart timestamp: `Sat 2026-06-06 11:53:25 EEST`.
+- PID after restart: `47469`.
+- Startup showed restart recovery armed for local ISSIs `{2260082, 2260616, 2260618}` and group `226333` restored for visible subscribers.
+- Journal rotated/vacuumed for the next RF gate at `2026-06-06 11:54:02 EEST`.
+- Next read should inspect journal since `2026-06-06 11:54:02 EEST`.
+
+## 2026-06-06 13:13 EEST - P2P close hardening and frame-18 STCH audit
+
+Trigger:
+
+- User reported a later P2P `2260618 -> 2260082` failure with terminal `Network trouble`, plus a GSSI call glitch where `2260082` briefly showed very low signal.
+- Last log review showed the P2P failure was setup-side: called `D-CONNECT ACKNOWLEDGE` was sent to `2260082`, but no L2 BL-ACK arrived; CMCE released with `AcknowledgedServiceNotComplete`.
+- A separate live regression showed Motorola MXP600 could soft-reset or display `Not Answered` when the peer was cleared by `D-DISCONNECT` after a simplex private call.
+
+ETSI basis checked:
+
+- EN 300 392-2 14.5.1.1.1/14.5.1.1.2: called `U-CONNECT` is followed by SwMI `D-CONNECT ACKNOWLEDGE`, then caller `D-CONNECT`.
+- EN 300 392-2 14.5.3.1 and Annex D.4: late channel assignment in `D-CONNECT`/`D-CONNECT ACKNOWLEDGE` can leave ambiguity between current-channel and assigned-channel listening; caller authorization remains gated until the called leg is L2-acknowledged.
+- EN 300 392-2 14.5.1.3.1: after `U-DISCONNECT`, the initiating MS waits for `D-RELEASE`; SwMI may inform the other MS by either `D-DISCONNECT` or `D-RELEASE`.
+- EN 300 392-2 14.5.1.3.3: `D-DISCONNECT` expects `U-RELEASE`, while `D-RELEASE` does not. For local simplex peer clear, use `D-RELEASE(UserRequestedDisconnection)` as the clause-permitted route that avoids the Motorola response-exchange crash.
+- EN 300 392-2 frame-18 handling remains conservative: no frame-18 receive extension is advertised; assigned-channel STCH recovery must survive a frame-18 traffic gap and transmit on the next legal traffic slot.
+
+Patch:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Converted simplex private-call peer-clear tests from old peer `D-DISCONNECT -> U-RELEASE` expectations to peer `D-RELEASE(UserRequestedDisconnection)` after bounded tail drain.
+  - Preserved explicit duplex/fallback `D-DISCONNECT` tests for the paths that intentionally require a peer `U-RELEASE`.
+  - Covered caller hangup, called-party hangup, pending release, call-id wrap, full simple private workflow, unsolicited `U-RELEASE`, and MXP600 last/current-speaker regressions.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_assigned_channel_stch_recovery_survives_frame_18_gap`.
+  - Proves a TS2 assigned-channel STCH recovery queued at `f=18,t=2` is not emitted illegally, is not reported as transmitted early, stays queued, and is emitted with channel allocation/usage marker on the next legal TS2 traffic opportunity.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_assigned_channel_stch_recovery_survives_frame_18_gap --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 84 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 11 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Current conclusion:
+
+- The previous `Network trouble` remains a real RF/setup failure, but focused UMAC evidence now shows queued assigned-channel STCH recovery is not lost at frame 18. Next live logs should determine whether `2260082` actually decodes and answers the current-channel or assigned-channel `D-CONNECT ACKNOWLEDGE`.
+- Do not claim formal ETSI certification. This is clause-scoped engineering evidence and lab hardening.
+
+Next RF gate:
+
+1. Deploy the verified local build directly to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Rotate/vacuum volatile journal.
+4. Ask user for one controlled P2P simplex `2260618 -> 2260082`, then one `2260082 -> 2260618`.
+5. Inspect for called `D-CONNECT ACKNOWLEDGE` current-channel attempt, assigned-channel retry only if needed, BL-ACK arrival, caller `D-CONNECT`, initial `FloorGranted`, first-PTT audio, and final peer `D-RELEASE` close without `Not Answered`/soft reboot.
+
+Deploy:
+
+- Ran `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh` after the verification above.
+- Local release build for `nexus-bs v0.1.55` passed.
+- Deployed commit label: `332fa519`.
+- Deployed binary SHA-256: `0c03206ffc72631e5d3541547952fd457055ebe1d3ab9cc9ce6279ff3e17c803`.
+- Service: `nexus-bs@chris.service`.
+- Restart timestamp: `Sat 2026-06-06 13:14:59 EEST`.
+- PID after restart: `48039`.
+- Startup showed restart recovery armed for local ISSIs `{2260082, 2260616, 2260618}`. `2260082` answered registration after two restart-recovery refresh attempts, so the next RF gate must watch its BL-ACK reliability closely.
+- Journal rotated/vacuumed for the RF gate at `2026-06-06T13:15:20+03:00`; immediately after vacuum, `journalctl -u nexus-bs@chris.service -n 12` had no entries.
+- Next read should inspect journal since `2026-06-06 13:15:20 EEST`.
+
+## 2026-06-06 13:37 EEST - P2P direct setup no-BL-ACK fallback for real terminals
+
+Trigger:
+
+- User completed the controlled P2P RF gate after the previous deploy.
+- Observed result: both P2P directions ended with `No answer`, no Motorola reboot, but no voice on any PTT.
+- Log review showed both calls failed before active voice:
+  - `2260618 -> 2260082`, `call_id=4`: called `D-CONNECT ACKNOWLEDGE` was sent/retried, but no BL-ACK arrived from `2260082`; caller `D-CONNECT` and initial `FloorGranted` were never sent.
+  - `2260082 -> 2260618`, `call_id=6`: same failure pattern toward `2260618`.
+- Conclusion: this was not a vocoder/audio-static failure. The CMCE direct setup gate was too strict for the observed terminal behavior because it treated called-side BL-ACK absence as a hard setup failure.
+
+ETSI basis checked:
+
+- EN 300 392-2 14.5.1.1.1/14.5.1.1.2: after called `U-CONNECT`, SwMI sends `D-CONNECT ACKNOWLEDGE`; caller reaches active call on `D-CONNECT`.
+- EN 300 392-2 14.5.3.1: late individual channel assignment may be carried in `D-CONNECT` and `D-CONNECT ACKNOWLEDGE`.
+- EN 300 392-2 Annex D.4: conservative sequence may wait for called MS L2 ACK, but if no PDU arrives in the granted subslot BS cannot know whether downlink failed or only the uplink ACK failed.
+- EN 300 392-2 Annex D.5 adjacent note: repeat signalling may use unacknowledged service, or the BS must otherwise provide an MCCH ACK subslot/delay ACK handling.
+- EN 300 392-2 20.3.1 and 22.3.2.4.1: basic-link unacknowledged service and BL-UDATA repetition are standard layer-2 tools for repeated point-to-point signalling when selected by the service user.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Reworked local RF P2P direct setup from a hard "wait for called BL-ACK before caller D-CONNECT" gate into two delivery guards:
+    1. called `D-CONNECT ACKNOWLEDGE` is sent as repeated `Layer2Service::Unacknowledged` BL-UDATA (`unacked_bl_repetitions = 2`) with the late channel allocation;
+    2. once local MAC/LLC reports the called `D-CONNECT ACKNOWLEDGE` transmitted, CMCE queues caller `D-CONNECT`;
+    3. initial private-simplex `FloorGranted` is emitted only after caller `D-CONNECT` is locally transmitted.
+  - Kept retry/release behavior for true local delivery failure: if the called `D-CONNECT ACKNOWLEDGE` is discarded or never locally transmitted, CMCE retries current-channel and assigned-channel recovery attempts; after bounded failure it releases with `AcknowledgedServiceNotComplete`.
+  - Caller `D-CONNECT` remains acknowledged service, but CMCE does not require its BL-ACK for first floor; it requires only local transmission so the terminal has been told the call is connected before voice is enabled.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`
+  - Added staged pending direct-setup state for called-leg delivery and caller `D-CONNECT` delivery guards.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Replaced BL-ACK-hard-gate P2P expectations with clause-scoped delivery-order tests:
+    - called `D-CONNECT ACKNOWLEDGE` is repeated unacknowledged with channel allocation;
+    - pending local delivery does not authorize caller or floor;
+    - no called BL-ACK still falls forward after local delivery instead of releasing;
+    - caller `D-CONNECT` precedes initial `FloorGranted`;
+    - local MAC discard retries before release.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 74 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 161 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` -> 84 passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` -> 11 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed before the final comment cleanup; re-run `git diff --check` before deploy.
+
+Next RF gate after deploy:
+
+1. Clear journal.
+2. Ask user for one P2P simplex `2260618 -> 2260082`, short first PTT voice, then close.
+3. Ask user for one P2P simplex `2260082 -> 2260618`, short first PTT voice, then close.
+4. Inspect logs for repeated unacknowledged called `D-CONNECT ACKNOWLEDGE`, caller `D-CONNECT` local transmission, then initial `FloorGranted`.
+5. Required field outcome: first PTT must carry voice; close must not show `No answer` and must not reboot MXP600.
+
+## 2026-06-06 13:46 EEST - P2P direct setup restored to Annex D.4 called BL-ACK gate
+
+Trigger:
+
+- User completed the post-deploy P2P RF test after the repeated-unacknowledged D.5-style fallback.
+- Field result: both call directions ended with `No answer`, no Motorola reboot, but no voice on any PTT.
+- Journal after the gate did not contain the expected `U-SETUP`/`U-CONNECT`/`D-CONNECT`/`FloorGranted` info lines, so the next RF gate must keep the journal clear and verify the exact call timestamps. However, the RF result invalidated the previous "local transmission is enough" called-leg fallback for real Motorola/Hytera terminals.
+
+ETSI basis re-checked:
+
+- EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 require `D-CONNECT ACKNOWLEDGE` to the called MS after `U-CONNECT`, with an indication of which party may transmit.
+- EN 300 392-2 Annex D.4 gives the conservative same-cell direct setup sequence: called `D-CONNECT ACK` with channel allocation, wait for the called MS layer-2 ACK, then send caller `D-CONNECT`.
+- EN 300 392-2 Annex D.5 allows a faster alternative, but explicitly warns that if the called MS misses `D-CONNECT ACK`, it will not receive the first part of traffic. The field result matched that risk, so the D.5-style fallback is not acceptable as the default P2P setup path.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Restored called-leg `D-CONNECT ACKNOWLEDGE` to `Layer2Service::Acknowledged`.
+  - Removed repeated unacknowledged BL-UDATA setup completion from the called leg.
+  - CMCE now treats called `D-CONNECT ACKNOWLEDGE` `TxReporter::is_acknowledged()` as the only success condition that releases caller `D-CONNECT`.
+  - Local transmission without BL-ACK no longer authorizes caller `D-CONNECT` or private-simplex `FloorGranted`.
+  - Existing bounded retry/recovery remains: current-channel retry, assigned-channel recovery retry, then setup release with `AcknowledgedServiceNotComplete` if the called leg cannot be locally transmitted/acknowledged.
+  - Caller `D-CONNECT` remains acknowledged service, but initial private-simplex floor still waits only for caller `D-CONNECT` local transmission, not caller BL-ACK, matching the existing clause-scoped guard.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P tests to assert called `D-CONNECT ACKNOWLEDGE` uses acknowledged L2 service and no unacknowledged repetitions.
+  - Added `test_p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_caller`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 75 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 162 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo test -p tetra-entities --test test_llc_bs ack --locked` -> 38 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo fmt -p tetra-entities` completed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Deploy local build to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Clear volatile journal.
+4. Ask user for exactly one P2P simplex call, first `2260618 -> 2260082`, with one short PTT and close.
+5. Read logs immediately and verify:
+   - called `D-CONNECT ACKNOWLEDGE` is acknowledged before caller `D-CONNECT`;
+   - `UMAC floor granted` appears only after caller `D-CONNECT` local transmission;
+   - first PTT voice is routed;
+   - close uses the current D-RELEASE path without `No answer` or MXP600 reboot.
+
+## 2026-06-06 14:05 EEST - Brew GSSI 91 group subscription no longer blocked by local P2P ISSI range
+
+Trigger:
+
+- User reported GSSI 91 was no longer audible on local TETRA terminals even though it should arrive via Brew to affiliated stations.
+- Journal since the last restart showed Brew SDS forwarding and external subscriber deregistration events, but no `GROUP_TX`, `NetworkCallStart`, `no listeners`, or `not routable` events for GSSI 91.
+- Runtime subscriber recovery cache in `/run/nexus-bs-chris/config.toml.subscribers` contained `2260618 91:0:4`, so the cell had a recoverable local listener for GSSI 91.
+
+Analysis:
+
+- The real Pi config keeps private-call lab ISSIs local with `local_ssi_ranges = [[0, 90], [2260000, 2269999]]`. That is correct for local P2P routing.
+- `BrewEntity` was also using `is_brew_issi_routable()` for group affiliation and local group `GROUP_TX` forwarding. This incorrectly filtered local ISSIs such as 2260618 before they could publish a Brew-routable GSSI 91 subscription.
+- This is not an ETSI air-interface PDU change. It is Brew interconnect policy around subscriber registration/affiliation. The ETSI-relevant air path remains normal group call setup/traffic handling under EN 300 392-2 clause 14.5.2 and MM group affiliation/recovery handling under clause 16 procedures.
+
+Patch:
+
+- `crates/tetra-entities/src/net_brew/entity.rs`
+  - Added GSSI-scoped filtering for Brew group subscriptions.
+  - Preserved `local_ssi_ranges` as the P2P/private-call ISSI policy.
+  - Allowed a local private-call ISSI to send `REGISTER + AFFILIATE` when the group itself is Brew-routable, e.g. `2260618 -> GSSI 91`.
+  - Resync after Brew reconnect now replays local ISSI group subscriptions when they contain Brew-routable groups.
+  - Local group PTT forwarding now checks `dest_gssi` routing policy, not `source_issi` P2P routing policy.
+  - Local GSSI 90 remains suppressed because it is inside the configured local range.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities --lib local_private_issi --locked` -> 4 passed.
+- `cargo test -p tetra-entities --lib net_brew::entity --locked` -> 16 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs brew --locked` -> 9 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF/network gate:
+
+1. Deploy local build to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Clear volatile journal.
+4. Verify startup/recovery logs contain `local ISSI 2260618 group-subscribe` or `resync ... groups=[91]`.
+5. Ask user for one controlled GSSI 91 Brew audio test.
+6. Expected logs: Brew subscriber `REGISTER + AFFILIATE groups=[91]`, then `GROUP_TX` for GSSI 91, then CMCE network group call and UMAC downlink audio to affiliated members.
+
+## 2026-06-06 14:12 EEST - Config exceptions narrowed to 1-90 and 226333
+
+Trigger:
+
+- User required `config.toml` to keep only `1-90` and `226333` as local exceptions.
+- Private calls between locally attached terminals must still stay inside Nexus-BS even when terminal ISSIs are not listed statically in TOML.
+
+Analysis:
+
+- `local_ssi_ranges` is a Brew/local routing exception policy, not the live list of terminals served by the cell.
+- Runtime-local private call selection remains CMCE/MM state based: a called ISSI that is registered in the SwMI state routes locally without a static TOML range.
+- Restart recovery uses the volatile subscriber cache and security policy; cached terminal ISSIs are not limited by `local_ssi_ranges`.
+- This checkpoint does not claim whole-stack ETSI certification. The ETSI-facing behaviour is clause-scoped to EN 300 392-2 MM registration/group recovery and CMCE private-call local setup; the TOML exception list itself is deployment policy.
+
+Patch:
+
+- `example_config/config.toml`
+  - `local_ssi_ranges = [[1, 90], [226333, 226333]]`.
+  - Removed the numeric `restart_recovery_issis` example so no terminal ISSI is presented as a static exception.
+- `crates/tetra-entities/src/net_brew/components/brew_routable.rs`
+  - Updated tests so 42 and 226333 are the configured local exceptions.
+  - Added an assertion that terminal ISSI 2260616 is not blocked by TOML policy; runtime CMCE/MM state decides local P2P.
+- `crates/tetra-entities/src/net_brew/entity.rs`
+  - Updated Brew entity tests to match the narrowed config policy: runtime subscribers can register/affiliate with Brew for interconnect while local P2P remains CMCE-state based.
+- Live Pi config `/home/chris/nexus-bs/config.toml`
+  - Confirmed active `local_ssi_ranges` contains only `[1, 90]` and `[226333, 226333]`.
+  - Removed old commented `restart_recovery_issis` entries for 2260082/2260616/2260618.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities --lib brew_routable --locked` -> 3 passed.
+- `cargo test -p tetra-entities --lib net_brew::entity --locked` -> 16 passed.
+- `cargo test -p tetra-config --lib bluestation::parsing --locked` -> 29 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs runtime_registered_local_issis --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery_cache_is_not_limited --locked` -> 1 passed.
+- `git diff --check` passed.
+
+Next gate:
+
+1. Do not re-add `[2260000, 2269999]` to `local_ssi_ranges`.
+2. For P2P regression work, validate local routing through runtime registration/attach state, not static TOML ISSI lists.
+
+## 2026-06-06 15:10 EEST - Private simplex close peer cause corrected for Motorola UI
+
+Trigger:
+
+- User re-framed the private simplex first-PTT behaviour correctly: for hook/simplex setup, the first caller PTT can initiate the call and the called user confirms/gets transmit permission before useful speech from the caller.
+- Remaining defect: Motorola peer showed `No answer` / `Not Answered` on normal private simplex call close, even when audio and setup were otherwise working.
+
+Technical explanation:
+
+- CMCE is the call-control component. It sends setup, floor, and release PDUs for private and group calls.
+- In private simplex, the MS that sends `U-DISCONNECT` is the disconnect initiator. It must receive `D-RELEASE` promptly.
+- The other MS is only the peer being informed that an already established call is being cleared. It did not request the disconnect itself.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: the MS sending `U-DISCONNECT` waits for `D-RELEASE`.
+- EN 300 392-2 clauses 14.5.1.3.1/14.5.1.3.3: the SwMI may inform the other individual-call MS by `D-DISCONNECT` or by `D-RELEASE`; `D-RELEASE` requires no MS response.
+- Mapping the peer-facing `D-RELEASE` cause from `UserRequestedDisconnection` to `SwmiRequestedDisconnection` is ETSI-compatible implementation policy, not an ETSI-mandated remap. It matches the peer perspective and avoids recent Motorola terminals rendering the normal close as setup `No answer`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Simplex peer clear now always sends assigned-channel reporter-tracked `D-RELEASE` after the bounded bearer tail drain.
+  - Initiator `D-RELEASE` keeps the original `UserRequestedDisconnection` cause.
+  - Peer `D-RELEASE` maps `UserRequestedDisconnection` to `SwmiRequestedDisconnection`; other causes are preserved.
+  - Peer timeout logging now reports the actual peer-facing release cause.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Updated the private simplex disconnect comment so it no longer says the peer preserves the initiator cause.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated all private-simplex peer release expectations to `SwmiRequestedDisconnection`.
+  - Kept initiator expectations as `UserRequestedDisconnection`.
+  - Added/renamed MXP600 regression coverage for peer clear after the Motorola peer was the last floor holder.
+  - Duplex/explicit `D-DISCONNECT -> U-RELEASE` tests remain separate because that is a different ETSI-valid path.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 77 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+- Read-only CMCE telecom audit confirmed the PDU-level simplex disconnect flow is clause-consistent and that the peer cause remap is ETSI-compatible but should be documented as implementation policy.
+
+Next RF gate:
+
+1. Deploy the local build directly to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Clear volatile journal.
+4. Ask user for one private simplex close test:
+   - recommended first scenario: `2260616 -> 2260618`, let `2260618` speak last, then close with red key from `2260616`;
+   - required outcome: `2260618` should show normal call disconnected/end-call state, not `No answer`, and must not reboot.
+5. Read logs immediately after the RF test and verify:
+   - initiator `D-RELEASE` cause is `UserRequestedDisconnection`;
+   - peer `D-RELEASE` cause is `SwmiRequestedDisconnection`;
+   - no peer `D-DISCONNECT` is emitted on this simplex close path;
+   - circuit closes only after reporter delivery or bounded guard.
+
+## 2026-06-06 16:28 EEST - Private simplex setup no longer falls forward after missing called BL-ACK
+
+Trigger:
+
+- RF test after the peer-cause deploy still failed: user reported `PTT denied` during the call and `No Answer` at final clear.
+- Journal from the clean test window showed call `2260616 -> 2260618`, call_id `4`, at `2026-06-06 16:24:25`.
+
+Log finding:
+
+- `D-CONNECT ACKNOWLEDGE` to called Motorola `2260618` was sent with acknowledged L2 service.
+- LLC retransmitted it 3 times and then reported exhausted retransmissions / no called BL-ACK.
+- CMCE then used the previous `current-channel unacknowledged repeat recovery`, treated local transmission of that repeat as enough, sent caller `D-CONNECT`, and enabled initial private U-plane.
+- After that, floor grants appeared normal in BS logs, but the terminal-side result was `PTT denied` and final `No Answer`.
+
+Technical explanation:
+
+- CMCE must not treat "I transmitted a repeated D-CONNECT ACK" as equivalent to "the called MS acknowledged D-CONNECT ACK".
+- For Motorola-like RF terminals this creates a false-active private call: BS thinks setup is complete, but the called terminal has not completed the CMCE/L2 setup state machine.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 require called-leg `D-CONNECT ACKNOWLEDGE` before caller `D-CONNECT`.
+- EN 300 392-2 Annex D.4 is the conservative same-cell direct setup sequence: called `D-CONNECT ACK` with channel allocation, wait for called MS L2 ACK, then send caller `D-CONNECT`.
+- The previous Annex D.5-style fallback is not acceptable as a default for these real terminals because the field result reproduced Annex D.5's risk: called MS missed/failed setup and then did not behave as a valid private-call participant.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Removed `CurrentChannelUnacknowledgedRepeat` from called `D-CONNECT ACK` recovery.
+  - All called `D-CONNECT ACK` retries now use `Layer2Service::Acknowledged`.
+  - Lost called BL-ACK retries alternate current-channel and assigned-channel recovery, but caller `D-CONNECT` is released only after real called BL-ACK.
+  - If called BL-ACK never arrives after bounded retries, CMCE releases setup with `AcknowledgedServiceNotComplete` instead of creating a false-active P2P call.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Replaced the old test that expected unacknowledged fallback with `test_p2p_called_d_connect_ack_lost_does_not_fall_forward_without_bl_ack`.
+  - New regression asserts no caller `D-CONNECT`, no `FloorGranted`, and setup release after exhausted called BL-ACK retries.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_called_d_connect_ack --locked` -> 4 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 77 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Deploy local build directly to `/home/chris/nexus-bs/nexus-bs`.
+2. Restart `nexus-bs@chris.service`.
+3. Clear volatile journal.
+4. Ask user for the same private simplex test: `2260616 -> 2260618`, let `2260618` speak last, close from `2260616`.
+5. Required log result:
+   - if called BL-ACK arrives: caller `D-CONNECT`, then floor grants, then close path as above;
+   - if called BL-ACK does not arrive: no caller `D-CONNECT`, no floor, release with `AcknowledgedServiceNotComplete`.
+6. Required RF result for success: no `PTT denied` during an active established call and no false `No Answer` at normal close.
+
+## 2026-06-06 16:46 EEST - Deployed private simplex peer clear via D-DISCONNECT/U-RELEASE
+
+Trigger:
+
+- RF test after the previous deploy still reported `PTT denied` and `No Answer` at final close.
+- The previous timeline checkpoint still expected peer `D-RELEASE(SwmiRequestedDisconnection)`, but live Motorola MXP600 behavior invalidated that as the normal local simplex peer-clear path.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1: the MS that sends `U-DISCONNECT` waits for `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: the other MS can be explicitly cleared by `D-DISCONNECT`, then responds with `U-RELEASE`.
+- This is clause-scoped implementation evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Local simplex `U-DISCONNECT` now keeps prompt initiator `D-RELEASE`, then tail-drains and clears the peer with `D-DISCONNECT`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Removed the normal peer `D-RELEASE` branch and stale peer-release reporter model.
+  - Normal peer clear is `D-DISCONNECT -> U-RELEASE`; `D-RELEASE` remains only as bounded fallback if `D-DISCONNECT` delivery/response fails.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P/MXP600 regression coverage to require peer `D-DISCONNECT`, reporter delivery, peer `U-RELEASE`, and only then final circuit close after the initiator `D-RELEASE` reporter.
+
+Verification:
+
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 77 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs mxp600 --locked` -> 2 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+- Local aarch64 release build completed through `scripts/nexus-bs-test-deploy.sh`.
+
+Deploy:
+
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Restarted `nexus-bs@chris.service`.
+- Running PID after deploy: `50516`.
+- Deployed binary SHA: `69b964ebd843a3324fbd34705d85e54a361591206d7cd0cf812b8a703b860e9b`.
+- Build marker: `v0.1.55-332fa519-modified`.
+- Journal was rotated/vacuumed at `2026-06-06 16:45:58 EEST`.
+
+Next RF gate:
+
+1. User performs private simplex `2260616 -> 2260618`.
+2. Preferably let `2260618` speak last.
+3. Close with red key from `2260616`.
+4. Expected normal log path:
+   - caller `U-DISCONNECT(UserRequestedDisconnection)`;
+   - initiator `D-RELEASE(UserRequestedDisconnection)`;
+   - after tail drain, peer `D-DISCONNECT(UserRequestedDisconnection)`;
+   - peer `U-RELEASE`;
+   - UMAC circuit closes only after peer clear and initiator release reporter/guard.
+5. Required RF result for success: no terminal-visible `PTT denied` in an established call, no false `No Answer` on `2260618`, and no MXP600 soft reboot.
+
+## 2026-06-06 16:52 EEST - Local PTT-denied regressions for P2P disconnect windows
+
+Context:
+
+- While the deployed BS was left running for the RF gate, expert-agent review identified two precise PTT-denial risk windows: `U-TX DEMAND` during simplex disconnect tail-drain and `U-TX DEMAND` after peer `D-DISCONNECT` delivery but before peer `U-RELEASE`.
+
+Patch:
+
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_p2p_disconnect_tail_drain_ignores_late_tx_demands_without_not_granted`.
+  - Added `test_p2p_disconnect_pending_ignores_tx_demands_before_peer_u_release`.
+  - Both assert zero `D-TX GRANTED/NotGranted`, zero floor events, and no premature close while the EN 300 392-2 clause 14.5.1.3.1/14.5.1.3.3 disconnect sequence is pending.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/{call.rs,timers.rs,shared.rs}`
+  - Cleaned comments to cite clause 14.5.1.3.3 for `D-DISCONNECT -> U-RELEASE`.
+- Renamed stale MXP600 test wording from "swmi_release" to "d_disconnect".
+
+Verification:
+
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_disconnect_tail_drain --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_disconnect_pending_ignores_tx_demands --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs mxp600 --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 79 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Deploy status:
+
+- No runtime redeploy needed for this checkpoint; changes after the `69b964...` deploy are comments/tests only.
+- Current RF test gate remains the already deployed PID `50516` binary.
+
+## 2026-06-06 18:14 EEST - Private simplex close changed to peer D-RELEASE after Motorola reboot
+
+Context:
+
+- RF test after the previous deploy soft-rebooted a Motorola after local private simplex close.
+- Live log showed call `2260082 -> 2260616`, floor turns worked, then close sent:
+  - initiator `D-RELEASE(UserRequestedDisconnection)`;
+  - peer `D-DISCONNECT(UserRequestedDisconnection)`;
+  - no peer `U-RELEASE`;
+  - timeout fallback `D-RELEASE(UserRequestedDisconnection)`;
+  - Motorola re-attached shortly after.
+- Clause-scoped ETSI review reconfirmed EN 300 392-2 clause 14.5.1.3.1 requires `D-RELEASE` to the MS that sent `U-DISCONNECT`, and clause 14.5.1.3.3 permits the other MS to be informed by either `D-DISCONNECT` or `D-RELEASE`. `D-RELEASE` is final and expects no MS response.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Local simplex `U-DISCONNECT` keeps prompt initiator `D-RELEASE`, then uses peer `D-RELEASE` after the bearer tail drain.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Pending individual disconnect release ack now tracks peer `D-RELEASE` reporters separately.
+  - Final cleanup waits for initiator `D-RELEASE` delivery and peer `D-RELEASE` delivery, or local guard expiry.
+  - Late `U-TX DEMAND` during the close window remains ignored to avoid terminal-visible `NotGranted` / PTT denied.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - If a legacy/duplex `D-DISCONNECT` path times out after delivery, BS now closes the local circuit without emitting another peer clear PDU.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated local private simplex and MXP600 close tests to expect peer `D-RELEASE` instead of peer `D-DISCONNECT -> U-RELEASE`.
+  - Updated stuck `D-DISCONNECT` timeout test to assert no fallback clear PDU and local cleanup.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 79 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs mxp600 --locked` -> 2 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Deploy status:
+
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Running service: `nexus-bs@chris.service`, `MainPID=50813`, active since `2026-06-06 18:15:28 EEST`.
+- Deployed binary SHA: `47391218eab933c880e36d06074fe4c03c2cef2c06aa0141aa8e3be07bdbec2e`.
+- Journal was rotated/vacuumed after deploy for a clean RF gate.
+
+Next RF gate:
+
+1. User performs private simplex `2260616 -> 2260618`.
+2. Preferably include at least one normal PTT turn, then close with red key from `2260616`.
+3. Expected normal log path:
+   - caller `U-DISCONNECT(UserRequestedDisconnection)`;
+   - initiator `D-RELEASE(UserRequestedDisconnection)`;
+   - after tail drain, peer `D-RELEASE(UserRequestedDisconnection)`;
+   - no peer `D-DISCONNECT` and no peer `U-RELEASE` requirement;
+   - UMAC circuit closes after both release reporters or local guard.
+4. Required RF result for success: no terminal-visible `PTT denied` in an established call, no false `No Answer`, and no Motorola soft reboot.
+
+## 2026-06-07 01:40 EEST - Private simplex setup grant now seeds initial UMAC floor
+
+Context:
+
+- Live RF regression after the 01:31 deploy: private simplex `2260616 -> 2260618` reached `Active`, but no `U-TX DEMAND` and no `FloorGranted` appeared after caller `D-CONNECT` was L2-acknowledged.
+- Field symptom matched the log: terminal opened the private-call channel with no speech because CMCE told the MS `TransmissionGrant::Granted` in setup, while BS internals kept UMAC media closed waiting for a later `U-TX DEMAND`.
+- This is not a formal certification claim; it is a clause-scoped correction against ETSI EN 300 392-2.
+
+ETSI basis:
+
+- Clause 14.5.1.1.1: `D-CONNECT ACKNOWLEDGE` shall indicate which party is permitted to transmit.
+- Clause 14.5.1.1.2: `D-CONNECT` shall indicate which party is permitted to transmit.
+- Clause 14.5.1.2.1 b): during call setup, the response to the setup-phase transmit request is handled by 14.5.1.1.1/14.5.1.1.2, and the MS given permission starts T311.
+- Therefore the setup `TransmissionGrant` is the initial simplex floor. Later `U-TX DEMAND` / `D-TX GRANTED` remains the in-call floor change/refresh procedure.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Kept the ETSI grant polarity restored earlier:
+    - called-first setup: called `D-CONNECT ACKNOWLEDGE = Granted`, caller `D-CONNECT = GrantedToOtherUser`;
+    - caller-first setup: called `D-CONNECT ACKNOWLEDGE = GrantedToOtherUser`, caller `D-CONNECT = Granted`.
+  - After caller `D-CONNECT` is L2-acknowledged and the call transitions active, CMCE now sets `floor_holder` to the setup-granted ISSI and emits one UMAC `FloorGranted` for that ISSI.
+  - Still blocks U-plane before caller `D-CONNECT` delivery, so the called-leg ACK alone cannot open media early.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P setup tests to enforce no floor before caller `D-CONNECT` ACK and exactly one setup-granted initial floor afterward.
+  - Added/updated coverage for default direct setup floor to caller and hook/request-other-MS floor to called MS.
+  - Kept later `U-TX DEMAND` semantics as explicit floor refresh/change, not the first floor.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` passed: 81/81.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 168/168.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` passed: 18/18.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Deploy direct to `/home/chris/nexus-bs/nexus-bs`.
+- Clear the volatile journal.
+- Ask for one structured test: `2260616 -> 2260618` private simplex. For this hook/request-other-MS path, expected BS log after caller `D-CONNECT` ACK is `setup grant seeds U-plane floor for ISSI 2260618`; first PTT from `2260616` should only open/setup, and speech should be valid when `2260618` responds.
+
+## 2026-06-06 19:45 EEST - PHY RF timing-collapse log storm guard
+
+Context:
+
+- After the P2P RF gate, the service did not process-crash: systemd still showed `ActiveState=active`, `MainPID=51128`, `NRestarts=0`, and no coredump.
+- The RF side collapsed instead: logs showed `Discarding TX samples in the past`, `RX buffer overrun`, then thousands of `Too late to produce TX block` warnings per second.
+- This patch is implementation hardening in PHY/Soapy I/O. It does not change ETSI CMCE/MM/UMAC/SDS PDUs or call-control semantics.
+
+Patch:
+
+- `crates/tetra-entities/src/phy/components/soapy_dev.rs`
+  - Added `SdrTimingEventLog` for one-second aggregation of repeated real-time timing warnings.
+  - RX lost-sample and TX-late hot paths now emit the first warning immediately, then summarize suppressed events/blocks/samples instead of logging every missed block.
+  - Purpose: keep circular journald usable and avoid warning spam making a recoverable SDR timing slip worse.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` completed.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo test -p tetra-entities --lib soapy --locked` passed, no matching tests.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 79 passed.
+- `git diff --check` passed.
+
+Deploy status:
+
+- Service was restarted once to recover the live SDR state. New running service before deploy: `nexus-bs@chris.service`, `MainPID=51592`, active since `2026-06-06 19:42:43 EEST`.
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Running service after deploy: `nexus-bs@chris.service`, `MainPID=52040`, active since `2026-06-06 19:46:27 EEST`.
+- Deployed binary SHA: `57ec48041095febd3f03df6bbc430f139a8f8850914014b6fb30e50f61c5da5f`.
+- Boot still emitted normal one-shot timing warnings (`Lost ... samples`, `Too late ...`) while Soapy streams initialized, but the repeated warning path is now rate-limited/summarized.
+
+## 2026-06-07 00:27 EEST - Nexus-BS test deploy for RF gate
+
+Context:
+
+- User returned in range of TetraHS and requested deploy/test.
+- ETSI law memory was reloaded before deploy; this step changed no protocol semantics.
+- Build remained local; no Rust compilation was performed on TetraHS.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs repeated_group_u_setup --locked` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 168 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` passed: 81 tests.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` passed: 34 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+- `cargo zigbuild --release -p nexus-bs --target aarch64-unknown-linux-gnu --locked --bin nexus-bs` passed.
+
+Deploy:
+
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Running service: `nexus-bs@chris.service`, `MainPID=53350`, `NRestarts=0`, active since `2026-06-07 00:27:16 EEST`.
+- Deployed binary SHA: `19d7900d3767055978582ded7d1a31cab2814389bd24f2e2da25abd0276031a1`.
+- Build banner: `Nexus-BS v0.1.55`, build `v0.1.55-332fa519-modified`.
+
+Observed restart recovery after deploy:
+
+- `2260616` restored cached group `[226333]`.
+- `2260082` registered and affiliated group `[91]`.
+- `2260618` initially needed several restart-recovery retries, then registered at `00:27:39` and affiliated group `[226333]`.
+
+Next RF gate:
+
+- Clear volatile journal before test.
+- Test local private simplex `2260616 -> 2260618` and close from the caller after at least one called-side PTT turn.
+- Also test one group PTT sequence on `226333` if private simplex is clean.
+- Required result: no false `No Answer`, no Motorola soft reboot, no established-call `PTT denied`, and no static-only audio after floor grant.
+
+## 2026-06-07 00:49 EEST - LLC early BL-ACK acceptance for P2P setup race
+
+Context:
+
+- RF gate after the 00:27 deploy failed for private simplex `2260616 -> 2260618`.
+- Log path:
+  - `U-SETUP` from `2260616` to `2260618`, `call_id=17`.
+  - BS sent called-leg `D-CONNECT ACKNOWLEDGE` with late channel allocation.
+  - LLC logged `received ACK for SSI 2260618 endpoint 0 N(R) 1 before a complete UMAC transmission. Ignoring`.
+  - BS then treated the called ACK path as still unsettled/retry-prone; shortly after caller `D-CONNECT`, `2260618` sent `U-DISCONNECT(InvalidCallIdentifier)` while CMCE was in `CallerConnectAckPending`.
+- Clause-scoped ETSI check:
+  - EN 300 392-2 clause 22.3.2.3(j): a matching BL-ACK `N(R)` confirms the waiting acknowledged BL-DATA transfer.
+  - EN 300 392-2 clause 22.3.2.3(f): first complete transmission starts the ACK wait/report path.
+  - EN 300 392-2 Annex D.4 supports waiting for the called MS L2 ACK before sending caller `D-CONNECT`.
+- Agent reviews agreed that the safe first patch is LLC ACK ordering only; no CMCE grant-field change was made.
+
+Patch:
+
+- `crates/tetra-entities/src/llc/llc_bs_ms.rs`
+  - If a BL-ACK arrives before LLC has observed the local UMAC completion reporter, and the basic-link context plus `N(R)` match the stored `N(S)`, LLC now accepts the ACK as proof that the peer received the downlink.
+  - It synthesizes first-complete reporting, marks the service transfer acknowledged, and removes the waiting transfer instead of retransmitting the already-acknowledged call-control PDU.
+  - Wrong/stale `N(R)` before first-complete remains ignored and does not confirm the transfer.
+- `crates/tetra-entities/tests/test_llc_bs.rs`
+  - Added regression for matching BL-ACK before local UMAC completion.
+  - Existing wrong-ACK, endpoint isolation, T.251, and BL-ADATA tests continue to cover stale/incorrect ACK risk.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_llc_bs matching_bl_ack --locked` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_llc_bs --locked` passed: 85 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` passed: 81 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` passed during deploy: 168 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` passed during deploy: 81 tests.
+- `cargo test -p tetra-entities --test test_mm_bs restart_recovery --locked` passed during deploy: 34 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+- `cargo fmt --package tetra-entities` completed.
+
+Deploy:
+
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Running service: `nexus-bs@chris.service`, `MainPID=53628`, `NRestarts=0`, active since `2026-06-07 00:49:44 EEST`.
+- Deployed binary SHA: `c0a9ef2b8d92316c343cd59a4f67835cf73d0a6f9eebef0905d79a9fcd66ccd5`.
+- Build banner: `Nexus-BS v0.1.55`, build `v0.1.55-332fa519-modified`.
+
+Next RF gate:
+
+- Clear volatile journal before test.
+- Repeat private simplex `2260616 -> 2260618`.
+- Watch specifically for absence of `received ACK ... before a complete UMAC transmission. Ignoring`, absence of `U-DISCONNECT(InvalidCallIdentifier)` from `2260618`, and successful caller/called `D-CONNECT` activation.

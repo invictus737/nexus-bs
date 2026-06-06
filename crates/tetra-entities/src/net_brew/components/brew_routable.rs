@@ -91,12 +91,16 @@ mod tests {
         let config = example_config();
 
         assert!(
-            !is_brew_issi_routable(&config, 2260082),
-            "local private-call lab ISSIs must remain inside this cell instead of being routed over Brew"
+            !is_brew_issi_routable(&config, 42),
+            "configured short local exceptions must remain inside this cell instead of being routed over Brew"
         );
         assert!(
-            !is_brew_issi_routable(&config, 2260616),
-            "local private-call lab ISSIs must remain inside this cell instead of being routed over Brew"
+            !is_brew_issi_routable(&config, 226333),
+            "configured GSSI/local exceptions must remain inside this cell instead of being routed over Brew"
+        );
+        assert!(
+            is_brew_issi_routable(&config, 2260616),
+            "lab terminal ISSIs are no longer static TOML exceptions; local P2P routing is decided from runtime SwMI registration state"
         );
     }
 

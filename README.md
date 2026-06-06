@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.55
+# Nexus-BS v0.1.56
 
 > **TETRA base station software for amateur radio operators and researchers.**
 > Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
@@ -30,6 +30,7 @@ Nexus-BS implements a functional TETRA base station (BS) in software. You plug i
 | Full-duplex P2P calls (local + Brew) | ✅ |
 | Half-duplex P2P calls (simplex PTT) | ✅ |
 | SDS forwarding (local + Brew) | ✅ |
+| WAP MVP over SDS Type4 | ✅ |
 | UTC time broadcast (D-NWRK-BROADCAST) | ✅ |
 | T351 periodic re-registration | ✅ |
 | Home Mode Display (SDS-TL text) | ✅ |
@@ -74,16 +75,26 @@ cargo build --release
 
 ### As a systemd service
 
-A sample unit file is in `contrib/systemd/`. Copy and adapt it:
+The current service layout is flat under the runtime user's home directory:
 
-```bash
-cp contrib/systemd/nexus-bs.service /etc/systemd/system/nexus-bs.service
-# Edit paths and user
-systemctl daemon-reload
-systemctl enable --now nexus-bs
+```text
+/home/<user>/nexus-bs/nexus-bs
+/home/<user>/nexus-bs/nexus-bs-control-service
+/home/<user>/nexus-bs/nexus-bs-control
+/home/<user>/nexus-bs/config.toml
 ```
 
-The service name (`nexus-bs`) must match the `service_name` used in any restart/shutdown commands.
+Install the templated units from `contrib/systemd/` and start them for the target user:
+
+```bash
+install -m 0644 contrib/systemd/nexus-bs@.service /etc/systemd/system/
+install -m 0644 contrib/systemd/nexus-bs-control@.service /etc/systemd/system/
+install -D -m 0644 contrib/systemd/journald-nexus-bs-volatile.conf /etc/systemd/journald.conf.d/90-nexus-bs-volatile.conf
+systemctl daemon-reload
+systemctl enable --now nexus-bs-control@<user>.service nexus-bs@<user>.service
+```
+
+The service name (`nexus-bs`) must match the `service_name` used in any restart/shutdown commands. The legacy `contrib/systemd/nexus-bs.service` remains only as a reference for old single-user installs.
 
 ---
 
@@ -133,7 +144,7 @@ username = "admin"
 password = "changeme"
 
 # Optional: reserved git source path for future OTA updates.
-# OTA update is disabled in Nexus-BS v0.1.55.
+# OTA update is disabled in Nexus-BS v0.1.56.
 # source_dir = "/opt/nexus-bs"
 ```
 
@@ -153,7 +164,7 @@ When running on fallback, the dashboard shows a persistent red warning banner wi
 [cell_info.home_mode_display]
 text = "Nexus-BS"            # Shown on radio home screen
 interval_multiframes = 96    # ≈ 96 seconds
-protocol_id = 130            # 0x82 ETSI SDS-TL text; 220/0xDC is vendor/user-defined
+protocol_id = 130            # 0x82 SDS-TL text
 text_coding_scheme = "LATIN"
 ```
 
@@ -217,13 +228,35 @@ Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
 - Live SDS broadcast queue — broadcast a text message to all radios on the cell, repeating at the HMD interval until deleted or repeat count exhausted
 - OTA update is intentionally disabled for now; update controls are visible but grayed out
 
+### WAP MVP over SDS
+
+Nexus-BS v0.1.56 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
+
+From the flat install directory, send the default WML page to a terminal ISSI:
+
+```bash
+./nexus-bs-control sendwap 16777215 2260618 false
+```
+
+The default page contains:
+
+```text
+Hello! You are running Nexus-BS. Gretings and 73! from Chris YO3TCO!
+```
+
+For terminal browsers that support basic HTML/color handling, use:
+
+```bash
+./nexus-bs-control sendwapcolor 16777215 2260618 false
+```
+
 ---
 
 ## Key fixes vs upstream
 
 **ExpiryOfTimer crash loop** — `release_group_call` now sends `NetworkCallEnd` to Brew when a network-initiated group call expires. Without this, Brew kept the call alive and re-issued `NetworkCallStart` with new speakers, generating thousands of `ExpiryOfTimer` releases per minute and crashing the stack.
 
-**Simplex P2P (half-duplex PTT)** — `transmission_request_permission` correctly set to `false` in `D-CONNECT`, `D-CONNECT-ACK`, `D-TX-CEASED`, and `D-TX-GRANTED` (`false` encodes ETSI table 14.81 value 0, allowed to request transmission). On `U-TX-CEASED`, BS sends `D-TX-CEASED` to both private-call parties so both terminals leave the active transmission state; it sends `D-TX-GRANTED(Granted)` only after a queued or new `U-TX-DEMAND`, avoiding an unsolicited grant while still unlocking the next PTT request.
+**Simplex P2P (half-duplex PTT)** — `transmission_request_permission` correctly set to `false` in `D-CONNECT`, `D-CONNECT-ACK`, `D-TX-CEASED`, and `D-TX-GRANTED` (`false` encodes EN 300 392-2 14.8.43/table 14.81 value 0, allowed to request transmission). On `U-TX-CEASED`, BS sends `D-TX-CEASED` to both private-call parties so both terminals leave the active transmission state; it sends `D-TX-GRANTED(Granted)` only after a queued or new `U-TX-DEMAND`, avoiding an unsolicited grant while still unlocking the next PTT request.
 
 **Sepura post-PTT RoamingLocationUpdating** — Sepura terminals send `RoamingLocationUpdating` after every PTT release, not just on power cycle. Without the heuristic (< 60s since last registration → treat as soft re-attach), CMCE briefly loses track of the terminal and the next PTT is denied. Fixed with timing-based soft re-attach detection.
 

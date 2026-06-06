@@ -3,8 +3,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{
-    BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, tetra_entities::TetraEntity,
-    unimplemented_log,
+    BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxReporter, TxState,
+    tetra_entities::TetraEntity, unimplemented_log,
 };
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::{
@@ -94,18 +94,10 @@ struct PendingIndividualDisconnectDelivery {
     started_at: TdmaTime,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum IndividualDisconnectPeerClear {
-    Disconnect,
-    Release,
-}
-
 struct PendingIndividualDisconnectTailDrain {
     sender: TetraAddress,
     peer_issi: u32,
     cause: DisconnectCause,
-    peer_cause: DisconnectCause,
-    peer_clear: IndividualDisconnectPeerClear,
     started_at: TdmaTime,
 }
 
@@ -113,9 +105,8 @@ struct PendingIndividualDisconnectReleaseAck {
     release_to_issi: u32,
     cause: DisconnectCause,
     reporters: Vec<TxReporter>,
+    peer_release_reporters: Vec<TxReporter>,
     started_at: TdmaTime,
-    peer_clear_reporters: Vec<TxReporter>,
-    peer_clear_started_at: Option<TdmaTime>,
     peer_clear_complete: bool,
 }
 
@@ -132,6 +123,38 @@ struct PendingIndividualTxCeasedTailDrain {
     peer: IndividualTailDrainLeg,
     notify_brew: bool,
     started_at: TdmaTime,
+}
+
+struct PendingIndividualConnectAck {
+    reporter: TxReporter,
+    stage: PendingIndividualConnectAckStage,
+    started_at: TdmaTime,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingIndividualConnectAckStage {
+    CalledConnectAck { attempts: u8, requires_l2_ack: bool },
+    CallerDConnect { attempts: u8 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PendingNetworkIndividualConnectKind {
+    LocalCallerDConnect,
+    LocalCalledDConnectAck,
+}
+
+struct PendingNetworkIndividualConnect {
+    reporter: TxReporter,
+    brew_uuid: uuid::Uuid,
+    call_id: u16,
+    ts: u8,
+    local_addr: TetraAddress,
+    peer_addr: TetraAddress,
+    simplex_duplex: bool,
+    grant: TransmissionGrant,
+    permission: u8,
+    started_at: TdmaTime,
+    kind: PendingNetworkIndividualConnectKind,
 }
 
 /// Clause 14 Call Control CMCE sub-entity (ETSI EN 300 392-2)
@@ -157,6 +180,10 @@ pub struct CcBsSubentity {
     pending_individual_disconnect_release_acks: HashMap<u16, PendingIndividualDisconnectReleaseAck>,
     /// Simplex private-call TX-CEASED/floor handoff signalling waiting for traffic tail bits.
     pending_individual_tx_ceased_tail_drains: HashMap<u16, PendingIndividualTxCeasedTailDrain>,
+    /// Direct private-call setup delivery guards before caller authorization.
+    pending_individual_connect_acks: HashMap<u16, PendingIndividualConnectAck>,
+    /// Brew-bridged individual connect waiting for the local RF leg to acknowledge D-CONNECT/D-CONNECT ACK.
+    pending_network_individual_connects: HashMap<u16, PendingNetworkIndividualConnect>,
     /// Individual releases waiting for assigned-channel D-RELEASE transmission or a bounded guard timeout.
     pending_individual_releases: HashMap<u16, PendingIndividualRelease>,
     /// Registered subscriber groups (ISSI -> set of GSSIs)

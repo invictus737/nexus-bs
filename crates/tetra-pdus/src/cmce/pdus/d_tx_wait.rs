@@ -17,7 +17,8 @@ pub struct DTxWait {
     /// Type1, 14 bits, Call identifier
     pub call_identifier: u16,
     /// Type1, 1 bits, Transmission request permission
-    /// Set to true to signal MSes they are allowed to send a U-TX DEMAND
+    /// EN 300 392-2 14.8.43/table 14.81 bit: false/0 = allowed to
+    /// request transmission, true/1 = not allowed to request transmission.
     pub transmission_request_permission: bool,
     /// Type2, 6 bits, Notification indicator
     pub notification_indicator: Option<u64>,

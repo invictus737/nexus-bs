@@ -35,7 +35,8 @@ pub struct DSetup {
     /// Type1, 2 bits, Transmission grant
     pub transmission_grant: TransmissionGrant,
     /// Type1, 1 bits, Transmission request permission
-    /// Set to true to signal MSes they are allowed to send a U-TX DEMAND
+    /// EN 300 392-2 14.8.43/table 14.81 bit: false/0 = allowed to
+    /// request transmission, true/1 = not allowed to request transmission.
     pub transmission_request_permission: bool,
     /// Type1, 4 bits, See note 1,
     pub call_priority: u8,

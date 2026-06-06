@@ -15,6 +15,7 @@ use tetra_pdus::{
         enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
         pdus::d_tx_granted::DTxGranted,
     },
+    llc::enums::llc_pdu_type::LlcPduType,
     llc::pdus::bl_udata::BlUdata,
     mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator,
     mle::pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
@@ -171,6 +172,7 @@ pub enum DlSchedElem {
 enum StealingSchedPriority {
     Ordinary,
     ChannelAllocation,
+    CmceChannelAllocation,
     ListenerFloorGrant,
     PositiveFloorGrant,
     FloorWithdraw,
@@ -179,6 +181,7 @@ enum StealingSchedPriority {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum DlBackpressurePriority {
     Ordinary,
+    CmceCallControl,
     GrantOrAck,
     ChannelAllocation,
     ListenerFloorGrant,
@@ -492,6 +495,20 @@ impl BsChannelScheduler {
                 "BsChannelScheduler: dropped {} queued DL media block(s) on ts {}: {}",
                 dropped,
                 ts,
+                reason
+            );
+        }
+    }
+
+    pub fn clear_dl_media_queue_except_source(&mut self, ts: u8, source_ul_ts: u8, source_addr: TetraAddress, reason: &str) {
+        let dropped = self.circuits.clear_tx_data_except_source(ts, source_ul_ts, source_addr);
+        if dropped > 0 {
+            tracing::info!(
+                "BsChannelScheduler: dropped {} queued stale DL media block(s) on ts {} while preserving source {} on UL ts {}: {}",
+                dropped,
+                ts,
+                source_addr,
+                source_ul_ts,
                 reason
             );
         }
@@ -915,7 +932,9 @@ impl BsChannelScheduler {
         if let DlSchedElem::Stealing(..) = elem {
             return match Self::stealing_sched_priority(elem) {
                 StealingSchedPriority::Ordinary => DlBackpressurePriority::Ordinary,
-                StealingSchedPriority::ChannelAllocation => DlBackpressurePriority::ChannelAllocation,
+                StealingSchedPriority::ChannelAllocation | StealingSchedPriority::CmceChannelAllocation => {
+                    DlBackpressurePriority::ChannelAllocation
+                }
                 StealingSchedPriority::ListenerFloorGrant => DlBackpressurePriority::ListenerFloorGrant,
                 StealingSchedPriority::PositiveFloorGrant => DlBackpressurePriority::PositiveFloorGrant,
                 StealingSchedPriority::FloorWithdraw => DlBackpressurePriority::FloorWithdraw,
@@ -931,6 +950,9 @@ impl BsChannelScheduler {
         }
 
         match elem {
+            DlSchedElem::Resource(_, sdu, _, _) if Self::resource_is_cmce_setup_call_control(sdu) => {
+                DlBackpressurePriority::CmceCallControl
+            }
             DlSchedElem::Grant(..) | DlSchedElem::PendingGrant(..) | DlSchedElem::RandomAccessAck(_) => DlBackpressurePriority::GrantOrAck,
             _ => DlBackpressurePriority::Ordinary,
         }
@@ -1102,6 +1124,27 @@ impl BsChannelScheduler {
     }
 
     pub fn dl_enqueue_tma(&mut self, pdu: MacResource, sdu: BitBuffer, tx_reporter: Option<TxReporter>) {
+        self.dl_enqueue_tma_inner(pdu, sdu, tx_reporter, None);
+    }
+
+    pub fn dl_enqueue_tma_with_current_channel_ack_grant(
+        &mut self,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+        grant_addr: TetraAddress,
+        res_req: ReservationRequirement,
+    ) {
+        self.dl_enqueue_tma_inner(pdu, sdu, tx_reporter, Some((grant_addr, res_req)));
+    }
+
+    fn dl_enqueue_tma_inner(
+        &mut self,
+        pdu: MacResource,
+        sdu: BitBuffer,
+        tx_reporter: Option<TxReporter>,
+        current_channel_ack_grant: Option<(TetraAddress, ReservationRequirement)>,
+    ) {
         let timeslots = Self::common_control_downlink_timeslots();
 
         // Queue the message for all timeslots on which we should transmit this message.
@@ -1137,16 +1180,28 @@ impl BsChannelScheduler {
                 tracing::debug!("dl_enqueue_tma: ts {} deferring chan_alloc PDU to next frame (slot capacity)", ts);
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
                 self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma");
+                if let Some((grant_addr, res_req)) = current_channel_ack_grant {
+                    let elem = DlSchedElem::PendingGrant(grant_addr, res_req);
+                    self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma_ack_grant");
+                }
                 break;
             } else if next_ts > 0 {
                 // There is another ts for which we need to transmit this message.
                 // Clone the message now and push it to the current ts.
                 let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), None);
                 self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma");
+                if let Some((grant_addr, res_req)) = current_channel_ack_grant {
+                    let elem = DlSchedElem::PendingGrant(grant_addr, res_req);
+                    self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma_ack_grant");
+                }
             } else {
                 // This is the last ts on which we need to transmit this message
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
                 self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma");
+                if let Some((grant_addr, res_req)) = current_channel_ack_grant {
+                    let elem = DlSchedElem::PendingGrant(grant_addr, res_req);
+                    self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma_ack_grant");
+                }
                 break;
             }
         }
@@ -1325,6 +1380,16 @@ impl BsChannelScheduler {
         targets
     }
 
+    fn is_predefined_broadcast_gssi(addr: Option<TetraAddress>) -> bool {
+        matches!(
+            addr,
+            Some(TetraAddress {
+                ssi: PREDEFINED_BROADCAST_GSSI,
+                ssi_type: SsiType::Gssi,
+            })
+        )
+    }
+
     fn retain_current_group_delivery_targets(
         state: &mut GroupDeliveryState,
         addr: TetraAddress,
@@ -1370,21 +1435,28 @@ impl BsChannelScheduler {
             let completed_reporter = match elem {
                 DlSchedElem::Resource(pdu, _, _, Some(state)) => pdu.addr.and_then(|addr| {
                     Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache, energy_saving);
-                    state.is_complete().then(|| state.tx_reporter.clone()).flatten()
+                    state.is_complete().then(|| state.tx_reporter.clone())
                 }),
                 DlSchedElem::FragBuf(fragger, Some(state)) => fragger.addr().and_then(|addr| {
                     Self::retain_current_group_delivery_targets(state, addr, subscribers, readiness_cache, energy_saving);
-                    state.is_complete().then(|| state.tx_reporter.clone()).flatten()
+                    state.is_complete().then(|| state.tx_reporter.clone())
                 }),
                 DlSchedElem::Stealing(_, addr, _, Some(state)) => {
                     Self::retain_current_group_stealing_targets(state, *addr, subscribers, readiness_cache, energy_saving);
-                    state.is_complete().then(|| state.tx_reporter.clone()).flatten()
+                    state.is_complete().then(|| state.tx_reporter.clone())
                 }
                 _ => None,
             };
 
             if let Some(reporter) = completed_reporter {
-                reporter.mark_transmitted();
+                if let Some(reporter) = reporter {
+                    if !reporter.try_mark_transmitted() {
+                        tracing::debug!(
+                            "BsChannelScheduler: ignoring late group complete-transmission report for reporter already in {:?}",
+                            reporter.get_state()
+                        );
+                    }
+                }
                 return false;
             }
 
@@ -1513,6 +1585,18 @@ impl BsChannelScheduler {
     }
 
     fn cmce_dl_payload_from_tma_sdu(sdu: &BitBuffer) -> Option<BitBuffer> {
+        let direct = BitBuffer::from_bitbuffer(sdu);
+        if matches!(
+            direct.peek_bits(5).and_then(|bits| CmcePduTypeDl::try_from(bits).ok()),
+            Some(CmcePduTypeDl::DTxGranted | CmcePduTypeDl::DTxCeased | CmcePduTypeDl::DTxInterrupt)
+        ) {
+            // EN 300 392-2 clauses 14.5.2.2.1 and 23.5 allow assigned-channel
+            // floor control directly on STCH. D-TX INTERRUPT can start with the
+            // same first four bits as LLC BL-UDATA-FCS, so classify direct
+            // floor-control before trying the LLC wrapper.
+            return Some(direct);
+        }
+
         let mut wrapped = BitBuffer::from_bitbuffer(sdu);
         if BlUdata::from_bitbuf(&mut wrapped).is_ok() {
             let discriminator = wrapped
@@ -1522,13 +1606,49 @@ impl BsChannelScheduler {
             if discriminator == Some(MleProtocolDiscriminator::Cmce) {
                 return Some(wrapped);
             }
+            return None;
         }
 
-        let direct = BitBuffer::from_bitbuffer(sdu);
+        if matches!(
+            direct.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok()),
+            Some(LlcPduType::BlAck | LlcPduType::BlAckFcs | LlcPduType::BlAdata | LlcPduType::BlAdataFcs)
+        ) {
+            return None;
+        }
+        if direct.get_len_remaining() < 10 {
+            return None;
+        }
         direct
             .peek_bits(5)
             .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())
             .map(|_| direct)
+    }
+
+    fn cmce_dl_pdu_type_from_tma_sdu(sdu: &BitBuffer) -> Option<CmcePduTypeDl> {
+        let mut payload = Self::cmce_dl_payload_from_tma_sdu(sdu)?;
+        payload
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())
+    }
+
+    fn cmce_setup_call_control_pdu(pdu_type: CmcePduTypeDl) -> bool {
+        matches!(
+            pdu_type,
+            CmcePduTypeDl::DAlert
+                | CmcePduTypeDl::DCallProceeding
+                | CmcePduTypeDl::DConnect
+                | CmcePduTypeDl::DConnectAcknowledge
+                | CmcePduTypeDl::DDisconnect
+                | CmcePduTypeDl::DRelease
+                | CmcePduTypeDl::DSetup
+                | CmcePduTypeDl::DCallRestore
+                | CmcePduTypeDl::CmceFunctionNotSupported
+        )
+    }
+
+    fn resource_is_cmce_setup_call_control(sdu: &BitBuffer) -> bool {
+        Self::cmce_dl_pdu_type_from_tma_sdu(sdu).is_some_and(Self::cmce_setup_call_control_pdu)
     }
 
     fn stealing_sched_priority(elem: &DlSchedElem) -> StealingSchedPriority {
@@ -1571,13 +1691,15 @@ impl BsChannelScheduler {
                 let Ok(grant) = DTxGranted::from_bitbuf(&mut grant_probe) else {
                     return StealingSchedPriority::Ordinary;
                 };
-                if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && uplink_allocated {
+                if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 && (uplink_allocated || !has_channel_allocation)
+                {
                     // The positive D-TX GRANTED with an uplink channel
-                    // allocation is the response that lets the requester
-                    // transmit; keep it ahead of RequestQueued/NotGranted
-                    // storm traffic in large GSSI cells.
+                    // allocation, or the already-assigned private-channel
+                    // equivalent, is the response that lets the requester
+                    // transmit; keep it ahead of RequestQueued/NotGranted storm
+                    // traffic in large GSSI cells.
                     StealingSchedPriority::PositiveFloorGrant
-                } else if grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8 && has_channel_allocation {
+                } else if grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8 {
                     // EN 300 392-2 clause 14.5.2.2.1 b): group listeners
                     // must be told when another MS is granted transmit
                     // permission. Keep the GSSI notification near the
@@ -1587,7 +1709,7 @@ impl BsChannelScheduler {
                     StealingSchedPriority::Ordinary
                 }
             }
-            _ if has_channel_allocation => StealingSchedPriority::ChannelAllocation,
+            _ if has_channel_allocation => StealingSchedPriority::CmceChannelAllocation,
             _ => StealingSchedPriority::Ordinary,
         }
     }
@@ -1694,10 +1816,8 @@ impl BsChannelScheduler {
     }
 
     fn mark_reporter_discarded_if_pending(tx_reporter: Option<TxReporter>) {
-        if let Some(tx_reporter) = tx_reporter
-            && tx_reporter.get_state() == tetra_core::TxState::Pending
-        {
-            tx_reporter.mark_discarded();
+        if let Some(tx_reporter) = tx_reporter {
+            tx_reporter.try_mark_discarded();
         }
     }
 
@@ -1833,8 +1953,24 @@ impl BsChannelScheduler {
         self.circuits.put_block(ts, block);
     }
 
+    pub fn dl_schedule_tmd_from_ul(&mut self, ts: u8, source_ul_ts: u8, speaker_addr: Option<TetraAddress>, block: Vec<u8>) {
+        self.circuits.put_block_from_ul(ts, source_ul_ts, speaker_addr, block);
+    }
+
     pub fn dl_schedule_raw_tch_s_half_slot(&mut self, ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
         self.circuits.put_raw_tch_s_half_slot(ts, block_num, type5_bits);
+    }
+
+    pub fn dl_schedule_raw_tch_s_half_slot_from_ul(
+        &mut self,
+        ts: u8,
+        source_ul_ts: u8,
+        speaker_addr: Option<TetraAddress>,
+        block_num: PhyBlockNum,
+        type5_bits: Vec<u8>,
+    ) {
+        self.circuits
+            .put_raw_tch_s_half_slot_from_ul(ts, source_ul_ts, speaker_addr, block_num, type5_bits);
     }
 
     pub fn circuit_is_active(&self, dir: Direction, ts: u8) -> bool {
@@ -1881,6 +2017,14 @@ impl BsChannelScheduler {
             .is_some_and(|circuit| circuit.is_primary_issi_scoped())
     }
 
+    pub fn ul_circuit_primary_addr(&self, ts: u8) -> Option<TetraAddress> {
+        if !(1..=4).contains(&ts) {
+            return None;
+        }
+
+        self.circuits.ul[ts as usize - 1].as_ref().and_then(|circuit| circuit.active_addr)
+    }
+
     /// Return the peer timeslot for the UL circuit on `ts`, if any.
     /// Used for full-duplex P2P cross-routing: UL voice on `ts` must be played out
     /// on the peer MS's DL timeslot. Returns `None` for simplex/group calls
@@ -1911,6 +2055,35 @@ impl BsChannelScheduler {
             self.hangtime[ts as usize - 1] = false;
         }
         self.circuits.close_circuit(dir, ts)
+    }
+
+    pub fn dl_discard_pending_stealing(&mut self, ts: u8, reason: &str) -> usize {
+        let Some(slot) = Self::dl_slot_index(ts, "dl_discard_pending_stealing") else {
+            return 0;
+        };
+
+        let old_queue = std::mem::take(&mut self.dltx_queues[slot]);
+        let mut retained = Vec::with_capacity(old_queue.len());
+        let mut discarded = 0;
+        for elem in old_queue {
+            if matches!(elem, DlSchedElem::Stealing(..)) {
+                discarded += 1;
+                Self::mark_sched_elem_discarded_if_reported(elem);
+            } else {
+                retained.push(elem);
+            }
+        }
+        self.dltx_queues[slot] = retained;
+
+        if discarded > 0 {
+            tracing::debug!(
+                "BsChannelScheduler: discarded {} queued STCH stealing block(s) on closed DL ts {}: {}",
+                discarded,
+                ts,
+                reason
+            );
+        }
+        discarded
     }
 
     pub fn create_circuit(&mut self, dir: Direction, circuit: Circuit) {
@@ -2283,6 +2456,7 @@ impl BsChannelScheduler {
 
                         DlSchedElem::Resource(pdu, sdu, tx_reporter, group_state) => {
                             let addr = pdu.addr;
+                            let is_all_ones_broadcast = Self::is_predefined_broadcast_gssi(addr);
                             let mut group_state = group_state.or_else(|| {
                                 addr.and_then(|addr| {
                                     Self::group_state_for_resource(
@@ -2309,6 +2483,7 @@ impl BsChannelScheduler {
                                 state.begin_batch_if_needed(ts, energy_saving);
                             }
                             let fragger_reporter = match group_state.as_ref() {
+                                Some(state) if is_all_ones_broadcast => state.tx_reporter.clone(),
                                 Some(state) if !state.is_final_batch() => None,
                                 Some(state) => state.tx_reporter.clone(),
                                 None => tx_reporter,
@@ -2327,6 +2502,15 @@ impl BsChannelScheduler {
                                 && fully_transmitted
                             {
                                 state.mark_batch_covered();
+                                if is_all_ones_broadcast && state.tx_reporter.as_ref().is_some_and(TxReporter::is_transmitted) {
+                                    // TMA-REPORT is local MAC progress per
+                                    // EN 300 392-2 20.4.1.1.3. For the
+                                    // predefined all-ones broadcast address,
+                                    // report once this TM-SDU has been fully
+                                    // emitted, while keeping EG repeats as
+                                    // best-effort receive coverage.
+                                    state.tx_reporter = None;
+                                }
                             }
                             if !fully_transmitted {
                                 // Fragmentation was started and we have more chunks to send
@@ -2342,6 +2526,7 @@ impl BsChannelScheduler {
 
                         DlSchedElem::FragBuf(mut fragger, mut group_state) => {
                             let addr = fragger.addr();
+                            let is_all_ones_broadcast = Self::is_predefined_broadcast_gssi(addr);
                             if let Some(state) = group_state.as_mut() {
                                 if let Some(addr) = addr {
                                     Self::retain_current_group_delivery_targets(
@@ -2366,6 +2551,9 @@ impl BsChannelScheduler {
                                 && fully_transmitted
                             {
                                 state.mark_batch_covered();
+                                if is_all_ones_broadcast && state.tx_reporter.as_ref().is_some_and(TxReporter::is_transmitted) {
+                                    state.tx_reporter = None;
+                                }
                             }
                             if !fully_transmitted {
                                 // Fragmentation was continued and we still have more chunks to send
@@ -2430,14 +2618,14 @@ impl BsChannelScheduler {
         energy_saving: &mut HashMap<u32, EnergySavingAssignment>,
     ) -> (Option<DlTchBlock>, Option<BitBuffer>) {
         let tch_buf = self.circuits.take_block(ts.t).and_then(|block| match block {
-            CircuitTxBlock::AcElp(block) => {
+            CircuitTxBlock::AcElp { block, .. } => {
                 let mut buf = BitBuffer::from_vec(block);
                 // Raw ACELP speech (274 bits for TCH/S).
                 // Clamp to TCH_S_CAP as Vec may be larger (e.g. 280 bits).
                 buf.set_raw_end(buf.get_raw_start() + TCH_S_CAP);
                 Some(DlTchBlock::AcElp(buf))
             }
-            CircuitTxBlock::RawTchSHalfSlot { block_num, type5_bits } => {
+            CircuitTxBlock::RawTchSHalfSlot { block_num, type5_bits, .. } => {
                 if block_num != PhyBlockNum::Block2 {
                     tracing::warn!(
                         "dl_build_traffic_block: dropping unsupported raw TCH/S half-slot {:?} on ts {}",
@@ -2488,6 +2676,7 @@ impl BsChannelScheduler {
         if let (Some(block), Some(addr)) = (stch_opt.as_ref(), stealing_addr_opt)
             && addr.ssi_type == SsiType::Gssi
         {
+            let is_all_ones_broadcast = Self::is_predefined_broadcast_gssi(Some(addr));
             let targets = readiness_cache.targets_for(addr, subscribers);
             let energy_economy_targets = Self::energy_economy_targets(targets, energy_saving);
             if energy_economy_targets.is_empty() {
@@ -2507,8 +2696,12 @@ impl BsChannelScheduler {
                     group_state.begin_batch_if_needed(ts, energy_saving);
                     Self::mark_stealing_signalling_activity(addr, Some(&group_state), ts, subscribers, energy_saving);
                     group_state.mark_batch_covered();
-                    should_report_transmitted = group_state.is_complete();
-                    if !should_report_transmitted {
+                    let coverage_complete = group_state.is_complete();
+                    should_report_transmitted = coverage_complete || is_all_ones_broadcast;
+                    if is_all_ones_broadcast {
+                        group_state.tx_reporter = None;
+                    }
+                    if !coverage_complete {
                         self.dl_requeue_group_stealing(ts.t, block.clone(), addr, group_state);
                     }
                 } else {
@@ -2520,7 +2713,12 @@ impl BsChannelScheduler {
         }
 
         if should_report_transmitted && let Some(tx_reporter) = tx_reporter_opt {
-            tx_reporter.mark_transmitted();
+            if !tx_reporter.try_mark_transmitted() {
+                tracing::debug!(
+                    "BsChannelScheduler: ignoring late stealing complete-transmission report for reporter already in {:?}",
+                    tx_reporter.get_state()
+                );
+            }
         }
 
         (tch_buf, stch_opt)
@@ -2593,6 +2791,18 @@ impl BsChannelScheduler {
         // EN 300 392-2 21.4.3.1 ACK/grant timing is not delayed by ordinary data.
         if let Some(i) = q.iter().position(|e| {
             Self::elem_has_integrated_grant_or_ack(e) && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
+        }) {
+            return Some(q.remove(i));
+        }
+
+        // EN 300 392-2 clause 14.5.1 call setup/release progress is CMCE
+        // control-plane signalling. Clause 23.5.2.2.7 still gates delivery to
+        // the addressed MS's EG receive opportunity; once that opportunity is
+        // present, keep D-SETUP/D-RELEASE style control ahead of ordinary
+        // SDS/data and fragmented backlog.
+        if let Some(i) = q.iter().position(|e| {
+            matches!(e, DlSchedElem::Resource(_, sdu, _, _) if Self::resource_is_cmce_setup_call_control(sdu))
+                && Self::elem_is_ready_for_tx(e, ts, energy_saving, subscribers, readiness_cache)
         }) {
             return Some(q.remove(i));
         }
@@ -3196,7 +3406,10 @@ mod tests {
     };
 
     use tetra_pdus::{
-        cmce::pdus::{d_tx_ceased::DTxCeased, d_tx_interrupt::DTxInterrupt},
+        cmce::{
+            enums::call_timeout::CallTimeout,
+            pdus::{d_connect_acknowledge::DConnectAcknowledge, d_tx_ceased::DTxCeased, d_tx_interrupt::DTxInterrupt},
+        },
         mle::{
             fields::bs_service_details::BsServiceDetails,
             pdus::{d_mle_sync::DMleSync, d_mle_sysinfo::DMleSysinfo},
@@ -3489,6 +3702,42 @@ mod tests {
         sdu.seek(0);
 
         test_cmce_stch_block(addr, sdu, ul_dl_assigned)
+    }
+
+    fn test_llc_wrapped_d_connect_ack_stch_block(addr: TetraAddress, ul_dl_assigned: UlDlAssignment) -> BitBuffer {
+        let d_connect_ack = DConnectAcknowledge {
+            call_identifier: 0x22,
+            call_time_out: CallTimeout::T2m,
+            transmission_grant: TransmissionGrant::Granted,
+            transmission_request_permission: false,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        let mut sdu = BitBuffer::new_autoexpand(64);
+        BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
+        sdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
+        d_connect_ack.to_bitbuf(&mut sdu).expect("test D-CONNECT ACK should serialize");
+        sdu.seek(0);
+
+        test_cmce_stch_block(addr, sdu, ul_dl_assigned)
+    }
+
+    #[test]
+    fn test_mle_bl_udata_is_not_classified_as_cmce_d_info() {
+        let mut sdu = BitBuffer::new_autoexpand(16);
+        BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
+        sdu.write_bits(MleProtocolDiscriminator::Mle.into_raw(), 3);
+        sdu.write_bits(0, 8);
+        sdu.seek(0);
+
+        // BL-UDATA(false) starts with 0010 and the MLE discriminator starts
+        // with 1, so the first five bits are 00101, the raw CMCE D-INFO type.
+        // EN 300 392-2 clause 18.5.21 still makes this an MLE payload, not a
+        // direct CMCE PDU; classifier code must not fall through after reading
+        // a non-CMCE discriminator.
+        assert!(BsChannelScheduler::cmce_dl_payload_from_tma_sdu(&sdu).is_none());
     }
 
     fn test_d_tx_interrupt_stch_block(addr: TetraAddress, ul_dl_assigned: UlDlAssignment) -> BitBuffer {
@@ -4689,6 +4938,75 @@ mod tests {
     }
 
     #[test]
+    fn test_explicit_channel_allocation_stch_recovery_preempts_ack_only_facch() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+
+        let traffic_ts = 2;
+        let called = TetraAddress::issi(2_260_618);
+        let ack_only = {
+            let mut sdu = BitBuffer::new_autoexpand(5);
+            sdu.write_bits(0, 5);
+            sdu.seek(0);
+            test_cmce_stch_block(called, sdu, UlDlAssignment::Both)
+        };
+        sched.dl_enqueue_stealing(traffic_ts, ack_only, called, None);
+
+        let connect_ack_reporter = TxReporter::new_unacked();
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_llc_wrapped_d_connect_ack_stch_block(called, UlDlAssignment::Both),
+            called,
+            Some(connect_ack_reporter.clone()),
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let (_tch, stch) = sched.dl_build_traffic_block(
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0,
+            },
+            &subscribers,
+            &mut energy_saving,
+        );
+        let stch = stch.expect("assigned traffic channel should send one STCH block");
+
+        let mut parsed = BitBuffer::from_bitbuffer(&stch);
+        let resource = MacResource::from_bitbuf(&mut parsed).expect("selected STCH should carry MAC-RESOURCE");
+        assert_eq!(resource.addr.map(|addr| addr.ssi), Some(called.ssi));
+        assert_eq!(
+            resource
+                .chan_alloc_element
+                .as_ref()
+                .expect("explicit channel-allocation STCH recovery must carry channel allocation")
+                .ul_dl_assigned,
+            UlDlAssignment::Both
+        );
+        let stch_payload = BitBuffer::from_bitbuffer_pos(&parsed);
+        let mut cmce_payload =
+            BsChannelScheduler::cmce_dl_payload_from_tma_sdu(&stch_payload).expect("STCH should carry BL-UDATA/MLE/CMCE payload");
+        DConnectAcknowledge::from_bitbuf(&mut cmce_payload).expect("selected STCH should carry D-CONNECT ACKNOWLEDGE");
+        assert_eq!(connect_ack_reporter.get_state(), TxState::Transmitted);
+
+        // EN 300 392-2 clause 23.8.2.2 permits ambiguity-safe recovery on an
+        // assigned channel after a receive-authorization ACK is missed. If such
+        // recovery is explicitly enqueued as STCH, a small ACK-only FACCH block
+        // must not occupy the next stealing opportunity ahead of the recovery
+        // PDU. The first authoritative P2P setup leg remains current-channel
+        // acknowledged signalling per clauses 14.5.3.1 and 23.5.4.3.1.
+        assert!(
+            sched.dltx_queues[traffic_ts as usize - 1]
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if *addr == called)),
+            "ACK-only FACCH should remain queued after explicit channel-allocation STCH recovery is sent"
+        );
+    }
+
+    #[test]
     fn test_preemptive_floor_interrupt_stch_stays_ahead_of_positive_grant() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
@@ -5246,7 +5564,7 @@ mod tests {
         let first = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
         assert_eq!(first.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
         assert_eq!(first.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::Stch));
-        assert_eq!(reporter.get_state(), TxState::Pending);
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
         assert_eq!(
             energy_saving.get(&first_issi).and_then(|assignment| assignment.awake_until),
             None,
@@ -5316,7 +5634,7 @@ mod tests {
         let first = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
         assert_eq!(first.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
         assert_eq!(first.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::Stch));
-        assert_eq!(reporter.get_state(), TxState::Pending);
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
 
         subscribers.deregister(second_issi);
 
@@ -5414,6 +5732,75 @@ mod tests {
             energy_saving.get(&second_issi).and_then(|a| a.awake_until),
             Some(TdmaTime { t: 1, f: 3, m: 2, h: 0 })
         );
+    }
+
+    #[test]
+    fn test_all_ones_resource_reports_after_first_complete_transmission_but_still_repeats_for_eg_targets() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+
+        let first_issi = 1001;
+        let second_issi = 1002;
+        let reporter = TxReporter::new_unacked();
+        let (pdu, sdu) = test_resource_for_gssi(PREDEFINED_BROADCAST_GSSI, 8);
+        sched.dl_enqueue_tma(pdu, sdu, Some(reporter.clone()));
+
+        let mut subscribers = SubscriberRegistry::new();
+        subscribers.register(first_issi);
+        subscribers.register(second_issi);
+
+        let mut energy_saving = HashMap::new();
+        energy_saving.insert(
+            first_issi,
+            EnergySavingAssignment {
+                mode: 5,
+                frame: Some(2),
+                multiframe: Some(1),
+                awake_until: None,
+                suspension_count: 0,
+            },
+        );
+        energy_saving.insert(
+            second_issi,
+            EnergySavingAssignment {
+                mode: 1,
+                frame: Some(3),
+                multiframe: Some(1),
+                awake_until: None,
+                suspension_count: 0,
+            },
+        );
+
+        let first = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(first.ts, TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        assert_eq!(first.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF));
+        assert_eq!(
+            reporter.get_state(),
+            TxState::Transmitted,
+            "TMA-REPORT is local MAC progress and must complete after the first all-ones TM-SDU is sent"
+        );
+        assert_eq!(energy_saving.get(&first_issi).and_then(|a| a.awake_until), None);
+        assert_eq!(energy_saving.get(&second_issi).and_then(|a| a.awake_until), None);
+
+        for ts in [
+            TdmaTime { t: 1, f: 2, m: 1, h: 0 },
+            TdmaTime { t: 2, f: 2, m: 1, h: 0 },
+            TdmaTime { t: 3, f: 2, m: 1, h: 0 },
+            TdmaTime { t: 4, f: 2, m: 1, h: 0 },
+        ] {
+            sched.tick_start(ts);
+        }
+
+        let second = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(second.ts, TdmaTime { t: 1, f: 3, m: 1, h: 0 });
+        assert_eq!(
+            second.blk1.as_ref().map(|block| block.logical_channel),
+            Some(LogicalChannel::SchF),
+            "all-ones repeat coverage should continue for later EG receive batches after TMA report completion"
+        );
+        assert_eq!(reporter.get_state(), TxState::Transmitted);
+        assert_eq!(energy_saving.get(&first_issi).and_then(|a| a.awake_until), None);
+        assert_eq!(energy_saving.get(&second_issi).and_then(|a| a.awake_until), None);
     }
 
     #[test]

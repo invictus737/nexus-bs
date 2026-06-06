@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-bs"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "clap",
  "crossbeam-channel",
@@ -1045,7 +1045,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-bs-control"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "argon2",
  "base64",
@@ -1062,7 +1062,7 @@ dependencies = [
 
 [[package]]
 name = "nexus-bs-telemetry"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "argon2",
  "base64",
@@ -1228,7 +1228,7 @@ dependencies = [
 
 [[package]]
 name = "pdu-tool"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "clap",
  "tetra-config",
@@ -1919,7 +1919,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-config"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "chrono-tz",
  "serde",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-core"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "bitcode",
  "chrono",
@@ -1945,7 +1945,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-entities"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "as-any",
  "base64",
@@ -1977,7 +1977,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-pdus"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "tetra-config",
  "tetra-core",
@@ -1987,7 +1987,7 @@ dependencies = [
 
 [[package]]
 name = "tetra-saps"
-version = "0.1.55"
+version = "0.1.56"
 dependencies = [
  "tetra-core",
  "tracing",

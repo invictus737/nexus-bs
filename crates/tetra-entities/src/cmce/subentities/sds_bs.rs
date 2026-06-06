@@ -741,13 +741,19 @@ impl SdsBsSubentity {
 
     fn discard_status_reporter(tx_reporter: Option<TxReporter>) {
         if let Some(reporter) = tx_reporter {
-            reporter.mark_discarded();
+            // EN 300 392-2 clause 13.3.2.2 exposes one transfer result per
+            // SDS/status handle. Control/Brew delivery can race with local
+            // reject paths, so a stale cloned reporter should not panic after
+            // another path has already produced the final result.
+            reporter.try_mark_discarded();
         }
     }
 
     fn discard_sds_reporter(tx_reporter: Option<TxReporter>) {
         if let Some(reporter) = tx_reporter {
-            reporter.mark_discarded();
+            // Same SDS report-handle rule as status: fail pending requests
+            // locally, but ignore late discard attempts after completion.
+            reporter.try_mark_discarded();
         }
     }
 

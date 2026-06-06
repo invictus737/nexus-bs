@@ -1283,6 +1283,39 @@ fn test_sds_from_brew_invalid_destination_discards_tx_reporter() {
 }
 
 #[test]
+fn test_sds_from_brew_invalid_destination_ignores_late_discard_after_transmit() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Brew]);
+
+    let reporter = TxReporter::new();
+    reporter.mark_transmitted();
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceSdsData(CmceSdsData {
+            source_issi: 3000001,
+            dest_issi: 2000001,
+            dest_ssi_type: Some(SsiType::Issi),
+            user_defined_data: SdsUserData::Type1(0xCAFE),
+            tx_reporter: Some(reporter.clone()),
+        }),
+    });
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 13.3.2.2 gives one transfer result for a status/SDS
+    // handle. A stale local reject after an async transmit report must not turn
+    // into a second conflicting result or panic the service.
+    assert_eq!(count_d_sds_data(&sink_msgs), 0);
+    assert_eq!(count_brew_sds(&sink_msgs), 0);
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
+}
+
+#[test]
 fn test_sds_from_brew_invalid_type4_discards_tx_reporter() {
     debug::setup_logging_verbose();
 
@@ -2658,6 +2691,42 @@ fn test_network_origin_sds_status_invalid_destination_discards_tx_reporter() {
         "invalid D-STATUS destination must not be handed to LLC"
     );
     assert_eq!(reporter.get_state(), TxState::Discarded);
+}
+
+#[test]
+fn test_network_origin_sds_status_invalid_destination_ignores_late_discard_after_transmit() {
+    debug::setup_logging_verbose();
+
+    let source_issi = 1000001;
+    let unregistered_dest_issi = 2000001;
+    let status = PreCodedStatus::NetworkUserSpecific(0x9001);
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(vec![TetraEntity::Cmce, TetraEntity::Mle], vec![TetraEntity::Llc, TetraEntity::Brew]);
+
+    let reporter = TxReporter::new();
+    reporter.mark_transmitted();
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceSdsStatus(CmceSdsStatus {
+            source_issi,
+            dest_issi: unregistered_dest_issi,
+            dest_ssi_type: SsiType::Issi,
+            status_number: status.into_raw(),
+            tx_reporter: Some(reporter.clone()),
+        }),
+    });
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        sink_msgs.iter().all(|m| m.dest != TetraEntity::Llc),
+        "invalid D-STATUS destination must not be handed to LLC"
+    );
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
 }
 
 #[test]

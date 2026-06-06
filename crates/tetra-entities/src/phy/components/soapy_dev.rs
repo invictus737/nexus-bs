@@ -197,6 +197,7 @@ struct RxDsp {
 
     monitors: Vec<MonitorDlUlPair>,
     ul_demodulators: Vec<DemodulatorChannel>,
+    timing_log: SdrTimingEventLog,
 }
 
 impl RxDsp {
@@ -238,6 +239,7 @@ impl RxDsp {
                 .iter()
                 .map(|ul_freq| DemodulatorChannel::new(fft_planner, rx_fcfb_params, *ul_freq, demodulator::Mode::Ul))
                 .collect(),
+            timing_log: SdrTimingEventLog::new(std::time::Duration::from_secs(1)),
         }
     }
 
@@ -294,12 +296,8 @@ impl RxDsp {
 
                 let mut samples_to_skip = next_block_beginning - next_count;
 
-                tracing::warn!(
-                    "Lost {} samples, skipping {} more samples and {} processing blocks",
-                    samples_lost,
-                    samples_to_skip,
-                    next_possible_block - self.rx_block_count
-                );
+                self.timing_log
+                    .rx_lost_samples(samples_lost, samples_to_skip, next_possible_block - self.rx_block_count);
 
                 self.rx_block_count = next_possible_block;
                 self.rx_buffer_i = 0;
@@ -354,6 +352,7 @@ struct TxDsp {
     /// wants to inspect it. Kept on the struct so we don't allocate on every
     /// monitored block; capacity grows once to fcfb output_block_size and stays.
     tx_signal_scratch: Vec<ComplexSample>,
+    timing_log: SdrTimingEventLog,
 }
 
 impl TxDsp {
@@ -383,6 +382,7 @@ impl TxDsp {
             modulators,
             monitor,
             tx_signal_scratch: Vec::new(),
+            timing_log: SdrTimingEventLog::new(std::time::Duration::from_secs(1)),
         }
     }
 
@@ -401,11 +401,7 @@ impl TxDsp {
         let dmin = 2; // how many blocks in future minimum
         if d < dmin {
             let new_block_count = current_block + dmin;
-            tracing::warn!(
-                "Too late to produce TX block {}, skipping {} TX blocks",
-                self.block_count,
-                new_block_count - self.block_count
-            );
+            self.timing_log.tx_late(self.block_count, new_block_count - self.block_count);
             self.block_count = new_block_count;
         }
         // Limit how far into future TX blocks are generated
@@ -480,6 +476,85 @@ impl TxDsp {
         // );
 
         Ok(true)
+    }
+}
+
+struct SdrTimingEventLog {
+    next_emit: std::time::Instant,
+    interval: std::time::Duration,
+    suppressed_events: u64,
+    suppressed_primary: i64,
+    suppressed_secondary: i64,
+}
+
+impl SdrTimingEventLog {
+    fn new(interval: std::time::Duration) -> Self {
+        Self {
+            next_emit: std::time::Instant::now(),
+            interval,
+            suppressed_events: 0,
+            suppressed_primary: 0,
+            suppressed_secondary: 0,
+        }
+    }
+
+    fn tx_late(&mut self, block_count: fcfb::BlockCount, skipped_blocks: fcfb::BlockCount) {
+        if self.should_emit() {
+            tracing::warn!(
+                "Too late to produce TX block {}, skipping {} TX blocks{}",
+                block_count,
+                skipped_blocks,
+                self.suppressed_summary("late TX events", "TX blocks")
+            );
+            self.reset_after_emit();
+        } else {
+            self.suppressed_events += 1;
+            self.suppressed_primary += skipped_blocks;
+        }
+    }
+
+    fn rx_lost_samples(&mut self, samples_lost: SampleCount, samples_to_skip: SampleCount, processing_blocks: fcfb::BlockCount) {
+        if self.should_emit() {
+            tracing::warn!(
+                "Lost {} samples, skipping {} more samples and {} processing blocks{}",
+                samples_lost,
+                samples_to_skip,
+                processing_blocks,
+                self.suppressed_summary("RX loss events", "processing blocks")
+            );
+            self.reset_after_emit();
+        } else {
+            self.suppressed_events += 1;
+            self.suppressed_primary += processing_blocks;
+            self.suppressed_secondary += samples_lost;
+        }
+    }
+
+    fn should_emit(&self) -> bool {
+        std::time::Instant::now() >= self.next_emit
+    }
+
+    fn reset_after_emit(&mut self) {
+        self.next_emit = std::time::Instant::now() + self.interval;
+        self.suppressed_events = 0;
+        self.suppressed_primary = 0;
+        self.suppressed_secondary = 0;
+    }
+
+    fn suppressed_summary(&self, event_label: &str, primary_label: &str) -> String {
+        if self.suppressed_events == 0 {
+            String::new()
+        } else if self.suppressed_secondary == 0 {
+            format!(
+                " (plus {} suppressed {}, {} suppressed {})",
+                self.suppressed_events, event_label, self.suppressed_primary, primary_label
+            )
+        } else {
+            format!(
+                " (plus {} suppressed {}, {} suppressed {}, {} suppressed samples)",
+                self.suppressed_events, event_label, self.suppressed_primary, primary_label, self.suppressed_secondary
+            )
+        }
     }
 }
 

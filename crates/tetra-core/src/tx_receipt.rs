@@ -126,6 +126,12 @@ impl TxReporter {
         }
     }
 
+    fn try_mark(&self, curr_state: TxState, new_state: TxState) -> bool {
+        self.state
+            .compare_exchange(curr_state as u8, new_state as u8, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    }
+
     fn mark_unchecked(&self, new_state: TxState) {
         self.state.store(new_state as u8, Ordering::Relaxed);
     }
@@ -135,9 +141,27 @@ impl TxReporter {
         self.mark(TxState::Pending, TxState::Transmitted);
     }
 
+    /// Pending → Transmitted if the reporter is still pending.
+    ///
+    /// Returns false when another owner has already completed or failed this
+    /// request. This is intended for asynchronous MAC/LLC report paths where a
+    /// stale cloned reporter can legitimately surface after cancellation,
+    /// timeout, or retry bookkeeping has already moved the receipt on.
+    pub fn try_mark_transmitted(&self) -> bool {
+        self.try_mark(TxState::Pending, TxState::Transmitted)
+    }
+
     /// Pending → Discarded: MAC layer was too busy to transmit.
     pub fn mark_discarded(&self) {
         self.mark(TxState::Pending, TxState::Discarded);
+    }
+
+    /// Pending → Discarded if the reporter is still pending.
+    ///
+    /// Returns false when another owner has already completed or failed this
+    /// request.
+    pub fn try_mark_discarded(&self) -> bool {
+        self.try_mark(TxState::Pending, TxState::Discarded)
     }
 
     /// Transmitted → Acknowledged: LLC received an ACK from the remote side.
@@ -156,6 +180,18 @@ impl TxReporter {
             "TxReporter: cannot mark as lost a message that does not expect an ACK"
         );
         self.mark(TxState::Transmitted, TxState::Lost);
+    }
+
+    /// Transmitted → Lost if the reporter still waits for an ACK.
+    ///
+    /// Returns false when another owner has already acknowledged or failed the
+    /// request. This is intended for asynchronous LLC timeout/failure paths.
+    pub fn try_mark_lost(&self) -> bool {
+        assert!(
+            self.expects_ack,
+            "TxReporter: cannot mark as lost a message that does not expect an ACK"
+        );
+        self.try_mark(TxState::Transmitted, TxState::Lost)
     }
 
     /// Tricky function to re-use linked TxReporters. Resets state to the initial state.
@@ -197,6 +233,47 @@ mod tests {
         let reporter = receipt.clone();
         reporter.mark_transmitted();
         reporter.mark_transmitted();
+    }
+
+    #[test]
+    fn try_mark_transmitted_ignores_late_completion_after_discard() {
+        let receipt = TxReporter::new_unacked();
+        let reporter = receipt.clone();
+        reporter.mark_discarded();
+
+        assert!(!reporter.try_mark_transmitted());
+        assert_eq!(receipt.get_state(), TxState::Discarded);
+    }
+
+    #[test]
+    fn try_mark_discarded_ignores_late_discard_after_completion() {
+        let receipt = TxReporter::new_unacked();
+        let reporter = receipt.clone();
+        reporter.mark_transmitted();
+
+        assert!(!reporter.try_mark_discarded());
+        assert_eq!(receipt.get_state(), TxState::Transmitted);
+    }
+
+    #[test]
+    fn try_mark_lost_marks_transmitted_ack_wait_as_lost() {
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        reporter.mark_transmitted();
+
+        assert!(reporter.try_mark_lost());
+        assert_eq!(receipt.get_state(), TxState::Lost);
+    }
+
+    #[test]
+    fn try_mark_lost_ignores_late_loss_after_acknowledgement() {
+        let receipt = TxReporter::new();
+        let reporter = receipt.clone();
+        reporter.mark_transmitted();
+        reporter.mark_acknowledged();
+
+        assert!(!reporter.try_mark_lost());
+        assert_eq!(receipt.get_state(), TxState::Acknowledged);
     }
 
     #[test]

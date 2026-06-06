@@ -4846,6 +4846,36 @@ fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
 }
 
 #[test]
+fn test_restart_recovery_cache_is_not_limited_by_local_ssi_routing_exceptions() {
+    debug::setup_logging_verbose();
+    let cached_issi = 2260618;
+    let path = unique_restart_recovery_path("startup-cache-with-brew-exceptions");
+    std::fs::write(&path, format!("{cached_issi} 91:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(1, 90), (226333, 226333)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    // EN 300 392-2 clause 16.4.4 permits SwMI-initiated registration with
+    // D-LOCATION UPDATE COMMAND. The volatile restart cache records terminals
+    // that were actually attached at runtime, so it must not be filtered by the
+    // operator's Brew/local routing exceptions in cell.local_ssi_ranges.
+    test.run_stack(Some(73));
+    let sink_msgs = test.dump_sinks();
+    let commands = location_update_commands(&sink_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, cached_issi);
+    assert!(commands[0].2.group_identity_report);
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
+#[test]
 fn test_restart_recovery_large_cache_paces_one_command_per_interval_and_restores_groups() {
     debug::setup_logging_verbose();
     let member_count = LARGE_RESTART_RECOVERY_MEMBER_COUNT;
@@ -6891,9 +6921,18 @@ fn test_restart_recovery_accepts_solicited_attach_detach_group_report_completion
         "pending solicited group report should prevent an immediate duplicate command"
     );
     let updates = subscriber_updates(&demand_msgs);
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
-    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+    assert!(
+        updates.is_empty(),
+        "incomplete solicited group report must not publish stable Register + No Group: {updates:?}"
+    );
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "shared subscriber state remains pending until group report completion"
+        );
+        assert!(state.subscribers.group_members(gssi).is_empty());
+    }
 
     submit_attach_detach_group_identity_with_report_response(
         &mut test,
@@ -6923,10 +6962,17 @@ fn test_restart_recovery_accepts_solicited_attach_detach_group_report_completion
     assert!(accepted_groups[0].group_identity_attachment.is_some());
 
     let updates = subscriber_updates(&report_msgs);
-    assert_eq!(updates.len(), 1);
-    assert_eq!(updates[0].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(
+        updates.len(),
+        2,
+        "completed follow-up report should publish Register then Affiliate after the pending window"
+    );
+    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
     assert_eq!(updates[0].issi, issi);
-    assert_eq!(updates[0].groups, vec![gssi]);
+    assert!(updates[0].groups.is_empty());
+    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
+    assert_eq!(updates[1].issi, issi);
+    assert_eq!(updates[1].groups, vec![gssi]);
     assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 
     test.run_stack(Some(2));
@@ -7039,9 +7085,17 @@ fn test_restart_recovery_re_requests_group_report_when_recovered_without_groups(
     assert!(!contains_location_update_command(&demand_msgs));
     assert!(debug_mm_solicited_group_report_pending(&mut test, issi));
 
+    let updates = subscriber_updates(&demand_msgs);
+    assert!(
+        updates.is_empty(),
+        "incomplete restart group report must not publish stable Register + No Group: {updates:?}"
+    );
     {
         let state = test.config.state_read();
-        assert!(state.subscribers.is_registered(issi));
+        assert!(
+            !state.subscribers.is_registered(issi),
+            "shared subscriber state remains pending while the solicited group report is incomplete"
+        );
         assert!(state.subscribers.group_members(gssi).is_empty());
     }
 

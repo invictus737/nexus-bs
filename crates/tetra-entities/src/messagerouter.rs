@@ -137,7 +137,7 @@ impl MessageRouter {
     pub fn tick_start(&mut self) {
         // tracing::info!("--- tick dl {} ul {} txdl {} ----------------------------",
         //     self.ts, self.ts.add_timeslots(-2), self.ts.add_timeslots(MACSCHED_TX_AHEAD as i32));
-        tracing::info!("--- tick dl {} ----------------------------", self.ts);
+        tracing::trace!("--- tick dl {} ----------------------------", self.ts);
 
         // Call tick on all entities
         for entity in self.entities.values_mut() {

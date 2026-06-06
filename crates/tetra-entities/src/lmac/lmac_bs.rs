@@ -51,8 +51,10 @@ pub struct LmacBs {
     /// keep this keyed by timeslot rather than a single "latest" value.
     uplink_phy_chan: [PhysicalChannel; 4],
 
-    /// Signalled by Umac per timeslot. Set to true when in a traffic burst, the 1st stolen block shows that the 2nd slot is also stolen
-    blk2_stolen: bool,
+    /// Signalled by UMAC per UL burst. A MAC-DATA/MAC-U-SIGNAL first half may
+    /// mark the second half as stolen; keep the exact UL time so a stale
+    /// indication cannot be applied to a later TCH/S speech half-slot.
+    blk2_stolen_at: [Option<TdmaTime>; 4],
     // Details about current burst, parsed from BBK broadcast block
     // cur_burst: CurBurst,
 }
@@ -82,7 +84,7 @@ impl LmacBs {
 
             dltime: TdmaTime::default(),
             uplink_phy_chan: [PhysicalChannel::Unallocated; 4],
-            blk2_stolen: false,
+            blk2_stolen_at: [None; 4],
         }
     }
 
@@ -184,6 +186,15 @@ impl LmacBs {
                 tracing::warn!("LMAC: unexpected UL burst_type {:?}, treating as SchHu", other);
                 LogicalChannel::SchHu
             }
+        }
+    }
+
+    fn ul_ts_index(ts: u8, context: &str) -> Option<usize> {
+        if (1..=4).contains(&ts) {
+            Some(ts as usize - 1)
+        } else {
+            tracing::warn!("LMAC: {context}: invalid UL timeslot {ts}");
+            None
         }
     }
 
@@ -336,8 +347,8 @@ impl LmacBs {
         true
     }
 
-    fn should_fallback_unknown_nub_to_tch_s(blk: &TpUnitdataInd, pchan: PhysicalChannel) -> bool {
-        pchan == PhysicalChannel::Unallocated
+    fn should_fallback_non_traffic_nub_to_tch_s(blk: &TpUnitdataInd, pchan: PhysicalChannel) -> bool {
+        matches!(pchan, PhysicalChannel::Unallocated | PhysicalChannel::Cp)
             && blk.burst_type == BurstType::NUB
             && matches!(
                 (blk.train_type, blk.block_num),
@@ -353,24 +364,39 @@ impl LmacBs {
             return;
         };
 
-        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago. 
-        let ts_idx = msg_dltime.t as usize - 1;
+        let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
+        let Some(ts_idx) = Self::ul_ts_index(msg_dltime.t, "rx_tp_prim") else {
+            return;
+        };
         let pchan = self.uplink_phy_chan[ts_idx];
-        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, self.blk2_stolen);
+        let block_num = prim.block_num;
+        let mut block2_stolen = self.blk2_stolen_at[ts_idx] == Some(msg_dltime);
+        if self.blk2_stolen_at[ts_idx].is_some() && !block2_stolen {
+            tracing::warn!(
+                "lmac_bs: dropping stale blk2_stolen marker for UL ts {} at {:?}; current uplink time is {:?}",
+                msg_dltime.t,
+                self.blk2_stolen_at[ts_idx],
+                msg_dltime
+            );
+            self.blk2_stolen_at[ts_idx] = None;
+        }
 
         // Sanity checks
-        if prim.block_num == PhyBlockNum::Block1 && self.blk2_stolen {
+        if block_num == PhyBlockNum::Block1 && block2_stolen {
             tracing::warn!("lmac_bs: blk2_stolen set when receiving block1, resetting");
-            self.blk2_stolen = false;
+            self.blk2_stolen_at[ts_idx] = None;
+            block2_stolen = false;
         }
-        if pchan != PhysicalChannel::Tp && self.blk2_stolen {
+        if pchan != PhysicalChannel::Tp && block2_stolen {
             tracing::warn!(
                 "lmac_bs: blk2_stolen set on non-traffic burst (pchan={:?}), resetting — likely late STCH after circuit close",
                 pchan
             );
-            self.blk2_stolen = false;
+            self.blk2_stolen_at[ts_idx] = None;
             return;
         }
+
+        let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, block2_stolen);
 
         match lchan {
             LogicalChannel::Clch => {}
@@ -380,15 +406,17 @@ impl LmacBs {
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
                 let fallback_candidate = prim.clone();
                 let control_forwarded = self.rx_blk_control(queue, prim, lchan);
-                if !control_forwarded && Self::should_fallback_unknown_nub_to_tch_s(&fallback_candidate, pchan) {
+                if !control_forwarded && Self::should_fallback_non_traffic_nub_to_tch_s(&fallback_candidate, pchan) {
                     // EN 300 392-2 clauses 23.5.2.2.1 and 23.8.5 require the
                     // BS to accept TCH/S on an assigned traffic channel. During
-                    // private-call setup the UL channel marker can lag the
-                    // downlink allocation by two timeslots; try TCH/S only
-                    // after the candidate failed as control. UMAC still drops
-                    // the result unless a matching circuit is active.
+                    // private-call setup and repeated simplex floor re-entry,
+                    // the UL channel marker can lag the downlink allocation or
+                    // hangtime exit by two timeslots; try TCH/S only after the
+                    // candidate failed as control. UMAC still drops the result
+                    // unless a matching non-hangtime circuit/floor is active.
                     tracing::debug!(
-                        "LMAC: retrying undecoded NUB as candidate TCH/S on unknown UL ts={} train={:?} block={:?}",
+                        "LMAC: retrying undecoded NUB as candidate TCH/S on non-traffic UL marker {:?} ts={} train={:?} block={:?}",
+                        pchan,
                         msg_dltime.t,
                         fallback_candidate.train_type,
                         fallback_candidate.block_num
@@ -401,6 +429,10 @@ impl LmacBs {
                 return;
             }
         }
+
+        if block_num == PhyBlockNum::Block2 && block2_stolen {
+            self.blk2_stolen_at[ts_idx] = None;
+        }
     }
 
     fn rx_tmv_configure_req(&mut self, _queue: &mut MessageQueue, message: SapMsg) {
@@ -409,7 +441,11 @@ impl LmacBs {
             return;
         };
         if let Some(stolen) = prim.blk2_stolen {
-            self.blk2_stolen = stolen;
+            let ul_time = prim.time.unwrap_or_else(|| self.dltime.add_timeslots(-2));
+            let Some(ts_idx) = Self::ul_ts_index(ul_time.t, "rx_tmv_configure_req") else {
+                return;
+            };
+            self.blk2_stolen_at[ts_idx] = stolen.then_some(ul_time);
         }
     }
 
@@ -614,6 +650,11 @@ impl TetraEntityTrait for LmacBs {
 
     fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
-        self.blk2_stolen = false; // reset in case it was set during this tick
+        let stale_before = ts.add_timeslots(-2);
+        for marker in &mut self.blk2_stolen_at {
+            if marker.is_some_and(|marked_time| marked_time != stale_before && marked_time.diff(stale_before) < 0) {
+                *marker = None;
+            }
+        }
     }
 }

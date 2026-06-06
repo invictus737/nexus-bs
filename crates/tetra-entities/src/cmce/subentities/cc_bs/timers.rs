@@ -3,7 +3,7 @@ use crate::net_telemetry::TelemetryEvent;
 
 const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
 
-// Local cleanup guard: EN 300 392-2 14.7.1.6 expects U-RELEASE after
+// Local cleanup guard: EN 300 392-2 clause 14.5.1.3.3 expects U-RELEASE after
 // D-DISCONNECT, but the BS must eventually free a circuit if the peer vanishes.
 // Use a multi-second guard so real MSs have time to process the assigned-channel
 // disconnect and return U-RELEASE before SwMI falls back to D-RELEASE.
@@ -41,6 +41,8 @@ impl CcBsSubentity {
         self.drain_pending_individual_disconnect_deliveries(queue);
         self.drain_pending_individual_disconnect_release_acks(queue);
         self.check_individual_disconnect_pending_timeout(queue);
+        self.drain_pending_individual_connect_acks(queue);
+        self.drain_pending_network_individual_connects(queue);
 
         // ETSI T310 equivalent for active calls.
         self.check_call_timeout_expiry(queue);
@@ -64,10 +66,7 @@ impl CcBsSubentity {
                             );
                             continue;
                         }
-                        let individual_setup_retry_blocked = self
-                            .individual_calls
-                            .get(&call_id)
-                            .is_some_and(|call| call.state != IndividualCallState::CallSetupPending);
+                        let individual_setup_state = self.individual_calls.get(&call_id).map(|call| call.state);
                         // Get our cached D-SETUP, build a prim and send it down the stack
                         let Some(cached) = self.cached_setups.get_mut(&call_id) else {
                             tracing::trace!(
@@ -79,11 +78,25 @@ impl CcBsSubentity {
                         if !cached.resend {
                             continue;
                         }
-                        if cached.is_individual && individual_setup_retry_blocked {
-                            tracing::debug!(
-                                "CMCE: suppressing D-SETUP resend for individual call_id={} outside setup-pending state",
-                                call_id
-                            );
+                        if cached.is_individual {
+                            if individual_setup_state == Some(IndividualCallState::CallSetupPending) {
+                                // EN 300 392-2 clause 14.5.1.1.1 uses a
+                                // specific private-call setup exchange on MCCH.
+                                // The generic group late-entry/backup D-SETUP
+                                // path would create a second identical private
+                                // D-SETUP while the initial reporter is still
+                                // pending; the dedicated EE retry below owns
+                                // any later setup retry.
+                                tracing::debug!(
+                                    "CMCE: suppressing generic backup D-SETUP for pending individual call_id={}",
+                                    call_id
+                                );
+                            } else {
+                                tracing::debug!(
+                                    "CMCE: suppressing generic D-SETUP resend for individual call_id={} outside setup-pending state",
+                                    call_id
+                                );
+                            }
                             continue;
                         }
                         if let Some(reporter) = &cached.last_resend_reporter
@@ -211,7 +224,7 @@ impl CcBsSubentity {
         }
     }
 
-    /// Release active P2P calls waiting for the peer U-RELEASE response to D-DISCONNECT.
+    /// Locally close active P2P calls stuck waiting for the peer U-RELEASE response to D-DISCONNECT.
     pub(super) fn check_individual_disconnect_pending_timeout(&mut self, queue: &mut MessageQueue) {
         let expired_individual_calls: Vec<(u16, DisconnectCause)> = self
             .individual_calls
@@ -224,10 +237,10 @@ impl CcBsSubentity {
 
         for (call_id, cause) in expired_individual_calls {
             tracing::warn!(
-                "Pending individual D-DISCONNECT timed out for call_id={}, releasing circuit",
+                "Pending individual D-DISCONNECT timed out for call_id={}, closing local circuit without another peer clear PDU",
                 call_id
             );
-            self.release_individual_disconnect_fallback(queue, call_id, cause, None);
+            self.complete_individual_disconnect_peer_clear_without_downlink(queue, call_id, cause);
         }
     }
 

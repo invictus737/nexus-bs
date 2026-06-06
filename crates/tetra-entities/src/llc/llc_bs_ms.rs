@@ -35,8 +35,10 @@ const TDMA_TIMESLOTS_PER_FRAME: u32 = 4;
 const T251_SENDER_RETRY_SIGNALLING_FRAMES: u32 = T251_SENDER_RETRY_TIMER / TDMA_TIMESLOTS_PER_FRAME;
 const INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES: u32 =
     (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as u32 + 1) * T251_SENDER_RETRY_SIGNALLING_FRAMES;
+const CHANNEL_ALLOCATION_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 18;
 const N253_MAX_REQUESTED_TLSDU_REPEATS: u8 = 5;
 const TMA_HIGHEST_PDU_PRIORITY: Todo = 7;
+const COMMON_CONTROL_TIMESLOT: u8 = 1;
 pub const LLC_MAX_OUTBOUND_ACKED_MESSAGES: usize = 8192;
 pub const LLC_MAX_OUTBOUND_UDATA_MESSAGES: usize = 8192;
 
@@ -100,9 +102,17 @@ pub struct ExpectedInAck {
     /// Time the RxReporter signalled the message was fully transmitted. Also set if the Umac discarded the message
     /// This helps attempting to retransmit the message after a brief delay.
     pub t_umac_done: Option<TdmaTime>,
-    /// TxReporter struct. Used by Umac to signal Tx time to Llc, so llc can do retransmissions if needed.
-    /// Also used by Llc to signal Ack to upper layer (if appliccable)
+    /// Time when N.252 retransmissions were exhausted but the transfer is
+    /// still retained for a bounded late BL-ACK on channel-allocation flows.
+    pub t_retransmissions_exhausted: Option<TdmaTime>,
+    /// Service-level TxReporter exposed to the LLC user. It moves to
+    /// Transmitted after the first complete MAC transmission, then to
+    /// Acknowledged or Lost according to the peer BL-ACK result.
     pub tx_reporter: TxReporter,
+    /// Per-TMA-attempt TxReporter used only between UMAC and LLC. A retry gets
+    /// a fresh reporter so stale MAC completion for an older attempt cannot
+    /// mutate the service-level reporter.
+    pub current_mac_reporter: Option<TxReporter>,
 
     // Optional retransmission buffer, to allow for automatic retransmission of the PDU if no acknowledgement is received
     pub retransmission_buf: SapMsg,
@@ -409,6 +419,41 @@ impl Llc {
         Self::basic_link_key(ack.addr, ack.endpoint_id)
     }
 
+    fn channel_allocation_late_ack_grace(ack: &ExpectedInAck) -> Option<u32> {
+        let SapMsgInner::TmaUnitdataReq(prim) = &ack.retransmission_buf.msg else {
+            return None;
+        };
+        prim.chan_alloc
+            .as_ref()
+            .map(|_| CHANNEL_ALLOCATION_LATE_ACK_GRACE_SIGNALLING_FRAMES)
+    }
+
+    fn late_ack_grace_expired(ack: &ExpectedInAck, now: TdmaTime) -> bool {
+        let Some(started_at) = ack.t_retransmissions_exhausted else {
+            return false;
+        };
+        let Some(grace_frames) = Self::channel_allocation_late_ack_grace(ack) else {
+            return true;
+        };
+        Self::t251_downlink_frames_elapsed(started_at, now, ack.ts, ack.stealing_repeats_flag) >= grace_frames
+    }
+
+    fn expected_ack_timeslot_for_outbound_bl(prim: &TlaTlDataReqBl) -> u8 {
+        if !prim.stealing_permission && prim.chan_alloc.is_some() {
+            // EN 300 392-2 clauses 23.5.2.2 and 23.5.4.3 allow a channel
+            // allocation to carry a basic slot grant on the current channel.
+            // For late-assignment P2P call-control sent on the MCCH, UMAC
+            // grants the peer's BL-ACK before the channel change so LLC must
+            // age T.251 against the MCCH, not the newly allocated traffic slot.
+            return COMMON_CONTROL_TIMESLOT;
+        }
+
+        prim.chan_alloc
+            .as_ref()
+            .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
+            .unwrap_or(COMMON_CONTROL_TIMESLOT)
+    }
+
     fn queued_udata_key(udata: &QueuedUdata) -> BasicLinkKey {
         Self::basic_link_key(udata.addr, udata.endpoint_id)
     }
@@ -418,15 +463,11 @@ impl Llc {
     }
 
     fn mark_reporter_transmitted_if_pending(reporter: &TxReporter) {
-        if reporter.get_state() == TxState::Pending {
-            reporter.mark_transmitted();
-        }
+        reporter.try_mark_transmitted();
     }
 
     fn mark_reporter_discarded_if_pending(reporter: &TxReporter) {
-        if reporter.get_state() == TxState::Pending {
-            reporter.mark_discarded();
-        }
+        reporter.try_mark_discarded();
     }
 
     fn mark_udata_current_mac_transmitted(udata: &mut QueuedUdata) {
@@ -450,6 +491,43 @@ impl Llc {
     fn mark_udata_service_discarded(udata: &QueuedUdata) {
         if let Some(reporter) = &udata.service_tx_reporter {
             Self::mark_reporter_discarded_if_pending(reporter);
+        }
+    }
+
+    fn ack_current_mac_state(ack: &ExpectedInAck) -> Option<TxState> {
+        ack.current_mac_reporter.as_ref().map(TxReporter::get_state)
+    }
+
+    fn mark_ack_current_mac_transmitted(ack: &mut ExpectedInAck) {
+        if let Some(reporter) = &ack.current_mac_reporter {
+            reporter.try_mark_transmitted();
+        }
+    }
+
+    fn mark_ack_current_mac_discarded(ack: &mut ExpectedInAck) {
+        if let Some(reporter) = &ack.current_mac_reporter {
+            reporter.try_mark_discarded();
+        }
+    }
+
+    fn mark_ack_service_first_complete(ack: &mut ExpectedInAck) {
+        ack.tx_reporter.try_mark_transmitted();
+    }
+
+    fn mark_ack_service_failed(ack: &ExpectedInAck) {
+        // EN 300 392-2 clause 22.3.2.3(g/h/i/k): MAC failure, retry
+        // exhaustion, T.251 expiry, or wrong-ACK exhaustion produces one
+        // failed-transfer result for the service TL-SDU. In production these
+        // reports can be observed through asynchronous reporter clones, so
+        // late failure must not panic after a prior completion.
+        match ack.tx_reporter.get_state() {
+            TxState::Pending => {
+                ack.tx_reporter.try_mark_discarded();
+            }
+            TxState::Transmitted => {
+                ack.tx_reporter.try_mark_lost();
+            }
+            TxState::Discarded | TxState::Lost | TxState::Acknowledged => {}
         }
     }
 
@@ -648,7 +726,8 @@ impl Llc {
     }
 
     fn reconcile_umac_done_from_reporter(queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime, context: &str) -> bool {
-        if ack.t_umac_done.is_some() || (!ack.tx_reporter.is_transmitted() && !ack.tx_reporter.is_discarded()) {
+        let mac_state = Self::ack_current_mac_state(ack);
+        if ack.t_umac_done.is_some() || !matches!(mac_state, Some(TxState::Transmitted | TxState::Discarded)) {
             return false;
         }
 
@@ -661,12 +740,13 @@ impl Llc {
             dltime
         );
 
-        if ack.tx_reporter.get_state() == TxState::Transmitted && !ack.first_complete_report_sent {
+        if mac_state == Some(TxState::Transmitted) && !ack.first_complete_report_sent {
             // EN 300 392-2 clause 22.3.2.3(f): first complete BL-DATA
             // transmission starts the T.251 wait for a peer ACK and produces
             // TL-REPORT first-complete. The production UMAC path may surface
             // that event through TxReporter immediately before the peer ACK is
             // processed, so ACK handling must reconcile it synchronously.
+            Self::mark_ack_service_first_complete(ack);
             Self::push_tla_report(queue, ack.req_handle, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION, Some(ack.endpoint_id));
             ack.first_complete_report_sent = true;
             return true;
@@ -675,7 +755,7 @@ impl Llc {
         false
     }
 
-    /// Process incoming ACK per ETSI 22.3.2.3(k).
+    /// Process incoming ACK per ETSI 22.3.2.3(j).
     /// Matches by address, endpoint, and N(R) so concurrent basic links for
     /// one SSI do not acknowledge each other.
     fn process_incoming_ack(
@@ -688,18 +768,49 @@ impl Llc {
         let key = Self::basic_link_key(addr, endpoint_id);
         // Get the expected ACK entry
         let Some(mut expected_ack) = self.take_expected_ack_for_key(key) else {
-            tracing::warn!("received unexpected ACK for SSI {} endpoint {} N(R) {}", addr.ssi, endpoint_id, nr);
+            tracing::debug!(
+                "received BL-ACK for SSI {} endpoint {} N(R) {} with no outstanding downlink; no-op unless it carries a TL-SDU",
+                addr.ssi,
+                endpoint_id,
+                nr
+            );
             return None;
         };
 
         Self::reconcile_umac_done_from_reporter(queue, &mut expected_ack, self.dltime, "process_incoming_ack");
 
-        // Check it was indeed already transmitted by the Umac
-        if expected_ack.t_umac_done.is_none() {
+        // Check it was indeed already transmitted by the Umac. A matching
+        // BL-ACK can arrive before the local MAC completion reporter has been
+        // reconciled; that ACK is itself evidence that the peer received this
+        // N(S), so complete the local transfer instead of retransmitting.
+        if expected_ack.t_umac_done.is_none() || !expected_ack.first_complete_report_sent {
+            if expected_ack.ns == nr {
+                tracing::info!(
+                    "received matching ACK for SSI {} endpoint {} N(R) {} before local UMAC completion; accepting as complete transfer",
+                    addr.ssi,
+                    endpoint_id,
+                    nr
+                );
+                Self::mark_ack_current_mac_transmitted(&mut expected_ack);
+                expected_ack.t_umac_done = Some(self.dltime);
+                if !expected_ack.first_complete_report_sent {
+                    Self::mark_ack_service_first_complete(&mut expected_ack);
+                    Self::push_tla_report(
+                        queue,
+                        expected_ack.req_handle,
+                        TLA_REPORT_FIRST_COMPLETE_TRANSMISSION,
+                        Some(expected_ack.endpoint_id),
+                    );
+                    expected_ack.first_complete_report_sent = true;
+                }
+                expected_ack.tx_reporter.mark_acknowledged();
+                return Some(expected_ack);
+            }
+
             // This may be an old retransmission of an ack for the before-last basic link message
             // Let's push the ack back into the head of the queue (not tail)..
             tracing::warn!(
-                "received ACK for SSI {} endpoint {} N(R) {} that was not yet transmitted by Umac. Ignoring",
+                "received ACK for SSI {} endpoint {} N(R) {} before a complete UMAC transmission. Ignoring",
                 addr.ssi,
                 endpoint_id,
                 nr
@@ -720,7 +831,7 @@ impl Llc {
             expected_ack.tx_reporter.mark_acknowledged();
             return Some(expected_ack);
         } else {
-            // N(R) mismatch — per ETSI EN 300 392-2 22.3.2.3(k), not a successful ACK.
+            // N(R) mismatch — per ETSI EN 300 392-2 22.3.2.3(j), not a successful ACK.
             // Retransmit immediately rather than waiting for the next T.251 expiry.
             tracing::warn!(
                 "received unexpected ACK for SSI {} endpoint {}: N(R)={}, expected N(S)={}",
@@ -739,28 +850,19 @@ impl Llc {
                 // the retry as BL-ADATA when it fits.
                 expected_ack.t_submitted_to_umac = None;
                 expected_ack.t_umac_done = None;
-                expected_ack.tx_reporter.reset();
+                expected_ack.t_retransmissions_exhausted = None;
+                expected_ack.current_mac_reporter = None;
                 self.outbound_messages.push_front(expected_ack);
             } else {
-                match expected_ack.tx_reporter.get_state() {
-                    TxState::Transmitted => expected_ack.tx_reporter.mark_lost(),
-                    TxState::Discarded => {
-                        tracing::warn!(
-                            "received unexpected ACK for SSI {} N(S) {} after UMAC discard; leaving reporter discarded",
-                            expected_ack.addr.ssi,
-                            expected_ack.ns
-                        );
-                    }
-                    state => {
-                        tracing::warn!(
-                            "received unexpected ACK for SSI {} N(S) {} in unexpected reporter state {:?}; marking lost",
-                            expected_ack.addr.ssi,
-                            expected_ack.ns,
-                            state
-                        );
-                        expected_ack.tx_reporter.mark_lost();
-                    }
+                if expected_ack.tx_reporter.get_state() != TxState::Transmitted {
+                    tracing::warn!(
+                        "received unexpected ACK for SSI {} N(S) {} with service reporter in {:?}; failing transfer",
+                        expected_ack.addr.ssi,
+                        expected_ack.ns,
+                        expected_ack.tx_reporter.get_state()
+                    );
                 }
+                Self::mark_ack_service_failed(&expected_ack);
                 Self::push_tla_report(
                     queue,
                     expected_ack.req_handle,
@@ -900,10 +1002,20 @@ impl Llc {
     /// Schedules a message that was not acked in time for a retransmission
     fn submit_for_acknowledged_transmission(queue: &mut MessageQueue, ack: &mut ExpectedInAck, dltime: TdmaTime) {
         // Clone the sapmsg. Make sure we set (or for retransmission: reset) timers properly
-        let sapmsg = ack.retransmission_buf.clone();
+        let mut sapmsg = ack.retransmission_buf.clone();
+        let mac_reporter = TxReporter::new_unacked();
+        if let SapMsgInner::TmaUnitdataReq(prim) = &mut sapmsg.msg {
+            prim.tx_reporter = Some(mac_reporter.clone());
+        } else {
+            tracing::warn!(
+                "LLC: cannot attach MAC reporter for SSI {} endpoint {}; retransmission buffer is not TMA-UNITDATA",
+                ack.addr.ssi,
+                ack.endpoint_id
+            );
+        }
         ack.t_submitted_to_umac = Some(dltime);
         ack.t_umac_done = None;
-        ack.tx_reporter.reset();
+        ack.current_mac_reporter = Some(mac_reporter);
 
         // Send the message
         queue.push_back(sapmsg);
@@ -951,13 +1063,8 @@ impl Llc {
             return;
         }
 
-        // Derive the timeslot from chan_alloc (first set timeslot in [bool;4]), defaulting to 1.
         // Must be done before chan_alloc is moved into TmaUnitdataReq below.
-        let derived_ts: u8 = prim
-            .chan_alloc
-            .as_ref()
-            .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
-            .unwrap_or(1);
+        let derived_ts = Self::expected_ack_timeslot_for_outbound_bl(&prim);
 
         // Get per-link send sequence number N(S) = V(S), then toggle V(S)
         // EN 300 392-2 clauses 22.3.1.1 and 23.1.2.5.2 make the
@@ -1000,7 +1107,7 @@ impl Llc {
                 stealing_repeats_flag: prim.stealing_repeats_flag,
                 data_category: prim.data_class_info,
                 chan_alloc: prim.chan_alloc,
-                tx_reporter: Some(tx_reporter.clone()),
+                tx_reporter: None,
             }),
         };
 
@@ -1019,9 +1126,11 @@ impl Llc {
             ts: derived_ts,
             bl_type: Layer2Service::Acknowledged,
             tx_reporter,
+            current_mac_reporter: None,
             t_first: self.dltime,
             t_submitted_to_umac: None,
             t_umac_done: None,
+            t_retransmissions_exhausted: None,
             retransmission_buf: sapmsg, // Clone the message to keep a copy for potential retransmission
             retransmit_count: 0,
             first_complete_report_sent: false,
@@ -1246,14 +1355,11 @@ impl Llc {
         };
 
         if matches!(prim.report, TmaReport::RandomAccessFailure | TmaReport::FailedTransfer) {
-            let Some(ack) = self.outbound_messages.remove(idx) else {
+            let Some(mut ack) = self.outbound_messages.remove(idx) else {
                 return;
             };
-            match ack.tx_reporter.get_state() {
-                TxState::Pending => ack.tx_reporter.mark_discarded(),
-                TxState::Transmitted => ack.tx_reporter.mark_lost(),
-                TxState::Discarded | TxState::Lost | TxState::Acknowledged => {}
-            }
+            Self::mark_ack_current_mac_discarded(&mut ack);
+            Self::mark_ack_service_failed(&ack);
             // EN 300 392-2 clauses 20.4.1.1.3 and 22.3.2.3(g): a MAC
             // failure report for service-user data is terminal for this
             // TL-SDU. Retries are only specified for fragmentation failure
@@ -1267,11 +1373,9 @@ impl Llc {
                 return;
             };
 
-            match ack.tx_reporter.get_state() {
-                TxState::Pending => ack.tx_reporter.mark_discarded(),
-                TxState::Transmitted => ack.tx_reporter.mark_lost(),
-                TxState::Discarded | TxState::Lost | TxState::Acknowledged => {}
-            }
+            Self::mark_ack_current_mac_discarded(&mut ack);
+            ack.t_umac_done = Some(self.dltime);
+            ack.t_retransmissions_exhausted = None;
 
             if ack.retransmit_count < N252_BL_MAX_TLSDU_RETRANSMITS_ACKED {
                 // EN 300 392-2 22.3.2.3(h): a BL-DATA/BL-ADATA fragmentation
@@ -1295,6 +1399,7 @@ impl Llc {
                 Self::submit_for_acknowledged_transmission(queue, &mut ack, resubmit_time);
                 self.outbound_messages.insert(idx, ack);
             } else {
+                Self::mark_ack_service_failed(&ack);
                 tracing::warn!(
                     "LLC: fragmentation failure exhausted N.252 for SSI {} endpoint {} N(S) {}",
                     ack.addr.ssi,
@@ -1312,13 +1417,12 @@ impl Llc {
                 tracing::trace!("LLC: TMA-REPORT confirm handle for req_handle={}", prim.req_handle);
             }
             TmaReport::SuccessRandomAccess | TmaReport::SuccessReservedOrStealing => {
-                if ack.tx_reporter.get_state() == TxState::Pending {
-                    ack.tx_reporter.mark_transmitted();
-                }
+                Self::mark_ack_current_mac_transmitted(ack);
                 if ack.t_umac_done.is_none() {
                     ack.t_umac_done = Some(self.dltime);
                 }
                 if !ack.first_complete_report_sent {
+                    Self::mark_ack_service_first_complete(ack);
                     Self::push_tla_report(queue, ack.req_handle, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION, Some(ack.endpoint_id));
                     ack.first_complete_report_sent = true;
                 }
@@ -1793,6 +1897,13 @@ impl Llc {
         for ack in self.outbound_messages.iter_mut() {
             had_activity |= Self::reconcile_umac_done_from_reporter(queue, ack, dltime, "schedule_retransmissions");
 
+            if ack.t_retransmissions_exhausted.is_some() {
+                if Self::late_ack_grace_expired(ack, dltime) {
+                    removals.get_or_insert(Vec::new()).push(Self::expected_ack_key(ack));
+                }
+                continue;
+            }
+
             // If we don't have a t_umac_done, there is no need for a retransmission in any case
             let Some(t_umac_done) = ack.t_umac_done else {
                 continue;
@@ -1806,6 +1917,7 @@ impl Llc {
                 if ack.retransmit_count < N252_BL_MAX_TLSDU_RETRANSMITS_ACKED {
                     // Retransmit
                     ack.retransmit_count += 1;
+                    ack.t_retransmissions_exhausted = None;
                     tracing::info!(
                         "retransmitting SSI {} N(S) {} attempt {}",
                         ack.addr.ssi,
@@ -1821,6 +1933,14 @@ impl Llc {
                     );
                     Self::submit_for_acknowledged_transmission(queue, ack, self.dltime.forward_to_timeslot(ack.t_first.t));
                     had_activity = true;
+                } else if let Some(grace_frames) = Self::channel_allocation_late_ack_grace(ack) {
+                    ack.t_retransmissions_exhausted = Some(dltime);
+                    tracing::warn!(
+                        "schedule_retransmissions: SSI {} N(S) {} exhausted retransmissions; retaining channel-allocation transfer for {} signalling-frame late-ACK grace",
+                        ack.addr.ssi,
+                        ack.ns,
+                        grace_frames
+                    );
                 } else {
                     // Exhausted retransmissions, flag for discard
                     removals.get_or_insert(Vec::new()).push(Self::expected_ack_key(ack));
@@ -1847,24 +1967,15 @@ impl Llc {
                     ack.addr.ssi,
                     ack.ns
                 );
-                match ack.tx_reporter.get_state() {
-                    TxState::Transmitted => ack.tx_reporter.mark_lost(),
-                    TxState::Discarded => {
-                        tracing::warn!(
-                            "schedule_retransmissions: SSI {} N(S) {} expired after repeated UMAC discards; leaving reporter discarded",
-                            ack.addr.ssi,
-                            ack.ns
-                        );
-                    }
-                    state => {
-                        tracing::warn!(
-                            "schedule_retransmissions: SSI {} N(S) {} expired in unexpected reporter state {:?}",
-                            ack.addr.ssi,
-                            ack.ns,
-                            state
-                        );
-                    }
+                if ack.tx_reporter.get_state() != TxState::Transmitted {
+                    tracing::warn!(
+                        "schedule_retransmissions: SSI {} N(S) {} exhausted before service reporter reached Transmitted; state {:?}",
+                        ack.addr.ssi,
+                        ack.ns,
+                        ack.tx_reporter.get_state()
+                    );
                 }
+                Self::mark_ack_service_failed(&ack);
                 Self::push_tla_report(queue, ack.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(ack.endpoint_id));
             }
             // The ack expires here
@@ -2121,7 +2232,7 @@ impl Llc {
             .filter_map(|(idx, ack)| {
                 if ack.t_submitted_to_umac.is_none()
                     || ack.t_umac_done.is_some()
-                    || ack.tx_reporter.get_state() != TxState::Pending
+                    || Self::ack_current_mac_state(ack) != Some(TxState::Pending)
                     || ack.pdu_prio >= TMA_HIGHEST_PDU_PRIORITY
                 {
                     return None;
@@ -2171,7 +2282,8 @@ impl Llc {
             Self::push_tma_cancel(queue, ack.req_handle);
             ack.t_submitted_to_umac = None;
             ack.t_umac_done = None;
-            ack.tx_reporter.reset();
+            Self::mark_ack_current_mac_discarded(ack);
+            ack.current_mac_reporter = None;
             had_activity = true;
         }
         for idx in cancel_udata_indices {
@@ -2390,7 +2502,11 @@ mod tests {
     use tetra_core::tetra_entities::TetraEntity;
     use tetra_core::{BitBuffer, EndpointId, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, TxState};
     use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
+    use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
+    use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
+    use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
     use tetra_saps::tla::TLA_REPORT_FAILED_TRANSFER;
+    use tetra_saps::tla::TlaTlDataReqBl;
     use tetra_saps::tma::TmaUnitdataReq;
     use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -2452,6 +2568,48 @@ mod tests {
         assert_eq!(
             T251_SENDER_RETRY_SIGNALLING_FRAMES * TDMA_TIMESLOTS_PER_FRAME,
             T251_SENDER_RETRY_TIMER
+        );
+    }
+
+    #[test]
+    fn acked_channel_allocation_sent_on_mcch_expects_peer_ack_on_current_channel() {
+        let mut assigned = [false; 4];
+        assigned[1] = true;
+        let mut prim = TlaTlDataReqBl {
+            main_address: TetraAddress::issi(1001),
+            link_id: 0,
+            endpoint_id: 0,
+            tl_sdu: BitBuffer::from_bitstr("101010"),
+            pdu_prio: 6,
+            stealing_permission: false,
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_class_info: None,
+            req_handle: 1,
+            graceful_degradation: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(4),
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        };
+
+        assert_eq!(
+            Llc::expected_ack_timeslot_for_outbound_bl(&prim),
+            1,
+            "EN 300 392-2 23.5.2.2/23.5.4.3: MCCH late-assignment call-control grants the BL-ACK on the current channel"
+        );
+
+        prim.stealing_permission = true;
+        assert_eq!(
+            Llc::expected_ack_timeslot_for_outbound_bl(&prim),
+            2,
+            "FACCH/STCH acknowledged signalling still ages T.251 against the assigned traffic timeslot"
         );
     }
 

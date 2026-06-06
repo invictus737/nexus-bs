@@ -296,6 +296,10 @@ pub fn get_default_filter() -> EnvFilter {
 }
 
 pub fn get_default_stdout_filter() -> EnvFilter {
+    if let Ok(filter) = EnvFilter::try_from_default_env() {
+        return filter;
+    }
+
     EnvFilter::new("info")
         // Quinn / QUIC debug logging
         .add_directive("quinn=info".parse().unwrap())

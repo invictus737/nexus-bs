@@ -1,11 +1,12 @@
 mod common;
 
-use tetra_config::bluestation::{CfgBrew, StackMode, from_toml_str};
+use tetra_config::bluestation::{CfgBrew, SharedConfig, StackMode, from_toml_str};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
 use tetra_entities::cmce::cmce_bs::CmceBs;
+use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::cmce::enums::call_timeout::CallTimeout;
 use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
 use tetra_pdus::cmce::enums::cmce_pdu_type_ul::CmcePduTypeUl;
@@ -130,6 +131,39 @@ fn submit_subscriber_update(test: &mut ComponentTest, issi: u32, groups: Vec<u32
         dest: TetraEntity::Cmce,
         msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
     });
+}
+
+fn submit_subscriber_update_to_cmce(
+    cmce: &mut CmceBs,
+    queue: &mut MessageQueue,
+    issi: u32,
+    groups: Vec<u32>,
+    action: BrewSubscriberAction,
+) {
+    cmce.rx_prim(
+        queue,
+        SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Mm,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
+        },
+    );
+}
+
+fn register_subscriber_to_cmce(cmce: &mut CmceBs, queue: &mut MessageQueue, issi: u32, gssi: u32) {
+    submit_subscriber_update_to_cmce(cmce, queue, issi, vec![], BrewSubscriberAction::Register);
+    drain_message_queue(queue);
+    submit_subscriber_update_to_cmce(cmce, queue, issi, vec![gssi], BrewSubscriberAction::Affiliate);
+    drain_message_queue(queue);
+}
+
+fn drain_message_queue(queue: &mut MessageQueue) -> Vec<SapMsg> {
+    let mut msgs = Vec::new();
+    while let Some(msg) = queue.pop_front() {
+        msgs.push(msg);
+    }
+    msgs
 }
 
 fn cmce_bs_mut(test: &mut ComponentTest) -> &mut CmceBs {
@@ -1432,41 +1466,68 @@ fn assert_established_p2p_release_pdus_to(msgs: &[SapMsg], call_id: u16, disconn
 
     assert_eq!(
         releases.len(),
-        expected_ssis.len() * 2,
-        "Established P2P release should send FACCH/STCH D-RELEASE plus MCCH fallback to the expected MS leg(s)"
+        expected_ssis.len(),
+        "Established P2P release should send one reporter-tracked FACCH/STCH D-RELEASE to the expected MS leg(s)"
     );
 
     let mut facch_ssis = Vec::new();
-    let mut mcch_ssis = Vec::new();
     for (prim, d_release) in releases {
         assert_eq!(d_release.call_identifier, call_id);
         assert_eq!(d_release.disconnect_cause, disconnect_cause);
         assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
         assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
-
-        if prim.stealing_permission {
-            facch_ssis.push(prim.main_address.ssi);
-            assert!(prim.tx_reporter.is_some(), "FACCH/STCH D-RELEASE must be reporter-tracked");
-            let chan_alloc = prim
-                .chan_alloc
-                .as_ref()
-                .expect("FACCH/STCH D-RELEASE should preserve assigned-channel allocation");
-            assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
-            assert!(chan_alloc.usage.is_some());
-            assert!(chan_alloc.timeslots.iter().any(|enabled| *enabled));
-        } else {
-            mcch_ssis.push(prim.main_address.ssi);
-            assert!(prim.tx_reporter.is_none(), "MCCH fallback should not carry a reporter");
-            assert!(prim.chan_alloc.is_none(), "MCCH fallback should not carry channel allocation");
-        }
+        assert!(
+            prim.stealing_permission,
+            "established-call D-RELEASE must use assigned-channel FACCH/STCH, not duplicate MCCH fallback"
+        );
+        facch_ssis.push(prim.main_address.ssi);
+        assert!(prim.tx_reporter.is_some(), "FACCH/STCH D-RELEASE must be reporter-tracked");
+        let chan_alloc = prim
+            .chan_alloc
+            .as_ref()
+            .expect("FACCH/STCH D-RELEASE should preserve assigned-channel allocation");
+        assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl);
+        assert!(chan_alloc.usage.is_some());
+        assert!(chan_alloc.timeslots.iter().any(|enabled| *enabled));
     }
 
     facch_ssis.sort_unstable();
-    mcch_ssis.sort_unstable();
     let mut expected = expected_ssis.to_vec();
     expected.sort_unstable();
     assert_eq!(facch_ssis, expected);
-    assert_eq!(mcch_ssis, expected);
+}
+
+fn assert_established_p2p_disconnect_pdu_to(msgs: &[SapMsg], call_id: u16, disconnect_cause: DisconnectCause, expected_issi: u32) {
+    let disconnects: Vec<_> = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_disconnect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        disconnects.len(),
+        1,
+        "Established P2P peer clear should send one reporter-tracked FACCH/STCH D-DISCONNECT"
+    );
+    let (prim, d_disconnect) = &disconnects[0];
+    assert_eq!(d_disconnect.call_identifier, call_id);
+    assert_eq!(d_disconnect.disconnect_cause, disconnect_cause);
+    assert_eq!(prim.main_address, TetraAddress::issi(expected_issi));
+    assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+    assert!(
+        prim.stealing_permission,
+        "established-call D-DISCONNECT must use assigned-channel FACCH/STCH"
+    );
+    assert!(prim.tx_reporter.is_some(), "FACCH/STCH D-DISCONNECT must be reporter-tracked");
+    let chan_alloc = prim
+        .chan_alloc
+        .as_ref()
+        .expect("FACCH/STCH D-DISCONNECT should preserve assigned-channel allocation");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert!(chan_alloc.usage.is_some());
+    assert!(chan_alloc.timeslots.iter().any(|enabled| *enabled));
 }
 
 fn assert_p2p_setup_rejected_with_dummy_call_id(msgs: &[SapMsg], calling_issi: u32) {
@@ -1558,6 +1619,68 @@ fn count_network_circuit_release(msgs: &[SapMsg], brew_uuid: uuid::Uuid) -> usiz
                 )
         })
         .count()
+}
+
+fn count_network_circuit_media_ready(msgs: &[SapMsg], brew_uuid: uuid::Uuid) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            msg.dest == TetraEntity::Brew
+                && matches!(
+                    &msg.msg,
+                    SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
+                        brew_uuid: got_uuid,
+                        ..
+                    }) if *got_uuid == brew_uuid
+                )
+        })
+        .count()
+}
+
+fn count_network_circuit_connect_confirm(msgs: &[SapMsg], brew_uuid: uuid::Uuid) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            msg.dest == TetraEntity::Brew
+                && matches!(
+                    &msg.msg,
+                    SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                        brew_uuid: got_uuid,
+                        ..
+                    }) if *got_uuid == brew_uuid
+                )
+        })
+        .count()
+}
+
+fn d_connect_reporter(msgs: &[SapMsg], issi: u32) -> tetra_core::TxReporter {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == issi && parse_d_connect(prim).is_some() => {
+                prim.tx_reporter.clone()
+            }
+            _ => None,
+        })
+        .expect("expected D-CONNECT with TxReporter")
+}
+
+fn first_d_connect_reporter(msgs: &[SapMsg]) -> tetra_core::TxReporter {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some() => prim.tx_reporter.clone(),
+            _ => None,
+        })
+        .expect("expected D-CONNECT with TxReporter")
+}
+
+fn acknowledge_d_connect(msgs: &[SapMsg], issi: u32) {
+    let reporter = d_connect_reporter(msgs, issi);
+    reporter.mark_transmitted();
+    reporter.mark_acknowledged();
+}
+
+fn acknowledge_first_d_connect(msgs: &[SapMsg]) {
+    let reporter = first_d_connect_reporter(msgs);
+    reporter.mark_transmitted();
+    reporter.mark_acknowledged();
 }
 
 fn build_network_call_end_msg(brew_uuid: uuid::Uuid) -> SapMsg {
@@ -1836,90 +1959,199 @@ fn start_active_p2p_call_with_connect_msgs(test: &mut ComponentTest) -> (u16, Ve
 
 fn start_active_p2p_call_between_with_connect_msgs(test: &mut ComponentTest, caller_issi: u32, called_issi: u32) -> (u16, Vec<SapMsg>) {
     let (call_id, _setup_msgs) = start_p2p_setup_between(test, caller_issi, called_issi);
-    test.submit_message(build_u_connect_msg(called_issi, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(test, build_u_connect_msg(called_issi, call_id), called_issi);
+    connect_msgs.extend(after_called_ack_msgs);
     assert!(count_umac_open(&connect_msgs) >= 1, "U-CONNECT should open the P2P traffic circuit");
+    let floor_msgs = grant_initial_p2p_floor(test, caller_issi, call_id);
+    connect_msgs.extend(floor_msgs);
     (call_id, connect_msgs)
 }
 
-fn grant_private_simplex_floor_to_called(test: &mut ComponentTest, call_id: u16) {
-    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+fn grant_initial_p2p_floor(test: &mut ComponentTest, speaker_issi: u32, call_id: u16) -> Vec<SapMsg> {
+    test.submit_message(build_u_tx_demand_msg(speaker_issi, call_id));
     test.run_stack(Some(1));
-    let queued_msgs = test.dump_sinks();
+    let floor_msgs = test.dump_sinks();
     assert_eq!(
-        count_d_tx_granted(&queued_msgs),
+        count_umac_floor_granted(&floor_msgs),
         1,
-        "called-party private floor request should queue while caller holds the floor"
+        "private simplex test helper should produce one floor grant for the requested PTT"
     );
-
-    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
-    test.run_stack(Some(1));
-    let handoff_msgs = test.dump_sinks();
-    assert_eq!(
-        count_d_tx_granted(&handoff_msgs),
-        2,
-        "caller U-TX CEASED should grant the private floor to the called party"
-    );
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    floor_msgs
 }
 
-fn start_called_party_disconnect_with_peer_d_disconnect(
+fn submit_p2p_connect_and_ack_called(test: &mut ComponentTest, u_connect_msg: SapMsg, called_issi: u32) -> (Vec<SapMsg>, Vec<SapMsg>) {
+    test.submit_message(u_connect_msg);
+    test.run_stack(Some(1));
+    let connect_msgs = test.dump_sinks();
+    acknowledge_called_d_connect_ack(&connect_msgs, called_issi);
+    test.run_stack(Some(1));
+    let mut after_called_ack_msgs = test.dump_sinks();
+    acknowledge_first_d_connect(&after_called_ack_msgs);
+    test.run_stack(Some(1));
+    after_called_ack_msgs.extend(test.dump_sinks());
+    (connect_msgs, after_called_ack_msgs)
+}
+
+fn direct_private_simplex_connect_msgs(u_setup: USetup) -> (u16, Vec<SapMsg>) {
+    direct_private_simplex_connect_msgs_with_config(u_setup, ComponentTest::get_default_test_config(StackMode::Bs))
+}
+
+fn direct_private_simplex_connect_msgs_with_config(u_setup: USetup, config: tetra_config::bluestation::StackConfig) -> (u16, Vec<SapMsg>) {
+    let (call_id, mut ack_msgs, after_called_ack_msgs, after_caller_ack_msgs) = direct_private_simplex_connect_phases(u_setup, config);
+    ack_msgs.extend(after_called_ack_msgs);
+    ack_msgs.extend(after_caller_ack_msgs);
+    (call_id, ack_msgs)
+}
+
+fn direct_private_simplex_connect_phases(
+    u_setup: USetup,
+    config: tetra_config::bluestation::StackConfig,
+) -> (u16, Vec<SapMsg>, Vec<SapMsg>, Vec<SapMsg>) {
+    let shared = SharedConfig::from_parts(config, None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, TdmaTime { h: 0, m: 1, f: 1, t: 1 });
+    let after_ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_first_d_connect(&after_ack_msgs);
+    cmce.tick_start(&mut queue, TdmaTime { h: 0, m: 1, f: 1, t: 2 });
+    let after_caller_ack_msgs = drain_message_queue(&mut queue);
+    (call_id, ack_msgs, after_ack_msgs, after_caller_ack_msgs)
+}
+
+fn acknowledge_called_d_connect_ack(msgs: &[SapMsg], called_issi: u32) {
+    transmit_called_d_connect_ack(msgs, called_issi);
+    let reporter = called_d_connect_ack_reporter(msgs, called_issi);
+    if !reporter.is_in_final_state() {
+        reporter.mark_acknowledged();
+    }
+}
+
+fn transmit_called_d_connect_ack(msgs: &[SapMsg], called_issi: u32) {
+    let reporter = called_d_connect_ack_reporter(msgs, called_issi);
+    reporter.mark_transmitted();
+}
+
+fn called_d_connect_ack_reporter(msgs: &[SapMsg], called_issi: u32) -> tetra_core::TxReporter {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address.ssi == called_issi && parse_d_connect_acknowledge(prim).is_some() =>
+            {
+                prim.tx_reporter.clone()
+            }
+            _ => None,
+        })
+        .expect("called MS should receive D-CONNECT ACKNOWLEDGE before caller D-CONNECT")
+}
+
+fn discard_called_d_connect_ack(msgs: &[SapMsg], called_issi: u32) {
+    let reporter = called_d_connect_ack_reporter(msgs, called_issi);
+    reporter.mark_discarded();
+}
+
+fn lose_called_d_connect_ack(msgs: &[SapMsg], called_issi: u32) {
+    let reporter = called_d_connect_ack_reporter(msgs, called_issi);
+    reporter.mark_transmitted();
+    reporter.mark_lost();
+}
+
+fn count_d_connect_acknowledges(msgs: &[SapMsg]) -> usize {
+    msgs.iter()
+        .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
+        .count()
+}
+
+fn assert_private_simplex_caller_d_connect_with_setup_floor(msgs: &[SapMsg], source_issi: u32, dest_issi: u32) {
+    let open_idx = msgs
+        .iter()
+        .position(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::Open(_))))
+        .expect("P2P U-CONNECT should open the UMAC bearer");
+    let caller_connect_idx = msgs
+        .iter()
+        .position(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == TEST_ISSI && parse_d_connect(prim).is_some()
+            )
+        })
+        .expect("private simplex setup should emit caller D-CONNECT after called ACK");
+
+    assert!(
+        open_idx < caller_connect_idx,
+        "EN 300 392-2 14.5.1.1.2: caller D-CONNECT must stay after the called D-CONNECT ACK path"
+    );
+    assert_eq!(
+        count_umac_floor_granted(msgs),
+        1,
+        "EN 300 392-2 14.5.1.1.1/14.5.1.1.2 and 14.5.1.2.1 b): the setup TransmissionGrant defines the initial U-plane floor"
+    );
+    assert!(
+        msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                source_issi: got_source,
+                dest_gssi,
+                ..
+            }) if *got_source == source_issi && *dest_gssi == dest_issi
+        )),
+        "initial setup floor should follow the MS that received TransmissionGrant::Granted"
+    );
+}
+
+fn start_duplex_called_party_disconnect_with_peer_d_disconnect(
     test: &mut ComponentTest,
-    dltime: TdmaTime,
     call_id: u16,
 ) -> (Vec<tetra_core::TxReporter>, Vec<tetra_core::TxReporter>) {
-    grant_private_simplex_floor_to_called(test, call_id);
-
     test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
-    let mut initiator_release_msgs = test.dump_sinks();
+    let mut disconnect_msgs = test.dump_sinks();
     assert_established_p2p_release_pdus_to(
-        &initiator_release_msgs,
+        &disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
-    assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
-    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
-    assert_eq!(release_ack_reporters.len(), 1);
-
-    drain_private_simplex_tail(test, dltime);
-    let mut disconnect_msgs = test.dump_sinks();
-    let d_disconnects: Vec<_> = disconnect_msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_disconnect(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(d_disconnects.len(), 1, "expected one peer D-DISCONNECT");
-    assert_eq!(d_disconnects[0].0.main_address, TetraAddress::issi(TEST_ISSI));
-    assert_eq!(d_disconnects[0].1.call_identifier, call_id);
-    assert_eq!(d_disconnects[0].1.disconnect_cause, DisconnectCause::UserRequestedDisconnection);
-    let chan_alloc = d_disconnects[0]
-        .0
-        .chan_alloc
-        .as_ref()
-        .expect("D-DISCONNECT must carry FACCH channel allocation");
-    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
-    assert_eq!(count_d_releases(&disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(&disconnect_msgs, call_id, DisconnectCause::UserRequestedDisconnection, TEST_ISSI);
     assert_eq!(count_umac_call_ended_or_close(&disconnect_msgs), 0);
 
+    let release_ack_reporters = extract_d_release_reporters(&mut disconnect_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
     let disconnect_reporters = extract_d_disconnect_reporters(&mut disconnect_msgs);
     assert_eq!(
         disconnect_reporters.len(),
         1,
-        "Assigned-channel D-DISCONNECT must carry one TxReporter"
+        "Duplex assigned-channel D-DISCONNECT must carry one TxReporter"
     );
     (release_ack_reporters, disconnect_reporters)
+}
+
+fn start_called_party_disconnect_with_peer_d_disconnect(
+    test: &mut ComponentTest,
+    _dltime: TdmaTime,
+    call_id: u16,
+) -> (Vec<tetra_core::TxReporter>, Vec<tetra_core::TxReporter>) {
+    start_duplex_called_party_disconnect_with_peer_d_disconnect(test, call_id)
 }
 
 fn p2p_open_ts_for(msgs: &[SapMsg], issi: u32) -> u8 {
     msgs.iter()
         .find_map(|msg| match &msg.msg {
             SapMsgInner::CmceCallControl(CallControl::Open(circuit))
-                if circuit.active_addr == Some(TetraAddress::new(issi, SsiType::Issi)) =>
+                if circuit.active_addr == Some(TetraAddress::new(issi, SsiType::Issi))
+                    || circuit.active_secondary_addrs.contains(&TetraAddress::new(issi, SsiType::Issi)) =>
             {
                 Some(circuit.ts)
             }
@@ -1941,9 +2173,9 @@ fn start_active_duplex_p2p_call(test: &mut ComponentTest) -> u16 {
     let mut u_setup = default_p2p_u_setup();
     u_setup.simplex_duplex_selection = true;
     let (call_id, _setup_msgs) = start_p2p_setup_with_u_setup(test, u_setup);
-    test.submit_message(build_u_connect_custom_msg(TEST_CALLED_ISSI, call_id, true));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(test, build_u_connect_custom_msg(TEST_CALLED_ISSI, call_id, true), TEST_CALLED_ISSI);
+    connect_msgs.extend(after_called_ack_msgs);
     assert!(
         count_umac_open(&connect_msgs) >= 1,
         "duplex U-CONNECT should open the P2P traffic circuit"
@@ -3027,10 +3259,28 @@ fn test_network_origin_private_call_preserves_method_and_timeout_fields() {
         })
         .expect("network connect confirm should emit D-CONNECT-ACKNOWLEDGE to the called MS");
     assert_eq!(connect_ack.0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(connect_ack.0.layer2service, Layer2Service::Acknowledged);
+    assert!(connect_ack.0.tx_reporter.is_some());
     assert_eq!(connect_ack.1.call_identifier, call_id);
     assert_eq!(connect_ack.1.call_time_out, CallTimeout::T10m);
     assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
     assert!(count_umac_open(&confirm_msgs) >= 1);
+    assert_eq!(
+        count_umac_floor_granted(&confirm_msgs),
+        0,
+        "Brew-origin private floor waits until the called D-CONNECT ACK is L2-acknowledged"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
+        0,
+        "Brew media must wait for local D-CONNECT ACK L2 ACK"
+    );
+
+    acknowledge_called_d_connect_ack(&confirm_msgs, TEST_CALLED_ISSI);
+    test.run_stack(Some(1));
+    let after_ack_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&after_ack_msgs), 1);
+    assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
 }
 
 #[test]
@@ -3082,6 +3332,11 @@ fn test_network_origin_private_release_sends_d_release_without_brew_echo() {
     test.run_stack(Some(1));
     let confirm_msgs = test.dump_sinks();
     assert!(count_umac_open(&confirm_msgs) >= 1);
+    assert_eq!(count_network_circuit_media_ready(&confirm_msgs, brew_uuid), 0);
+    acknowledge_called_d_connect_ack(&confirm_msgs, TEST_CALLED_ISSI);
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    assert_eq!(count_network_circuit_media_ready(&ready_msgs, brew_uuid), 1);
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -3108,12 +3363,16 @@ fn test_network_origin_private_release_sends_d_release_without_brew_echo() {
         .collect();
     assert_eq!(
         releases.len(),
-        2,
-        "network-origin private release should send FACCH plus MCCH D-RELEASE to the local MS"
+        1,
+        "network-origin private release should send one assigned-channel D-RELEASE to the local MS"
     );
     for (prim, release) in releases {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+        assert!(
+            prim.stealing_permission,
+            "established-call D-RELEASE should stay on the assigned channel"
+        );
         assert_eq!(release.call_identifier, call_id);
         assert_eq!(release.disconnect_cause, DisconnectCause::UserRequestedDisconnection);
     }
@@ -3201,17 +3460,28 @@ fn test_local_origin_brew_private_connect_preserves_method_and_timeout_fields() 
     // EN 300 392-2 tables 14.50 and 14.62: D-CONNECT carries the selected
     // call timeout and hook method; these are independent of simplex/duplex.
     assert_eq!(connect.0.main_address.ssi, TEST_ISSI);
+    assert_eq!(connect.0.layer2service, Layer2Service::Acknowledged);
+    assert!(connect.0.tx_reporter.is_some());
     assert_eq!(connect.1.call_time_out, CallTimeout::T10m);
     assert!(connect.1.hook_method_selection);
     assert!(!connect.1.simplex_duplex_selection);
     assert!(count_umac_open(&connect_msgs) >= 1);
-    assert!(connect_msgs.iter().any(|msg| matches!(
-        &msg.msg,
-        SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
-            brew_uuid: confirm_uuid,
-            ..
-        }) if *confirm_uuid == brew_uuid
-    )));
+    assert_eq!(
+        count_network_circuit_connect_confirm(&connect_msgs, brew_uuid),
+        0,
+        "Brew connect confirm must wait for local caller D-CONNECT L2 ACK"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&connect_msgs, brew_uuid),
+        0,
+        "Brew media must wait for local caller D-CONNECT L2 ACK"
+    );
+
+    acknowledge_d_connect(&connect_msgs, TEST_ISSI);
+    test.run_stack(Some(1));
+    let after_ack_msgs = test.dump_sinks();
+    assert_eq!(count_network_circuit_connect_confirm(&after_ack_msgs, brew_uuid), 1);
+    assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
 }
 
 #[test]
@@ -3270,12 +3540,34 @@ fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
         })
         .expect("Brew connect request should emit D-CONNECT to the local caller");
     assert_eq!(connect.0.main_address.ssi, TEST_ISSI);
+    assert_eq!(connect.0.layer2service, Layer2Service::Acknowledged);
+    assert!(connect.0.tx_reporter.is_some());
     assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
     let call_id = connect.1.call_identifier;
 
-    assert_eq!(count_umac_floor_granted(&connect_msgs), 1);
+    assert_eq!(
+        count_umac_floor_granted(&connect_msgs),
+        0,
+        "Annex D.4-compatible Brew private setup must wait for local D-CONNECT L2 ACK before initial floor"
+    );
+    assert_eq!(
+        count_network_circuit_connect_confirm(&connect_msgs, brew_uuid),
+        0,
+        "Brew connect confirm must wait for local caller D-CONNECT L2 ACK"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&connect_msgs, brew_uuid),
+        0,
+        "Brew media must wait for local caller D-CONNECT L2 ACK"
+    );
+
+    acknowledge_d_connect(&connect_msgs, TEST_ISSI);
+    test.run_stack(Some(1));
+    let after_ack_msgs = test.dump_sinks();
+
+    assert_eq!(count_umac_floor_granted(&after_ack_msgs), 1);
     assert!(
-        connect_msgs.iter().any(|msg| matches!(
+        after_ack_msgs.iter().any(|msg| matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
                 call_id: got_call_id,
@@ -3284,8 +3576,10 @@ fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
                 ..
             }) if *got_call_id == call_id && *source_issi == TEST_ISSI && *dest_gssi == remote_issi
         )),
-        "EN 300 392-2 clause 14.5.1.2.1: Brew-routed simplex D-CONNECT grant must seed the local floor holder"
+        "EN 300 392-2 clause 14.5.1.2.1 plus Annex D.4: Brew-routed simplex D-CONNECT grant seeds the local floor after L2 ACK"
     );
+    assert_eq!(count_network_circuit_connect_confirm(&after_ack_msgs, brew_uuid), 1);
+    assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
@@ -3299,6 +3593,76 @@ fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
     assert!(
         count_umac_floor_released(&tail_msgs) >= 1,
         "U-TX CEASED from the granted local Brew-private speaker must not be ignored as floor_holder=None"
+    );
+}
+
+#[test]
+fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_does_not_open_media() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let remote_issi = 7_000_102;
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(remote_issi as u64);
+    u_setup.simplex_duplex_selection = false;
+
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let (brew_uuid, mut network_call) = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid, call }) => Some((*brew_uuid, call.clone())),
+            _ => None,
+        })
+        .expect("local private U-SETUP should be forwarded to Brew");
+    network_call.grant = TransmissionGrant::Granted.into_raw() as u8;
+    network_call.permission = 0;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+            brew_uuid,
+            call: network_call,
+        }),
+    });
+    test.run_stack(Some(1));
+    let connect_msgs = test.dump_sinks();
+
+    let connect_reporter = d_connect_reporter(&connect_msgs, TEST_ISSI);
+    connect_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let after_transmit_only_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_umac_floor_granted(&after_transmit_only_msgs),
+        0,
+        "Annex D.4/D.5: local D-CONNECT transmission alone must not authorize first simplex traffic"
+    );
+    assert_eq!(
+        count_network_circuit_connect_confirm(&after_transmit_only_msgs, brew_uuid),
+        0,
+        "Brew connect confirm waits for local D-CONNECT L2 ACK, not only MAC transmission"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
+        0,
+        "Brew media waits for local D-CONNECT L2 ACK, not only MAC transmission"
     );
 }
 
@@ -3365,11 +3729,28 @@ fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor()
         })
         .expect("network connect confirm should emit D-CONNECT-ACKNOWLEDGE");
     assert_eq!(connect_ack.0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(connect_ack.0.layer2service, Layer2Service::Acknowledged);
+    assert!(connect_ack.0.tx_reporter.is_some());
     assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
 
-    assert_eq!(count_umac_floor_granted(&confirm_msgs), 1);
+    assert_eq!(
+        count_umac_floor_granted(&confirm_msgs),
+        0,
+        "Annex D.4-compatible Brew private setup must wait for local D-CONNECT ACK L2 ACK before initial floor"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
+        0,
+        "Brew media must wait for local D-CONNECT ACK L2 ACK"
+    );
+
+    acknowledge_called_d_connect_ack(&confirm_msgs, TEST_CALLED_ISSI);
+    test.run_stack(Some(1));
+    let after_ack_msgs = test.dump_sinks();
+
+    assert_eq!(count_umac_floor_granted(&after_ack_msgs), 1);
     assert!(
-        confirm_msgs.iter().any(|msg| matches!(
+        after_ack_msgs.iter().any(|msg| matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
                 call_id: got_call_id,
@@ -3378,8 +3759,9 @@ fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor()
                 ..
             }) if *got_call_id == call_id && *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_ISSI
         )),
-        "EN 300 392-2 clause 14.5.1.2.1: Brew-routed simplex D-CONNECT-ACK grant must seed the local floor holder"
+        "EN 300 392-2 clause 14.5.1.2.1 plus Annex D.4: Brew-routed simplex D-CONNECT-ACK grant seeds the local floor after L2 ACK"
     );
+    assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
 
     test.submit_message(build_u_tx_ceased_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -3392,6 +3774,78 @@ fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor()
     assert!(
         count_umac_floor_released(&tail_msgs) >= 1,
         "U-TX CEASED from the granted network-origin local speaker must not be ignored as floor_holder=None"
+    );
+}
+
+#[test]
+fn test_network_origin_brew_private_d_connect_ack_transmitted_without_l2_ack_does_not_open_media() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    let mut call = default_network_circuit_call(TEST_ISSI, TEST_CALLED_ISSI);
+    call.priority = 11;
+    call.duplex = 0;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
+            brew_uuid,
+            call: call.clone(),
+        }),
+    });
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let call_id = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .expect("network-origin private setup should emit D-SETUP");
+
+    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+            brew_uuid,
+            grant: TransmissionGrant::Granted.into_raw() as u8,
+            permission: 0,
+        }),
+    });
+    test.run_stack(Some(1));
+    let confirm_msgs = test.dump_sinks();
+
+    let connect_ack_reporter = called_d_connect_ack_reporter(&confirm_msgs, TEST_CALLED_ISSI);
+    connect_ack_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let after_transmit_only_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_umac_floor_granted(&after_transmit_only_msgs),
+        0,
+        "Annex D.4/D.5: local D-CONNECT ACK transmission alone must not authorize first simplex traffic"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
+        0,
+        "Brew media waits for local D-CONNECT ACK L2 ACK, not only MAC transmission"
     );
 }
 
@@ -7928,7 +8382,7 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
@@ -7936,19 +8390,19 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
 
     peer_release_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
-    let release_msgs = test.dump_sinks();
+    let delivery_msgs = test.dump_sinks();
     assert_eq!(
-        count_d_releases(&release_msgs),
+        count_d_releases(&delivery_msgs),
         0,
         "Peer D-RELEASE delivery must not duplicate the D-RELEASE already sent to the initiator"
     );
     assert_eq!(
-        count_umac_call_ended_or_close(&release_msgs),
+        count_umac_call_ended_or_close(&delivery_msgs),
         0,
-        "P2P circuit must stay open while prompt D-RELEASE reporters are pending"
+        "P2P circuit must stay open while initiator D-RELEASE delivery is pending"
     );
 
-    // EN 300 392-2 clauses 14.5.1.1.2 and 14.5.1.3.2/14.5.1.3.3: while
+    // EN 300 392-2 clauses 14.5.1.1.2 and 14.5.1.3.1: while
     // the established private call is being released with pending
     // assigned-channel D-RELEASE delivery, neither party has an idle CC
     // sub-entity for another private setup.
@@ -8014,10 +8468,11 @@ fn test_p2p_pending_release_call_id_wrap_skips_old_release_id() {
 
     drain_private_simplex_tail(&mut test, dltime);
     let peer_release_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         old_call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
@@ -8095,6 +8550,45 @@ fn test_p2p_setup_to_configured_local_unregistered_issi_rejects_without_brew_fal
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { .. })
         )),
         "configured-local unregistered ISSI must not be forwarded as a Brew network setup"
+    );
+}
+
+#[test]
+fn test_p2p_setup_between_runtime_registered_local_issis_stays_local_without_config_ranges() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(Vec::new());
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.config.state_write().network_connected = true;
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    submit_subscriber_update(&mut test, LAB_ISSI_A, Vec::new(), BrewSubscriberAction::Register);
+    submit_subscriber_update(&mut test, LAB_ISSI_MXP600, Vec::new(), BrewSubscriberAction::Register);
+    test.run_stack(Some(2));
+    let _ = test.dump_sinks();
+
+    let (_call_id, msgs) = start_p2p_setup_between(&mut test, LAB_ISSI_A, LAB_ISSI_MXP600);
+
+    // EN 300 392-2 clause 14.5.1 local individual-call setup is selected from
+    // current SwMI subscriber state. Static local_ssi_ranges is deployment
+    // policy for unregistered/offline fallback only; two runtime-registered
+    // local MSs must not be routed through Brew just because the config has no
+    // explicit ISSI range.
+    assert_eq!(count_d_call_proceedings(&msgs), 1);
+    assert_eq!(count_d_setups(&msgs), 1);
+    assert_eq!(count_d_releases(&msgs), 0);
+    assert!(
+        !msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { .. })
+        )),
+        "runtime-registered local P2P must stay inside the BS without Brew fallback"
     );
 }
 
@@ -8276,13 +8770,12 @@ fn test_simple_private_call_after_real_mm_registration_and_group_affiliation() {
     assert!(setup_prim.chan_alloc.is_none());
     assert_eq!(count_umac_open(&setup_msgs), 0, "P2P setup must not open traffic before U-CONNECT");
 
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(TEST_CALLED_ISSI, call_id), TEST_CALLED_ISSI);
 
     // EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2: U-CONNECT completes the
-    // called leg, after which the SwMI sends D-CONNECT/D-CONNECT ACKNOWLEDGE
-    // and opens the assigned channel.
+    // called leg. Annex D.4 keeps caller D-CONNECT blocked until the called
+    // D-CONNECT ACKNOWLEDGE is L2-acknowledged.
     assert_eq!(
         count_umac_open(&connect_msgs),
         1,
@@ -8291,19 +8784,26 @@ fn test_simple_private_call_after_real_mm_registration_and_group_affiliation() {
     assert!(
         connect_msgs
             .iter()
-            .any(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
-        "U-CONNECT should produce D-CONNECT to the caller"
+            .all(|msg| !matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
+        "caller D-CONNECT must wait for called D-CONNECT ACK BL-ACK"
     );
     assert!(
         connect_msgs
             .iter()
             .any(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some())),
-        "U-CONNECT should produce D-CONNECT ACKNOWLEDGE to the called MS"
+        "U-CONNECT should first produce D-CONNECT ACKNOWLEDGE to the called MS"
     );
     let open_ts = p2p_open_ts_for(&connect_msgs, TEST_ISSI);
     assert!(
         (1..=4).contains(&open_ts),
         "assigned-channel open should use a valid TETRA timeslot"
+    );
+    connect_msgs.extend(after_called_ack_msgs);
+    assert!(
+        connect_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
+        "called D-CONNECT ACK BL-ACK should release D-CONNECT to the caller"
     );
 }
 
@@ -8455,7 +8955,7 @@ fn test_p2p_u_setup_numeric_collision_routes_to_registered_issi_not_gssi() {
 }
 
 #[test]
-fn test_p2p_pending_setup_retry_is_reporter_throttled_before_timeout() {
+fn test_p2p_pending_setup_does_not_duplicate_while_initial_reporter_pending() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -8467,45 +8967,48 @@ fn test_p2p_pending_setup_retry_is_reporter_throttled_before_timeout() {
     );
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let (call_id, _setup_msgs) = start_p2p_setup(&mut test);
+    let (call_id, mut setup_msgs) = start_p2p_setup(&mut test);
 
-    // The CircuitMgr path emits an early backup D-SETUP; later EE retries use
-    // the same reporter throttle so an untransmitted retry does not turn into
-    // repeated setup spam before T302 expires.
-    test.run_stack(Some(70));
-    let mut retry_msgs = test.dump_sinks();
-    let setups: Vec<_> = retry_msgs
+    let setups: Vec<_> = setup_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
             SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
             _ => None,
         })
         .collect();
-    assert_eq!(setups.len(), 1, "pending P2P setup should retry D-SETUP before setup timeout");
+    assert_eq!(setups.len(), 1, "P2P setup should emit one initial D-SETUP");
     let (setup_prim, setup) = &setups[0];
     assert_eq!(setup.call_identifier, call_id);
     assert_eq!(setup_prim.main_address.ssi, TEST_CALLED_ISSI);
-    assert!(setup_prim.chan_alloc.is_none(), "setup-phase retry remains on MCCH");
+    assert!(setup_prim.chan_alloc.is_none(), "setup-phase D-SETUP remains on MCCH");
     assert!(
         setup_prim.tx_reporter.is_some(),
-        "retry should be reporter-tracked so later resends are throttled until MAC reports completion"
+        "initial D-SETUP should be reporter-tracked so backup/retry paths wait for MAC completion"
     );
-    assert_eq!(
-        count_umac_open(&retry_msgs),
-        0,
-        "D-SETUP retry must not open traffic before U-CONNECT"
-    );
+    assert_eq!(count_umac_open(&setup_msgs), 0, "D-SETUP must not open traffic before U-CONNECT");
 
-    let reporters = extract_d_setup_reporters(&mut retry_msgs);
-    assert_eq!(reporters.len(), 1, "retry should expose exactly one D-SETUP TxReporter");
+    let reporters = extract_d_setup_reporters(&mut setup_msgs);
+    assert_eq!(reporters.len(), 1, "initial setup should expose exactly one D-SETUP TxReporter");
     assert_eq!(reporters[0].get_state(), TxState::Pending);
+
+    // EN 300 392-2 clause 14.5.1.1.1 requires D-SETUP to the called MS before
+    // U-CONNECT. While MAC has not completed that first transfer, neither the
+    // generic circuit backup path nor the EE retry path may enqueue a second
+    // same-call D-SETUP.
+    test.run_stack(Some(70));
+    let backup_window_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_setups(&backup_window_msgs),
+        0,
+        "pending P2P setup must not send a generic backup D-SETUP while the initial reporter is still pending"
+    );
 
     test.run_stack(Some(720));
     let pending_retry_msgs = test.dump_sinks();
     assert_eq!(
         count_d_setups(&pending_retry_msgs),
         0,
-        "pending P2P setup must not send another D-SETUP while the previous retry reporter is still pending"
+        "pending P2P setup must not send an EE retry while the initial reporter is still pending"
     );
 }
 
@@ -8622,6 +9125,770 @@ fn test_p2p_setup_phase_called_u_disconnect_releases_without_d_disconnect() {
 }
 
 #[test]
+fn test_p2p_setup_phase_reject_busy_and_no_answer_causes_are_preserved() {
+    debug::setup_logging_verbose();
+
+    for disconnect_cause in [
+        DisconnectCause::CallRejectedByTheCalledParty,
+        DisconnectCause::CalledPartyBusy,
+        DisconnectCause::ExpiryOfTimer,
+        DisconnectCause::InvalidCallIdentifier,
+    ] {
+        let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+        let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+        test.populate_entities(
+            vec![TetraEntity::Cmce],
+            vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+        );
+        register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+        register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+        let (call_id, _setup_msgs) = start_p2p_setup(&mut test);
+
+        test.submit_message(build_u_disconnect_pdu_msg(
+            TEST_CALLED_ISSI,
+            UDisconnect {
+                call_identifier: call_id,
+                disconnect_cause,
+                facility: None,
+                proprietary: None,
+            },
+        ));
+        test.run_stack(Some(1));
+        let reject_msgs = test.dump_sinks();
+
+        assert_eq!(
+            count_d_disconnects(&reject_msgs),
+            0,
+            "setup-phase private reject/no-answer/busy cause {disconnect_cause:?} must not use established D-DISCONNECT"
+        );
+        let releases: Vec<_> = reject_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            releases.len(),
+            6,
+            "setup-phase private reject/no-answer/busy cause {disconnect_cause:?} should repeat MCCH D-RELEASE to both parties"
+        );
+        for (prim, release) in releases {
+            assert_eq!(release.call_identifier, call_id);
+            assert_eq!(release.disconnect_cause, disconnect_cause);
+            assert!(prim.main_address.ssi == TEST_ISSI || prim.main_address.ssi == TEST_CALLED_ISSI);
+            assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+            assert!(prim.chan_alloc.is_none());
+        }
+    }
+}
+
+#[test]
+fn test_p2p_u_connect_waits_for_called_delivery_then_caller_d_connect_before_setup_floor() {
+    debug::setup_logging_verbose();
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    let config = ComponentTest::get_default_test_config(StackMode::Bs);
+    let (_call_id, ack_msgs, after_called_delivery_msgs, after_caller_delivery_msgs) =
+        direct_private_simplex_connect_phases(u_setup, config);
+
+    assert!(
+        ack_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == TEST_ISSI && parse_d_connect(prim).is_some()
+            )
+        }),
+        "ETSI EN 300 392-2 14.5.1.1.1/14.5.1.1.2: caller D-CONNECT must wait until called D-CONNECT ACKNOWLEDGE is delivered"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&ack_msgs),
+        0,
+        "private floor must not be released before called D-CONNECT ACKNOWLEDGE and caller D-CONNECT delivery"
+    );
+
+    let d_connect_acks: Vec<_> = ack_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(d_connect_acks.len(), 1);
+    assert_eq!(d_connect_acks[0].0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Acknowledged);
+    assert!(
+        !d_connect_acks[0].0.stealing_permission,
+        "first called D-CONNECT ACK with late assignment starts on the current channel; assigned-channel recovery remains for local MAC failure retries"
+    );
+    assert_eq!(d_connect_acks[0].0.unacked_bl_repetitions, None);
+    let chan_alloc = d_connect_acks[0]
+        .0
+        .chan_alloc
+        .as_ref()
+        .expect("called D-CONNECT ACK must carry channel allocation");
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert!(d_connect_acks[0].0.tx_reporter.is_some());
+
+    assert_eq!(
+        count_d_connects(&after_called_delivery_msgs),
+        1,
+        "called D-CONNECT ACK BL-ACK should release caller D-CONNECT"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&after_called_delivery_msgs),
+        0,
+        "called D-CONNECT ACK BL-ACK should send caller D-CONNECT without enabling floor"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&after_caller_delivery_msgs),
+        1,
+        "caller D-CONNECT L2 ACK completes private simplex setup and opens the ETSI setup-granted U-plane floor"
+    );
+
+    let mut connect_msgs = ack_msgs;
+    connect_msgs.extend(after_called_delivery_msgs);
+    connect_msgs.extend(after_caller_delivery_msgs);
+    assert_private_simplex_caller_d_connect_with_setup_floor(&connect_msgs, TEST_ISSI, TEST_CALLED_ISSI);
+}
+
+#[test]
+fn test_p2p_called_d_connect_ack_pending_local_delivery_does_not_authorize_caller() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    let reporter = called_d_connect_ack_reporter(&ack_msgs, TEST_CALLED_ISSI);
+    assert_eq!(reporter.get_state(), TxState::Pending);
+
+    cmce.tick_start(&mut queue, dltime.add_timeslots(4));
+    let pending_delivery_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_d_connects(&pending_delivery_msgs),
+        0,
+        "caller D-CONNECT must not be queued until called D-CONNECT ACK BL-ACK is reported"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&pending_delivery_msgs),
+        0,
+        "private-simplex floor must remain blocked while called D-CONNECT ACK BL-ACK is pending"
+    );
+    assert_eq!(
+        count_d_releases(&pending_delivery_msgs),
+        0,
+        "CMCE should keep waiting/retrying instead of releasing before the delivery guard expires"
+    );
+}
+
+#[test]
+fn test_p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_caller() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    transmit_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, dltime.add_timeslots(4));
+    let transmitted_only_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_d_connects(&transmitted_only_msgs),
+        0,
+        "EN 300 392-2 Annex D.4: called D-CONNECT ACK local transmission alone must not authorize caller D-CONNECT"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&transmitted_only_msgs),
+        0,
+        "private-simplex U-plane must remain blocked until called D-CONNECT ACK BL-ACK"
+    );
+    assert_eq!(
+        count_d_releases(&transmitted_only_msgs),
+        0,
+        "a short missing-BL-ACK guard should not release immediately"
+    );
+}
+
+#[test]
+fn test_p2p_called_d_connect_ack_lost_does_not_fall_forward_without_bl_ack() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let mut dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let mut ack_msgs = drain_message_queue(&mut queue);
+
+    // Field regression for Motorola MXP600: treating a locally transmitted
+    // D-CONNECT ACK as enough, after the BL-ACK was lost, made the BS open
+    // caller D-CONNECT and floor while the called MS still behaved as if the
+    // private setup was incomplete. Keep Annex D.4 conservative: retry with
+    // acknowledged service and never authorize caller/floor without BL-ACK.
+    let expected_stealing_by_attempt = [false, false, true, false, true];
+    for (idx, expected_stealing) in expected_stealing_by_attempt.iter().copied().enumerate() {
+        let attempt = idx + 1;
+        assert_eq!(
+            count_d_connect_acknowledges(&ack_msgs),
+            1,
+            "attempt {attempt}: called MS should receive one D-CONNECT ACKNOWLEDGE retry"
+        );
+        let d_connect_acks: Vec<_> = ack_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        let (ack_prim, ack_pdu) = &d_connect_acks[0];
+        assert_eq!(ack_prim.main_address.ssi, TEST_CALLED_ISSI);
+        assert_eq!(ack_pdu.call_identifier, call_id);
+        assert_eq!(ack_prim.layer2service, Layer2Service::Acknowledged);
+        assert_eq!(ack_prim.unacked_bl_repetitions, None);
+        assert_eq!(ack_prim.stealing_permission, expected_stealing);
+        assert!(ack_prim.chan_alloc.is_some());
+        assert_eq!(
+            count_d_connects(&ack_msgs),
+            0,
+            "attempt {attempt}: caller D-CONNECT must remain blocked until called BL-ACK"
+        );
+        assert_eq!(
+            count_umac_floor_granted(&ack_msgs),
+            0,
+            "attempt {attempt}: private floor must remain blocked until called BL-ACK"
+        );
+        assert_eq!(
+            count_d_releases(&ack_msgs),
+            0,
+            "attempt {attempt}: setup release should wait until called ACK retries are exhausted"
+        );
+
+        lose_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+        dltime = dltime.add_timeslots(4);
+        cmce.tick_start(&mut queue, dltime);
+        ack_msgs = drain_message_queue(&mut queue);
+    }
+    let fail_msgs = ack_msgs;
+
+    assert_eq!(
+        count_d_connect_acknowledges(&fail_msgs),
+        0,
+        "after retry exhaustion CMCE should stop retrying called D-CONNECT ACKNOWLEDGE"
+    );
+    assert_eq!(
+        count_d_connects(&fail_msgs),
+        0,
+        "caller D-CONNECT must never be sent when called D-CONNECT ACK was never BL-ACKed"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&fail_msgs),
+        0,
+        "private floor must never be seeded when called D-CONNECT ACK was never BL-ACKed"
+    );
+    let releases: Vec<_> = fail_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !releases.is_empty(),
+        "called D-CONNECT ACK BL-ACK exhaustion should release the private setup"
+    );
+    for (prim, release) in releases {
+        assert_eq!(release.call_identifier, call_id);
+        assert_eq!(release.disconnect_cause, DisconnectCause::AcknowledgedServiceNotComplete);
+        assert!(prim.main_address.ssi == TEST_ISSI || prim.main_address.ssi == TEST_CALLED_ISSI);
+    }
+}
+
+#[test]
+fn test_p2p_caller_d_connect_transmitted_without_l2_ack_does_not_seed_initial_floor() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, dltime);
+    let caller_connect_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_d_connects(&caller_connect_msgs),
+        1,
+        "called D-CONNECT ACK BL-ACK should send one caller D-CONNECT"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&caller_connect_msgs),
+        0,
+        "caller D-CONNECT must be locally delivered before the first simplex floor"
+    );
+
+    let reporter = d_connect_reporter(&caller_connect_msgs, TEST_ISSI);
+    reporter.mark_transmitted();
+    cmce.tick_start(&mut queue, dltime.add_timeslots(4));
+    let no_ack_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_umac_floor_granted(&no_ack_msgs),
+        0,
+        "caller D-CONNECT local transmission must not seed private-simplex U-plane without L2 ACK"
+    );
+    assert_eq!(
+        count_d_releases(&no_ack_msgs),
+        0,
+        "CMCE must not release simply because the caller D-CONNECT L2 ACK has not arrived inside this short guard"
+    );
+
+    cmce.rx_prim(&mut queue, build_u_tx_demand_msg(TEST_ISSI, call_id));
+    let premature_ptt_msgs = drain_message_queue(&mut queue);
+    assert_eq!(
+        count_d_tx_granted(&premature_ptt_msgs),
+        0,
+        "caller U-TX DEMAND must not receive D-TX GRANTED until caller D-CONNECT is L2-ACKed"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&premature_ptt_msgs),
+        0,
+        "caller U-TX DEMAND must not open U-plane while caller D-CONNECT ACK is still pending"
+    );
+
+    reporter.mark_acknowledged();
+    cmce.tick_start(&mut queue, dltime.add_timeslots(8));
+    let activated_msgs = drain_message_queue(&mut queue);
+    assert_eq!(
+        count_umac_floor_granted(&activated_msgs),
+        1,
+        "caller D-CONNECT BL-ACK should activate the ETSI setup-granted private-simplex U-plane floor"
+    );
+
+    cmce.rx_prim(&mut queue, build_u_tx_demand_msg(TEST_ISSI, call_id));
+    let first_ptt_msgs = drain_message_queue(&mut queue);
+    assert_eq!(
+        count_d_tx_granted(&first_ptt_msgs),
+        2,
+        "explicit U-TX DEMAND from the setup floor holder should notify both private-call parties"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&first_ptt_msgs),
+        1,
+        "explicit U-TX DEMAND from the setup floor holder should refresh exactly one U-plane floor"
+    );
+    assert!(
+        first_ptt_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *got_call_id == call_id && *source_issi == TEST_ISSI && *dest_gssi == TEST_CALLED_ISSI
+        )),
+        "explicit PTT should grant the requesting caller floor"
+    );
+}
+
+#[test]
+fn test_p2p_caller_invalid_call_identifier_during_caller_connect_ack_pending_releases_without_active_teardown() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, dltime);
+    let caller_connect_msgs = drain_message_queue(&mut queue);
+    let caller_reporter = d_connect_reporter(&caller_connect_msgs, TEST_ISSI);
+    caller_reporter.mark_transmitted();
+
+    cmce.rx_prim(
+        &mut queue,
+        build_u_disconnect_pdu_msg(
+            TEST_ISSI,
+            UDisconnect {
+                call_identifier: call_id,
+                disconnect_cause: DisconnectCause::InvalidCallIdentifier,
+                facility: None,
+                proprietary: None,
+            },
+        ),
+    );
+    let mut release_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_d_disconnects(&release_msgs),
+        0,
+        "caller-connect abort must not use established-call D-DISCONNECT"
+    );
+    assert_eq!(
+        count_d_tx_granted(&release_msgs),
+        0,
+        "caller-connect abort must not grant a private floor"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&release_msgs),
+        0,
+        "caller-connect abort must not open U-plane"
+    );
+
+    let releases: Vec<_> = release_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        releases.len(),
+        2,
+        "caller-connect abort should release caller on current signalling and called leg on assigned signalling"
+    );
+    let caller_release = releases
+        .iter()
+        .find(|(prim, _)| prim.main_address.ssi == TEST_ISSI)
+        .expect("caller must receive D-RELEASE");
+    assert_eq!(caller_release.1.call_identifier, call_id);
+    assert_eq!(caller_release.1.disconnect_cause, DisconnectCause::InvalidCallIdentifier);
+    assert!(!caller_release.0.stealing_permission);
+    assert!(caller_release.0.chan_alloc.is_none());
+
+    let called_release = releases
+        .iter()
+        .find(|(prim, _)| prim.main_address.ssi == TEST_CALLED_ISSI)
+        .expect("called MS must receive D-RELEASE");
+    assert_eq!(called_release.1.call_identifier, call_id);
+    assert_eq!(called_release.1.disconnect_cause, DisconnectCause::InvalidCallIdentifier);
+    assert!(called_release.0.stealing_permission);
+    assert!(called_release.0.chan_alloc.is_some());
+    assert!(called_release.0.tx_reporter.is_some());
+
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1);
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "assigned bearer must stay open until called-leg D-RELEASE is locally transmitted"
+    );
+
+    reporters[0].mark_transmitted();
+    cmce.tick_start(&mut queue, dltime.add_timeslots(4));
+    let cleanup_msgs = drain_message_queue(&mut queue);
+    assert!(
+        count_umac_call_ended_or_close(&cleanup_msgs) >= 1,
+        "called-leg D-RELEASE transmission should close the pending connect-abort bearer"
+    );
+
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_msg(TEST_ISSI, TEST_CALLED_ISSI));
+    let fresh_setup_msgs = drain_message_queue(&mut queue);
+    assert_eq!(
+        count_d_setups(&fresh_setup_msgs),
+        1,
+        "connect-abort cleanup must not leave either P2P party busy for the next setup"
+    );
+    assert_eq!(count_d_releases(&fresh_setup_msgs), 0);
+}
+
+#[test]
+fn test_p2p_duplex_u_connect_waits_for_called_delivery_before_caller_d_connect() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    u_setup.simplex_duplex_selection = true;
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(
+        &mut queue,
+        build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, true),
+    );
+    let ack_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_d_connects(&ack_msgs),
+        0,
+        "duplex caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&ack_msgs),
+        0,
+        "duplex direct setup must not synthesize simplex floor before called delivery"
+    );
+
+    let d_connect_acks: Vec<_> = ack_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(d_connect_acks.len(), 1);
+    assert_eq!(d_connect_acks[0].0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(d_connect_acks[0].0.main_address.ssi_type, SsiType::Issi);
+    assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Acknowledged);
+    assert_eq!(d_connect_acks[0].0.unacked_bl_repetitions, None);
+    assert!(d_connect_acks[0].0.chan_alloc.is_some());
+    assert!(d_connect_acks[0].0.tx_reporter.is_some());
+    assert_eq!(d_connect_acks[0].1.call_identifier, call_id);
+    assert_eq!(d_connect_acks[0].1.transmission_grant, TransmissionGrant::Granted);
+
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, TdmaTime { h: 0, m: 1, f: 1, t: 1 });
+    let after_called_ack_msgs = drain_message_queue(&mut queue);
+
+    let d_connects: Vec<_> = after_called_ack_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        d_connects.len(),
+        1,
+        "called D-CONNECT ACK BL-ACK should release exactly one duplex D-CONNECT to the caller"
+    );
+    let (connect_prim, d_connect) = &d_connects[0];
+    assert_eq!(connect_prim.main_address.ssi, TEST_ISSI);
+    assert_eq!(connect_prim.main_address.ssi_type, SsiType::Issi);
+    assert_eq!(connect_prim.layer2service, Layer2Service::Acknowledged);
+    assert!(connect_prim.chan_alloc.is_some());
+    assert!(connect_prim.tx_reporter.is_some());
+    assert_eq!(d_connect.call_identifier, call_id);
+    assert!(d_connect.simplex_duplex_selection);
+    assert_eq!(d_connect.transmission_grant, TransmissionGrant::Granted);
+    assert_eq!(count_umac_floor_granted(&after_called_ack_msgs), 0);
+}
+
+#[test]
+fn test_p2p_called_d_connect_ack_local_discard_retries_before_release() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let mut dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let mut ack_msgs = drain_message_queue(&mut queue);
+    assert_eq!(count_umac_open(&ack_msgs), 1);
+
+    let expected_stealing_by_attempt = [false, false, true, false, true];
+    for (idx, expected_stealing) in expected_stealing_by_attempt.iter().copied().enumerate() {
+        let attempt = idx + 1;
+        assert_eq!(
+            count_d_connect_acknowledges(&ack_msgs),
+            1,
+            "attempt {attempt}: called MS should receive one repeated D-CONNECT ACKNOWLEDGE delivery attempt"
+        );
+        let d_connect_acks: Vec<_> = ack_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(d_connect_acks[0].0.main_address.ssi, TEST_CALLED_ISSI);
+        assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Acknowledged);
+        assert_eq!(d_connect_acks[0].0.unacked_bl_repetitions, None);
+        assert_eq!(
+            d_connect_acks[0].0.stealing_permission, expected_stealing,
+            "attempt {attempt}: D-CONNECT ACK retry should alternate MCCH/current-channel and assigned-channel STCH/FACCH recovery"
+        );
+        assert_eq!(
+            d_connect_acks[0]
+                .0
+                .chan_alloc
+                .as_ref()
+                .expect("called D-CONNECT ACK must carry late channel allocation")
+                .ul_dl_assigned,
+            UlDlAssignment::Both
+        );
+        assert_eq!(d_connect_acks[0].1.call_identifier, call_id);
+        assert!(d_connect_acks[0].0.tx_reporter.is_some());
+        assert_eq!(
+            count_d_connects(&ack_msgs),
+            0,
+            "attempt {attempt}: caller D-CONNECT must remain blocked until called D-CONNECT ACK BL-ACK"
+        );
+        assert_eq!(
+            count_umac_floor_granted(&ack_msgs),
+            0,
+            "attempt {attempt}: UMAC floor must remain blocked until called D-CONNECT ACK BL-ACK"
+        );
+        assert_eq!(
+            count_d_releases(&ack_msgs),
+            0,
+            "attempt {attempt}: release should wait until retries are exhausted"
+        );
+
+        discard_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+        dltime = dltime.add_timeslots(4);
+        cmce.tick_start(&mut queue, dltime);
+        ack_msgs = drain_message_queue(&mut queue);
+    }
+    let fail_msgs = ack_msgs;
+
+    assert_eq!(
+        count_d_connect_acknowledges(&fail_msgs),
+        0,
+        "after retry exhaustion CMCE should stop retrying called D-CONNECT ACKNOWLEDGE"
+    );
+    assert_eq!(
+        count_d_connects(&fail_msgs),
+        0,
+        "caller D-CONNECT must never be sent when called D-CONNECT ACK was never locally transmitted"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&fail_msgs),
+        0,
+        "private floor must never be seeded when called D-CONNECT ACK was never locally transmitted"
+    );
+
+    let releases: Vec<_> = fail_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !releases.is_empty(),
+        "called D-CONNECT ACK retry exhaustion should release the private setup"
+    );
+    for (prim, release) in releases {
+        assert_eq!(release.call_identifier, call_id);
+        assert_eq!(release.disconnect_cause, DisconnectCause::AcknowledgedServiceNotComplete);
+        assert!(prim.main_address.ssi == TEST_ISSI || prim.main_address.ssi == TEST_CALLED_ISSI);
+        assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+        assert!(prim.chan_alloc.is_none());
+    }
+}
+
+#[test]
+fn test_p2p_hook_other_ms_connect_waits_for_called_ack_then_seeds_called_floor() {
+    debug::setup_logging_verbose();
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    u_setup.hook_method_selection = true;
+    u_setup.request_to_transmit_send_data = true;
+    let (_call_id, connect_msgs) = direct_private_simplex_connect_msgs(u_setup);
+
+    assert_private_simplex_caller_d_connect_with_setup_floor(&connect_msgs, TEST_CALLED_ISSI, TEST_ISSI);
+
+    let d_connect = connect_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_ISSI => parse_d_connect(prim),
+            _ => None,
+        })
+        .expect("caller should receive D-CONNECT");
+    assert_eq!(
+        d_connect.transmission_grant,
+        TransmissionGrant::GrantedToOtherUser,
+        "called-first hook setup must preserve ETSI connect grant polarity while BS UMAC floor remains silent"
+    );
+
+    let d_connect_ack = connect_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_CALLED_ISSI => parse_d_connect_acknowledge(prim),
+            _ => None,
+        })
+        .expect("called MS should receive D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(
+        d_connect_ack.transmission_grant,
+        TransmissionGrant::Granted,
+        "called-first hook setup must preserve called MS ETSI transmit grant while BS UMAC floor remains silent"
+    );
+}
+
+#[test]
 fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     debug::setup_logging_verbose();
 
@@ -8639,6 +9906,12 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let connect_msgs = test.dump_sinks();
+    acknowledge_called_d_connect_ack(&connect_msgs, TEST_CALLED_ISSI);
+    test.run_stack(Some(1));
+    let after_called_ack_msgs = test.dump_sinks();
+    acknowledge_first_d_connect(&after_called_ack_msgs);
+    test.run_stack(Some(1));
+    let after_caller_ack_msgs = test.dump_sinks();
 
     assert!(
         count_umac_open(&connect_msgs) >= 1,
@@ -8658,57 +9931,47 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     );
     let simplex_open = open_circuits
         .iter()
-        .find(|circuit| circuit.active_addr == Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)))
-        .expect("simplex P2P should open a caller-owned UMAC traffic circuit");
+        .find(|circuit| circuit.active_addr == Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)))
+        .expect("simplex P2P should open a called-leg primary UMAC traffic circuit for pre-floor ACK attribution");
     // EN 300 392-2 clause 14.5.1.2.1: simple private setup keeps one
     // simplex traffic channel; peer_ts is reserved for duplex cross-routing.
     assert_eq!(simplex_open.peer_ts, None);
     assert_eq!(simplex_open.dl_media_source, CircuitDlMediaSource::LocalLoopback);
     assert_eq!(
         simplex_open.active_secondary_addrs,
-        vec![TetraAddress::issi(TEST_CALLED_ISSI)],
+        vec![TetraAddress::issi(TEST_ISSI)],
         "simplex P2P shared assigned channel must identify both ISSIs so UMAC suspends EG for both active MSs"
     );
     assert_eq!(
         count_umac_floor_granted(&connect_msgs),
-        1,
-        "local private simplex U-CONNECT should synchronize the initial floor into UMAC"
+        0,
+        "local private simplex U-CONNECT must not open U-plane before caller D-CONNECT is delivered"
     );
-    assert!(connect_msgs.iter().any(|msg| {
-        matches!(
-            &msg.msg,
-            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id: got_call_id,
-                source_issi,
-                dest_gssi,
-                ts,
-            }) if *got_call_id == call_id
-                && *source_issi == TEST_ISSI
-                && *dest_gssi == TEST_CALLED_ISSI
-                && *ts == simplex_open.ts
-        )
-    }));
+    assert_eq!(
+        count_umac_floor_granted(&after_called_ack_msgs),
+        0,
+        "called D-CONNECT ACK BL-ACK should send caller D-CONNECT without enabling floor yet"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&after_caller_ack_msgs),
+        1,
+        "caller D-CONNECT L2 ACK should open the ETSI setup-granted U-plane floor"
+    );
     assert_eq!(count_umac_floor_released(&connect_msgs), 0);
+    assert_eq!(count_umac_floor_released(&after_called_ack_msgs), 0);
+    assert_eq!(count_umac_floor_released(&after_caller_ack_msgs), 0);
 
-    let d_connects: Vec<_> = connect_msgs
+    let d_connects: Vec<_> = after_called_ack_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
             SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
             _ => None,
         })
         .collect();
-    assert_eq!(d_connects.len(), 2, "Expected FACCH D-CONNECT plus MCCH fallback");
-    assert!(
-        d_connects
-            .iter()
-            .any(|(prim, _)| prim.stealing_permission && prim.chan_alloc.is_some()),
-        "One D-CONNECT should be sent with FACCH stealing and channel allocation"
-    );
-    assert!(
-        d_connects
-            .iter()
-            .any(|(prim, _)| !prim.stealing_permission && prim.chan_alloc.is_some()),
-        "One D-CONNECT fallback should be sent on MCCH with the same allocation"
+    assert_eq!(
+        d_connects.len(),
+        1,
+        "direct setup sends caller D-CONNECT only after called D-CONNECT ACK BL-ACK"
     );
     for (prim, pdu) in &d_connects {
         assert_eq!(pdu.call_identifier, call_id);
@@ -8718,7 +9981,9 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
         assert!(pdu.call_ownership);
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
         assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
-        assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+        assert_eq!(prim.layer2service, Layer2Service::Acknowledged);
+        assert!(!prim.stealing_permission);
+        assert!(prim.tx_reporter.is_some());
         let chan_alloc = prim.chan_alloc.as_ref().expect("D-CONNECT should carry channel allocation");
         assert_chan_alloc_matches_circuit(chan_alloc, simplex_open.ts, simplex_open.usage, "D-CONNECT");
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
@@ -8731,18 +9996,10 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 2, "Expected FACCH D-CONNECT-ACKNOWLEDGE plus MCCH fallback");
-    assert!(
-        d_connect_acks
-            .iter()
-            .any(|(prim, _)| prim.stealing_permission && prim.chan_alloc.is_some()),
-        "One D-CONNECT-ACKNOWLEDGE should be sent with FACCH stealing and channel allocation"
-    );
-    assert!(
-        d_connect_acks
-            .iter()
-            .any(|(prim, _)| !prim.stealing_permission && prim.chan_alloc.is_some()),
-        "One D-CONNECT-ACKNOWLEDGE fallback should be sent on MCCH with the same allocation"
+    assert_eq!(
+        d_connect_acks.len(),
+        1,
+        "U-CONNECT should first send one acknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
     );
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(pdu.call_identifier, call_id);
@@ -8750,7 +10007,13 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
         assert!(!pdu.transmission_request_permission);
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
-        assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+        assert_eq!(prim.layer2service, Layer2Service::Acknowledged);
+        assert_eq!(prim.unacked_bl_repetitions, None);
+        assert!(
+            !prim.stealing_permission,
+            "called D-CONNECT-ACKNOWLEDGE with channel allocation starts on current-channel signalling; STCH-only stealing is reserved for recovery retry"
+        );
+        assert!(prim.tx_reporter.is_some());
         let chan_alloc = prim
             .chan_alloc
             .as_ref()
@@ -8797,7 +10060,13 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
 
     test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let mut connect_msgs = test.dump_sinks();
+    acknowledge_called_d_connect_ack(&connect_msgs, TEST_CALLED_ISSI);
+    test.run_stack(Some(1));
+    connect_msgs.extend(test.dump_sinks());
+    acknowledge_first_d_connect(&connect_msgs);
+    test.run_stack(Some(1));
+    connect_msgs.extend(test.dump_sinks());
 
     assert_eq!(
         count_umac_open(&connect_msgs),
@@ -8809,16 +10078,16 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
             .iter()
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
-        2,
-        "simple private setup should send FACCH and MCCH D-CONNECT to the caller"
+        1,
+        "simple private setup should send caller D-CONNECT after called D-CONNECT ACK BL-ACK"
     );
     assert_eq!(
         connect_msgs
             .iter()
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
             .count(),
-        2,
-        "simple private setup should send FACCH and MCCH D-CONNECT-ACKNOWLEDGE to the called MS"
+        1,
+        "simple private setup should send one acknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
     );
     assert_eq!(
         count_d_tx_interrupt(&connect_msgs),
@@ -8826,10 +10095,9 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
         "default simple private setup must not use pre-emptive interruption"
     );
 
-    // EN 300 392-2 clause 14.5.1.3.1: after one party sends U-DISCONNECT it
-    // waits for D-RELEASE. The SwMI may also inform the peer leg by D-RELEASE
-    // instead of D-DISCONNECT; for local caller-hangup simplex calls this keeps
-    // the called ISSI on an end-call path with no U-RELEASE response exchange.
+    // EN 300 392-2 clauses 14.5.1.3.1 and 14.5.1.3.3: after one party sends
+    // U-DISCONNECT it waits for D-RELEASE. The SwMI may inform the local
+    // simplex peer by D-RELEASE, which is final and expects no U-RELEASE.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -8842,7 +10110,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
-        "simplex floor-holder U-DISCONNECT must tail-drain before peer D-DISCONNECT"
+        "simplex floor-holder U-DISCONNECT must tail-drain before peer D-RELEASE"
     );
     assert_eq!(
         count_umac_call_ended_or_close(&initiator_release_msgs),
@@ -8860,15 +10128,11 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
     test.run_stack(Some(1));
     let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(
-        count_d_disconnects(&peer_release_msgs),
-        0,
-        "caller-hangup simplex clear must not send D-DISCONNECT to the called ISSI"
-    );
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
     assert_eq!(
@@ -8888,7 +10152,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     assert_eq!(
         count_umac_call_ended_or_close(&test.dump_sinks()),
         0,
-        "called ISSI D-RELEASE transmission alone must wait for prompt caller D-RELEASE delivery"
+        "called ISSI D-RELEASE transmission alone must wait for caller D-RELEASE delivery"
     );
 
     for reporter in &release_ack_reporters {
@@ -8897,7 +10161,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "both D-RELEASE reporter completions should close the simple private call"
+        "peer and initiator D-RELEASE delivery should close the simple private call"
     );
 }
 
@@ -8998,9 +10262,17 @@ fn test_simple_private_call_works_with_transmission_interruption_enabled() {
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
 
     let (call_id, _setup_msgs) = start_p2p_setup(&mut test);
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(TEST_CALLED_ISSI, call_id), TEST_CALLED_ISSI);
+    assert_eq!(
+        connect_msgs
+            .iter()
+            .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
+            .count(),
+        0,
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+    );
+    connect_msgs.extend(after_called_ack_msgs);
 
     // EN 300 392-2 clause 14.5.1.2.1 f) only uses transmission interruption
     // for pre-emptive priority requests during an active transmission. Enabling
@@ -9012,16 +10284,16 @@ fn test_simple_private_call_works_with_transmission_interruption_enabled() {
             .iter()
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
-        2,
-        "simple private call should still send FACCH and MCCH D-CONNECT"
+        1,
+        "simple private call should send one acknowledged caller D-CONNECT after called D-CONNECT ACK BL-ACK"
     );
     assert_eq!(
         connect_msgs
             .iter()
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
             .count(),
-        2,
-        "simple private call should still send FACCH and MCCH D-CONNECT-ACKNOWLEDGE"
+        1,
+        "simple private call should send one acknowledged D-CONNECT ACKNOWLEDGE to the called MS"
     );
 }
 
@@ -9045,14 +10317,22 @@ fn test_simple_private_call_works_with_preemption_default_off() {
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
 
     let (call_id, _setup_msgs) = start_p2p_setup(&mut test);
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(TEST_CALLED_ISSI, call_id), TEST_CALLED_ISSI);
+    assert_eq!(
+        connect_msgs
+            .iter()
+            .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
+            .count(),
+        0,
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+    );
+    connect_msgs.extend(after_called_ack_msgs);
 
     // EN 300 392-2 clauses 14.5.1.2.1 and 14.7.2.3: a simple private
-    // U-CONNECT completes with D-CONNECT to the caller and
-    // D-CONNECT-ACKNOWLEDGE to the called MS. Optional transmission
-    // interruption/pre-emption is not part of this ordinary setup path.
+    // U-CONNECT first sends D-CONNECT-ACKNOWLEDGE to the called MS and, after
+    // BL-ACK of that called-leg signalling, sends D-CONNECT to the caller. Optional
+    // transmission interruption/pre-emption is not part of this ordinary path.
     assert_eq!(count_d_tx_interrupt(&connect_msgs), 0);
     assert_eq!(count_umac_open(&connect_msgs), 1);
     assert_eq!(
@@ -9060,16 +10340,16 @@ fn test_simple_private_call_works_with_preemption_default_off() {
             .iter()
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
-        2,
-        "default-off simple private call should send FACCH and MCCH D-CONNECT"
+        1,
+        "default-off simple private call should send one acknowledged caller D-CONNECT"
     );
     assert_eq!(
         connect_msgs
             .iter()
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
             .count(),
-        2,
-        "default-off simple private call should send FACCH and MCCH D-CONNECT-ACKNOWLEDGE"
+        1,
+        "default-off simple private call should send one acknowledged D-CONNECT ACKNOWLEDGE"
     );
 }
 
@@ -9107,9 +10387,8 @@ fn test_example_config_simple_private_call_works_with_preemption_default_off() {
     assert_eq!(count_d_setups(&setup_msgs), 1);
     assert_eq!(count_d_tx_interrupt(&setup_msgs), 0);
 
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (connect_msgs, _after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(TEST_CALLED_ISSI, call_id), TEST_CALLED_ISSI);
 
     assert_eq!(
         count_umac_open(&connect_msgs),
@@ -9162,9 +10441,8 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
     // has the setup-phase permission.
     assert_eq!(setup.transmission_grant, TransmissionGrant::GrantedToOtherUser);
 
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(TEST_CALLED_ISSI, call_id), TEST_CALLED_ISSI);
 
     let open_circuits: Vec<_> = connect_msgs
         .iter()
@@ -9175,30 +10453,27 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
         .collect();
     assert_eq!(open_circuits.len(), 1, "simplex private call should open one shared traffic bearer");
     let open = open_circuits[0];
-    // EN 300 392-2 clause 14.5.1.2.1 and table 14.74: with on/off-hook
-    // signalling, raw bit 0 asks for caller transmit permission. Keep the CMCE
-    // grant state and UMAC current UL speaker aligned.
+    // Called-leg D-CONNECT-ACKNOWLEDGE delivery precedes caller activation.
+    // The shared bearer therefore keeps the called ISSI primary for setup
+    // assigned-channel signalling attribution; U-plane opens only after the
+    // caller D-CONNECT delivery completes the setup grant.
     assert_eq!(open.peer_ts, None);
-    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)));
+    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
     assert!(
-        open.active_secondary_addrs
-            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
-        "shared simplex private bearer must still keep the called MS active for assigned-channel listening"
+        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
+        "shared simplex private bearer must still keep the calling MS active for assigned-channel listening"
     );
-    assert!(connect_msgs.iter().any(|msg| {
-        matches!(
-            &msg.msg,
-            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id: got_call_id,
-                source_issi,
-                dest_gssi,
-                ts,
-            }) if *got_call_id == call_id
-                && *source_issi == TEST_ISSI
-                && *dest_gssi == TEST_CALLED_ISSI
-                && *ts == open.ts
-        )
-    }));
+    assert_eq!(
+        count_umac_floor_granted(&connect_msgs),
+        0,
+        "private simplex setup must not enable U-plane before caller D-CONNECT L2 ACK"
+    );
+    connect_msgs.extend(after_called_ack_msgs);
+    assert_eq!(
+        count_umac_floor_granted(&connect_msgs),
+        1,
+        "private simplex connect completion should open the ETSI setup-granted U-plane floor"
+    );
 
     let d_connects: Vec<_> = connect_msgs
         .iter()
@@ -9207,7 +10482,11 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
             _ => None,
         })
         .collect();
-    assert_eq!(d_connects.len(), 2, "Expected FACCH D-CONNECT plus MCCH fallback");
+    assert_eq!(
+        d_connects.len(),
+        1,
+        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+    );
     for (_, pdu) in &d_connects {
         // EN 300 392-2 clauses 14.7.1.4/14.7.2.3 keep the same timeout and
         // hook method on D-CONNECT when the simple private call is accepted.
@@ -9225,7 +10504,7 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 2, "Expected FACCH D-CONNECT-ACKNOWLEDGE plus MCCH fallback");
+    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
     for (_, pdu) in &d_connect_acks {
         assert_eq!(pdu.call_identifier, call_id);
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
@@ -9251,14 +10530,22 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
     u_setup.simplex_duplex_selection = true;
     let (call_id, _setup_msgs) = start_p2p_setup_with_u_setup(&mut test, u_setup);
 
-    test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, false));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) = submit_p2p_connect_and_ack_called(
+        &mut test,
+        build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, false),
+        TEST_CALLED_ISSI,
+    );
 
     // EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 allow a called MS
     // that cannot support requested duplex to offer simplex in U-CONNECT.
     // The SwMI must not reject that valid simple private-call answer.
     assert_eq!(count_d_releases(&connect_msgs), 0);
+    assert!(
+        connect_msgs
+            .iter()
+            .all(|msg| !matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+    );
 
     let open_circuits: Vec<_> = connect_msgs
         .iter()
@@ -9277,13 +10564,13 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
         open.peer_ts.is_none(),
         "downgraded simplex private call must not cross-route to a second bearer"
     );
-    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_ISSI, SsiType::Issi)));
+    assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
     assert!(
-        open.active_secondary_addrs
-            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
+        open.active_secondary_addrs.contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
         "downgraded simplex private call must keep both MS awake on the shared assigned channel"
     );
 
+    connect_msgs.extend(after_called_ack_msgs);
     let d_connects: Vec<_> = connect_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
@@ -9291,7 +10578,11 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connects.len(), 2, "Expected FACCH D-CONNECT plus MCCH fallback");
+    assert_eq!(
+        d_connects.len(),
+        1,
+        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+    );
     for (prim, pdu) in &d_connects {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -9306,7 +10597,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 2, "Expected FACCH D-CONNECT-ACKNOWLEDGE plus MCCH fallback");
+    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -9359,11 +10650,19 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
         "D-ALERT must carry the called MS simplex offer to the caller"
     );
 
-    test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, false));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) = submit_p2p_connect_and_ack_called(
+        &mut test,
+        build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, false),
+        TEST_CALLED_ISSI,
+    );
 
     assert_eq!(count_d_releases(&connect_msgs), 0);
+    assert!(
+        connect_msgs
+            .iter()
+            .all(|msg| !matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+    );
     let open_circuits: Vec<_> = connect_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
@@ -9383,10 +10682,11 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
     assert!(
         open_circuits[0]
             .active_secondary_addrs
-            .contains(&TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)),
+            .contains(&TetraAddress::new(TEST_ISSI, SsiType::Issi)),
         "simplex-offered private call must keep both MS awake on the shared assigned channel"
     );
 
+    connect_msgs.extend(after_called_ack_msgs);
     let d_connects: Vec<_> = connect_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
@@ -9394,7 +10694,11 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connects.len(), 2, "Expected FACCH D-CONNECT plus MCCH fallback");
+    assert_eq!(
+        d_connects.len(),
+        1,
+        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+    );
     for (prim, pdu) in &d_connects {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -9409,7 +10713,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 2, "Expected FACCH D-CONNECT-ACKNOWLEDGE plus MCCH fallback");
+    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -9418,7 +10722,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
 }
 
 #[test]
-fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
+fn test_p2p_hook_setup_other_ms_request_seeds_called_setup_floor() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -9451,9 +10755,8 @@ fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
     assert_eq!(d_setups[0].1.call_identifier, call_id);
     assert_eq!(d_setups[0].1.transmission_grant, TransmissionGrant::Granted);
 
-    test.submit_message(build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    test.run_stack(Some(1));
-    let connect_msgs = test.dump_sinks();
+    let (mut connect_msgs, after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(TEST_CALLED_ISSI, call_id), TEST_CALLED_ISSI);
 
     let open_circuits: Vec<_> = connect_msgs
         .iter()
@@ -9470,16 +10773,42 @@ fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
     let open = open_circuits[0];
     // EN 300 392-2 clause 14.5.1.2.1 and table 14.74: with on/off-hook
     // signalling, raw bit 1 asks that the other MS may transmit/send data.
-    // Keep the CMCE grant state and UMAC current speaker aligned so the first
-    // speech burst follows the setup grant.
+    // The connect grant gives the called MS the setup-phase floor. Later
+    // U-TX DEMAND is only a floor refresh/change procedure.
     assert_eq!(open.peer_ts, None);
     assert_eq!(open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
+    let open_ts = open.ts;
     assert_eq!(
         open.active_secondary_addrs,
         vec![TetraAddress::new(TEST_ISSI, SsiType::Issi)],
         "shared simplex private bearer must still keep exactly the calling MS active for assigned-channel listening"
     );
-    assert!(connect_msgs.iter().any(|msg| {
+    assert_eq!(
+        count_umac_floor_granted(&connect_msgs),
+        0,
+        "called-first hook setup must not open U-plane before caller D-CONNECT L2 ACK"
+    );
+    connect_msgs.extend(after_called_ack_msgs);
+    assert_eq!(
+        count_umac_floor_granted(&connect_msgs),
+        1,
+        "called-first hook connect completion should open the called MS setup-granted floor"
+    );
+
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let called_ptt_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_tx_granted(&called_ptt_msgs),
+        2,
+        "called MS explicit U-TX DEMAND should refresh/confirm both private-call parties"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&called_ptt_msgs),
+        1,
+        "called MS explicit U-TX DEMAND should refresh one U-plane floor"
+    );
+    assert!(called_ptt_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -9490,7 +10819,7 @@ fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
             }) if *got_call_id == call_id
                 && *source_issi == TEST_CALLED_ISSI
                 && *dest_gssi == TEST_ISSI
-                && *ts == open.ts
+                && *ts == open_ts
         )
     }));
 
@@ -9501,7 +10830,11 @@ fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connects.len(), 2, "Expected FACCH D-CONNECT plus MCCH fallback");
+    assert_eq!(
+        d_connects.len(),
+        1,
+        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+    );
     for (prim, pdu) in &d_connects {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -9516,7 +10849,7 @@ fn test_p2p_hook_setup_other_ms_request_sets_called_ms_initial_floor() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 2, "Expected FACCH D-CONNECT-ACKNOWLEDGE plus MCCH fallback");
+    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -9792,6 +11125,116 @@ fn test_simplex_p2p_current_floor_holder_u_tx_demand_is_granted_not_denied() {
     assert_eq!(count_d_tx_ceased(&demand_msgs), 0);
     assert_eq!(count_d_releases(&demand_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0);
+}
+
+#[test]
+fn test_simplex_p2p_same_speaker_rekey_during_tx_ceased_tail_suppresses_stale_floor_release() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = LAB_ISSI_B;
+    let called_issi = LAB_ISSI_MXP600;
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, caller_issi, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, called_issi, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_setup_p2p_msg(caller_issi, called_issi));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    let (connect_msgs, _after_called_ack_msgs) =
+        submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(called_issi, call_id), called_issi);
+    let caller_ts = p2p_open_ts_for(&connect_msgs, caller_issi);
+
+    test.submit_message(build_u_tx_ceased_msg(caller_issi, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    test.submit_message(build_u_tx_demand_msg(caller_issi, call_id));
+    test.run_stack(Some(1));
+    let rekey_msgs = test.dump_sinks();
+
+    let grants: Vec<_> = rekey_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grants.len(),
+        2,
+        "same-speaker private rekey should refresh both MSs with D-TX GRANTED"
+    );
+    let requester_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address.ssi == caller_issi && prim.main_address.ssi_type == SsiType::Issi)
+        .expect("same-speaker rekey should grant the requester");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_eq!(
+        requester_grant
+            .0
+            .chan_alloc
+            .as_ref()
+            .expect("requester rekey grant should carry FACCH allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    let listener_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address.ssi == called_issi && prim.main_address.ssi_type == SsiType::Issi)
+        .expect("same-speaker rekey should refresh the listener");
+    assert_eq!(
+        listener_grant.1.transmission_grant,
+        TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    );
+    assert_eq!(
+        listener_grant
+            .0
+            .chan_alloc
+            .as_ref()
+            .expect("listener rekey grant should carry FACCH allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    assert_eq!(count_d_tx_ceased(&rekey_msgs), 0);
+    assert_eq!(count_umac_floor_released(&rekey_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&rekey_msgs), 1);
+    assert!(rekey_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == caller_issi
+                && *dest_gssi == called_issi
+                && *ts == caller_ts
+        )
+    }));
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let stale_tail_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_tx_ceased(&stale_tail_msgs),
+        0,
+        "EN 300 392-2 clause 14.5.1.4.2: a stale D-TX CEASED must not switch U-plane off after the same MS was regranted"
+    );
+    assert_eq!(count_umac_floor_released(&stale_tail_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&stale_tail_msgs), 0);
 }
 
 #[test]
@@ -10195,9 +11638,8 @@ fn test_simplex_p2p_field_issis_u_tx_demand_after_idle_floor_uses_bidirectional_
     let setup_msgs = test.dump_sinks();
     let call_id = first_d_setup_call_id(&setup_msgs);
 
-    test.submit_message(build_u_connect_msg(called_issi, call_id));
-    test.run_stack(Some(1));
-    let _ = test.dump_sinks();
+    let _ = submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(called_issi, call_id), called_issi);
+    let _ = grant_initial_p2p_floor(&mut test, caller_issi, call_id);
 
     test.submit_message(build_u_tx_ceased_msg(caller_issi, call_id));
     test.run_stack(Some(1));
@@ -10293,9 +11735,8 @@ fn test_simplex_p2p_field_issis_non_holder_u_tx_demand_is_queued_not_denied() {
     let setup_msgs = test.dump_sinks();
     let call_id = first_d_setup_call_id(&setup_msgs);
 
-    test.submit_message(build_u_connect_msg(called_issi, call_id));
-    test.run_stack(Some(1));
-    let _ = test.dump_sinks();
+    let _ = submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(called_issi, call_id), called_issi);
+    let _ = grant_initial_p2p_floor(&mut test, caller_issi, call_id);
 
     test.submit_message(build_u_tx_demand_msg(called_issi, call_id));
     test.run_stack(Some(1));
@@ -10340,10 +11781,10 @@ fn test_simplex_p2p_field_issis_queued_handoff_uses_requester_source_both_direct
         let setup_msgs = test.dump_sinks();
         let call_id = first_d_setup_call_id(&setup_msgs);
 
-        test.submit_message(build_u_connect_msg(called_issi, call_id));
-        test.run_stack(Some(1));
-        let connect_msgs = test.dump_sinks();
+        let (connect_msgs, _after_called_ack_msgs) =
+            submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(called_issi, call_id), called_issi);
         let caller_ts = p2p_open_ts_for(&connect_msgs, caller_issi);
+        let _ = grant_initial_p2p_floor(&mut test, caller_issi, call_id);
 
         test.submit_message(build_u_tx_demand_msg(called_issi, call_id));
         test.run_stack(Some(1));
@@ -10452,10 +11893,10 @@ fn test_simplex_p2p_field_issis_queued_u_tx_ceased_withdraws_before_handoff() {
         let setup_msgs = test.dump_sinks();
         let call_id = first_d_setup_call_id(&setup_msgs);
 
-        test.submit_message(build_u_connect_msg(called_issi, call_id));
-        test.run_stack(Some(1));
-        let connect_msgs = test.dump_sinks();
+        let (connect_msgs, _after_called_ack_msgs) =
+            submit_p2p_connect_and_ack_called(&mut test, build_u_connect_msg(called_issi, call_id), called_issi);
         let caller_ts = p2p_open_ts_for(&connect_msgs, caller_issi);
+        let _ = grant_initial_p2p_floor(&mut test, caller_issi, call_id);
 
         test.submit_message(build_u_tx_demand_msg(called_issi, call_id));
         test.run_stack(Some(1));
@@ -10815,7 +12256,7 @@ fn test_unsolicited_private_u_release_does_not_start_disconnect_pending() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_disconnect(prim).is_some()))
             .count(),
         0,
-        "simplex caller U-DISCONNECT should tail-drain before called-peer release"
+        "simplex caller U-DISCONNECT should tail-drain before called-peer D-RELEASE"
     );
     assert_established_p2p_release_pdus_to(
         &disconnect_start_msgs,
@@ -10828,19 +12269,24 @@ fn test_unsolicited_private_u_release_does_not_start_disconnect_pending() {
     test.router
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
     test.run_stack(Some(1));
-    let peer_release_msgs = test.dump_sinks();
-    assert_eq!(
-        count_d_disconnects(&peer_release_msgs),
-        0,
-        "unsolicited U-RELEASE must not force caller-hangup simplex clear back to D-DISCONNECT"
-    );
+    let mut peer_release_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    assert_eq!(peer_release_reporters.len(), 1);
+    peer_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 }
 
 #[test]
@@ -11010,9 +12456,9 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     let call_id = start_active_p2p_call(&mut test);
 
     // EN 300 392-2 clause 14.5.1.3.1: the MS that sent U-DISCONNECT
-    // receives D-RELEASE promptly. The SwMI may inform the other MS by
-    // D-RELEASE; for local simplex caller hangup, send the called peer a
-    // SwMI end-call release instead of a D-DISCONNECT response exchange.
+    // receives D-RELEASE promptly. Clause 14.5.1.3.3 also permits the peer
+    // leg to be cleared with D-RELEASE, which is final and expects no
+    // U-RELEASE response.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -11025,7 +12471,7 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
-        "simplex caller U-DISCONNECT must tail-drain before peer release"
+        "simplex caller U-DISCONNECT must tail-drain before peer D-RELEASE"
     );
     assert_eq!(
         count_umac_call_ended_or_close(&initiator_release_msgs),
@@ -11054,7 +12500,7 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
     assert_eq!(
@@ -11083,7 +12529,7 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     assert_eq!(
         count_umac_call_ended_or_close(&transmitted_peer_release_msgs),
         0,
-        "Peer D-RELEASE transmission alone must not close before caller ACK D-RELEASE is transmitted"
+        "peer D-RELEASE delivery must still wait for the initiator D-RELEASE reporter"
     );
 
     test.run_stack(Some(3));
@@ -11101,7 +12547,151 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     let closed_msgs = test.dump_sinks();
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
-        "Reporter completion should close the P2P traffic circuit"
+        "Reporter completion for both D-RELEASE legs should close the P2P traffic circuit"
+    );
+}
+
+#[test]
+fn test_p2p_disconnect_tail_drain_ignores_late_tx_demands_without_not_granted() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let call_id = start_active_p2p_call(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    // EN 300 392-2 clauses 14.5.1.3.1/14.5.1.3.3 put the established
+    // individual call into disconnection clearance. Floor requests arriving
+    // during the bearer tail drain are stale and must not be answered with
+    // D-TX GRANTED/NotGranted that a terminal can render as PTT denied.
+    for issi in [TEST_CALLED_ISSI, TEST_ISSI] {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+        test.run_stack(Some(1));
+        let demand_msgs = test.dump_sinks();
+        assert_eq!(count_d_tx_granted(&demand_msgs), 0, "late U-TX DEMAND from ISSI {issi}");
+        assert_eq!(count_umac_floor_granted(&demand_msgs), 0, "late U-TX DEMAND from ISSI {issi}");
+        assert_eq!(count_umac_floor_released(&demand_msgs), 0, "late U-TX DEMAND from ISSI {issi}");
+        assert_eq!(count_d_disconnects(&demand_msgs), 0, "late U-TX DEMAND from ISSI {issi}");
+        assert_eq!(count_d_releases(&demand_msgs), 0, "late U-TX DEMAND from ISSI {issi}");
+        assert_eq!(count_umac_call_ended_or_close(&demand_msgs), 0, "late U-TX DEMAND from ISSI {issi}");
+    }
+
+    drain_private_simplex_tail(&mut test, dltime);
+    let mut peer_release_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
+    assert_established_p2p_release_pdus_to(
+        &peer_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_CALLED_ISSI],
+    );
+    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    assert_eq!(peer_release_reporters.len(), 1);
+    peer_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    release_ack_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert!(
+        count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
+        "P2P circuit should close after peer and initiator D-RELEASE delivery"
+    );
+}
+
+#[test]
+fn test_p2p_disconnect_pending_ignores_tx_demands_before_peer_u_release() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let call_id = start_active_p2p_call(&mut test);
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    drain_private_simplex_tail(&mut test, dltime);
+    let mut peer_release_msgs = test.dump_sinks();
+    assert_established_p2p_release_pdus_to(
+        &peer_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_CALLED_ISSI],
+    );
+    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    assert_eq!(peer_release_reporters.len(), 1);
+    peer_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    // After peer D-RELEASE delivery, EN 300 392-2 clause 14.5.1.3.3 leaves
+    // the peer with no response to send. Additional PTT requests are stale
+    // floor control and must not become terminal-visible NotGranted responses.
+    for issi in [TEST_CALLED_ISSI, TEST_ISSI] {
+        test.submit_message(build_u_tx_demand_msg(issi, call_id));
+        test.run_stack(Some(1));
+        let demand_msgs = test.dump_sinks();
+        assert_eq!(
+            count_d_tx_granted(&demand_msgs),
+            0,
+            "disconnect-pending U-TX DEMAND from ISSI {issi}"
+        );
+        assert_eq!(
+            count_umac_floor_granted(&demand_msgs),
+            0,
+            "disconnect-pending U-TX DEMAND from ISSI {issi}"
+        );
+        assert_eq!(
+            count_umac_floor_released(&demand_msgs),
+            0,
+            "disconnect-pending U-TX DEMAND from ISSI {issi}"
+        );
+        assert_eq!(
+            count_d_disconnects(&demand_msgs),
+            0,
+            "disconnect-pending U-TX DEMAND from ISSI {issi}"
+        );
+        assert_eq!(count_d_releases(&demand_msgs), 0, "disconnect-pending U-TX DEMAND from ISSI {issi}");
+        assert_eq!(
+            count_umac_call_ended_or_close(&demand_msgs),
+            0,
+            "disconnect-pending U-TX DEMAND from ISSI {issi}"
+        );
+    }
+
+    release_ack_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert!(
+        count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
+        "P2P circuit should close after peer and initiator D-RELEASE delivery"
     );
 }
 
@@ -11159,11 +12749,8 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
 
     // Field regression for 2260616 -> 2260618: if the MXP600 peer is the
     // current simplex floor holder and the caller presses the red key, keep the
-    // caller D-RELEASE prompt but drain the peer-facing clear before peer
-    // D-RELEASE. EN 300 392-2 clause 14.5.1.3.1 allows the SwMI to inform the
-    // other MS by D-RELEASE as an alternative to D-DISCONNECT; the drain is a
-    // bounded bearer compatibility guard before clearing the active speech
-    // path.
+    // caller D-RELEASE prompt but drain the peer-facing D-RELEASE so bearer
+    // tail bits finish before the terminal receives the final clear.
     test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -11189,15 +12776,11 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
 
     drain_private_simplex_tail(&mut test, dltime);
     let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(
-        count_d_disconnects(&peer_release_msgs),
-        0,
-        "MXP600 peer-floor clear should use D-RELEASE instead of D-DISCONNECT"
-    );
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
@@ -11217,7 +12800,7 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
 }
 
 #[test]
-fn test_p2p_caller_disconnect_releases_mxp600_peer_after_peer_ceased_last_floor() {
+fn test_p2p_caller_disconnect_clears_mxp600_peer_with_d_disconnect_after_peer_ceased_last_floor() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -11278,11 +12861,10 @@ fn test_p2p_caller_disconnect_releases_mxp600_peer_after_peer_ceased_last_floor(
     assert_eq!(count_umac_floor_released(&peer_ceased_tail_msgs), 1);
     assert_eq!(count_umac_call_ended_or_close(&peer_ceased_tail_msgs), 0);
 
-    // Field regression for the live MXP600 reboot: 2260618 was the last
-    // simplex speaker, sent U-TX CEASED, and then 2260616 cleared the call.
-    // Clause 14.5.1.3.1 lets the SwMI inform the other MS by D-RELEASE rather
-    // than D-DISCONNECT; since D-RELEASE expects no U-RELEASE, avoid the peer
-    // response exchange that the MXP600 crashes on.
+    // Field regression for the live MXP600 "No Answer" close: 2260618 was
+    // the last simplex speaker, sent U-TX CEASED, and then 2260616 cleared the
+    // call. Keep a bearer-tail drain before the peer D-RELEASE so final clear
+    // does not race late traffic/floor signalling.
     test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -11295,7 +12877,7 @@ fn test_p2p_caller_disconnect_releases_mxp600_peer_after_peer_ceased_last_floor(
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
-        "caller hangup must not send peer D-DISCONNECT while peer clear is tail-draining"
+        "caller hangup must not send peer D-RELEASE while peer clear is tail-draining"
     );
     assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
     let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
@@ -11306,15 +12888,11 @@ fn test_p2p_caller_disconnect_releases_mxp600_peer_after_peer_ceased_last_floor(
     test.router.set_dl_time(after_disconnect_tail);
     test.run_stack(Some(1));
     let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(
-        count_d_disconnects(&peer_release_msgs),
-        0,
-        "last-speaker MXP600 peer should be cleared by D-RELEASE instead of D-DISCONNECT"
-    );
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
@@ -11369,7 +12947,7 @@ fn test_p2p_caller_disconnect_cancels_pending_peer_tx_ceased_tail() {
 
     // Regression for 2260616 -> 2260618 when the MXP600 releases PTT and the
     // caller presses red before the peer TX-CEASED tail drain expires. The
-    // disconnect release supersedes floor-idle signalling, so no stale
+    // disconnect clear supersedes floor-idle signalling, so no stale
     // D-TX CEASED may leak before the peer D-RELEASE.
     test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
     test.run_stack(Some(1));
@@ -11398,18 +12976,21 @@ fn test_p2p_caller_disconnect_cancels_pending_peer_tx_ceased_tail() {
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
 
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
     assert_eq!(peer_release_reporters.len(), 1);
     peer_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
     release_ack_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "P2P circuit closes after both caller and called-peer D-RELEASE delivery"
+        "P2P circuit closes after caller and peer D-RELEASE"
     );
 }
 
@@ -11430,10 +13011,10 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
 
     // EN 300 392-2 clause 14.5.1.3.1 permits either user application to
     // initiate individual-call disconnection. If the called MS disconnects, it
-    // receives D-RELEASE promptly. Because the calling peer is the current
-    // simplex floor holder, the peer-facing clear waits for the bounded bearer
-    // drain and then uses the D-RELEASE alternative permitted by clause
-    // 14.5.1.3.1.
+    // receives D-RELEASE promptly. Because the calling peer did not request
+    // release, the peer-facing clear waits for the bounded bearer drain and
+    // then uses D-RELEASE, which expects no peer response per clause
+    // 14.5.1.3.3.
     test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let mut called_release_msgs = test.dump_sinks();
@@ -11459,15 +13040,11 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
 
     drain_private_simplex_tail(&mut test, dltime);
     let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(
-        count_d_disconnects(&peer_release_msgs),
-        0,
-        "Peer floor-holder should be cleared by D-RELEASE instead of D-DISCONNECT"
-    );
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
     assert_established_p2p_release_pdus_to(
         &peer_release_msgs,
         call_id,
-        DisconnectCause::SwmiRequestedDisconnection,
+        DisconnectCause::UserRequestedDisconnection,
         &[TEST_ISSI],
     );
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
@@ -11509,7 +13086,7 @@ fn test_p2p_peer_u_disconnect_does_not_ack_pending_d_disconnect() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
 
@@ -11518,11 +13095,11 @@ fn test_p2p_peer_u_disconnect_does_not_ack_pending_d_disconnect() {
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
-    // EN 300 392-2 clauses 14.7.1.6 and 14.7.2.9 make U-RELEASE, not
-    // U-DISCONNECT, the MS acknowledgement to D-DISCONNECT. A peer
-    // U-DISCONNECT during the pending release handshake must not be treated as
-    // the expected acknowledgement and must not trigger final one-leg
-    // D-RELEASE to the original disconnecting MS.
+    // EN 300 392-2 clause 14.5.1.3.3 makes U-RELEASE, not U-DISCONNECT, the
+    // MS acknowledgement to D-DISCONNECT. A peer U-DISCONNECT during the
+    // pending release handshake must not be treated as the expected
+    // acknowledgement and must not trigger final one-leg D-RELEASE to the
+    // original disconnecting MS.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let peer_disconnect_msgs = test.dump_sinks();
@@ -11557,7 +13134,7 @@ fn test_p2p_pending_release_ignores_duplicate_u_disconnect_and_tx_demand() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
 
@@ -11617,7 +13194,7 @@ fn test_p2p_pending_release_large_duplicate_disconnect_ptt_flood_is_ignored_and_
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
 
@@ -11684,7 +13261,7 @@ fn test_p2p_disconnect_pending_suppresses_d_setup_resend() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (_release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
 
@@ -11718,7 +13295,7 @@ fn test_p2p_pending_disconnect_delivery_suppresses_floor_pdus() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (_release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
     assert_eq!(disconnect_reporters[0].get_state(), TxState::Pending);
@@ -11758,7 +13335,7 @@ fn test_p2p_u_disconnect_delivery_guard_falls_back_to_release_without_peer_wait(
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     // EN 300 392-2 clause 14.5.1.3.3 makes U-RELEASE the MS response to
     // D-DISCONNECT. If local delivery is not reported, the BS must not start a
@@ -11822,11 +13399,11 @@ fn test_p2p_discarded_d_disconnect_falls_back_to_d_release() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (_release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
 
-    // EN 300 392-2 clause 14.7.1.6 expects U-RELEASE only after a
+    // EN 300 392-2 clause 14.5.1.3.3 expects U-RELEASE only after a
     // D-DISCONNECT reaches the MS. A local UMAC discard is not transmission, so
     // the SwMI uses the clause 14.5.1.3.2 D-RELEASE path instead of waiting for
     // an impossible peer response.
@@ -12026,7 +13603,7 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    let call_id = start_active_p2p_call(&mut test);
+    let call_id = start_active_duplex_p2p_call(&mut test);
 
     let (_release_ack_reporters, disconnect_reporters) = start_called_party_disconnect_with_peer_d_disconnect(&mut test, dltime, call_id);
 
@@ -12059,33 +13636,19 @@ fn test_p2p_pending_disconnect_closes_after_bounded_timeout() {
             + 1,
     ));
     test.run_stack(Some(1));
-    let release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::UserRequestedDisconnection, &[TEST_ISSI]);
-    assert_eq!(
-        count_umac_call_ended_or_close(&release_msgs),
-        0,
-        "Disconnect timeout should emit D-RELEASE before closing the assigned channel"
-    );
-
-    test.run_stack(Some(20));
-    let early_release_msgs = test.dump_sinks();
-    assert_eq!(
-        count_umac_call_ended_or_close(&early_release_msgs),
-        0,
-        "Fallback D-RELEASE must also wait for the two-second delivery guard before closing"
-    );
-
-    test.router.set_dl_time(dltime.add_timeslots(
-        PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS
-            + PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS
-            + PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS
-            + (2 * PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS)
-            + 1,
-    ));
-    test.run_stack(Some(1));
     let closed_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_releases(&closed_msgs),
+        0,
+        "Delivered D-DISCONNECT peer-response timeout must not emit another peer clear PDU"
+    );
+    assert_eq!(
+        count_d_disconnects(&closed_msgs),
+        0,
+        "Delivered D-DISCONNECT peer-response timeout must not retry D-DISCONNECT"
+    );
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
-        "Local release guard timeout should eventually close a stuck P2P release"
+        "Peer-response timeout should close the stuck P2P circuit locally"
     );
 }

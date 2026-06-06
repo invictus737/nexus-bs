@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
 use tetra_core::freqs::FreqInfo;
@@ -8,6 +8,8 @@ use tetra_pdus::cmce::{
     enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
     pdus::d_tx_granted::DTxGranted,
 };
+use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
@@ -69,11 +71,10 @@ pub struct UmacBs {
     /// Timestamp of last received UL voice frame per timeslot (0-indexed: ts1..ts4).
     /// Used to detect UL inactivity when a radio disappears mid-transmission.
     last_ul_voice: [Option<TdmaTime>; 4],
-    /// Raw NormalTrainSeq2 Block2 TCH/S from LMAC, held until same-burst STCH
-    /// floor-control signalling has drained through CMCE. This preserves valid
-    /// non-stolen half-slot speech without letting stale audio race ahead of a
-    /// U-TX CEASED/FloorReleased event.
-    pending_raw_tch_s_block2: [Option<PendingRawTchSHalfSlot>; 4],
+    /// Private-call UL media from LMAC, held until same-burst STCH floor-control
+    /// signalling has drained through CMCE. This preserves valid TCH/S speech
+    /// without letting stale audio race ahead of a U-TX CEASED/FloorReleased event.
+    pending_private_ul_media: [VecDeque<PendingPrivateUlMedia>; 4],
     /// Current ISSI allowed to send U-plane signalling on each assigned UL
     /// timeslot. MAC-U-SIGNAL has no address field, so STCH signalling such
     /// as U-TX DEMAND / U-TX CEASED must inherit the speaker identity from
@@ -94,26 +95,109 @@ struct PendingTmaReport {
     req_handle: Todo,
     tx_reporter: TxReporter,
     created_at: TdmaTime,
+    context: PendingTmaReportContext,
+}
+
+#[derive(Debug, Clone)]
+struct PendingTmaReportContext {
+    main_address: TetraAddress,
+    endpoint_id: u32,
+    pdu_bits: usize,
+    pdu_prio: Todo,
+    stealing_permission: bool,
+    stealing_repeats_flag: Option<bool>,
+    chan_alloc: Option<PendingTmaChanAllocContext>,
     priority: TmaAdmissionPriority,
+    cmce_pdu_type: Option<CmcePduTypeDl>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingTmaChanAllocContext {
+    usage: Option<u8>,
+    timeslots: [bool; 4],
+    alloc_type: ChanAllocType,
+    ul_dl_assigned: UlDlAssignment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum TmaAdmissionPriority {
     Ordinary,
+    CallControl,
     ChannelAllocation,
     ListenerFloorGrant,
     PositiveFloorGrant,
     FloorWithdraw,
 }
 
-struct PendingRawTchSHalfSlot {
+impl PendingTmaReportContext {
+    fn from_tma_unitdata_req(prim: &TmaUnitdataReq, priority: TmaAdmissionPriority) -> Self {
+        let chan_alloc = prim.chan_alloc.as_ref().map(|chan_alloc| PendingTmaChanAllocContext {
+            usage: chan_alloc.usage,
+            timeslots: chan_alloc.timeslots,
+            alloc_type: chan_alloc.alloc_type,
+            ul_dl_assigned: chan_alloc.ul_dl_assigned,
+        });
+
+        Self {
+            main_address: prim.main_address,
+            endpoint_id: prim.endpoint_id,
+            pdu_bits: prim.pdu.get_len(),
+            pdu_prio: prim.pdu_prio,
+            stealing_permission: prim.stealing_permission,
+            stealing_repeats_flag: prim.stealing_repeats_flag,
+            chan_alloc,
+            priority,
+            cmce_pdu_type: UmacBs::cmce_dl_pdu_type_from_tma_sdu(&prim.pdu),
+        }
+    }
+
+    fn summary(&self) -> String {
+        let chan_alloc = self.chan_alloc.map_or_else(
+            || "none".to_string(),
+            |chan_alloc| {
+                format!(
+                    "usage={:?} timeslots={:?} alloc_type={} ul_dl={}",
+                    chan_alloc.usage, chan_alloc.timeslots, chan_alloc.alloc_type, chan_alloc.ul_dl_assigned
+                )
+            },
+        );
+        format!(
+            "addr={} endpoint_id={} pdu_bits={} pdu_prio={} stealing={} repeats={:?} chan_alloc=[{}] priority={:?} cmce_pdu={:?}",
+            self.main_address,
+            self.endpoint_id,
+            self.pdu_bits,
+            self.pdu_prio,
+            self.stealing_permission,
+            self.stealing_repeats_flag,
+            chan_alloc,
+            self.priority,
+            self.cmce_pdu_type
+        )
+    }
+}
+
+struct PendingPrivateUlMedia {
     ul_ts: u8,
     dl_target_ts: u8,
-    block_num: PhyBlockNum,
-    type5_bits: Vec<u8>,
     received_at: TdmaTime,
     speaker_addr: Option<TetraAddress>,
     peer_ts: Option<u8>,
+    deferred_during_hangtime: bool,
+    media: PendingPrivateUlMediaKind,
+}
+
+enum PendingPrivateUlMediaKind {
+    RawTchSHalfSlot { block_num: PhyBlockNum, type5_bits: Vec<u8> },
+    AcElp { packed_bits: Vec<u8> },
+}
+
+impl PendingPrivateUlMedia {
+    fn label(&self) -> &'static str {
+        match &self.media {
+            PendingPrivateUlMediaKind::RawTchSHalfSlot { .. } => "raw TCH/S",
+            PendingPrivateUlMediaKind::AcElp { .. } => "ACELP",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -126,6 +210,8 @@ const PREDEFINED_BROADCAST_GSSI: u32 = 0xFF_FFFF;
 
 impl UmacBs {
     const MAX_PENDING_TMA_REPORTS: usize = 4096;
+    const MAX_PENDING_PRIVATE_UL_MEDIA_PER_TS: usize = 4;
+    const PENDING_PRIVATE_UL_MEDIA_TTL_TIMESLOTS: i32 = 18;
     // Local guard for a retained TMA-UNITDATA reporter that never reaches a
     // terminal TxReporter state. EN 300 392-2 clause 20.4.1.1.3 defines the
     // report primitive; this timeout only prevents implementation-state leaks.
@@ -148,7 +234,7 @@ impl UmacBs {
             channel_scheduler: BsChannelScheduler::new(scrambling_code, precomps),
             pending_tma_reports: Vec::new(),
             last_ul_voice: [None; 4],
-            pending_raw_tch_s_block2: [None, None, None, None],
+            pending_private_ul_media: std::array::from_fn(|_| VecDeque::new()),
             current_ul_speaker: [None; 4],
             active_energy_saving_suspensions: HashMap::new(),
         }
@@ -164,6 +250,20 @@ impl UmacBs {
     #[doc(hidden)]
     pub fn debug_pending_tma_report_count_for_test(&self) -> usize {
         self.pending_tma_reports.len()
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_tma_report_pending_timeout_timeslots_for_test(&self) -> i32 {
+        Self::TMA_REPORT_PENDING_TIMEOUT_TIMESLOTS
+    }
+
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn debug_force_pending_tma_report_age_for_test(&mut self, age_timeslots: i32) {
+        for report in &mut self.pending_tma_reports {
+            report.created_at = self.dltime.add_timeslots(-age_timeslots);
+        }
     }
 
     fn mark_ms_signalling_activity(&self, addr: TetraAddress, activity_time: TdmaTime) {
@@ -298,6 +398,17 @@ impl UmacBs {
     }
 
     fn initial_ul_speaker_for_open_circuit(circuit: &Circuit) -> Option<TetraAddress> {
+        let private_shared_simplex = circuit.peer_ts.is_none()
+            && matches!(circuit.active_addr, Some(addr) if addr.ssi_type == SsiType::Issi)
+            && circuit.active_secondary_addrs.iter().any(|addr| addr.ssi_type == SsiType::Issi);
+        if private_shared_simplex {
+            // For private simplex on one shared assigned channel, CMCE
+            // FloorGranted is the authoritative U-plane switch. Opening the
+            // bearer only makes the channel/listener context available; it
+            // must not authorize a speaker before D-CONNECT ACK L2 ACK.
+            return None;
+        }
+
         match circuit.active_addr {
             Some(addr) if addr.ssi_type == SsiType::Issi => Some(addr),
             Some(addr) if addr.ssi_type == SsiType::Gssi => circuit
@@ -322,162 +433,349 @@ impl UmacBs {
         self.current_ul_speaker[ts as usize - 1]
     }
 
-    fn discard_pending_raw_tch_s_involving(&mut self, ts: u8, reason: &str) {
+    fn llc_sdu_is_ack_response(sdu: &BitBuffer) -> bool {
+        let probe = BitBuffer::from_bitbuffer(sdu);
+        matches!(
+            probe.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok()),
+            Some(LlcPduType::BlAck | LlcPduType::BlAckFcs | LlcPduType::BlAdata | LlcPduType::BlAdataFcs)
+        )
+    }
+
+    fn pre_floor_private_ack_addr(&self, ts: u8, sdu: &BitBuffer) -> Option<TetraAddress> {
+        if !self.private_simplex_waiting_for_floor_grant(ts) || !Self::llc_sdu_is_ack_response(sdu) {
+            return None;
+        }
+
+        let addr = self.channel_scheduler.ul_circuit_primary_addr(ts)?;
+        (addr.ssi_type == SsiType::Issi).then_some(addr)
+    }
+
+    fn private_simplex_waiting_for_floor_grant(&self, ts: u8) -> bool {
+        self.channel_scheduler.ul_circuit_is_private_participant_scoped(ts)
+            && self.channel_scheduler.ul_circuit_peer_ts(ts).is_none()
+            && self.current_ul_signal_addr(ts).is_none()
+    }
+
+    fn ul_media_speaker_tag(&self, ts: u8) -> Option<TetraAddress> {
+        if !(1..=4).contains(&ts) {
+            return None;
+        }
+
+        // In private simplex on one shared assigned channel, raw TCH/S carries
+        // no ISSI. Around U-TX DEMAND/D-TX GRANTED the first speech half-slot
+        // can arrive before CMCE has updated current_ul_speaker, so tagging it
+        // with the old floor holder would falsely purge the first requester
+        // media. Cross-routed P2P and group calls keep the speaker tag because
+        // their source side is unambiguous enough for stale-media filtering.
+        if self.channel_scheduler.ul_circuit_is_private_participant_scoped(ts) && self.channel_scheduler.ul_circuit_peer_ts(ts).is_none() {
+            None
+        } else {
+            self.current_ul_signal_addr(ts)
+        }
+    }
+
+    fn can_defer_ul_media_during_hangtime(&self, ts: u8) -> bool {
+        use tetra_saps::control::call_control::CircuitDlMediaSource;
+
+        if !(1..=4).contains(&ts) || !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
+            return false;
+        }
+        if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::SwMI {
+            return false;
+        }
+
+        let dl_target_ts = self.channel_scheduler.ul_circuit_peer_ts(ts).unwrap_or(ts);
+        self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts)
+    }
+
+    fn discard_pending_private_ul_media_involving(&mut self, ts: u8, reason: &str) {
         if !(1..=4).contains(&ts) {
             return;
         }
-        for pending in &mut self.pending_raw_tch_s_block2 {
-            let should_discard = pending.as_ref().is_some_and(|raw| raw.ul_ts == ts || raw.dl_target_ts == ts);
-            if should_discard {
-                if let Some(raw) = pending.take() {
+        for pending in &mut self.pending_private_ul_media {
+            pending.retain(|media| {
+                let should_discard = media.ul_ts == ts || media.dl_target_ts == ts;
+                if should_discard {
                     tracing::info!(
-                        "UMAC: dropped deferred raw TCH/S {:?} ul_ts={} dl_ts={} received_at={} because {}",
-                        raw.block_num,
-                        raw.ul_ts,
-                        raw.dl_target_ts,
-                        raw.received_at,
+                        "UMAC: dropped deferred private {} ul_ts={} dl_ts={} received_at={} because {}",
+                        media.label(),
+                        media.ul_ts,
+                        media.dl_target_ts,
+                        media.received_at,
                         reason
                     );
+                }
+                !should_discard
+            });
+        }
+    }
+
+    fn discard_pending_private_ul_media_except_source(
+        &mut self,
+        affected_ts: u8,
+        source_ul_ts: u8,
+        source_addr: TetraAddress,
+        reason: &str,
+    ) {
+        if !(1..=4).contains(&affected_ts) {
+            return;
+        }
+        for pending in &mut self.pending_private_ul_media {
+            pending.retain(|media| {
+                let should_consider = media.ul_ts == affected_ts || media.dl_target_ts == affected_ts;
+                if !should_consider {
+                    return true;
+                }
+
+                let preserve_for_new_source =
+                    media.ul_ts == source_ul_ts && media.speaker_addr.is_none_or(|speaker_addr| speaker_addr == source_addr);
+                if preserve_for_new_source {
+                    return true;
+                }
+
+                tracing::info!(
+                    "UMAC: dropped deferred private {} ul_ts={} dl_ts={} received_at={} because {}",
+                    media.label(),
+                    media.ul_ts,
+                    media.dl_target_ts,
+                    media.received_at,
+                    reason
+                );
+                false
+            });
+        }
+    }
+
+    fn discard_pending_group_ul_media_except_hangtime_source(
+        &mut self,
+        affected_ts: u8,
+        source_ul_ts: u8,
+        source_addr: TetraAddress,
+        reason: &str,
+    ) {
+        if !(1..=4).contains(&affected_ts) {
+            return;
+        }
+        for pending in &mut self.pending_private_ul_media {
+            pending.retain(|media| {
+                let should_consider = media.ul_ts == affected_ts || media.dl_target_ts == affected_ts;
+                if !should_consider {
+                    return true;
+                }
+
+                let preserve_hangtime_media_for_new_source = media.deferred_during_hangtime
+                    && media.ul_ts == source_ul_ts
+                    && media.speaker_addr.is_none_or(|speaker_addr| speaker_addr == source_addr);
+                if preserve_hangtime_media_for_new_source {
+                    return true;
+                }
+
+                tracing::info!(
+                    "UMAC: dropped deferred group {} ul_ts={} dl_ts={} received_at={} because {}",
+                    media.label(),
+                    media.ul_ts,
+                    media.dl_target_ts,
+                    media.received_at,
+                    reason
+                );
+                false
+            });
+        }
+    }
+
+    fn defer_private_ul_media(&mut self, ul_ts: u8, dl_target_ts: u8, media: PendingPrivateUlMediaKind) {
+        if !(1..=4).contains(&ul_ts) {
+            return;
+        }
+        let idx = ul_ts as usize - 1;
+        let speaker_addr = self.ul_media_speaker_tag(ul_ts);
+        let peer_ts = self.channel_scheduler.ul_circuit_peer_ts(ul_ts);
+        let deferred_during_hangtime = self.channel_scheduler.is_hangtime(ul_ts) || self.channel_scheduler.is_hangtime(dl_target_ts);
+        let queue = &mut self.pending_private_ul_media[idx];
+        if queue.len() >= Self::MAX_PENDING_PRIVATE_UL_MEDIA_PER_TS
+            && let Some(old) = queue.pop_front()
+        {
+            tracing::warn!(
+                "UMAC: dropping oldest deferred private {} ul_ts={} dl_ts={} received_at={} because pending media queue reached {} item(s)",
+                old.label(),
+                old.ul_ts,
+                old.dl_target_ts,
+                old.received_at,
+                Self::MAX_PENDING_PRIVATE_UL_MEDIA_PER_TS
+            );
+        }
+        queue.push_back(PendingPrivateUlMedia {
+            ul_ts,
+            dl_target_ts,
+            received_at: self.dltime,
+            speaker_addr,
+            peer_ts,
+            deferred_during_hangtime,
+            media,
+        });
+    }
+
+    fn flush_pending_private_ul_media(&mut self) {
+        for idx in 0..self.pending_private_ul_media.len() {
+            let pending = std::mem::take(&mut self.pending_private_ul_media[idx]);
+            for media in pending {
+                if let Some(media) = self.flush_pending_private_ul_media_item(media) {
+                    self.pending_private_ul_media[idx].push_back(media);
                 }
             }
         }
     }
 
-    fn defer_raw_tch_s_half_slot(&mut self, ul_ts: u8, dl_target_ts: u8, block_num: PhyBlockNum, type5_bits: Vec<u8>) {
-        let idx = ul_ts as usize - 1;
-        if let Some(old) = self.pending_raw_tch_s_block2[idx].take() {
-            tracing::warn!(
-                "UMAC: replacing unflushed raw TCH/S {:?} ul_ts={} dl_ts={} received_at={}; dropping old half-slot",
-                old.block_num,
-                old.ul_ts,
-                old.dl_target_ts,
-                old.received_at
-            );
-        }
-        self.pending_raw_tch_s_block2[idx] = Some(PendingRawTchSHalfSlot {
-            ul_ts,
-            dl_target_ts,
-            block_num,
-            type5_bits,
-            received_at: self.dltime,
-            speaker_addr: self.current_ul_signal_addr(ul_ts),
-            peer_ts: self.channel_scheduler.ul_circuit_peer_ts(ul_ts),
-        });
-    }
-
-    fn flush_pending_raw_tch_s_half_slots(&mut self) {
-        for idx in 0..self.pending_raw_tch_s_block2.len() {
-            let Some(raw) = self.pending_raw_tch_s_block2[idx].take() else {
-                continue;
-            };
-            self.flush_pending_raw_tch_s_half_slot(raw);
-        }
-    }
-
-    fn flush_pending_raw_tch_s_half_slot(&mut self, raw: PendingRawTchSHalfSlot) {
+    fn flush_pending_private_ul_media_item(&mut self, media: PendingPrivateUlMedia) -> Option<PendingPrivateUlMedia> {
         use tetra_saps::control::call_control::CircuitDlMediaSource;
 
-        if !self.channel_scheduler.circuit_is_active(Direction::Ul, raw.ul_ts) {
+        if media.received_at.age(self.dltime) > Self::PENDING_PRIVATE_UL_MEDIA_TTL_TIMESLOTS {
             tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because UL circuit is inactive",
-                raw.block_num,
-                raw.ul_ts
+                "UMAC: dropping deferred private {} ul_ts={} dl_ts={} received_at={} because age exceeded {} timeslots",
+                media.label(),
+                media.ul_ts,
+                media.dl_target_ts,
+                media.received_at,
+                Self::PENDING_PRIVATE_UL_MEDIA_TTL_TIMESLOTS
             );
-            return;
-        }
-        if self.channel_scheduler.is_hangtime(raw.ul_ts) {
-            tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because UL floor is in hangtime",
-                raw.block_num,
-                raw.ul_ts
-            );
-            return;
-        }
-        if raw.speaker_addr.is_some() && self.current_ul_signal_addr(raw.ul_ts) != raw.speaker_addr {
-            tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because the current speaker changed from {:?} to {:?}",
-                raw.block_num,
-                raw.ul_ts,
-                raw.speaker_addr,
-                self.current_ul_signal_addr(raw.ul_ts)
-            );
-            return;
+            return None;
         }
 
-        let current_peer_ts = self.channel_scheduler.ul_circuit_peer_ts(raw.ul_ts);
-        if current_peer_ts != raw.peer_ts {
+        if !self.channel_scheduler.circuit_is_active(Direction::Ul, media.ul_ts) {
             tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because peer_ts changed from {:?} to {:?}",
-                raw.block_num,
-                raw.ul_ts,
-                raw.peer_ts,
+                "UMAC: dropping deferred private {} ul_ts={} because UL circuit is inactive",
+                media.label(),
+                media.ul_ts
+            );
+            return None;
+        }
+        if self.channel_scheduler.is_hangtime(media.ul_ts) {
+            tracing::debug!(
+                "UMAC: keeping deferred private {} ul_ts={} because UL floor is still in hangtime",
+                media.label(),
+                media.ul_ts
+            );
+            return Some(media);
+        }
+        if self.private_simplex_waiting_for_floor_grant(media.ul_ts) {
+            tracing::debug!(
+                "UMAC: keeping deferred private {} ul_ts={} because private simplex has no FloorGranted speaker yet",
+                media.label(),
+                media.ul_ts
+            );
+            return Some(media);
+        }
+        if media.speaker_addr.is_some() && self.current_ul_signal_addr(media.ul_ts) != media.speaker_addr {
+            tracing::debug!(
+                "UMAC: dropping deferred private {} ul_ts={} because the current speaker changed from {:?} to {:?}",
+                media.label(),
+                media.ul_ts,
+                media.speaker_addr,
+                self.current_ul_signal_addr(media.ul_ts)
+            );
+            return None;
+        }
+
+        let current_peer_ts = self.channel_scheduler.ul_circuit_peer_ts(media.ul_ts);
+        if current_peer_ts != media.peer_ts {
+            tracing::debug!(
+                "UMAC: dropping deferred private {} ul_ts={} because peer_ts changed from {:?} to {:?}",
+                media.label(),
+                media.ul_ts,
+                media.peer_ts,
                 current_peer_ts
             );
-            return;
+            return None;
         }
 
         let dl_target_ts = match current_peer_ts {
             Some(peer_ts) => peer_ts,
             None => {
-                if self.channel_scheduler.ul_circuit_dl_media_source(raw.ul_ts) == CircuitDlMediaSource::SwMI {
+                if self.channel_scheduler.ul_circuit_dl_media_source(media.ul_ts) == CircuitDlMediaSource::SwMI {
                     tracing::debug!(
-                        "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because SwMI supplies DL media",
-                        raw.block_num,
-                        raw.ul_ts
+                        "UMAC: dropping deferred private {} ul_ts={} because SwMI supplies DL media",
+                        media.label(),
+                        media.ul_ts
                     );
-                    return;
+                    return None;
                 }
-                raw.ul_ts
+                media.ul_ts
             }
         };
-        if dl_target_ts != raw.dl_target_ts {
+        if dl_target_ts != media.dl_target_ts {
             tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} because DL target changed from {} to {}",
-                raw.block_num,
-                raw.ul_ts,
-                raw.dl_target_ts,
+                "UMAC: dropping deferred private {} ul_ts={} because DL target changed from {} to {}",
+                media.label(),
+                media.ul_ts,
+                media.dl_target_ts,
                 dl_target_ts
             );
-            return;
+            return None;
         }
         if self.channel_scheduler.is_hangtime(dl_target_ts) {
             tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} dl_ts={} because DL target is in hangtime",
-                raw.block_num,
-                raw.ul_ts,
+                "UMAC: keeping deferred private {} ul_ts={} dl_ts={} because DL target is still in hangtime",
+                media.label(),
+                media.ul_ts,
                 dl_target_ts
             );
-            return;
+            return Some(media);
         }
         if !self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
             tracing::debug!(
-                "UMAC: dropping deferred raw TCH/S {:?} ul_ts={} dl_ts={} because DL circuit is inactive",
-                raw.block_num,
-                raw.ul_ts,
+                "UMAC: dropping deferred private {} ul_ts={} dl_ts={} because DL circuit is inactive",
+                media.label(),
+                media.ul_ts,
                 dl_target_ts
             );
-            return;
+            return None;
         }
 
-        tracing::debug!(
-            "UMAC voice route: UL ts={} deferred raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} received_at={} media_source={:?}",
-            raw.ul_ts,
-            raw.block_num,
-            raw.type5_bits.len(),
-            dl_target_ts,
-            current_peer_ts,
-            raw.received_at,
-            self.channel_scheduler.ul_circuit_dl_media_source(raw.ul_ts)
-        );
-        self.channel_scheduler
-            .dl_schedule_raw_tch_s_half_slot(dl_target_ts, raw.block_num, raw.type5_bits);
-        self.last_ul_voice[raw.ul_ts as usize - 1] = Some(raw.received_at);
+        let source_ul_ts = media.ul_ts;
+        let speaker_addr = media.speaker_addr;
+        let received_at = media.received_at;
+        match media.media {
+            PendingPrivateUlMediaKind::RawTchSHalfSlot { block_num, type5_bits } => {
+                tracing::debug!(
+                    "UMAC voice route: UL ts={} deferred raw TCH/S {:?} bits={} -> DL ts={} peer_ts={:?} received_at={} media_source={:?}",
+                    source_ul_ts,
+                    block_num,
+                    type5_bits.len(),
+                    dl_target_ts,
+                    current_peer_ts,
+                    received_at,
+                    self.channel_scheduler.ul_circuit_dl_media_source(source_ul_ts)
+                );
+                self.channel_scheduler.dl_schedule_raw_tch_s_half_slot_from_ul(
+                    dl_target_ts,
+                    source_ul_ts,
+                    speaker_addr,
+                    block_num,
+                    type5_bits,
+                );
+            }
+            PendingPrivateUlMediaKind::AcElp { packed_bits } => {
+                tracing::debug!(
+                    "UMAC voice route: UL ts={} deferred ACELP packed_bytes={} -> DL ts={} peer_ts={:?} received_at={} media_source={:?}",
+                    source_ul_ts,
+                    packed_bits.len(),
+                    dl_target_ts,
+                    current_peer_ts,
+                    received_at,
+                    self.channel_scheduler.ul_circuit_dl_media_source(source_ul_ts)
+                );
+                self.channel_scheduler
+                    .dl_schedule_tmd_from_ul(dl_target_ts, source_ul_ts, speaker_addr, packed_bits);
+            }
+        }
+        self.last_ul_voice[source_ul_ts as usize - 1] = Some(received_at);
         if let Some(peer_ts) = current_peer_ts
             && (1..=4).contains(&peer_ts)
             && self.channel_scheduler.circuit_is_active(Direction::Ul, peer_ts)
         {
-            self.last_ul_voice[peer_ts as usize - 1] = Some(raw.received_at);
+            self.last_ul_voice[peer_ts as usize - 1] = Some(received_at);
         }
+        None
     }
 
     fn floor_media_timeslots(&self, ts: u8) -> [Option<u8>; 2] {
@@ -795,6 +1093,18 @@ impl UmacBs {
     }
 
     fn cmce_dl_payload_from_tma_sdu(sdu: &BitBuffer) -> Option<BitBuffer> {
+        let direct = BitBuffer::from_bitbuffer(sdu);
+        if matches!(
+            direct.peek_bits(5).and_then(|bits| CmcePduTypeDl::try_from(bits).ok()),
+            Some(CmcePduTypeDl::DTxGranted | CmcePduTypeDl::DTxCeased | CmcePduTypeDl::DTxInterrupt)
+        ) {
+            // EN 300 392-2 clauses 14.5.2.2.1 and 23.5 allow assigned-channel
+            // floor control directly on STCH. D-TX INTERRUPT can start with the
+            // same first four bits as LLC BL-UDATA-FCS, so classify direct
+            // floor-control before trying the LLC wrapper.
+            return Some(direct);
+        }
+
         let mut wrapped = BitBuffer::from_bitbuffer(sdu);
         if BlUdata::from_bitbuf(&mut wrapped).is_ok() {
             let discriminator = wrapped
@@ -804,13 +1114,45 @@ impl UmacBs {
             if discriminator == Some(MleProtocolDiscriminator::Cmce) {
                 return Some(wrapped);
             }
+            return None;
         }
 
-        let direct = BitBuffer::from_bitbuffer(sdu);
+        if matches!(
+            direct.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok()),
+            Some(LlcPduType::BlAck | LlcPduType::BlAckFcs | LlcPduType::BlAdata | LlcPduType::BlAdataFcs)
+        ) {
+            return None;
+        }
+        if direct.get_len_remaining() < 10 {
+            return None;
+        }
         direct
             .peek_bits(5)
             .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())
             .map(|_| direct)
+    }
+
+    fn cmce_dl_pdu_type_from_tma_sdu(sdu: &BitBuffer) -> Option<CmcePduTypeDl> {
+        let mut pdu_type_probe = Self::cmce_dl_payload_from_tma_sdu(sdu)?;
+        pdu_type_probe
+            .read_field(5, "cmce_pdu_type_dl")
+            .ok()
+            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok())
+    }
+
+    fn cmce_setup_call_control_priority(pdu_type: CmcePduTypeDl) -> bool {
+        matches!(
+            pdu_type,
+            CmcePduTypeDl::DAlert
+                | CmcePduTypeDl::DCallProceeding
+                | CmcePduTypeDl::DConnect
+                | CmcePduTypeDl::DConnectAcknowledge
+                | CmcePduTypeDl::DDisconnect
+                | CmcePduTypeDl::DRelease
+                | CmcePduTypeDl::DSetup
+                | CmcePduTypeDl::DCallRestore
+                | CmcePduTypeDl::CmceFunctionNotSupported
+        )
     }
 
     fn classify_tma_admission_priority(prim: &TmaUnitdataReq) -> TmaAdmissionPriority {
@@ -819,28 +1161,31 @@ impl UmacBs {
             .as_ref()
             .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both));
         let has_channel_allocation = prim.chan_alloc.is_some();
+        let cmce_pdu_type = Self::cmce_dl_pdu_type_from_tma_sdu(&prim.pdu);
 
         if !prim.stealing_permission {
             return if has_channel_allocation {
                 TmaAdmissionPriority::ChannelAllocation
+            } else if cmce_pdu_type.is_some_and(Self::cmce_setup_call_control_priority) {
+                // EN 300 392-2 clause 14.5.1 call setup/release messages are
+                // C-plane call-control progress. They still obey MAC/EG
+                // scheduling below, but must not be admitted as ordinary SDS/data
+                // when a pending setup is competing with local queue pressure.
+                TmaAdmissionPriority::CallControl
             } else {
                 TmaAdmissionPriority::Ordinary
             };
         }
 
-        let Some(mut pdu_type_probe) = Self::cmce_dl_payload_from_tma_sdu(&prim.pdu) else {
+        let Some(pdu_type) = cmce_pdu_type else {
             return if has_channel_allocation {
                 TmaAdmissionPriority::ChannelAllocation
             } else {
                 TmaAdmissionPriority::Ordinary
             };
         };
-        let pdu_type = pdu_type_probe
-            .read_field(5, "cmce_pdu_type_dl")
-            .ok()
-            .and_then(|bits| CmcePduTypeDl::try_from(bits).ok());
 
-        match pdu_type {
+        match Some(pdu_type) {
             Some(CmcePduTypeDl::DTxInterrupt) | Some(CmcePduTypeDl::DTxCeased) => {
                 // EN 300 392-2 clause 14.5.2.2.1 floor withdrawal/interrupt
                 // is time-critical assigned-channel signalling.
@@ -878,13 +1223,68 @@ impl UmacBs {
         }
     }
 
+    fn d_tx_granted_from_tma_sdu(sdu: &BitBuffer) -> Option<DTxGranted> {
+        let mut payload = Self::cmce_dl_payload_from_tma_sdu(sdu)?;
+        DTxGranted::from_bitbuf(&mut payload).ok()
+    }
+
+    fn tma_sdu_has_acknowledged_basic_link_tx(sdu: &BitBuffer) -> bool {
+        matches!(
+            BitBuffer::from_bitbuffer(sdu)
+                .peek_bits(4)
+                .and_then(|bits| LlcPduType::try_from(bits).ok()),
+            Some(LlcPduType::BlData | LlcPduType::BlDataFcs | LlcPduType::BlAdata | LlcPduType::BlAdataFcs)
+        )
+    }
+
+    fn tma_sdu_is_standalone_ack_only_bl_ack(sdu: &BitBuffer) -> bool {
+        let mut probe = BitBuffer::from_bitbuffer(sdu);
+        if !matches!(
+            probe.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok()),
+            Some(LlcPduType::BlAck | LlcPduType::BlAckFcs)
+        ) {
+            return false;
+        }
+
+        BlAck::from_bitbuf(&mut probe).is_ok_and(|_| probe.get_len_remaining() == 0)
+    }
+
+    fn tma_needs_current_channel_ack_grant(prim: &TmaUnitdataReq) -> bool {
+        if prim.stealing_permission || !Self::tma_sdu_has_acknowledged_basic_link_tx(&prim.pdu) {
+            return false;
+        }
+
+        prim.chan_alloc
+            .as_ref()
+            .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both))
+    }
+
+    fn is_redundant_private_floor_grant_chan_alloc(&self, prim: &TmaUnitdataReq, ts: u8, grant: &DTxGranted) -> bool {
+        if prim.main_address.ssi_type != SsiType::Issi {
+            return false;
+        }
+        if grant.transmission_grant != TransmissionGrant::Granted.into_raw() as u8
+            && grant.transmission_grant != TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        {
+            return false;
+        }
+        if !self.channel_scheduler.ul_circuit_is_private_participant_scoped(ts) {
+            return false;
+        }
+        self.channel_scheduler
+            .circuit_is_active_for_addr(Direction::Dl, ts, prim.main_address)
+            || self
+                .channel_scheduler
+                .circuit_is_active_for_addr(Direction::Ul, ts, prim.main_address)
+    }
+
     fn evict_lower_priority_tma_report(&mut self, queue: &mut MessageQueue, incoming_priority: TmaAdmissionPriority) -> bool {
         let Some((pos, _)) = self
             .pending_tma_reports
             .iter()
             .enumerate()
-            .filter(|(_, pending)| pending.priority < incoming_priority && pending.tx_reporter.get_state() == TxState::Pending)
-            .min_by_key(|(_, pending)| pending.priority)
+            .filter(|(_, pending)| pending.context.priority < incoming_priority && pending.tx_reporter.get_state() == TxState::Pending)
+            .min_by_key(|(_, pending)| pending.context.priority)
         else {
             return false;
         };
@@ -892,12 +1292,13 @@ impl UmacBs {
         let pending = self.pending_tma_reports.remove(pos);
         let removed = self.channel_scheduler.dl_cancel_by_reporter(&pending.tx_reporter);
         if removed == 0 {
-            pending.tx_reporter.mark_discarded();
+            pending.tx_reporter.try_mark_discarded();
         }
         tracing::warn!(
-            "UMAC: evicting queued TMA req_handle={} priority {:?} for incoming priority {:?} under pending-report cap",
+            "UMAC: evicting queued TMA req_handle={} priority {:?} context=\"{}\" for incoming priority {:?} under pending-report cap",
             pending.req_handle,
-            pending.priority,
+            pending.context.priority,
+            pending.context.summary(),
             incoming_priority
         );
         Self::send_tma_report_ind(queue, pending.req_handle, TmaReport::FragmentationFailure);
@@ -909,18 +1310,30 @@ impl UmacBs {
         queue: &mut MessageQueue,
         handle: Todo,
         tx_reporter: Option<TxReporter>,
-        priority: TmaAdmissionPriority,
-    ) -> Option<TxReporter> {
+        context: PendingTmaReportContext,
+        retain_report: bool,
+    ) -> Option<Option<TxReporter>> {
         self.emit_completed_tma_reports(queue);
-        let tx_reporter = tx_reporter.unwrap_or_else(TxReporter::new_unacked);
-        if self.pending_tma_reports.len() >= Self::MAX_PENDING_TMA_REPORTS && !self.evict_lower_priority_tma_report(queue, priority) {
-            tracing::warn!(
-                "UMAC: dropping TMA-UNITDATA req_handle={} priority {:?} because {} pending TMA reports are already retained",
+        if !retain_report {
+            tracing::debug!(
+                "UMAC: TMA-UNITDATA req_handle={} has no TxReporter and no retained TMA report context=\"{}\"",
                 handle,
-                priority,
+                context.summary()
+            );
+            return Some(None);
+        }
+
+        let tx_reporter = tx_reporter.unwrap_or_else(TxReporter::new_unacked);
+        if self.pending_tma_reports.len() >= Self::MAX_PENDING_TMA_REPORTS && !self.evict_lower_priority_tma_report(queue, context.priority)
+        {
+            tracing::warn!(
+                "UMAC: dropping TMA-UNITDATA req_handle={} priority {:?} context=\"{}\" because {} pending TMA reports are already retained",
+                handle,
+                context.priority,
+                context.summary(),
                 self.pending_tma_reports.len()
             );
-            tx_reporter.mark_discarded();
+            tx_reporter.try_mark_discarded();
             Self::send_tma_report_ind(queue, handle, TmaReport::FragmentationFailure);
             return None;
         }
@@ -928,9 +1341,9 @@ impl UmacBs {
             req_handle: handle,
             tx_reporter: tx_reporter.clone(),
             created_at: self.dltime,
-            priority,
+            context,
         });
-        Some(tx_reporter)
+        Some(Some(tx_reporter))
     }
 
     fn rx_tma_cancel_req(&mut self, message: SapMsg) {
@@ -998,11 +1411,18 @@ impl UmacBs {
                 .diff(report.created_at.add_timeslots(Self::TMA_REPORT_PENDING_TIMEOUT_TIMESLOTS))
                 >= 0
             {
+                let age_timeslots = self.dltime.diff(report.created_at);
+                let removed = self.channel_scheduler.dl_cancel_by_reporter(&report.tx_reporter);
                 tracing::warn!(
-                    "UMAC: TMA report req_handle={} timed out after local pending-report guard",
-                    report.req_handle
+                    "UMAC: TMA report req_handle={} timed out after local pending-report guard age_timeslots={} cancelled_queued={} context=\"{}\"",
+                    report.req_handle,
+                    age_timeslots,
+                    removed,
+                    report.context.summary()
                 );
-                report.tx_reporter.mark_discarded();
+                if removed == 0 {
+                    report.tx_reporter.try_mark_discarded();
+                }
                 Self::send_tma_report_ind(queue, report.req_handle, TmaReport::FragmentationFailure);
             } else {
                 pending.push(report);
@@ -1250,7 +1670,8 @@ impl UmacBs {
 
         if second_half_stolen {
             tracing::debug!("rx_mac_data: STCH 2nd half stolen");
-            self.signal_lmac_second_half_stolen(queue);
+            let msg_dltime = self.dltime.add_timeslots(-2);
+            self.signal_lmac_second_half_stolen(queue, msg_dltime);
         }
 
         // Truncate len if past end (okay with standard)
@@ -1833,7 +2254,8 @@ impl UmacBs {
             // STCH instead of TCH. Preserve the current TM-SDU and notify LMAC
             // before it processes block 2, otherwise signalling bits may be
             // passed upward as speech and heard as static.
-            self.signal_lmac_second_half_stolen(queue);
+            let msg_dltime = self.dltime.add_timeslots(-2);
+            self.signal_lmac_second_half_stolen(queue, msg_dltime);
         }
 
         // The remaining bits after the MAC-U-SIGNAL header are the TM-SDU (LLC PDU)
@@ -1846,7 +2268,10 @@ impl UmacBs {
         tracing::debug!("rx_ul_mac_u_signal: forwarding {} bit TM-SDU to LLC", sdu.get_len());
 
         let msg_dltime = self.dltime.add_timeslots(-2);
-        let Some(main_address) = self.current_ul_signal_addr(msg_dltime.t) else {
+        let Some(main_address) = self
+            .current_ul_signal_addr(msg_dltime.t)
+            .or_else(|| self.pre_floor_private_ack_addr(msg_dltime.t, &sdu))
+        else {
             tracing::warn!(
                 "rx_ul_mac_u_signal: dropping STCH TM-SDU because no current ISSI speaker is known for UL ts {}",
                 msg_dltime.t
@@ -1970,10 +2395,16 @@ impl UmacBs {
             return;
         };
         let admission_priority = Self::classify_tma_admission_priority(&prim);
-        let Some(tx_reporter) = self.track_tma_request(queue, prim.req_handle, prim.tx_reporter.take(), admission_priority) else {
+        let report_context = PendingTmaReportContext::from_tma_unitdata_req(&prim, admission_priority);
+        let supplied_tx_reporter = prim.tx_reporter.take();
+        let retain_tma_report = supplied_tx_reporter.is_some() || !Self::tma_sdu_is_standalone_ack_only_bl_ack(&prim.pdu);
+        let Some(tx_reporter) = self.track_tma_request(queue, prim.req_handle, supplied_tx_reporter, report_context, retain_tma_report)
+        else {
             return;
         };
-        let mut sdu = prim.pdu;
+        let needs_current_channel_ack_grant = Self::tma_needs_current_channel_ack_grant(&prim);
+        let current_channel_ack_grant_addr = prim.main_address;
+        let mut sdu = prim.pdu.clone();
 
         // ── FACCH/Stealing path ──────────────────────────────────────────
         // stealing_permission → STCH on traffic channel for time-critical signaling
@@ -2003,9 +2434,18 @@ impl UmacBs {
                     const STCH_CAP: usize = 124;
 
                     let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
+                    let d_tx_granted = Self::d_tx_granted_from_tma_sdu(&sdu);
+                    let omit_redundant_private_floor_chan_alloc = d_tx_granted
+                        .as_ref()
+                        .is_some_and(|grant| self.is_redundant_private_floor_grant_chan_alloc(&prim, ts, grant));
+                    let consume_ra_ack_without_chan_alloc = omit_redundant_private_floor_chan_alloc
+                        && d_tx_granted
+                            .as_ref()
+                            .is_some_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8);
                     let mac_chan_alloc = prim
                         .chan_alloc
                         .as_ref()
+                        .filter(|_| !omit_redundant_private_floor_chan_alloc)
                         .map(|chan_alloc| Self::cmce_to_mac_chanalloc(chan_alloc, self.config.config().cell.main_carrier));
                     let mut mac_pdu = MacResource {
                         fill_bits: false,
@@ -2050,7 +2490,7 @@ impl UmacBs {
                         mac_pdu.random_access_flag = self.channel_scheduler.take_pending_ra_ack_for_stch(
                             ts,
                             prim.main_address,
-                            mac_pdu.chan_alloc_element.is_some(),
+                            mac_pdu.chan_alloc_element.is_some() || consume_ra_ack_without_chan_alloc,
                         );
                         mac_pdu.length_ind = (total_len / 8) as u8;
                         mac_pdu.fill_bits = fill_bits > 0;
@@ -2072,7 +2512,7 @@ impl UmacBs {
                         );
 
                         self.channel_scheduler
-                            .dl_enqueue_stealing(ts, stch_block, prim.main_address, Some(tx_reporter));
+                            .dl_enqueue_stealing(ts, stch_block, prim.main_address, tx_reporter);
 
                         return;
                     }
@@ -2127,7 +2567,22 @@ impl UmacBs {
         // }
         // self.channel_scheduler.dl_enqueue_tma(message.dltime.t, pdu, sdu, prim.tx_reporter);
 
-        self.channel_scheduler.dl_enqueue_tma(pdu, sdu, Some(tx_reporter));
+        if needs_current_channel_ack_grant {
+            // EN 300 392-2 clauses 23.5.2.2 and 23.5.4.3: late-assignment
+            // individual call control may carry channel allocation while still
+            // granting the BL-ACK subslot on the current MCCH. This avoids
+            // asking the MS to acknowledge on a traffic slot that the BS has
+            // already switched to U-plane reception.
+            self.channel_scheduler.dl_enqueue_tma_with_current_channel_ack_grant(
+                pdu,
+                sdu,
+                tx_reporter,
+                current_channel_ack_grant_addr,
+                ReservationRequirement::Req1Subslot,
+            );
+        } else {
+            self.channel_scheduler.dl_enqueue_tma(pdu, sdu, tx_reporter);
+        }
 
         // let enqueue_ts = 1;
         // self.channel_scheduler.dl_enqueue_tma(enqueue_ts, pdu, sdu, prim.tx_reporter);
@@ -2192,13 +2647,6 @@ impl UmacBs {
                     tracing::trace!("rx_tmd_prim: no active UL circuit on ts={}, dropping UL voice", ts);
                     return;
                 }
-                if self.channel_scheduler.is_hangtime(ts) {
-                    tracing::debug!(
-                        "rx_tmd_prim: dropping UL voice on ts={} during hangtime to keep U-plane stopped",
-                        ts
-                    );
-                    return;
-                }
                 enum AcceptedUlMedia {
                     RawTchSHalfSlot { block_num: PhyBlockNum, type5_bits: Vec<u8> },
                     AcElp { original_bits: Vec<u8>, packed_bits: Vec<u8> },
@@ -2228,6 +2676,31 @@ impl UmacBs {
                     tracing::warn!("rx_tmd_prim: unsupported UL voice length {} on ts={}, skipping", data.len(), ts);
                     return;
                 };
+
+                let defer_ul_media_during_hangtime = self.can_defer_ul_media_during_hangtime(ts);
+                if self.channel_scheduler.is_hangtime(ts) && !defer_ul_media_during_hangtime {
+                    tracing::debug!(
+                        "rx_tmd_prim: dropping UL voice on ts={} during hangtime to keep U-plane stopped",
+                        ts
+                    );
+                    return;
+                }
+
+                if self.private_simplex_waiting_for_floor_grant(ts) {
+                    // EN 300 392-2 Annex D.4 delays caller authorization until
+                    // the called D-CONNECT ACK is L2-acknowledged. The private
+                    // simplex bearer may already be open, but U-plane speech
+                    // must wait for CMCE FloorGranted to identify the speaker.
+                    match accepted_media {
+                        AcceptedUlMedia::RawTchSHalfSlot { block_num, type5_bits } => {
+                            self.defer_private_ul_media(ts, ts, PendingPrivateUlMediaKind::RawTchSHalfSlot { block_num, type5_bits });
+                        }
+                        AcceptedUlMedia::AcElp { packed_bits, .. } => {
+                            self.defer_private_ul_media(ts, ts, PendingPrivateUlMediaKind::AcElp { packed_bits });
+                        }
+                    }
+                    return;
+                }
 
                 let mut delivered_media = false;
 
@@ -2278,7 +2751,7 @@ impl UmacBs {
                     }
                 };
 
-                if self.channel_scheduler.is_hangtime(dl_target_ts) {
+                if self.channel_scheduler.is_hangtime(dl_target_ts) && !defer_ul_media_during_hangtime {
                     tracing::debug!(
                         "rx_tmd_prim: dropping UL voice from ts={} because DL target ts={} is in hangtime",
                         ts,
@@ -2288,6 +2761,8 @@ impl UmacBs {
                 }
 
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, dl_target_ts) {
+                    let defer_for_hangtime = defer_ul_media_during_hangtime
+                        && (self.channel_scheduler.is_hangtime(ts) || self.channel_scheduler.is_hangtime(dl_target_ts));
                     match accepted_media {
                         AcceptedUlMedia::RawTchSHalfSlot { block_num, type5_bits } => {
                             tracing::debug!(
@@ -2306,7 +2781,11 @@ impl UmacBs {
                             // until same-burst STCH has drained through CMCE,
                             // so U-TX CEASED/FloorReleased cannot race stale
                             // speech into the downlink scheduler.
-                            self.defer_raw_tch_s_half_slot(ts, dl_target_ts, block_num, type5_bits);
+                            self.defer_private_ul_media(
+                                ts,
+                                dl_target_ts,
+                                PendingPrivateUlMediaKind::RawTchSHalfSlot { block_num, type5_bits },
+                            );
                         }
                         AcceptedUlMedia::AcElp {
                             original_bits,
@@ -2321,8 +2800,22 @@ impl UmacBs {
                                 self.channel_scheduler.ul_circuit_peer_ts(ts),
                                 self.channel_scheduler.ul_circuit_dl_media_source(ts)
                             );
-                            self.channel_scheduler.dl_schedule_tmd(dl_target_ts, packed_bits);
-                            delivered_media = true;
+                            if defer_for_hangtime {
+                                // EN 300 392-2 clauses 14.5.1.4.2 and 23.8.5:
+                                // once the SwMI grants the private floor, the first
+                                // valid TCH/S frame from that speaker must not be
+                                // discarded only because lower-layer grant state was
+                                // still draining through FACCH/STCH.
+                                self.defer_private_ul_media(ts, dl_target_ts, PendingPrivateUlMediaKind::AcElp { packed_bits });
+                            } else {
+                                self.channel_scheduler.dl_schedule_tmd_from_ul(
+                                    dl_target_ts,
+                                    ts,
+                                    self.ul_media_speaker_tag(ts),
+                                    packed_bits,
+                                );
+                                delivered_media = true;
+                            }
                         }
                     }
                 } else {
@@ -2348,15 +2841,19 @@ impl UmacBs {
         }
     }
 
-    fn signal_lmac_second_half_stolen(&mut self, queue: &mut MessageQueue) {
+    fn signal_lmac_second_half_stolen(&mut self, queue: &mut MessageQueue, ul_time: TdmaTime) {
         // Signal LMAC that Block2 is also stolen (STCH, not TCH).
         // Must be Immediate priority so LMAC sees it before processing Block2.
+        // EN 300 392-2 clause 21.4.5 scopes the stolen second half to this
+        // received traffic burst; pass the UL time so LMAC does not apply the
+        // indication to a later private-simplex TCH/S burst on another slot.
         let m = SapMsg {
             sap: Sap::TmvSap,
             src: self.self_component,
             dest: TetraEntity::Lmac,
             msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
                 blk2_stolen: Some(true),
+                time: Some(ul_time),
                 ..Default::default()
             }),
         };
@@ -2423,7 +2920,7 @@ impl UmacBs {
         };
         let ts = circuit.ts;
         let dir = circuit.direction;
-        self.discard_pending_raw_tch_s_involving(ts, "new circuit open/replacement");
+        self.discard_pending_private_ul_media_involving(ts, "new circuit open/replacement");
 
         // Direction::Both needs to be split into separate DL and UL operations
         // because the UMAC circuit manager tracks them independently.
@@ -2466,6 +2963,7 @@ impl UmacBs {
             // Start UL inactivity timer when opening a UL circuit
             if d == Direction::Ul && (1..=4).contains(&ts) {
                 self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                self.clear_current_ul_speaker(ts);
                 if let Some(speaker_addr) = Self::initial_ul_speaker_for_open_circuit(&circuit) {
                     self.set_current_ul_speaker(ts, speaker_addr);
                 }
@@ -2494,7 +2992,7 @@ impl UmacBs {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
-        self.discard_pending_raw_tch_s_involving(ts, "circuit close");
+        self.discard_pending_private_ul_media_involving(ts, "circuit close");
 
         // Direction::Both needs to be split into separate DL and UL close operations
         let dirs: Vec<Direction> = match dir {
@@ -2512,6 +3010,9 @@ impl UmacBs {
                 Some(circuit) => {
                     for addr in circuit.active_addresses() {
                         closed_suspensions.insert(EnergySavingSuspensionKey { ts, addr });
+                    }
+                    if d == Direction::Dl {
+                        self.channel_scheduler.dl_discard_pending_stealing(ts, "DL circuit close");
                     }
                     // Clear UL inactivity timer when closing a UL circuit
                     if d == Direction::Ul && (1..=4).contains(&ts) {
@@ -2588,7 +3089,7 @@ impl UmacBs {
             // Floor-control signals drive traffic↔signalling transitions during hangtime.
             CallControl::FloorReleased { ts, .. } => {
                 for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
-                    self.discard_pending_raw_tch_s_involving(floor_ts, "floor released; U-plane enters hangtime");
+                    self.discard_pending_private_ul_media_involving(floor_ts, "floor released; U-plane enters hangtime");
                     self.channel_scheduler
                         .clear_dl_media_queue(floor_ts, "floor released; U-plane enters hangtime");
                     self.channel_scheduler.set_hangtime(floor_ts, true);
@@ -2605,12 +3106,6 @@ impl UmacBs {
                 dest_gssi,
                 ts,
             } => {
-                for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
-                    self.discard_pending_raw_tch_s_involving(floor_ts, "new floor grant; discard previous speaker media");
-                    self.channel_scheduler
-                        .clear_dl_media_queue(floor_ts, "new floor grant; discard previous speaker media");
-                    self.channel_scheduler.set_hangtime(floor_ts, false);
-                }
                 // Restart UL inactivity timer when new speaker gets floor
                 if (1..=4).contains(&ts) {
                     let source_addr = TetraAddress::issi(source_issi);
@@ -2623,6 +3118,34 @@ impl UmacBs {
                         );
                         return;
                     }
+                    self.set_current_ul_speaker(ts, source_addr);
+                    for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
+                        if private_participant_scoped {
+                            self.discard_pending_private_ul_media_except_source(
+                                floor_ts,
+                                ts,
+                                source_addr,
+                                "new private floor grant; discard previous speaker media",
+                            );
+                            self.channel_scheduler.clear_dl_media_queue_except_source(
+                                floor_ts,
+                                ts,
+                                source_addr,
+                                "new private floor grant; discard previous speaker media",
+                            );
+                        } else {
+                            self.discard_pending_group_ul_media_except_hangtime_source(
+                                floor_ts,
+                                ts,
+                                source_addr,
+                                "new group floor grant; discard previous speaker media",
+                            );
+                            self.channel_scheduler
+                                .clear_dl_media_queue(floor_ts, "new floor grant; discard previous speaker media");
+                        }
+                        self.channel_scheduler.set_hangtime(floor_ts, false);
+                    }
+                    self.flush_pending_private_ul_media();
                     if !private_participant_scoped {
                         let group_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
                         let removed = self
@@ -2639,7 +3162,6 @@ impl UmacBs {
                         }
                     }
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
-                    self.set_current_ul_speaker(ts, source_addr);
                     tracing::info!(
                         "UMAC floor granted: call_id={} source_issi={} dest_gssi={} ul_ts={} peer_ts={:?} media_source={:?} private_participant_scoped={}",
                         call_id,
@@ -2654,7 +3176,7 @@ impl UmacBs {
             }
             CallControl::CallEnded { ts, .. } => {
                 for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
-                    self.discard_pending_raw_tch_s_involving(floor_ts, "call ended");
+                    self.discard_pending_private_ul_media_involving(floor_ts, "call ended");
                     self.channel_scheduler.clear_dl_media_queue(floor_ts, "call ended");
                     self.channel_scheduler.set_hangtime(floor_ts, false);
                     self.last_ul_voice[floor_ts as usize - 1] = None;
@@ -2739,7 +3261,7 @@ impl TetraEntityTrait for UmacBs {
         // Check for UL inactivity (stuck transmitter detection)
         self.check_ul_inactivity(queue);
 
-        self.flush_pending_raw_tch_s_half_slots();
+        self.flush_pending_private_ul_media();
 
         // Collect/construct traffic that should be sent down to the LMAC
         // This is basically the _previous_ timeslot

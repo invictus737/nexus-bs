@@ -5,7 +5,7 @@ use tetra_config::bluestation::StackMode;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhyBlockType, PhysicalChannel, Sap, TdmaTime, TrainingSequence, debug};
 use tetra_entities::lmac::components::{errorcontrol, scrambler};
-use tetra_saps::tmv::{TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel};
+use tetra_saps::tmv::{TmvConfigureReq, TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel};
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -17,7 +17,12 @@ fn acelp_test_bits() -> Vec<u8> {
     (0..274).map(|idx| ((idx * 7 + 3) % 2) as u8).collect()
 }
 
-fn build_downlink_traffic_req_for_ul_ts(logical_channel: LogicalChannel, type1_bits: usize, ul_ts: u8) -> SapMsg {
+fn build_downlink_req_for_ul_phy_chan(
+    logical_channel: LogicalChannel,
+    type1_bits: usize,
+    ul_ts: u8,
+    ul_phy_chan: PhysicalChannel,
+) -> SapMsg {
     SapMsg {
         sap: Sap::TmvSap,
         src: TetraEntity::Umac,
@@ -29,7 +34,7 @@ fn build_downlink_traffic_req_for_ul_ts(logical_channel: LogicalChannel, type1_b
                 f: 1,
                 t: ul_ts,
             },
-            ul_phy_chan: PhysicalChannel::Tp,
+            ul_phy_chan,
             blk1: Some(TmvUnitdataReq {
                 mac_block: BitBuffer::new(type1_bits),
                 logical_channel,
@@ -43,6 +48,10 @@ fn build_downlink_traffic_req_for_ul_ts(logical_channel: LogicalChannel, type1_b
             }),
         }),
     }
+}
+
+fn build_downlink_traffic_req_for_ul_ts(logical_channel: LogicalChannel, type1_bits: usize, ul_ts: u8) -> SapMsg {
+    build_downlink_req_for_ul_phy_chan(logical_channel, type1_bits, ul_ts, PhysicalChannel::Tp)
 }
 
 fn build_downlink_traffic_req(logical_channel: LogicalChannel, type1_bits: usize) -> SapMsg {
@@ -110,6 +119,19 @@ fn build_corrupt_uplink_tch_s_ind() -> SapMsg {
 fn mark_all_ul_timeslots_as_traffic(test: &mut ComponentTest) {
     for ul_ts in 1..=4 {
         test.submit_message(build_downlink_traffic_req_for_ul_ts(LogicalChannel::TchS, 274, ul_ts));
+        test.deliver_all_messages();
+        let _ = test.dump_sinks();
+    }
+}
+
+fn mark_all_ul_timeslots_as_signalling(test: &mut ComponentTest) {
+    for ul_ts in 1..=4 {
+        test.submit_message(build_downlink_req_for_ul_phy_chan(
+            LogicalChannel::SchF,
+            124,
+            ul_ts,
+            PhysicalChannel::Cp,
+        ));
         test.deliver_all_messages();
         let _ = test.dump_sinks();
     }
@@ -211,6 +233,40 @@ fn bs_lmac_recovers_first_fullslot_tch_s_before_ul_phy_channel_marker() {
 }
 
 #[test]
+fn bs_lmac_recovers_fullslot_tch_s_after_hangtime_cp_marker_lag() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+    mark_all_ul_timeslots_as_signalling(&mut test);
+
+    let codec_bits = acelp_test_bits();
+    let encoded = encoded_tch_s(&codec_bits, 1);
+
+    test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq1,
+        PhyBlockNum::Both,
+        encoded,
+    ));
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2, 23.5.2.2.1 and 23.8.5: repeated private-simplex floor re-entry must not lose valid TCH/S only because the UL marker still says CP after hangtime"
+    );
+    assert_eq!(traffic[0].data, codec_bits);
+}
+
+#[test]
 fn bs_lmac_forwards_normal_seq2_block2_tch_s_as_raw_halfslot() {
     debug::setup_logging_verbose();
 
@@ -282,6 +338,92 @@ fn bs_lmac_recovers_first_seq2_block2_tch_s_before_ul_phy_channel_marker() {
         traffic.len(),
         1,
         "EN 300 392-2 clause 23.8.5: a first non-stolen TCH/S half-slot must be preserved while the traffic marker catches up"
+    );
+    assert_eq!(traffic[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
+    assert_eq!(traffic[0].data, expected_raw);
+}
+
+#[test]
+fn bs_lmac_recovers_seq2_block2_tch_s_after_hangtime_cp_marker_lag() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+    mark_all_ul_timeslots_as_signalling(&mut test);
+
+    let codec_bits = acelp_test_bits();
+    let encoded = encoded_tch_s(&codec_bits, 2);
+    let mut expected_raw = vec![0u8; encoded.get_len()];
+    let mut encoded_for_read = encoded.clone();
+    encoded_for_read.to_bitarr(&mut expected_raw);
+
+    test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq2,
+        PhyBlockNum::Block2,
+        encoded,
+    ));
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "EN 300 392-2 clauses 14.5.1.4.2, 23.5 and 23.8.5: a valid second half-slot TCH/S must survive a stale CP marker after D-TX GRANTED"
+    );
+    assert_eq!(traffic[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
+    assert_eq!(traffic[0].data, expected_raw);
+}
+
+#[test]
+fn bs_lmac_ignores_stale_blk2_stolen_marker_for_later_tch_s_block2() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+    mark_all_ul_timeslots_as_traffic(&mut test);
+
+    let codec_bits = acelp_test_bits();
+    let encoded = encoded_tch_s(&codec_bits, 2);
+    let mut expected_raw = vec![0u8; encoded.get_len()];
+    let mut encoded_for_read = encoded.clone();
+    encoded_for_read.to_bitarr(&mut expected_raw);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TmvConfigureReq(TmvConfigureReq {
+            blk2_stolen: Some(true),
+            time: Some(TdmaTime { h: 0, m: 1, f: 1, t: 2 }),
+            ..Default::default()
+        }),
+    });
+    test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq2,
+        PhyBlockNum::Block2,
+        encoded,
+    ));
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "EN 300 392-2 clauses 21.4.5 and 23.8.5: a second-half-stolen indication belongs only to the same received burst and must not suppress a later private-simplex TCH/S Block2"
     );
     assert_eq!(traffic[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
     assert_eq!(traffic[0].data, expected_raw);

@@ -114,6 +114,15 @@ impl CcBsSubentity {
         let pdu = match USetup::from_bitbuf(&mut prim.sdu) {
             Ok(pdu) => {
                 tracing::debug!("<- U-SETUP {:?}", pdu);
+                tracing::info!(
+                    "CMCE: <- U-SETUP from ISSI {} called_party={:?} comm_type={:?} simplex={} hook={} priority={}",
+                    calling_party.ssi,
+                    pdu.called_party_ssi,
+                    pdu.basic_service_information.communication_type,
+                    !pdu.simplex_duplex_selection,
+                    pdu.hook_method_selection,
+                    pdu.call_priority
+                );
                 pdu
             }
             Err(e) => {

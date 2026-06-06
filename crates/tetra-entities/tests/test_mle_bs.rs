@@ -617,6 +617,30 @@ fn test_mle_broadcast_uses_configured_subscriber_class() {
 }
 
 #[test]
+fn test_mle_network_time_broadcast_uses_fresh_single_llc_transmission() {
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.timezone = Some("UTC".to_string());
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { h: 0, m: 20, f: 1, t: 1 }));
+    test.populate_entities(vec![TetraEntity::Mle], vec![TetraEntity::Llc]);
+
+    test.run_stack(Some(1));
+    let broadcast_msgs = test.dump_sinks();
+    let n253 = broadcast_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::TlaTlUnitdataReqBl(prim) if prim.main_address.ssi == 0x00FF_FFFF => Some(prim.n_tlsdu_repeats),
+            _ => None,
+        })
+        .expect("D-NWRK-BROADCAST should be emitted as TL-UNITDATA.req");
+
+    assert_eq!(
+        n253,
+        Some(0),
+        "EN 300 392-2 clause 18.5.24 network time is sampled at PDU construction; do not repeat stale timestamp TL-SDUs via default N.253"
+    );
+}
+
+#[test]
 fn test_mle_broadcast_forces_neighbor_sndcp_service_unavailable() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.neighbor_cell_broadcast = 2;

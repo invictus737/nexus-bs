@@ -24,7 +24,8 @@ pub struct DTxInterrupt {
     /// Type1, 2 bits, Transmission grant
     pub transmission_grant: u8,
     /// Type1, 1 bits, Transmission request permission
-    /// Set to true to signal MSes they are allowed to send a U-TX DEMAND
+    /// EN 300 392-2 14.8.43/table 14.81 bit: false/0 = allowed to
+    /// request transmission, true/1 = not allowed to request transmission.
     pub transmission_request_permission: bool,
     /// Type1, 1 bits, Encryption control
     pub encryption_control: bool,

@@ -23,7 +23,8 @@ pub struct DConnectAcknowledge {
     /// Type1, 2 bits, Transmission grant (clause 14.8.42)
     pub transmission_grant: TransmissionGrant,
     /// Type1, 1 bits, Transmission request permission
-    /// Set to true to signal MSes they are allowed to send a U-TX DEMAND
+    /// EN 300 392-2 14.8.43/table 14.81 bit: false/0 = allowed to
+    /// request transmission, true/1 = not allowed to request transmission.
     pub transmission_request_permission: bool,
     /// Type2, 6 bits, Notification indicator
     pub notification_indicator: Option<u64>,
@@ -172,6 +173,44 @@ mod tests {
     fn serialize_err(pdu: &DConnectAcknowledge) -> PduParseErr {
         let mut buf = BitBuffer::new_autoexpand(64);
         pdu.to_bitbuf(&mut buf).unwrap_err()
+    }
+
+    #[test]
+    fn d_connect_acknowledge_transmission_request_permission_false_serializes_etsi_allowed_zero() {
+        let pdu = DConnectAcknowledge {
+            transmission_request_permission: false,
+            notification_indicator: None,
+            ..base_d_connect_acknowledge()
+        };
+
+        let mut encoded = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut encoded)
+            .expect("serialize D-CONNECT ACKNOWLEDGE with ETSI transmission request permission");
+
+        // EN 300 392-2 14.8.43/table 14.81: raw bit 0 means transmission requests are allowed.
+        assert_eq!(encoded.to_bitstr().chars().nth(25), Some('0'));
+        encoded.seek(0);
+        let decoded = DConnectAcknowledge::from_bitbuf(&mut encoded).expect("parse D-CONNECT ACKNOWLEDGE");
+        assert!(!decoded.transmission_request_permission);
+    }
+
+    #[test]
+    fn d_connect_acknowledge_transmission_request_permission_true_serializes_etsi_not_allowed_one() {
+        let pdu = DConnectAcknowledge {
+            transmission_request_permission: true,
+            notification_indicator: None,
+            ..base_d_connect_acknowledge()
+        };
+
+        let mut encoded = BitBuffer::new_autoexpand(32);
+        pdu.to_bitbuf(&mut encoded)
+            .expect("serialize D-CONNECT ACKNOWLEDGE with ETSI transmission request permission");
+
+        // EN 300 392-2 14.8.43/table 14.81: raw bit 1 means transmission requests are not allowed.
+        assert_eq!(encoded.to_bitstr().chars().nth(25), Some('1'));
+        encoded.seek(0);
+        let decoded = DConnectAcknowledge::from_bitbuf(&mut encoded).expect("parse D-CONNECT ACKNOWLEDGE");
+        assert!(decoded.transmission_request_permission);
     }
 
     #[test]

@@ -10,7 +10,7 @@ const GROUP_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 360 * 4;
 // EN 300 392-2 clauses 14.5.1.3.2/14.5.1.3.3 require D-RELEASE/D-DISCONNECT
 // before the MS clears an established individual call. Keep assigned-channel
 // FACCH/STCH alive long enough for all repeated BL-UDATA fragments to finish;
-// this is a local safety guard, not a replacement for the peer U-RELEASE path.
+// this is a local safety guard, not a replacement for the CMCE clear procedure.
 const INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 const INDIVIDUAL_DISCONNECT_DELIVERY_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 // EN 300 392-2 clause 23.8.5 BS operation mandates this ordering for N=4/8
@@ -52,6 +52,8 @@ impl CcBsSubentity {
             pending_individual_disconnect_deliveries: HashMap::new(),
             pending_individual_disconnect_release_acks: HashMap::new(),
             pending_individual_tx_ceased_tail_drains: HashMap::new(),
+            pending_individual_connect_acks: HashMap::new(),
+            pending_network_individual_connects: HashMap::new(),
             pending_individual_releases: HashMap::new(),
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
@@ -96,7 +98,7 @@ impl CcBsSubentity {
         self.config = config;
     }
 
-    fn cmce_downlink_pdu_prio(sdu: &BitBuffer) -> i32 {
+    pub(in crate::cmce::subentities::cc_bs) fn cmce_downlink_pdu_prio(sdu: &BitBuffer) -> i32 {
         let mut probe = BitBuffer::from_bitbuffer(sdu);
         let pdu_type = probe
             .read_field(5, "cmce_pdu_type_dl")
@@ -142,6 +144,7 @@ impl CcBsSubentity {
                 + self.pending_individual_disconnect_deliveries.len()
                 + self.pending_individual_disconnect_release_acks.len()
                 + self.pending_individual_tx_ceased_tail_drains.len()
+                + self.pending_individual_connect_acks.len()
                 + self.pending_individual_releases.len()
                 + 4,
         );
@@ -154,6 +157,7 @@ impl CcBsSubentity {
         ids.extend(self.pending_individual_disconnect_deliveries.keys().copied());
         ids.extend(self.pending_individual_disconnect_release_acks.keys().copied());
         ids.extend(self.pending_individual_tx_ceased_tail_drains.keys().copied());
+        ids.extend(self.pending_individual_connect_acks.keys().copied());
         ids.extend(self.pending_individual_releases.keys().copied());
         ids.extend(self.circuits.active_call_ids());
         if let Some(session) = &self.echo_session {
@@ -469,12 +473,7 @@ impl CcBsSubentity {
             .unwrap_or(false)
     }
 
-    pub(super) fn first_affiliated_group_floor_requester(
-        &self,
-        call_id: u16,
-        call: &ActiveCall,
-        context: &str,
-    ) -> Option<TetraAddress> {
+    pub(super) fn first_affiliated_group_floor_requester(&self, call_id: u16, call: &ActiveCall, context: &str) -> Option<TetraAddress> {
         call.queued_tx_demands().find(|requester| {
             let affiliated = self.subscriber_affiliated_to_group(requester.ssi, call.dest_gssi);
             if !affiliated {
@@ -1031,11 +1030,10 @@ impl CcBsSubentity {
             };
             let reporter = TxReporter::new_unacked();
             delivery_reporter = Some(reporter.clone());
-            // EN 300 392-2 clauses 14.7.1.6 and 14.5.1.3.3 define
-            // D-DISCONNECT as a downlink request that expects an uplink
-            // U-RELEASE response. Keep the assigned channel response-capable;
-            // the final D-RELEASE path remains DL-only because it expects no
-            // MS response.
+            // EN 300 392-2 clause 14.5.1.3.3 defines D-DISCONNECT as a
+            // downlink request that expects an uplink U-RELEASE response. Keep
+            // the assigned channel response-capable; the final D-RELEASE path
+            // remains DL-only because it expects no MS response.
             Self::build_sapmsg_stealing_ul_dl_reported(sdu, target_addr, target_ts, usage, UlDlAssignment::Both, Some(reporter))
         } else if target_addr.ssi == call_snapshot.calling_addr.ssi {
             Self::build_sapmsg_direct(
@@ -1094,8 +1092,6 @@ impl CcBsSubentity {
         sender: TetraAddress,
         peer_issi: u32,
         disconnect_cause: DisconnectCause,
-        peer_disconnect_cause: DisconnectCause,
-        peer_clear: IndividualDisconnectPeerClear,
     ) {
         if self.pending_individual_disconnect_tail_drains.contains_key(&call_id) {
             tracing::debug!(
@@ -1118,8 +1114,7 @@ impl CcBsSubentity {
         };
 
         tracing::debug!(
-            "CMCE: delaying simplex private peer {:?} call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
-            peer_clear,
+            "CMCE: delaying simplex private peer D-RELEASE call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
             call_id,
             sender.ssi,
             peer_issi
@@ -1130,8 +1125,6 @@ impl CcBsSubentity {
                 sender,
                 peer_issi,
                 cause: disconnect_cause,
-                peer_cause: peer_disconnect_cause,
-                peer_clear,
                 started_at,
             },
         );
@@ -1139,6 +1132,27 @@ impl CcBsSubentity {
 
     pub(super) fn has_pending_individual_disconnect_tail_drain(&self, call_id: u16) -> bool {
         self.pending_individual_disconnect_tail_drains.contains_key(&call_id)
+    }
+
+    pub(super) fn cancel_matching_individual_tx_ceased_tail_drain(&mut self, call_id: u16, sender_issi: u32) -> bool {
+        let should_cancel = self
+            .pending_individual_tx_ceased_tail_drains
+            .get(&call_id)
+            .is_some_and(|pending| pending.sender.addr.ssi == sender_issi);
+        if !should_cancel {
+            return false;
+        }
+
+        if let Some(pending) = self.pending_individual_tx_ceased_tail_drains.remove(&call_id) {
+            tracing::debug!(
+                "CMCE: same-speaker U-TX DEMAND call_id={} from ISSI {} supersedes pending TX-CEASED tail drain; suppressing stale D-TX CEASED/FloorReleased",
+                call_id,
+                pending.sender.addr.ssi
+            );
+            true
+        } else {
+            false
+        }
     }
 
     pub(super) fn drain_pending_individual_tx_ceased_tail_drains(&mut self, queue: &mut MessageQueue) {
@@ -1318,19 +1332,13 @@ impl CcBsSubentity {
                 continue;
             }
 
-            match pending.peer_clear {
-                IndividualDisconnectPeerClear::Disconnect => {
-                    if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, pending.sender, pending.cause)
-                    {
-                        self.begin_individual_disconnect_delivery(call_id, pending.peer_issi, pending.sender.ssi, reporter, pending.cause);
-                    } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                        call.begin_disconnect_pending(pending.peer_issi, pending.sender.ssi, self.dltime, pending.cause);
-                    }
-                }
-                IndividualDisconnectPeerClear::Release => {
-                    self.send_individual_disconnect_peer_release(queue, call_id, pending.peer_issi, pending.peer_cause);
-                }
-            }
+            tracing::info!(
+                "CMCE: simplex private peer clear by D-RELEASE call_id={} peer ISSI {} cause={:?}",
+                call_id,
+                pending.peer_issi,
+                pending.cause
+            );
+            self.send_individual_disconnect_peer_release(queue, call_id, &call_snapshot, pending.cause, pending.peer_issi);
         }
     }
 
@@ -1445,8 +1453,9 @@ impl CcBsSubentity {
 
         // EN 300 392-2 clause 14.5.1.3.1 says the MS that sent
         // U-DISCONNECT waits for D-RELEASE. Send that acknowledgement promptly
-        // to the requesting leg, while the peer leg is cleared separately with
-        // D-DISCONNECT -> U-RELEASE per clauses 14.5.1.3.3 and 14.7.1.6.
+        // to the requesting leg. The peer leg is cleared after the bearer
+        // tail drain by D-RELEASE, a clause 14.5.1.3.3 peer-clear option that
+        // expects no MS response.
         let reporters = self.send_established_individual_release_pdus(queue, call_id, call, disconnect_cause, Some(release_to_issi));
         self.pending_individual_disconnect_release_acks.insert(
             call_id,
@@ -1454,9 +1463,8 @@ impl CcBsSubentity {
                 release_to_issi,
                 cause: disconnect_cause,
                 reporters,
+                peer_release_reporters: Vec::new(),
                 started_at: self.dltime,
-                peer_clear_reporters: Vec::new(),
-                peer_clear_started_at: None,
                 peer_clear_complete: false,
             },
         );
@@ -1467,32 +1475,16 @@ impl CcBsSubentity {
         &mut self,
         queue: &mut MessageQueue,
         call_id: u16,
-        release_to_issi: u32,
+        call: &IndividualCall,
         disconnect_cause: DisconnectCause,
+        peer_issi: u32,
     ) {
-        let Some(call) = self.individual_calls.get(&call_id).cloned() else {
-            return;
-        };
-
-        // EN 300 392-2 clause 14.5.1.3.1 permits the SwMI to inform the
-        // other individual-call MS of clearance by either D-DISCONNECT or
-        // D-RELEASE. For simplex peer-floor shutdown, D-RELEASE avoids a
-        // response exchange while the peer is simultaneously leaving U-plane.
-        tracing::info!(
-            "CMCE: simplex private peer clear by D-RELEASE call_id={} peer ISSI {} cause={:?}",
-            call_id,
-            release_to_issi,
-            disconnect_cause
-        );
-        let reporters = self.send_established_individual_release_pdus(queue, call_id, &call, disconnect_cause, Some(release_to_issi));
-
+        let reporters = self.send_established_individual_release_pdus(queue, call_id, call, disconnect_cause, Some(peer_issi));
         if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
-            pending.peer_clear_reporters = reporters;
-            pending.peer_clear_started_at = Some(self.dltime);
-            pending.peer_clear_complete = pending.peer_clear_reporters.is_empty();
+            pending.peer_release_reporters.extend(reporters);
             self.complete_individual_disconnect_if_ready(queue, call_id);
         } else {
-            self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true, Some(release_to_issi));
+            self.begin_individual_release(queue, call_id, disconnect_cause, Vec::new(), true, Some(peer_issi));
         }
     }
 
@@ -1509,6 +1501,24 @@ impl CcBsSubentity {
         } else {
             self.release_individual_call_to_issi(queue, call_id, disconnect_cause, release_to_issi);
         }
+    }
+
+    pub(super) fn complete_individual_disconnect_peer_clear_without_downlink(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+    ) {
+        if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
+            pending.peer_clear_complete = true;
+            self.complete_individual_disconnect_if_ready(queue, call_id);
+            return;
+        }
+
+        let Some(call) = self.individual_calls.remove(&call_id) else {
+            return;
+        };
+        self.complete_individual_release_cleanup(queue, call_id, call, disconnect_cause, Vec::new(), true);
     }
 
     pub(super) fn release_individual_disconnect_fallback(
@@ -1534,29 +1544,11 @@ impl CcBsSubentity {
     }
 
     pub(super) fn drain_pending_individual_disconnect_release_acks(&mut self, queue: &mut MessageQueue) {
-        for (&call_id, pending) in self.pending_individual_disconnect_release_acks.iter_mut() {
-            if pending.peer_clear_complete || pending.peer_clear_reporters.is_empty() {
-                continue;
-            }
-            let peer_reporters_transmitted = pending.peer_clear_reporters.iter().all(TxReporter::is_transmitted);
-            let peer_started_at = pending.peer_clear_started_at.unwrap_or(pending.started_at);
-            if peer_reporters_transmitted || peer_started_at.age(self.dltime) >= INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS {
-                if !peer_reporters_transmitted {
-                    tracing::warn!(
-                        "CMCE: completing individual peer D-RELEASE call_id={} after local delivery guard cause={:?}",
-                        call_id,
-                        pending.cause
-                    );
-                }
-                pending.peer_clear_complete = true;
-            }
-        }
-
         let ready: Vec<u16> = self
             .pending_individual_disconnect_release_acks
             .iter()
             .filter_map(|(&call_id, pending)| {
-                if pending.peer_clear_complete && self.individual_disconnect_release_ack_done(pending) {
+                if self.individual_disconnect_peer_clear_done(pending) && self.individual_disconnect_release_ack_done(pending) {
                     Some(call_id)
                 } else {
                     None
@@ -1570,15 +1562,24 @@ impl CcBsSubentity {
     }
 
     fn individual_disconnect_release_ack_done(&self, pending: &PendingIndividualDisconnectReleaseAck) -> bool {
-        pending.reporters.iter().all(TxReporter::is_transmitted)
+        pending.reporters.iter().all(TxReporter::is_transmitted) && pending.peer_release_reporters.iter().all(TxReporter::is_transmitted)
             || pending.started_at.age(self.dltime) >= INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS
+    }
+
+    fn individual_disconnect_peer_clear_done(&self, pending: &PendingIndividualDisconnectReleaseAck) -> bool {
+        pending.peer_clear_complete
+            || (!pending.peer_release_reporters.is_empty()
+                && (pending.peer_release_reporters.iter().all(TxReporter::is_transmitted)
+                    || pending.started_at.age(self.dltime) >= INDIVIDUAL_RELEASE_PENDING_TIMEOUT_TIMESLOTS))
     }
 
     fn complete_individual_disconnect_if_ready(&mut self, queue: &mut MessageQueue, call_id: u16) {
         let ready = self
             .pending_individual_disconnect_release_acks
             .get(&call_id)
-            .is_some_and(|pending| pending.peer_clear_complete && self.individual_disconnect_release_ack_done(pending));
+            .is_some_and(|pending| {
+                self.individual_disconnect_peer_clear_done(pending) && self.individual_disconnect_release_ack_done(pending)
+            });
         if !ready {
             return;
         }
@@ -2188,6 +2189,102 @@ impl CcBsSubentity {
         }
     }
 
+    pub(super) fn send_pending_individual_release_direct_ack(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        target: TetraAddress,
+        handle: u32,
+        link_id: u32,
+        endpoint_id: u32,
+        uplink_label: &str,
+    ) -> bool {
+        let Some(pending) = self.pending_individual_releases.get(&call_id) else {
+            return false;
+        };
+
+        tracing::debug!(
+            "CMCE: {} absorbed for private call_id={} from ISSI {} while D-RELEASE is pending; repeating direct D-RELEASE cause={:?}",
+            uplink_label,
+            call_id,
+            target.ssi,
+            pending.cause
+        );
+        let sdu = self.build_individual_release_sdu(call_id, pending.cause);
+        queue.push_back(Self::build_sapmsg_direct(sdu, target, handle, link_id, endpoint_id));
+        true
+    }
+
+    fn send_direct_individual_release_pdu(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        call: &IndividualCall,
+        disconnect_cause: DisconnectCause,
+        target_issi: u32,
+    ) {
+        let sdu = self.build_individual_release_sdu(call_id, disconnect_cause);
+        if target_issi == call.calling_addr.ssi {
+            queue.push_back(Self::build_sapmsg_direct(
+                sdu,
+                call.calling_addr,
+                call.calling_handle,
+                call.calling_link_id,
+                call.calling_endpoint_id,
+            ));
+        } else if target_issi == call.called_addr.ssi {
+            if let (Some(handle), Some(link_id), Some(endpoint_id)) = (call.called_handle, call.called_link_id, call.called_endpoint_id) {
+                queue.push_back(Self::build_sapmsg_direct(sdu, call.called_addr, handle, link_id, endpoint_id));
+            } else {
+                queue.push_back(Self::build_sapmsg(sdu, None, call.called_addr, Layer2Service::Unacknowledged, None));
+            }
+        }
+    }
+
+    fn send_connecting_individual_release_pdus(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        call: &IndividualCall,
+        disconnect_cause: DisconnectCause,
+        release_to_issi: Option<u32>,
+    ) -> Vec<TxReporter> {
+        let mut reporters = Vec::new();
+
+        let send_calling_leg = !call.calling_over_brew && release_to_issi.map_or(true, |issi| issi == call.calling_addr.ssi);
+        let send_called_leg = !call.called_over_brew && release_to_issi.map_or(true, |issi| issi == call.called_addr.ssi);
+
+        if send_calling_leg {
+            // The caller leg is not active until caller D-CONNECT is L2-ACKed.
+            // Release it on the original signalling context so a caller that
+            // rejected the call id does not need to have moved to traffic.
+            self.send_direct_individual_release_pdu(queue, call_id, call, disconnect_cause, call.calling_addr.ssi);
+        }
+
+        if send_called_leg {
+            if matches!(call.state, IndividualCallState::CallerConnectAckPending) {
+                let reporter = TxReporter::new_unacked();
+                let facch = Self::build_sapmsg_stealing_ul_dl_reported(
+                    self.build_individual_release_sdu(call_id, disconnect_cause),
+                    call.called_addr,
+                    call.called_ts,
+                    Some(call.called_usage),
+                    UlDlAssignment::Dl,
+                    Some(reporter.clone()),
+                );
+                queue.push_back(facch);
+                reporters.push(reporter);
+            } else {
+                // Called D-CONNECT ACK has not been L2-ACKed yet. Keep the
+                // rejection/no-answer/invalid cleanup on the called MS's
+                // current signalling context.
+                self.send_direct_individual_release_pdu(queue, call_id, call, disconnect_cause, call.called_addr.ssi);
+            }
+        }
+
+        reporters
+    }
+
     fn send_established_individual_release_pdus(
         &self,
         queue: &mut MessageQueue,
@@ -2203,6 +2300,9 @@ impl CcBsSubentity {
 
         if send_calling_leg {
             let reporter = TxReporter::new_unacked();
+            // Established individual calls already have an assigned channel;
+            // keep release on FACCH/STCH with a reporter so the same MS does
+            // not receive duplicate D-RELEASE copies on MCCH.
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
                 self.build_individual_release_sdu(call_id, disconnect_cause),
                 call.calling_addr,
@@ -2213,19 +2313,13 @@ impl CcBsSubentity {
             );
             queue.push_back(facch);
             reporters.push(reporter);
-
-            let mcch = Self::build_sapmsg(
-                self.build_individual_release_sdu(call_id, disconnect_cause),
-                None,
-                call.calling_addr,
-                Layer2Service::Unacknowledged,
-                None,
-            );
-            queue.push_back(mcch);
         }
 
         if send_called_leg {
             let reporter = TxReporter::new_unacked();
+            // EN 300 392-2 clause 14.5.1.3.1 permits clearing the peer with
+            // D-RELEASE; in an established call it belongs on the assigned
+            // channel rather than as an additional MCCH fallback duplicate.
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
                 self.build_individual_release_sdu(call_id, disconnect_cause),
                 call.called_addr,
@@ -2236,15 +2330,6 @@ impl CcBsSubentity {
             );
             queue.push_back(facch);
             reporters.push(reporter);
-
-            let mcch = Self::build_sapmsg(
-                self.build_individual_release_sdu(call_id, disconnect_cause),
-                None,
-                call.called_addr,
-                Layer2Service::Unacknowledged,
-                None,
-            );
-            queue.push_back(mcch);
         }
 
         reporters
@@ -2285,6 +2370,8 @@ impl CcBsSubentity {
         self.pending_individual_disconnect_deliveries.remove(&call_id);
         self.pending_individual_disconnect_release_acks.remove(&call_id);
         self.pending_individual_tx_ceased_tail_drains.remove(&call_id);
+        self.pending_individual_connect_acks.remove(&call_id);
+        self.pending_network_individual_connects.remove(&call_id);
 
         if notify_brew
             && (call.called_over_brew || call.calling_over_brew)
@@ -2388,6 +2475,8 @@ impl CcBsSubentity {
         self.pending_individual_disconnect_deliveries.remove(&call_id);
         self.pending_individual_disconnect_release_acks.remove(&call_id);
         self.pending_individual_tx_ceased_tail_drains.remove(&call_id);
+        self.pending_individual_connect_acks.remove(&call_id);
+        self.pending_network_individual_connects.remove(&call_id);
 
         let Some(call_snapshot) = self.individual_calls.remove(&call_id) else {
             tracing::warn!("No individual call for call_id={}", call_id);
@@ -2400,14 +2489,17 @@ impl CcBsSubentity {
 
         const SETUP_RELEASE_REPEATS: usize = 3;
 
-        if call_snapshot.has_established_circuit() {
+        if call_snapshot.has_assigned_circuit() {
             // EN 300 392-2 14.5.1.3.2 says the SwMI sends D-RELEASE to both
             // MSs and subsequently releases the call. Assigned-mode MSs receive
             // CC signalling on the assigned channel, so keep the circuit open
             // until FACCH/STCH D-RELEASE transmission is reported or a local
             // guard timeout expires.
-            let reporters =
-                self.send_established_individual_release_pdus(queue, call_id, &call_snapshot, disconnect_cause, release_to_issi);
+            let reporters = if call_snapshot.is_connect_ack_pending() {
+                self.send_connecting_individual_release_pdus(queue, call_id, &call_snapshot, disconnect_cause, release_to_issi)
+            } else {
+                self.send_established_individual_release_pdus(queue, call_id, &call_snapshot, disconnect_cause, release_to_issi)
+            };
             self.pending_individual_releases.insert(
                 call_id,
                 PendingIndividualRelease {
@@ -2543,7 +2635,7 @@ impl CcBsSubentity {
         if let Some((&id, _)) = self
             .individual_calls
             .iter()
-            .find(|(_, c)| c.has_established_circuit() && (c.calling_ts == ts || c.called_ts == ts))
+            .find(|(_, c)| c.has_assigned_circuit() && (c.calling_ts == ts || c.called_ts == ts))
         {
             return Some(id);
         }

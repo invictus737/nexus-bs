@@ -250,13 +250,7 @@ impl MmBs {
             return false;
         }
 
-        let cfg = config.config();
-        let local_ranges = &cfg.cell.local_ssi_ranges;
-        if !local_ranges.as_slice().is_empty() && !local_ranges.contains(issi) {
-            return false;
-        }
-
-        cfg.security.is_issi_allowed(issi)
+        config.config().security.is_issi_allowed(issi)
     }
 
     fn parse_restart_recovery_group_spec(spec: &str) -> Result<(u32, GroupAttachmentInfo), String> {
@@ -408,7 +402,7 @@ impl MmBs {
                 issis.insert(issi);
             } else {
                 tracing::warn!(
-                    "MM: restart recovery cache ISSI {} ignored because it is outside local policy/whitelist",
+                    "MM: restart recovery cache ISSI {} ignored because it is outside air-interface/security policy",
                     issi
                 );
             }
@@ -1988,10 +1982,16 @@ impl MmBs {
         // Try to register the client
         let issi = received_issi;
         let handle = prim.handle;
-        let location_update_carries_group_state =
-            pdu.group_identity_location_demand.is_some() || Self::group_report_response_is_complete(&pdu);
+        let location_update_has_group_identity_location_demand = pdu.group_identity_location_demand.is_some();
+        let group_report_complete = Self::group_report_response_is_complete(&pdu);
+        let location_update_carries_group_state = location_update_has_group_identity_location_demand || group_report_complete;
         let was_solicited_group_report_pending = self.solicited_group_report_pending(issi);
         let was_restart_recovery_candidate = self.restart_recovery.contains_key(&issi);
+        let defer_shared_registration_for_incomplete_solicited_report = pdu.location_update_type
+            == LocationUpdateType::DemandLocationUpdating
+            && !location_update_has_group_identity_location_demand
+            && !group_report_complete
+            && (was_solicited_group_report_pending || was_restart_recovery_candidate);
 
         // ISSI whitelist check — reject if whitelist is non-empty and ISSI not in it.
         // The dashboard can override the config whitelist at runtime (state override takes
@@ -2132,7 +2132,21 @@ impl MmBs {
         if is_new {
             match self.client_mgr.try_register_client(issi, true) {
                 Ok(_) => {
-                    self.config.state_write().subscribers.register(issi);
+                    if defer_shared_registration_for_incomplete_solicited_report {
+                        // EN 300 392-2 clause 16.4.4 requires a terminal
+                        // answering a SwMI group-report request to either report
+                        // groups or send group-report-complete when it has none.
+                        // Until one of those standardized completions arrives,
+                        // keep MM internally addressable but do not publish a
+                        // stable "registered with no groups" state to
+                        // CMCE/dashboard.
+                        tracing::info!(
+                            "MM: ISSI {} answered D-LOCATION-UPDATE-COMMAND without groups or group-report-complete; keeping shared subscriber state pending",
+                            issi
+                        );
+                    } else {
+                        self.config.state_write().subscribers.register(issi);
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Failed registering roaming MS {}: {:?}", issi, e);
@@ -2143,7 +2157,7 @@ impl MmBs {
             tracing::warn!("Failed updating roaming MS {}: {:?}", issi, e);
             return;
         }
-        if needs_brew_register {
+        if needs_brew_register && !defer_shared_registration_for_incomplete_solicited_report {
             if !is_new {
                 tracing::info!(
                     "MM: ISSI {} re-attaching via ItsiAttach (returned from another network) — re-registering in Brew",
@@ -2192,10 +2206,8 @@ impl MmBs {
             self.set_client_stay_alive(issi);
         }
 
-        let group_report_complete = Self::group_report_response_is_complete(&pdu);
-
         // Process optional GroupIdentityLocationDemand field
-        let _has_groups = pdu.group_identity_location_demand.is_some();
+        let _has_groups = location_update_has_group_identity_location_demand;
         let mut cached_restart_group_refresh = CachedRestartGroupRefresh {
             groups: Vec::new(),
             remaining: Vec::new(),

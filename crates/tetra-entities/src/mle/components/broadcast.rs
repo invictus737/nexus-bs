@@ -182,7 +182,11 @@ impl MleBroadcast {
                 air_interface_encryption: None,
                 stealing_repeats_flag: None,
                 packet_data_flag: false,
-                n_tlsdu_repeats: None,
+                // EN 300 392-2 clause 18.5.24 network time is sampled at
+                // PDU construction. Do not let LLC repeat an old timestamp as
+                // N.253+1 BL-UDATA copies; the next broadcast slot will carry
+                // a fresh value.
+                n_tlsdu_repeats: Some(0),
                 data_class_info: None,
                 req_handle,
                 chan_alloc: None,

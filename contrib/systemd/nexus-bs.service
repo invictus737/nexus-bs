@@ -1,4 +1,12 @@
-# Sample systemd service file for Nexus-BS v0.1.55
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.56.
+#
+# New deployments should prefer:
+#   contrib/systemd/nexus-bs@.service
+#   contrib/systemd/nexus-bs-control@.service
+#   contrib/systemd/journald-nexus-bs-volatile.conf
+#
+# Those templates keep runtime state under /run/nexus-bs-USER and use volatile
+# circular journald logging, which is better for read-only/appliance Pi images.
 #
 # Installation: (as root or with sudo)
 # - adapt your user/group and paths, sample assumes:
@@ -17,7 +25,7 @@
 # - see log with "journalctl -u nexus-bs --output=cat -f"
 
 [Unit]
-Description=Nexus-BS v0.1.55 TETRA base station service
+Description=Nexus-BS v0.1.56 TETRA base station service
 # network-online.target ensures the interface is UP and routable,
 # not just "declared active" like network.target.
 After=network-online.target
