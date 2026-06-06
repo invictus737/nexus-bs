@@ -75,6 +75,7 @@ const PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS: i32 = 16;
+const PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS: u8 = 3;
 
 fn unique_restart_recovery_path(label: &str) -> String {
     let nanos = std::time::SystemTime::now()
@@ -2059,12 +2060,6 @@ fn called_d_connect_ack_reporter(msgs: &[SapMsg], called_issi: u32) -> tetra_cor
 fn discard_called_d_connect_ack(msgs: &[SapMsg], called_issi: u32) {
     let reporter = called_d_connect_ack_reporter(msgs, called_issi);
     reporter.mark_discarded();
-}
-
-fn lose_called_d_connect_ack(msgs: &[SapMsg], called_issi: u32) {
-    let reporter = called_d_connect_ack_reporter(msgs, called_issi);
-    reporter.mark_transmitted();
-    reporter.mark_lost();
 }
 
 fn count_d_connect_acknowledges(msgs: &[SapMsg]) -> usize {
@@ -9219,12 +9214,15 @@ fn test_p2p_u_connect_waits_for_called_delivery_then_caller_d_connect_before_set
         .collect();
     assert_eq!(d_connect_acks.len(), 1);
     assert_eq!(d_connect_acks[0].0.main_address.ssi, TEST_CALLED_ISSI);
-    assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Acknowledged);
+    assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Unacknowledged);
     assert!(
         !d_connect_acks[0].0.stealing_permission,
         "first called D-CONNECT ACK with late assignment starts on the current channel; assigned-channel recovery remains for local MAC failure retries"
     );
-    assert_eq!(d_connect_acks[0].0.unacked_bl_repetitions, None);
+    assert_eq!(
+        d_connect_acks[0].0.unacked_bl_repetitions,
+        Some(PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS)
+    );
     let chan_alloc = d_connect_acks[0]
         .0
         .chan_alloc
@@ -9236,12 +9234,12 @@ fn test_p2p_u_connect_waits_for_called_delivery_then_caller_d_connect_before_set
     assert_eq!(
         count_d_connects(&after_called_delivery_msgs),
         1,
-        "called D-CONNECT ACK BL-ACK should release caller D-CONNECT"
+        "called D-CONNECT ACK local unacknowledged delivery should release caller D-CONNECT"
     );
     assert_eq!(
         count_umac_floor_granted(&after_called_delivery_msgs),
         0,
-        "called D-CONNECT ACK BL-ACK should send caller D-CONNECT without enabling floor"
+        "called D-CONNECT ACK local delivery should send caller D-CONNECT without enabling floor"
     );
     assert_eq!(
         count_umac_floor_granted(&after_caller_delivery_msgs),
@@ -9299,7 +9297,7 @@ fn test_p2p_called_d_connect_ack_pending_local_delivery_does_not_authorize_calle
 }
 
 #[test]
-fn test_p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_caller() {
+fn test_p2p_called_d_connect_ack_unack_transmission_authorizes_caller_d_connect() {
     debug::setup_logging_verbose();
 
     let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
@@ -9324,29 +9322,29 @@ fn test_p2p_called_d_connect_ack_transmitted_without_l2_ack_does_not_authorize_c
 
     assert_eq!(
         count_d_connects(&transmitted_only_msgs),
-        0,
-        "EN 300 392-2 Annex D.4: called D-CONNECT ACK local transmission alone must not authorize caller D-CONNECT"
+        1,
+        "EN 300 392-2 Annex D.4: simplex called D-CONNECT ACK may use repeated unacknowledged service, so local transmission authorizes caller D-CONNECT"
     );
     assert_eq!(
         count_umac_floor_granted(&transmitted_only_msgs),
         0,
-        "private-simplex U-plane must remain blocked until called D-CONNECT ACK BL-ACK"
+        "private-simplex U-plane must remain blocked until caller D-CONNECT is delivered"
     );
     assert_eq!(
         count_d_releases(&transmitted_only_msgs),
         0,
-        "a short missing-BL-ACK guard should not release immediately"
+        "simplex unacknowledged called-leg delivery must not release for missing BL-ACK"
     );
 }
 
 #[test]
-fn test_p2p_called_d_connect_ack_lost_does_not_fall_forward_without_bl_ack() {
+fn test_p2p_called_d_connect_ack_unack_repeat_delivery_does_not_wait_for_bl_ack() {
     debug::setup_logging_verbose();
 
     let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
     let mut cmce = CmceBs::new(shared, None, None);
     let mut queue = MessageQueue::new();
-    let mut dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
 
     register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
     register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
@@ -9358,89 +9356,46 @@ fn test_p2p_called_d_connect_ack_lost_does_not_fall_forward_without_bl_ack() {
     let call_id = first_d_setup_call_id(&setup_msgs);
 
     cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
-    let mut ack_msgs = drain_message_queue(&mut queue);
-
-    // Field regression for Motorola MXP600: treating a locally transmitted
-    // D-CONNECT ACK as enough, after the BL-ACK was lost, made the BS open
-    // caller D-CONNECT and floor while the called MS still behaved as if the
-    // private setup was incomplete. Keep Annex D.4 conservative: retry with
-    // acknowledged service and never authorize caller/floor without BL-ACK.
-    let expected_stealing_by_attempt = [false, false, true, false, true];
-    for (idx, expected_stealing) in expected_stealing_by_attempt.iter().copied().enumerate() {
-        let attempt = idx + 1;
-        assert_eq!(
-            count_d_connect_acknowledges(&ack_msgs),
-            1,
-            "attempt {attempt}: called MS should receive one D-CONNECT ACKNOWLEDGE retry"
-        );
-        let d_connect_acks: Vec<_> = ack_msgs
-            .iter()
-            .filter_map(|msg| match &msg.msg {
-                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
-                _ => None,
-            })
-            .collect();
-        let (ack_prim, ack_pdu) = &d_connect_acks[0];
-        assert_eq!(ack_prim.main_address.ssi, TEST_CALLED_ISSI);
-        assert_eq!(ack_pdu.call_identifier, call_id);
-        assert_eq!(ack_prim.layer2service, Layer2Service::Acknowledged);
-        assert_eq!(ack_prim.unacked_bl_repetitions, None);
-        assert_eq!(ack_prim.stealing_permission, expected_stealing);
-        assert!(ack_prim.chan_alloc.is_some());
-        assert_eq!(
-            count_d_connects(&ack_msgs),
-            0,
-            "attempt {attempt}: caller D-CONNECT must remain blocked until called BL-ACK"
-        );
-        assert_eq!(
-            count_umac_floor_granted(&ack_msgs),
-            0,
-            "attempt {attempt}: private floor must remain blocked until called BL-ACK"
-        );
-        assert_eq!(
-            count_d_releases(&ack_msgs),
-            0,
-            "attempt {attempt}: setup release should wait until called ACK retries are exhausted"
-        );
-
-        lose_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
-        dltime = dltime.add_timeslots(4);
-        cmce.tick_start(&mut queue, dltime);
-        ack_msgs = drain_message_queue(&mut queue);
-    }
-    let fail_msgs = ack_msgs;
-
-    assert_eq!(
-        count_d_connect_acknowledges(&fail_msgs),
-        0,
-        "after retry exhaustion CMCE should stop retrying called D-CONNECT ACKNOWLEDGE"
-    );
-    assert_eq!(
-        count_d_connects(&fail_msgs),
-        0,
-        "caller D-CONNECT must never be sent when called D-CONNECT ACK was never BL-ACKed"
-    );
-    assert_eq!(
-        count_umac_floor_granted(&fail_msgs),
-        0,
-        "private floor must never be seeded when called D-CONNECT ACK was never BL-ACKed"
-    );
-    let releases: Vec<_> = fail_msgs
+    let ack_msgs = drain_message_queue(&mut queue);
+    let d_connect_acks: Vec<_> = ack_msgs
         .iter()
         .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
             _ => None,
         })
         .collect();
-    assert!(
-        !releases.is_empty(),
-        "called D-CONNECT ACK BL-ACK exhaustion should release the private setup"
+    assert_eq!(d_connect_acks.len(), 1);
+    let (ack_prim, ack_pdu) = &d_connect_acks[0];
+    assert_eq!(ack_prim.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(ack_pdu.call_identifier, call_id);
+    assert_eq!(ack_prim.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(
+        ack_prim.unacked_bl_repetitions,
+        Some(PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS)
     );
-    for (prim, release) in releases {
-        assert_eq!(release.call_identifier, call_id);
-        assert_eq!(release.disconnect_cause, DisconnectCause::AcknowledgedServiceNotComplete);
-        assert!(prim.main_address.ssi == TEST_ISSI || prim.main_address.ssi == TEST_CALLED_ISSI);
-    }
+    assert!(ack_prim.chan_alloc.is_some());
+    assert_eq!(count_d_connects(&ack_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&ack_msgs), 0);
+
+    transmit_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, dltime.add_timeslots(4));
+    let after_delivery_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(
+        count_d_connects(&after_delivery_msgs),
+        1,
+        "Annex D.4 repeat signalling may proceed after unacknowledged local delivery"
+    );
+    assert_eq!(
+        count_umac_floor_granted(&after_delivery_msgs),
+        0,
+        "private floor must still wait for caller D-CONNECT delivery"
+    );
+    assert_eq!(
+        count_d_releases(&after_delivery_msgs),
+        0,
+        "unacknowledged repeated called-leg setup delivery must not fail the call for missing BL-ACK"
+    );
 }
 
 #[test]
@@ -9773,11 +9728,14 @@ fn test_p2p_called_d_connect_ack_local_discard_retries_before_release() {
             })
             .collect();
         assert_eq!(d_connect_acks[0].0.main_address.ssi, TEST_CALLED_ISSI);
-        assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Acknowledged);
-        assert_eq!(d_connect_acks[0].0.unacked_bl_repetitions, None);
+        assert_eq!(d_connect_acks[0].0.layer2service, Layer2Service::Unacknowledged);
+        assert_eq!(
+            d_connect_acks[0].0.unacked_bl_repetitions,
+            Some(PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS)
+        );
         assert_eq!(
             d_connect_acks[0].0.stealing_permission, expected_stealing,
-            "attempt {attempt}: D-CONNECT ACK retry should alternate MCCH/current-channel and assigned-channel STCH/FACCH recovery"
+            "attempt {attempt}: local-discard retry should alternate MCCH/current-channel and assigned-channel STCH/FACCH recovery"
         );
         assert_eq!(
             d_connect_acks[0]
@@ -9793,12 +9751,12 @@ fn test_p2p_called_d_connect_ack_local_discard_retries_before_release() {
         assert_eq!(
             count_d_connects(&ack_msgs),
             0,
-            "attempt {attempt}: caller D-CONNECT must remain blocked until called D-CONNECT ACK BL-ACK"
+            "attempt {attempt}: caller D-CONNECT must remain blocked until called D-CONNECT ACK is locally transmitted"
         );
         assert_eq!(
             count_umac_floor_granted(&ack_msgs),
             0,
-            "attempt {attempt}: UMAC floor must remain blocked until called D-CONNECT ACK BL-ACK"
+            "attempt {attempt}: UMAC floor must remain blocked until called D-CONNECT ACK is locally transmitted and caller D-CONNECT follows"
         );
         assert_eq!(
             count_d_releases(&ack_msgs),
@@ -9871,7 +9829,7 @@ fn test_p2p_hook_other_ms_connect_waits_for_called_ack_then_seeds_called_floor()
     assert_eq!(
         d_connect.transmission_grant,
         TransmissionGrant::GrantedToOtherUser,
-        "called-first hook setup must preserve ETSI connect grant polarity while BS UMAC floor remains silent"
+        "called-first hook setup must preserve ETSI connect grant polarity while BS seeds the called-side setup floor after both setup legs are delivered"
     );
 
     let d_connect_ack = connect_msgs
@@ -9950,7 +9908,7 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     assert_eq!(
         count_umac_floor_granted(&after_called_ack_msgs),
         0,
-        "called D-CONNECT ACK BL-ACK should send caller D-CONNECT without enabling floor yet"
+        "called D-CONNECT ACK local delivery should send caller D-CONNECT without enabling floor yet"
     );
     assert_eq!(
         count_umac_floor_granted(&after_caller_ack_msgs),
@@ -9971,7 +9929,7 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     assert_eq!(
         d_connects.len(),
         1,
-        "direct setup sends caller D-CONNECT only after called D-CONNECT ACK BL-ACK"
+        "direct setup sends caller D-CONNECT only after called D-CONNECT ACK local delivery"
     );
     for (prim, pdu) in &d_connects {
         assert_eq!(pdu.call_identifier, call_id);
@@ -9999,7 +9957,7 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     assert_eq!(
         d_connect_acks.len(),
         1,
-        "U-CONNECT should first send one acknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
+        "U-CONNECT should first send one repeated unacknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
     );
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(pdu.call_identifier, call_id);
@@ -10007,8 +9965,8 @@ fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
         assert!(!pdu.transmission_request_permission);
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
-        assert_eq!(prim.layer2service, Layer2Service::Acknowledged);
-        assert_eq!(prim.unacked_bl_repetitions, None);
+        assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+        assert_eq!(prim.unacked_bl_repetitions, Some(PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS));
         assert!(
             !prim.stealing_permission,
             "called D-CONNECT-ACKNOWLEDGE with channel allocation starts on current-channel signalling; STCH-only stealing is reserved for recovery retry"
@@ -10079,7 +10037,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
         1,
-        "simple private setup should send caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+        "simple private setup should send caller D-CONNECT after called D-CONNECT ACK local delivery"
     );
     assert_eq!(
         connect_msgs
@@ -10087,7 +10045,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
             .count(),
         1,
-        "simple private setup should send one acknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
+        "simple private setup should send one repeated unacknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
     );
     assert_eq!(
         count_d_tx_interrupt(&connect_msgs),
@@ -10270,7 +10228,7 @@ fn test_simple_private_call_works_with_transmission_interruption_enabled() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
         0,
-        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK local delivery"
     );
     connect_msgs.extend(after_called_ack_msgs);
 
@@ -10285,7 +10243,7 @@ fn test_simple_private_call_works_with_transmission_interruption_enabled() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
         1,
-        "simple private call should send one acknowledged caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+        "simple private call should send one acknowledged caller D-CONNECT after called D-CONNECT ACK local delivery"
     );
     assert_eq!(
         connect_msgs
@@ -10293,7 +10251,7 @@ fn test_simple_private_call_works_with_transmission_interruption_enabled() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
             .count(),
         1,
-        "simple private call should send one acknowledged D-CONNECT ACKNOWLEDGE to the called MS"
+        "simple private call should send one repeated unacknowledged D-CONNECT ACKNOWLEDGE to the called MS"
     );
 }
 
@@ -10325,13 +10283,13 @@ fn test_simple_private_call_works_with_preemption_default_off() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some()))
             .count(),
         0,
-        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK local delivery"
     );
     connect_msgs.extend(after_called_ack_msgs);
 
     // EN 300 392-2 clauses 14.5.1.2.1 and 14.7.2.3: a simple private
     // U-CONNECT first sends D-CONNECT-ACKNOWLEDGE to the called MS and, after
-    // BL-ACK of that called-leg signalling, sends D-CONNECT to the caller. Optional
+    // called-leg local delivery, sends D-CONNECT to the caller. Optional
     // transmission interruption/pre-emption is not part of this ordinary path.
     assert_eq!(count_d_tx_interrupt(&connect_msgs), 0);
     assert_eq!(count_umac_open(&connect_msgs), 1);
@@ -10349,7 +10307,7 @@ fn test_simple_private_call_works_with_preemption_default_off() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect_acknowledge(prim).is_some()))
             .count(),
         1,
-        "default-off simple private call should send one acknowledged D-CONNECT ACKNOWLEDGE"
+        "default-off simple private call should send one repeated unacknowledged D-CONNECT ACKNOWLEDGE"
     );
 }
 
@@ -10485,7 +10443,7 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
     assert_eq!(
         d_connects.len(),
         1,
-        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+        "Expected one caller D-CONNECT after called D-CONNECT ACK local delivery"
     );
     for (_, pdu) in &d_connects {
         // EN 300 392-2 clauses 14.7.1.4/14.7.2.3 keep the same timeout and
@@ -10504,7 +10462,11 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(
+        d_connect_acks.len(),
+        1,
+        "Expected one repeated unacknowledged D-CONNECT-ACKNOWLEDGE"
+    );
     for (_, pdu) in &d_connect_acks {
         assert_eq!(pdu.call_identifier, call_id);
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
@@ -10544,7 +10506,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
         connect_msgs
             .iter()
             .all(|msg| !matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
-        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK local delivery"
     );
 
     let open_circuits: Vec<_> = connect_msgs
@@ -10581,7 +10543,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
     assert_eq!(
         d_connects.len(),
         1,
-        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+        "Expected one caller D-CONNECT after called D-CONNECT ACK local delivery"
     );
     for (prim, pdu) in &d_connects {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
@@ -10597,7 +10559,11 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(
+        d_connect_acks.len(),
+        1,
+        "Expected one repeated unacknowledged D-CONNECT-ACKNOWLEDGE"
+    );
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -10661,7 +10627,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
         connect_msgs
             .iter()
             .all(|msg| !matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_connect(prim).is_some())),
-        "caller D-CONNECT stays blocked until called D-CONNECT ACK BL-ACK"
+        "caller D-CONNECT stays blocked until called D-CONNECT ACK local delivery"
     );
     let open_circuits: Vec<_> = connect_msgs
         .iter()
@@ -10697,7 +10663,7 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
     assert_eq!(
         d_connects.len(),
         1,
-        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+        "Expected one caller D-CONNECT after called D-CONNECT ACK local delivery"
     );
     for (prim, pdu) in &d_connects {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
@@ -10713,7 +10679,11 @@ fn test_p2p_duplex_request_accepts_called_simplex_offer_in_u_alert() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(
+        d_connect_acks.len(),
+        1,
+        "Expected one repeated unacknowledged D-CONNECT-ACKNOWLEDGE"
+    );
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);
@@ -10833,7 +10803,7 @@ fn test_p2p_hook_setup_other_ms_request_seeds_called_setup_floor() {
     assert_eq!(
         d_connects.len(),
         1,
-        "Expected one caller D-CONNECT after called D-CONNECT ACK BL-ACK"
+        "Expected one caller D-CONNECT after called D-CONNECT ACK local delivery"
     );
     for (prim, pdu) in &d_connects {
         assert_eq!(prim.main_address.ssi, TEST_ISSI);
@@ -10849,7 +10819,11 @@ fn test_p2p_hook_setup_other_ms_request_seeds_called_setup_floor() {
             _ => None,
         })
         .collect();
-    assert_eq!(d_connect_acks.len(), 1, "Expected one acknowledged D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(
+        d_connect_acks.len(),
+        1,
+        "Expected one repeated unacknowledged D-CONNECT-ACKNOWLEDGE"
+    );
     for (prim, pdu) in &d_connect_acks {
         assert_eq!(prim.main_address.ssi, TEST_CALLED_ISSI);
         assert_eq!(pdu.call_identifier, call_id);

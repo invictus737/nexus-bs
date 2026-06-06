@@ -27,6 +27,7 @@ pub(in crate::cmce::subentities::cc_bs) enum IndividualTransitionError {
 const INDIVIDUAL_CONNECT_ACK_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * 18 * 4;
 const INDIVIDUAL_CONNECT_ACK_MAX_ATTEMPTS: u8 = 5;
 const INDIVIDUAL_CALLER_CONNECT_MAX_ATTEMPTS: u8 = 3;
+const PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS: u8 = 3;
 
 #[derive(Clone, Copy)]
 enum PendingConnectAckAction {
@@ -61,16 +62,24 @@ impl PrivateCalledConnectAckDelivery {
         matches!(self, Self::AssignedChannelRecovery)
     }
 
-    fn requires_l2_ack(self) -> bool {
-        true
+    fn requires_l2_ack(self, simplex_duplex: bool) -> bool {
+        simplex_duplex
     }
 
-    fn layer2_service(self) -> Layer2Service {
-        Layer2Service::Acknowledged
+    fn layer2_service(self, simplex_duplex: bool) -> Layer2Service {
+        if simplex_duplex {
+            Layer2Service::Acknowledged
+        } else {
+            Layer2Service::Unacknowledged
+        }
     }
 
-    fn unacked_bl_repetitions(self) -> Option<u8> {
-        None
+    fn unacked_bl_repetitions(self, simplex_duplex: bool) -> Option<u8> {
+        if simplex_duplex {
+            None
+        } else {
+            Some(PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS)
+        }
     }
 
     fn label(self) -> &'static str {
@@ -93,9 +102,9 @@ impl CcBsSubentity {
 
         // EN 300 392-2 clauses 14.5.1.1.1, 14.5.1.1.2 and table 14.74:
         // when on/off-hook signalling is selected, value 1 means "request
-        // that other MS may transmit/send data". This selects the preferred
-        // setup-phase talker; the U-plane floor is still granted only by the
-        // transmission control procedure in clause 14.5.1.2.1.
+        // that other MS may transmit/send data". This selects the setup-phase
+        // talker named by the connect grants; later floor changes remain under
+        // the transmission control procedure in clause 14.5.1.2.1.
         hook_method_selection && request_to_transmit_send_data
     }
 
@@ -337,12 +346,15 @@ impl CcBsSubentity {
         delivery: PrivateCalledConnectAckDelivery,
     ) -> TxReporter {
         let (called_grant, _) = Self::private_connect_grants(call.simplex_duplex, called_ms_transmits_first);
+        let requires_l2_ack = delivery.requires_l2_ack(call.simplex_duplex);
 
         // EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 require
         // D-CONNECT ACKNOWLEDGE to tell the called MS the setup transmit
         // state. The matching UMAC FloorGranted is emitted only after caller
         // D-CONNECT delivery, so both MSs have completed setup before the
-        // setup-time U-plane floor is opened.
+        // setup-time U-plane floor is opened. Annex D.4 allows repeat
+        // signalling to use unacknowledged service when the called-side BL-ACK
+        // is not a reliable setup gate.
         let d_connect_ack = DConnectAcknowledge {
             call_identifier: call_id,
             call_time_out: if call.simplex_duplex {
@@ -363,7 +375,11 @@ impl CcBsSubentity {
             "-> {:?} (called leg first, {} D-CONNECT ACK, {})",
             d_connect_ack,
             delivery.label(),
-            "waiting for called BL-ACK before caller D-CONNECT"
+            if requires_l2_ack {
+                "waiting for called BL-ACK before caller D-CONNECT"
+            } else {
+                "unacknowledged repeated delivery; caller D-CONNECT follows local transmission per EN 300 392-2 Annex D.4"
+            }
         );
         let mut ack_sdu = BitBuffer::new_autoexpand(28);
         d_connect_ack
@@ -371,7 +387,7 @@ impl CcBsSubentity {
             .expect("Failed to serialize DConnectAcknowledge");
         ack_sdu.seek(0);
         let pdu_prio = Self::cmce_downlink_pdu_prio(&ack_sdu);
-        let reporter = if delivery.requires_l2_ack() {
+        let reporter = if requires_l2_ack {
             TxReporter::new()
         } else {
             TxReporter::new_unacked()
@@ -386,12 +402,12 @@ impl CcBsSubentity {
                 handle: call.called_handle.unwrap_or(0),
                 endpoint_id: call.called_endpoint_id.unwrap_or(0),
                 link_id: call.called_link_id.unwrap_or(0),
-                layer2service: delivery.layer2_service(),
+                layer2service: delivery.layer2_service(call.simplex_duplex),
                 pdu_prio,
                 layer2_qos: 0,
                 stealing_permission: delivery.stealing_permission(),
                 stealing_repeats_flag: false,
-                unacked_bl_repetitions: delivery.unacked_bl_repetitions(),
+                unacked_bl_repetitions: delivery.unacked_bl_repetitions(call.simplex_duplex),
                 chan_alloc: Some(Self::private_connect_chan_alloc(call.called_ts, call.called_usage)),
                 main_address: call.called_addr,
                 tx_reporter: Some(reporter.clone()),
@@ -511,7 +527,7 @@ impl CcBsSubentity {
                         pending.reporter = reporter;
                         pending.stage = PendingIndividualConnectAckStage::CalledConnectAck {
                             attempts: attempts + 1,
-                            requires_l2_ack: delivery.requires_l2_ack(),
+                            requires_l2_ack: delivery.requires_l2_ack(call_snapshot.simplex_duplex),
                         };
                         pending.started_at = self.dltime;
                     }
@@ -1136,7 +1152,7 @@ impl CcBsSubentity {
                 reporter,
                 stage: PendingIndividualConnectAckStage::CalledConnectAck {
                     attempts: 1,
-                    requires_l2_ack: PrivateCalledConnectAckDelivery::CurrentChannel.requires_l2_ack(),
+                    requires_l2_ack: PrivateCalledConnectAckDelivery::CurrentChannel.requires_l2_ack(current_call.simplex_duplex),
                 },
                 started_at: self.dltime,
             },

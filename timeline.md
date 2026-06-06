@@ -1,5 +1,59 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 01:58 EEST - Private simplex called-leg delivery switched to Annex D.4 unacknowledged repeat path
+
+Component in simple technical terms:
+
+- CMCE private-call setup opens the call-control path between caller ISSI and called ISSI.
+- `D-CONNECT ACKNOWLEDGE` is the called-side acceptance message sent after the called terminal sends `U-CONNECT`.
+- Layer 2 acknowledged service waits for a BL-ACK from the terminal; unacknowledged service repeats the message without waiting for that BL-ACK.
+- `FloorGranted` remains the internal UMAC media switch. It is still emitted only after caller `D-CONNECT` delivery, not when the called-side ACK message is merely queued.
+
+RF failure analysed:
+
+- Live `v0.1.56-8bf759df` test at `2026-06-07 01:49:43 EEST` showed `2260616 -> 2260618`, call_id `4`.
+- Nexus-BS sent called-side `D-CONNECT ACKNOWLEDGE` to `2260618` with `TransmissionGrant::Granted`.
+- The called-side BL-ACK never arrived after five acknowledged attempts, including assigned-channel recovery attempts.
+- CMCE never sent caller `D-CONNECT`; setup was released at `01:49:52.922` with `AcknowledgedServiceNotComplete`.
+- Therefore the failed RF test was not a first-floor/audio bug. It was a called-side setup delivery gate stuck on missing BL-ACK.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 require `D-CONNECT ACKNOWLEDGE` / `D-CONNECT` to identify the party permitted to transmit.
+- EN 300 392-2 clause 14.5.1.2.1 says the SwMI controls transmit permission; during setup, the response to the transmit request is handled by 14.5.1.1.1/14.5.1.1.2, while later in-call changes use `U-TX DEMAND` / `D-TX GRANTED`.
+- EN 300 392-2 Annex D.4 says if the BS does not receive the called-side layer 2 acknowledgement, it cannot know whether the downlink failed or only the uplink response failed. For repeat signalling, the BS should either use unacknowledged service, grant a subslot on MCCH before channel change, or delay the layer 2 acknowledgement until frame 18.
+- Nexus-BS now uses the Annex D.4 unacknowledged repeat option for simplex called-side `D-CONNECT ACKNOWLEDGE`; duplex remains acknowledged.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Simplex called-side `D-CONNECT ACKNOWLEDGE` now uses `Layer2Service::Unacknowledged`.
+  - It requests 3 BL-UDATA repetitions, giving 4 complete transmissions under the LLC `N.253 + 1` model.
+  - CMCE proceeds to caller `D-CONNECT` after local transmission of the unacknowledged repeated called-leg message.
+  - Duplex called-side `D-CONNECT ACKNOWLEDGE` remains `Layer2Service::Acknowledged`.
+  - Caller `D-CONNECT` remains acknowledged and still gates initial `FloorGranted`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated P2P tests to assert the Annex D.4 unacknowledged repeat path for simplex called-leg `D-CONNECT ACKNOWLEDGE`.
+  - Kept local-discard retry coverage: if MAC cannot transmit the message at all, CMCE retries and eventually releases setup.
+  - Kept duplex tests on acknowledged called-leg delivery.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` -> 168 passed.
+- `cargo fmt --package tetra-entities` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Commit and deploy direct.
+- Clean journal.
+- Ask for one structured private simplex test `2260616 -> 2260618`.
+- Expected log: called-side `D-CONNECT ACKNOWLEDGE` sent as unacknowledged repeated delivery, then caller `D-CONNECT`, then setup-floor `FloorGranted` only after caller `D-CONNECT` ACK.
+
 ## 2026-06-07 01:46 EEST - Nexus-BS v0.1.56 release bump and private-simplex setup-floor correction
 
 Component in simple technical terms:
