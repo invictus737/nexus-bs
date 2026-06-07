@@ -11160,3 +11160,61 @@ Next RF gate:
    - peer Motorola should render normal end/disconnected state, not `No answer`;
    - no Motorola reboot, no `PTT denied`, no `Network trouble`, no BS restart.
 5. If `No answer` persists, do not change release cause next. Inspect whether terminal UI saw notification indicator `19` in both connect PDUs and consider a separate `D-INFO` imminent-disconnection experiment with notification value `26` only after EN 300 392-9 semantics are rechecked.
+
+## 2026-06-07 22:22 EEST - Private simplex peer clear cleanup and Tetra-Core/SmartConnect analysis agent
+
+Context:
+
+- Latest RF loop before this patch: `v0.1.57-783780c3` kept first-PTT/private audio usable, but `2260082 -> 2260618` followed by red-button close on `2260082` still soft-rebooted the MXP600 peer.
+- Log evidence from that loop showed:
+  - `U-DISCONNECT(UserRequestedDisconnection)` from `2260082`;
+  - prompt `D-RELEASE` to the requesting MS;
+  - delayed peer `D-DISCONNECT(UserRequestedDisconnection)` to `2260618`;
+  - no peer `U-RELEASE`;
+  - MXP600 reattach after reboot.
+- Historical RF attempts showed the same two repeated bad outcomes:
+  - peer `D-DISCONNECT` can reboot MXP600;
+  - blind peer `D-RELEASE`/cause experiments can render terminal-visible `No Answer`.
+- A new read-only agent, `Halley the 5th`, was added to inspect `/Users/ctermure/Work/Tetra-Core` SmartConnect/IP TETRA support and protocol captures as inspiration only. It must not be treated as an ETSI normative reference.
+
+Clause-scoped ETSI check:
+
+- EN 300 392-2 clause 14.5.1.3.1: after `U-DISCONNECT`, the requesting MS waits for `D-RELEASE`; the SwMI may inform the other MS by `D-DISCONNECT` or `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: only `D-DISCONNECT` expects peer `U-RELEASE`.
+- EN 300 392-2 clause 23.8.2.2: after `U-TX CEASED` or `U-DISCONNECT`, BS should allow bearer tail bits before `D-TX CEASED`, `D-RELEASE`, or `D-DISCONNECT`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Local simplex peer clear after tail drain now uses the clause 14.5.1.3.1 `D-RELEASE` alternative.
+  - It no longer starts the `D-DISCONNECT -> U-RELEASE` wait on local simplex release.
+  - The traffic circuit still stays open until peer and requester `D-RELEASE` TxReporters complete or guard out.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Comments now describe the actual local simplex release path: prompt requester `D-RELEASE`, tail-drain, peer `D-RELEASE`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated the full simple private workflow and MXP600 regression tests so local simplex peer clear asserts no `D-DISCONNECT`.
+  - Kept `D-DISCONNECT -> U-RELEASE` tests only for duplex/fallback paths where `D-DISCONNECT` is deliberately sent.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs --locked test_simple_private_call_full_direct_setup_and_release_workflow -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked mxp600` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked p2p` passed: 82 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked private` passed: 20 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo fmt --package tetra-entities` completed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Wait for the Tetra-Core/SmartConnect agent report and record any useful inspiration separately from ETSI requirements.
+2. Commit and deploy directly to `/home/chris/nexus-bs/nexus-bs`.
+3. Clear volatile journal.
+4. Controlled test: `2260082 -> 2260618`, one PTT each direction, close from `2260082`.
+5. Required log/UI result:
+   - no peer `D-DISCONNECT` to `2260618` on local simplex close;
+   - peer `D-RELEASE` only after bearer-tail drain;
+   - no MXP600 soft reboot/reattach;
+   - no `No Answer` if the terminal maps the established-call release correctly;
+   - first PTT/media path remains unchanged from the current RF-good base.

@@ -880,11 +880,10 @@ impl CcBsSubentity {
                 }
                 self.send_individual_disconnect_release_ack(queue, call_id, &call_snapshot, sender.ssi, disconnect_cause);
                 if !call_snapshot.simplex_duplex {
-                    // EN 300 392-2 clauses 14.5.1.3.1 and 14.5.1.3.3:
-                    // the MS that sends U-DISCONNECT waits for D-RELEASE;
-                    // the SwMI may inform the peer by D-DISCONNECT. Local
-                    // simplex delays that peer clear until the bearer tail
-                    // drain completes, then waits for the peer U-RELEASE.
+                    // EN 300 392-2 clause 14.5.1.3.1: the MS that sends
+                    // U-DISCONNECT waits for D-RELEASE, and the SwMI may
+                    // inform the peer by D-RELEASE. Local simplex delays that
+                    // peer clear until the bearer tail drain completes.
                     self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause);
                     return;
                 }

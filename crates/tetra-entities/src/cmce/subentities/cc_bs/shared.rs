@@ -1114,7 +1114,7 @@ impl CcBsSubentity {
         };
 
         tracing::debug!(
-            "CMCE: delaying simplex private peer D-DISCONNECT call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
+            "CMCE: delaying simplex private peer D-RELEASE call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
             call_id,
             sender.ssi,
             peer_issi
@@ -1333,16 +1333,18 @@ impl CcBsSubentity {
             }
 
             tracing::info!(
-                "CMCE: simplex private peer clear by D-DISCONNECT call_id={} peer ISSI {} cause={:?}",
+                "CMCE: simplex private peer clear by D-RELEASE call_id={} peer ISSI {} cause={:?}",
                 call_id,
                 pending.peer_issi,
                 pending.cause
             );
-            if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, pending.sender, pending.cause) {
-                self.begin_individual_disconnect_delivery(call_id, pending.peer_issi, pending.sender.ssi, reporter, pending.cause);
-            } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                call.begin_disconnect_pending(pending.peer_issi, pending.sender.ssi, self.dltime, pending.cause);
-            }
+            // EN 300 392-2 clause 14.5.1.3.1 permits the SwMI to inform the
+            // other MS by D-DISCONNECT or D-RELEASE. Live Motorola MXP600 RF
+            // testing showed peer D-DISCONNECT can trigger a terminal reboot,
+            // so local simplex uses the D-RELEASE alternative after the same
+            // bearer-tail drain. This expects no U-RELEASE response; the BS
+            // closes only after the release reporters complete or guard out.
+            self.send_individual_disconnect_peer_release(queue, call_id, &call_snapshot, pending.cause, pending.peer_issi);
         }
     }
 
@@ -1458,7 +1460,7 @@ impl CcBsSubentity {
         // EN 300 392-2 clause 14.5.1.3.1 says the MS that sent
         // U-DISCONNECT waits for D-RELEASE. Send that acknowledgement promptly
         // to the requesting leg. The peer leg is cleared after the bearer
-        // tail drain by D-RELEASE, a clause 14.5.1.3.3 peer-clear option that
+        // tail drain by D-RELEASE, a clause 14.5.1.3.1 peer-clear option that
         // expects no MS response.
         let reporters = self.send_established_individual_release_pdus(queue, call_id, call, disconnect_cause, Some(release_to_issi));
         self.pending_individual_disconnect_release_acks.insert(
