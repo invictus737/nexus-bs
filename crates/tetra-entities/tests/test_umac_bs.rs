@@ -1465,7 +1465,7 @@ fn test_stch_mac_u_signal_waits_for_private_floor_granted() {
 }
 
 #[test]
-fn test_stch_bl_ack_before_private_floor_granted_uses_called_primary() {
+fn test_stch_bl_ack_before_private_floor_granted_routes_to_private_participants() {
     debug::setup_logging_verbose();
 
     let caller_issi = 2_260_616;
@@ -1476,8 +1476,10 @@ fn test_stch_bl_ack_before_private_floor_granted_uses_called_primary() {
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
 
     // CMCE seeds the called ISSI as primary on same-timeslot private simplex
-    // when the called leg must acknowledge D-CONNECT ACK before caller
-    // authorization (EN 300 392-2 Annex D.4).
+    // during setup, but MAC-U-SIGNAL/STCH BL-ACK has no address field. Some
+    // radios send the caller D-CONNECT BL-ACK on the assigned channel before
+    // FloorGranted; route pure ACKs to both participants and let LLC match the
+    // pending acknowledged transfer by SSI/N(S).
     test.submit_message(private_call_open_msg(called_issi, caller_issi, traffic_ts));
     submit_stch_mac_u_signal_bl_ack(&mut test, 1);
     test.run_stack(Some(1));
@@ -1485,8 +1487,8 @@ fn test_stch_bl_ack_before_private_floor_granted_uses_called_primary() {
     let addresses = tma_unitdata_ind_addresses(&test.dump_sinks());
     assert_eq!(
         addresses,
-        vec![TetraAddress::issi(called_issi)],
-        "EN 300 392-2 Annex D.4 and clauses 21.4.5/22.3.2.3: called-leg BL-ACK on assigned-channel STCH must reach LLC before FloorGranted"
+        vec![TetraAddress::issi(called_issi), TetraAddress::issi(caller_issi)],
+        "EN 300 392-2 Annex D.4 and clauses 21.4.5/22.3.2.3: addressless pre-floor private BL-ACK on assigned-channel STCH must reach LLC for both candidate ISSI links before FloorGranted"
     );
 }
 

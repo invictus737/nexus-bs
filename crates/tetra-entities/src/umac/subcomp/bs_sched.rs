@@ -2025,6 +2025,17 @@ impl BsChannelScheduler {
         self.circuits.ul[ts as usize - 1].as_ref().and_then(|circuit| circuit.active_addr)
     }
 
+    pub fn ul_circuit_issi_participants(&self, ts: u8) -> Vec<TetraAddress> {
+        if !(1..=4).contains(&ts) {
+            return Vec::new();
+        }
+
+        self.circuits.ul[ts as usize - 1]
+            .as_ref()
+            .map(|circuit| circuit.active_addresses().filter(|addr| addr.ssi_type == SsiType::Issi).collect())
+            .unwrap_or_default()
+    }
+
     /// Return the peer timeslot for the UL circuit on `ts`, if any.
     /// Used for full-duplex P2P cross-routing: UL voice on `ts` must be played out
     /// on the peer MS's DL timeslot. Returns `None` for simplex/group calls

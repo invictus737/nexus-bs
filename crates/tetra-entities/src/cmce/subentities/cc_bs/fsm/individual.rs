@@ -544,7 +544,7 @@ impl CcBsSubentity {
                     if attempts >= INDIVIDUAL_CALLER_CONNECT_MAX_ATTEMPTS {
                         self.pending_individual_connect_acks.remove(&call_id);
                         tracing::warn!(
-                            "CMCE: caller D-CONNECT was not locally transmitted after {} attempts for call_id={}; releasing setup",
+                            "CMCE: caller D-CONNECT was not L2-acknowledged after {} attempts for call_id={}; releasing setup",
                             attempts,
                             call_id
                         );
@@ -568,7 +568,7 @@ impl CcBsSubentity {
                     };
 
                     tracing::warn!(
-                        "CMCE: retrying caller D-CONNECT for call_id={} attempt {}/{} before initial floor",
+                        "CMCE: retrying caller D-CONNECT for call_id={} attempt {}/{} after missing L2 ACK before initial floor",
                         call_id,
                         attempts + 1,
                         INDIVIDUAL_CALLER_CONNECT_MAX_ATTEMPTS

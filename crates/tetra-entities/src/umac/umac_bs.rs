@@ -441,13 +441,23 @@ impl UmacBs {
         )
     }
 
-    fn pre_floor_private_ack_addr(&self, ts: u8, sdu: &BitBuffer) -> Option<TetraAddress> {
+    fn pre_floor_private_ack_addrs(&self, ts: u8, sdu: &BitBuffer) -> Vec<TetraAddress> {
         if !self.private_simplex_waiting_for_floor_grant(ts) || !Self::llc_sdu_is_ack_response(sdu) {
-            return None;
+            return Vec::new();
         }
 
-        let addr = self.channel_scheduler.ul_circuit_primary_addr(ts)?;
-        (addr.ssi_type == SsiType::Issi).then_some(addr)
+        if Self::tma_sdu_is_standalone_ack_only_bl_ack(sdu) {
+            let participants = self.channel_scheduler.ul_circuit_issi_participants(ts);
+            if !participants.is_empty() {
+                return participants;
+            }
+        }
+
+        self.channel_scheduler
+            .ul_circuit_primary_addr(ts)
+            .filter(|addr| addr.ssi_type == SsiType::Issi)
+            .into_iter()
+            .collect()
     }
 
     fn private_simplex_waiting_for_floor_grant(&self, ts: u8) -> bool {
@@ -2268,39 +2278,50 @@ impl UmacBs {
         tracing::debug!("rx_ul_mac_u_signal: forwarding {} bit TM-SDU to LLC", sdu.get_len());
 
         let msg_dltime = self.dltime.add_timeslots(-2);
-        let Some(main_address) = self
+        let main_addresses = self
             .current_ul_signal_addr(msg_dltime.t)
-            .or_else(|| self.pre_floor_private_ack_addr(msg_dltime.t, &sdu))
-        else {
+            .map(|addr| vec![addr])
+            .unwrap_or_else(|| self.pre_floor_private_ack_addrs(msg_dltime.t, &sdu));
+        if main_addresses.is_empty() {
             tracing::warn!(
                 "rx_ul_mac_u_signal: dropping STCH TM-SDU because no current ISSI speaker is known for UL ts {}",
                 msg_dltime.t
             );
             return;
-        };
+        }
+        if main_addresses.len() > 1 {
+            tracing::debug!(
+                "rx_ul_mac_u_signal: routing pre-floor private BL-ACK on UL ts {} to participant candidates {:?}",
+                msg_dltime.t,
+                main_addresses
+            );
+        }
 
         // EN 300 392-2 clauses 21.4.5 and 14.5.1.2.1/14.5.2.2.1: MAC-U-SIGNAL
         // carries U-plane signalling on STCH without an address field. Preserve
-        // the current assigned-channel speaker identity so CMCE floor-control
-        // PDUs are scoped to the MS that actually sent them.
-        let m = SapMsg {
-            sap: Sap::TmaSap,
-            src: TetraEntity::Umac,
-            dest: TetraEntity::Llc,
-            msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
-                pdu: Some(sdu),
-                main_address,
-                scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,
-                new_endpoint_id: None,
-                css_endpoint_id: None,
-                air_interface_encryption: 0,
-                chan_change_response_req: false,
-                chan_change_handle: None,
-                chan_info: None,
-            }),
-        };
-        queue.push_back(m);
+        // the current assigned-channel speaker identity when it is known. Before
+        // private-simplex FloorGranted, pure BL-ACK has no sender address, so
+        // route it to the participant candidates and let LLC match the pending
+        // acknowledged transfer by SSI/N(S).
+        for main_address in main_addresses {
+            queue.push_back(SapMsg {
+                sap: Sap::TmaSap,
+                src: TetraEntity::Umac,
+                dest: TetraEntity::Llc,
+                msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+                    pdu: Some(sdu.clone()),
+                    main_address,
+                    scrambling_code: prim.scrambling_code,
+                    endpoint_id: 0,
+                    new_endpoint_id: None,
+                    css_endpoint_id: None,
+                    air_interface_encryption: 0,
+                    chan_change_response_req: false,
+                    chan_change_handle: None,
+                    chan_info: None,
+                }),
+            });
+        }
     }
 
     /// TMA-SAP MAC-U-BLCK

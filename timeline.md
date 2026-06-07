@@ -1,5 +1,49 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 08:18 EEST - Private simplex Motorola caller D-CONNECT ACK attribution fix
+
+Component in simple technical terms:
+
+- `MAC-U-SIGNAL` on STCH is the signalling path carried on the assigned traffic channel.
+- `BL-ACK` is the LLC acknowledgement that confirms an acknowledged downlink transfer such as caller `D-CONNECT`.
+- In private simplex on one shared assigned timeslot, STCH signalling carries no ISSI address before `FloorGranted`; UMAC must infer which participant sent the ACK from bearer context.
+
+RF evidence:
+
+- After log clean, two P2P calls were captured.
+- `call_id=15`, `2260616 -> 2260618`, succeeded: called `D-CONNECT ACKNOWLEDGE`, caller `D-CONNECT`, caller L2 ACK, setup-time `FloorGranted`, repeated floor changes, and final `D-RELEASE` all completed.
+- `call_id=16`, `2260082 -> 2260618`, failed before activation: called leg completed, caller `D-CONNECT` to `2260082` retransmitted/exhausted, media frames accumulated while U-plane was correctly blocked, then CMCE released setup with `AcknowledgedServiceNotComplete`.
+- A late `U-CONNECT for unknown call_id=16` arrived after release, indicating the failure was setup/ACK timing or attribution, not a post-activation audio-floor bug.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 define setup `D-CONNECT ACKNOWLEDGE` / `D-CONNECT` grant semantics.
+- EN 300 392-2 clause 14.5.1.2.1 keeps U-plane transmit permission under SwMI control and requires permission before circuit-mode U-plane transmission.
+- EN 300 392-2 Annex D.4 allows repeated/unacknowledged setup signalling where the layer-2 ACK path is unreliable; Nexus-BS still keeps caller `D-CONNECT` acknowledged and gates `FloorGranted` on its ACK.
+- EN 300 392-2 clause 21.4.5 STCH/MAC-U-SIGNAL carries assigned-channel signalling without an explicit ISSI field, so pre-floor private BL-ACK must be attributed by bearer participant context.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - For pre-floor private-simplex STCH `MAC-U-SIGNAL`, pure standalone `BL-ACK` is routed to all ISSI participants on the shared private bearer.
+  - LLC remains the authority that accepts only the ACK matching a pending acknowledged transfer by SSI/N(S).
+  - Non-ACK STCH before floor remains blocked; `BL-ADATA` is not duplicated because it may carry payload.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `ul_circuit_issi_participants()` to expose private bearer participants to UMAC.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Corrected caller `D-CONNECT` retry/failure logs to say missing L2 ACK rather than missing local transmission.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Updated the pre-floor private BL-ACK test to assert both participant candidate ISSIs are delivered upward.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs stch_bl_ack_before_private_floor --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 18 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 81 passed.
+- `cargo check -p tetra-entities --locked` passed.
+
 ## 2026-06-07 07:58 EEST - Nexus-BS v0.1.57 RF-good private simplex checkpoint
 
 Component in simple technical terms:
