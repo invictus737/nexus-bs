@@ -1114,7 +1114,7 @@ impl CcBsSubentity {
         };
 
         tracing::debug!(
-            "CMCE: delaying simplex private peer D-RELEASE call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
+            "CMCE: delaying simplex private peer D-DISCONNECT call_id={} sender ISSI {} peer ISSI {} for TCH tail drain",
             call_id,
             sender.ssi,
             peer_issi
@@ -1333,12 +1333,16 @@ impl CcBsSubentity {
             }
 
             tracing::info!(
-                "CMCE: simplex private peer clear by D-RELEASE call_id={} peer ISSI {} cause={:?}",
+                "CMCE: simplex private peer clear by D-DISCONNECT call_id={} peer ISSI {} cause={:?}",
                 call_id,
                 pending.peer_issi,
                 pending.cause
             );
-            self.send_individual_disconnect_peer_release(queue, call_id, &call_snapshot, pending.cause, pending.peer_issi);
+            if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, pending.sender, pending.cause) {
+                self.begin_individual_disconnect_delivery(call_id, pending.peer_issi, pending.sender.ssi, reporter, pending.cause);
+            } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                call.begin_disconnect_pending(pending.peer_issi, pending.sender.ssi, self.dltime, pending.cause);
+            }
         }
     }
 

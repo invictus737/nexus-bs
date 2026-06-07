@@ -8372,24 +8372,24 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
     assert_eq!(release_ack_reporters.len(), 1);
 
     drain_private_simplex_tail(&mut test, dltime);
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
 
-    peer_release_reporters[0].mark_transmitted();
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     let delivery_msgs = test.dump_sinks();
     assert_eq!(
         count_d_releases(&delivery_msgs),
         0,
-        "Peer D-RELEASE delivery must not duplicate the D-RELEASE already sent to the initiator"
+        "Peer D-DISCONNECT delivery must not duplicate the D-RELEASE already sent to the initiator"
     );
     assert_eq!(
         count_umac_call_ended_or_close(&delivery_msgs),
@@ -8414,6 +8414,7 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
     for reporter in &release_ack_reporters {
         reporter.mark_transmitted();
     }
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(8));
     let closed_msgs = test.dump_sinks();
     assert!(
@@ -8462,15 +8463,15 @@ fn test_p2p_pending_release_call_id_wrap_skips_old_release_id() {
     assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
 
     drain_private_simplex_tail(&mut test, dltime);
-    let peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         old_call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
-    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&peer_disconnect_msgs), 0);
 
     force_cmce_next_call_identifier(&mut test, old_call_id);
     let (new_call_id, setup_msgs) = start_p2p_setup_between(&mut test, new_caller, new_called);
@@ -10181,8 +10182,9 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     );
 
     // EN 300 392-2 clauses 14.5.1.3.1 and 14.5.1.3.3: after one party sends
-    // U-DISCONNECT it waits for D-RELEASE. The SwMI may inform the local
-    // simplex peer by D-RELEASE, which is final and expects no U-RELEASE.
+    // U-DISCONNECT it waits for D-RELEASE. The SwMI informs the local
+    // simplex peer by D-DISCONNECT after bearer tail drain; the peer answers
+    // with U-RELEASE.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -10195,7 +10197,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
-        "simplex floor-holder U-DISCONNECT must tail-drain before peer D-RELEASE"
+        "simplex floor-holder U-DISCONNECT must tail-drain before peer D-DISCONNECT"
     );
     assert_eq!(
         count_umac_call_ended_or_close(&initiator_release_msgs),
@@ -10212,32 +10214,40 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     test.router
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
     test.run_stack(Some(1));
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
     assert_eq!(
-        count_umac_call_ended_or_close(&peer_release_msgs),
+        count_umac_call_ended_or_close(&peer_disconnect_msgs),
         0,
-        "traffic circuit must remain open while called ISSI D-RELEASE is pending"
+        "traffic circuit must remain open while called ISSI D-DISCONNECT is pending"
     );
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
     assert_eq!(
-        peer_release_reporters[0].get_state(),
+        peer_disconnect_reporters[0].get_state(),
         TxState::Pending,
-        "called ISSI D-RELEASE must be reporter-tracked before UMAC close"
+        "called ISSI D-DISCONNECT must be reporter-tracked before waiting for U-RELEASE"
     );
-    peer_release_reporters[0].mark_transmitted();
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     assert_eq!(
         count_umac_call_ended_or_close(&test.dump_sinks()),
         0,
-        "called ISSI D-RELEASE transmission alone must wait for caller D-RELEASE delivery"
+        "called ISSI D-DISCONNECT transmission alone must wait for peer U-RELEASE"
+    );
+
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    assert_eq!(
+        count_umac_call_ended_or_close(&test.dump_sinks()),
+        0,
+        "peer U-RELEASE must still wait for caller D-RELEASE delivery"
     );
 
     for reporter in &release_ack_reporters {
@@ -10246,7 +10256,7 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "peer and initiator D-RELEASE delivery should close the simple private call"
+        "peer U-RELEASE and initiator D-RELEASE delivery should close the simple private call"
     );
 }
 
@@ -12357,7 +12367,7 @@ fn test_unsolicited_private_u_release_does_not_start_disconnect_pending() {
             .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_disconnect(prim).is_some()))
             .count(),
         0,
-        "simplex caller U-DISCONNECT should tail-drain before called-peer D-RELEASE"
+        "simplex caller U-DISCONNECT should tail-drain before called-peer D-DISCONNECT"
     );
     assert_established_p2p_release_pdus_to(
         &disconnect_start_msgs,
@@ -12370,18 +12380,18 @@ fn test_unsolicited_private_u_release_does_not_start_disconnect_pending() {
     test.router
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
     test.run_stack(Some(1));
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
-    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
-    peer_release_reporters[0].mark_transmitted();
+    assert_eq!(count_umac_call_ended_or_close(&peer_disconnect_msgs), 0);
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
@@ -12557,9 +12567,8 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     let call_id = start_active_p2p_call(&mut test);
 
     // EN 300 392-2 clause 14.5.1.3.1: the MS that sent U-DISCONNECT
-    // receives D-RELEASE promptly. Clause 14.5.1.3.3 also permits the peer
-    // leg to be cleared with D-RELEASE, which is final and expects no
-    // U-RELEASE response.
+    // receives D-RELEASE promptly. Clause 14.5.1.3.3 permits the peer leg to
+    // be cleared with D-DISCONNECT, followed by U-RELEASE from that peer.
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -12572,7 +12581,7 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
-        "simplex caller U-DISCONNECT must tail-drain before peer D-RELEASE"
+        "simplex caller U-DISCONNECT must tail-drain before peer D-DISCONNECT"
     );
     assert_eq!(
         count_umac_call_ended_or_close(&initiator_release_msgs),
@@ -12594,43 +12603,43 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     test.router
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
     test.run_stack(Some(1));
-    let mut peer_release_msgs = test.dump_sinks();
+    let mut peer_disconnect_msgs = test.dump_sinks();
 
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_eq!(count_d_setups(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_eq!(count_d_setups(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
     assert_eq!(
-        count_umac_call_ended_or_close(&peer_release_msgs),
+        count_umac_call_ended_or_close(&peer_disconnect_msgs),
         0,
-        "P2P circuit must stay open while peer D-RELEASE is pending"
+        "P2P circuit must stay open while peer D-DISCONNECT is pending"
     );
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
     assert_eq!(
-        peer_release_reporters.len(),
+        peer_disconnect_reporters.len(),
         1,
-        "Assigned-channel peer D-RELEASE must carry one TxReporter"
+        "Assigned-channel peer D-DISCONNECT must carry one TxReporter"
     );
-    assert_eq!(peer_release_reporters[0].get_state(), TxState::Pending);
+    assert_eq!(peer_disconnect_reporters[0].get_state(), TxState::Pending);
     test.run_stack(Some(3));
     let pending_peer_release_msgs = test.dump_sinks();
     assert_eq!(
         count_umac_call_ended_or_close(&pending_peer_release_msgs),
         0,
-        "P2P circuit must stay open while peer D-RELEASE delivery is still pending"
+        "P2P circuit must stay open while peer D-DISCONNECT delivery is still pending"
     );
 
-    peer_release_reporters[0].mark_transmitted();
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     let transmitted_peer_release_msgs = test.dump_sinks();
     assert_eq!(
         count_umac_call_ended_or_close(&transmitted_peer_release_msgs),
         0,
-        "peer D-RELEASE delivery must still wait for the initiator D-RELEASE reporter"
+        "peer D-DISCONNECT delivery must still wait for peer U-RELEASE"
     );
 
     test.run_stack(Some(3));
@@ -12644,11 +12653,12 @@ fn test_p2p_u_disconnect_waits_for_peer_release_before_circuit_close() {
     for reporter in &release_ack_reporters {
         reporter.mark_transmitted();
     }
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let closed_msgs = test.dump_sinks();
     assert!(
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
-        "Reporter completion for both D-RELEASE legs should close the P2P traffic circuit"
+        "peer U-RELEASE and initiator D-RELEASE delivery should close the P2P traffic circuit"
     );
 }
 
@@ -12696,25 +12706,26 @@ fn test_p2p_disconnect_tail_drain_ignores_late_tx_demands_without_not_granted() 
     }
 
     drain_private_simplex_tail(&mut test, dltime);
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
-    peer_release_reporters[0].mark_transmitted();
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
     release_ack_reporters[0].mark_transmitted();
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "P2P circuit should close after peer and initiator D-RELEASE delivery"
+        "P2P circuit should close after peer U-RELEASE and initiator D-RELEASE delivery"
     );
 }
 
@@ -12740,22 +12751,22 @@ fn test_p2p_disconnect_pending_ignores_tx_demands_before_peer_u_release() {
     assert_eq!(release_ack_reporters.len(), 1);
 
     drain_private_simplex_tail(&mut test, dltime);
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_CALLED_ISSI],
+        TEST_CALLED_ISSI,
     );
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
-    peer_release_reporters[0].mark_transmitted();
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
-    // After peer D-RELEASE delivery, EN 300 392-2 clause 14.5.1.3.3 leaves
-    // the peer with no response to send. Additional PTT requests are stale
-    // floor control and must not become terminal-visible NotGranted responses.
+    // After peer D-DISCONNECT delivery, EN 300 392-2 clause 14.5.1.3.3 waits
+    // for peer U-RELEASE. Additional PTT requests are stale floor control and
+    // must not become terminal-visible NotGranted responses.
     for issi in [TEST_CALLED_ISSI, TEST_ISSI] {
         test.submit_message(build_u_tx_demand_msg(issi, call_id));
         test.run_stack(Some(1));
@@ -12789,10 +12800,11 @@ fn test_p2p_disconnect_pending_ignores_tx_demands_before_peer_u_release() {
     }
 
     release_ack_reporters[0].mark_transmitted();
+    test.submit_message(build_u_release_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "P2P circuit should close after peer and initiator D-RELEASE delivery"
+        "P2P circuit should close after peer U-RELEASE and initiator D-RELEASE delivery"
     );
 }
 
@@ -12876,19 +12888,23 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
     assert_eq!(count_umac_call_ended_or_close(&early_tail_msgs), 0);
 
     drain_private_simplex_tail(&mut test, dltime);
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[LAB_ISSI_MXP600],
+        LAB_ISSI_MXP600,
     );
-    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&peer_disconnect_msgs), 0);
 
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
-    peer_release_reporters[0].mark_transmitted();
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
+    peer_disconnect_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    test.submit_message(build_u_release_msg(LAB_ISSI_MXP600, call_id));
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
@@ -12896,7 +12912,7 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "P2P circuit closes only after peer and caller D-RELEASE delivery"
+        "P2P circuit closes only after peer U-RELEASE and caller D-RELEASE delivery"
     );
 }
 
@@ -12964,7 +12980,7 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_d_disconnect_after_peer_ce
 
     // Field regression for the live MXP600 "No Answer" close: 2260618 was
     // the last simplex speaker, sent U-TX CEASED, and then 2260616 cleared the
-    // call. Keep a bearer-tail drain before the peer D-RELEASE so final clear
+    // call. Keep a bearer-tail drain before the peer D-DISCONNECT so final clear
     // does not race late traffic/floor signalling.
     test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
     test.run_stack(Some(1));
@@ -12978,7 +12994,7 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_d_disconnect_after_peer_ce
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
-        "caller hangup must not send peer D-RELEASE while peer clear is tail-draining"
+        "caller hangup must not send peer D-DISCONNECT while peer clear is tail-draining"
     );
     assert_eq!(count_umac_call_ended_or_close(&initiator_release_msgs), 0);
     let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
@@ -12988,19 +13004,23 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_d_disconnect_after_peer_ce
         after_peer_cease_tail.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS);
     test.router.set_dl_time(after_disconnect_tail);
     test.run_stack(Some(1));
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[LAB_ISSI_MXP600],
+        LAB_ISSI_MXP600,
     );
-    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&peer_disconnect_msgs), 0);
 
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
-    peer_release_reporters[0].mark_transmitted();
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
+    peer_disconnect_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    test.submit_message(build_u_release_msg(LAB_ISSI_MXP600, call_id));
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
@@ -13008,7 +13028,7 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_d_disconnect_after_peer_ce
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "P2P circuit closes only after peer and caller D-RELEASE delivery"
+        "P2P circuit closes only after peer U-RELEASE and caller D-RELEASE delivery"
     );
 }
 
@@ -13049,7 +13069,7 @@ fn test_p2p_caller_disconnect_cancels_pending_peer_tx_ceased_tail() {
     // Regression for 2260616 -> 2260618 when the MXP600 releases PTT and the
     // caller presses red before the peer TX-CEASED tail drain expires. The
     // disconnect clear supersedes floor-idle signalling, so no stale
-    // D-TX CEASED may leak before the peer D-RELEASE.
+    // D-TX CEASED may leak before the peer D-DISCONNECT.
     test.submit_message(build_u_disconnect_msg(LAB_ISSI_A, call_id));
     test.run_stack(Some(1));
     let mut initiator_release_msgs = test.dump_sinks();
@@ -13066,24 +13086,28 @@ fn test_p2p_caller_disconnect_cancels_pending_peer_tx_ceased_tail() {
     assert_eq!(release_ack_reporters.len(), 1);
 
     drain_private_simplex_tail(&mut test, dltime);
-    let mut peer_release_msgs = test.dump_sinks();
+    let mut peer_disconnect_msgs = test.dump_sinks();
     assert_eq!(
-        count_d_tx_ceased(&peer_release_msgs),
+        count_d_tx_ceased(&peer_disconnect_msgs),
         0,
         "disconnect must suppress stale peer U-TX CEASED completion"
     );
-    assert_eq!(count_umac_floor_released(&peer_release_msgs), 0);
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    assert_eq!(count_umac_floor_released(&peer_disconnect_msgs), 0);
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[LAB_ISSI_MXP600],
+        LAB_ISSI_MXP600,
     );
 
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
-    assert_eq!(peer_release_reporters.len(), 1);
-    peer_release_reporters[0].mark_transmitted();
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
+    assert_eq!(peer_disconnect_reporters.len(), 1);
+    peer_disconnect_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
+
+    test.submit_message(build_u_release_msg(LAB_ISSI_MXP600, call_id));
     test.run_stack(Some(1));
     assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
@@ -13091,7 +13115,7 @@ fn test_p2p_caller_disconnect_cancels_pending_peer_tx_ceased_tail() {
     test.run_stack(Some(1));
     assert!(
         count_umac_call_ended_or_close(&test.dump_sinks()) >= 2,
-        "P2P circuit closes after caller and peer D-RELEASE"
+        "P2P circuit closes after caller D-RELEASE and peer U-RELEASE"
     );
 }
 
@@ -13114,8 +13138,7 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
     // initiate individual-call disconnection. If the called MS disconnects, it
     // receives D-RELEASE promptly. Because the calling peer did not request
     // release, the peer-facing clear waits for the bounded bearer drain and
-    // then uses D-RELEASE, which expects no peer response per clause
-    // 14.5.1.3.3.
+    // then uses D-DISCONNECT, expecting peer U-RELEASE per clause 14.5.1.3.3.
     test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
     let mut called_release_msgs = test.dump_sinks();
@@ -13140,28 +13163,32 @@ fn test_p2p_called_party_u_disconnect_waits_for_caller_release_before_circuit_cl
     );
 
     drain_private_simplex_tail(&mut test, dltime);
-    let mut peer_release_msgs = test.dump_sinks();
-    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
-    assert_established_p2p_release_pdus_to(
-        &peer_release_msgs,
+    let mut peer_disconnect_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&peer_disconnect_msgs), 0);
+    assert_established_p2p_disconnect_pdu_to(
+        &peer_disconnect_msgs,
         call_id,
         DisconnectCause::UserRequestedDisconnection,
-        &[TEST_ISSI],
+        TEST_ISSI,
     );
-    assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&peer_disconnect_msgs), 0);
 
-    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    let peer_disconnect_reporters = extract_d_disconnect_reporters(&mut peer_disconnect_msgs);
     assert_eq!(
-        peer_release_reporters.len(),
+        peer_disconnect_reporters.len(),
         1,
-        "Assigned-channel D-RELEASE to caller peer must carry one TxReporter"
+        "Assigned-channel D-DISCONNECT to caller peer must carry one TxReporter"
     );
-    assert_eq!(peer_release_reporters[0].get_state(), TxState::Pending);
+    assert_eq!(peer_disconnect_reporters[0].get_state(), TxState::Pending);
 
-    peer_release_reporters[0].mark_transmitted();
+    peer_disconnect_reporters[0].mark_transmitted();
     test.run_stack(Some(1));
     let transmitted_delivery_msgs = test.dump_sinks();
     assert_eq!(count_umac_call_ended_or_close(&transmitted_delivery_msgs), 0);
+
+    test.submit_message(build_u_release_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    assert_eq!(count_umac_call_ended_or_close(&test.dump_sinks()), 0);
 
     for reporter in &release_ack_reporters {
         reporter.mark_transmitted();

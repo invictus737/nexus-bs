@@ -1,5 +1,63 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 22:00 EEST - Private simplex peer clear restored to tail-drained D-DISCONNECT
+
+Component in simple technical terms:
+
+- CMCE individual-call release is the BS state machine that handles red-key hangup in a private call.
+- The disconnecting MS receives `D-RELEASE`; that is the acknowledgement required after its `U-DISCONNECT`.
+- The other MS can be cleared by `D-DISCONNECT`, which explicitly asks it to release the call and answer with `U-RELEASE`.
+- The bearer tail drain keeps final call-control signalling behind the last interleaved speech/tail frames so voice is not cut by the release PDU.
+
+RF failure analysed:
+
+- Deployed build `v0.1.57-7a895d8b` fixed the caller `D-CONNECT` STCH packing regression.
+- RF test `2260082 -> 2260618` reached active private simplex successfully:
+  - called `D-CONNECT ACKNOWLEDGE notification_indicator=Some(19)`;
+  - caller `D-CONNECT notification_indicator=None`;
+  - assigned-channel retry fit exactly as `MAC-RESOURCE hdr 76 + SDU 38 + fill 6 bits -> 124 STCH bits`;
+  - `FloorGranted` was emitted for `2260082`, then later for `2260618`;
+  - speech was present in both PTT directions.
+- Final close still produced terminal-visible `No Answer` on `2260618`.
+- Log cause: after `2260082` sent `U-DISCONNECT(UserRequestedDisconnection)`, BS sent prompt `D-RELEASE` to `2260082`, then peer clear by `D-RELEASE(UserRequestedDisconnection)` to `2260618`. Motorola rendered that peer-side final `D-RELEASE` as `No Answer` even though the call was established.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.3.1 requires the MS that sent `U-DISCONNECT` to wait for `D-RELEASE`.
+- The same clause says the SwMI should inform the other MS of call clearance either by `D-DISCONNECT` or `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3 says an MS receiving `D-DISCONNECT` responds with `U-RELEASE`; an MS receiving `D-RELEASE` sends no response.
+- EN 300 392-2 clause 23.8.2.2 says after `U-TX CEASED` or `U-DISCONNECT`, BS should issue tail bits before sending `D-TX CEASED`, `D-RELEASE`, or `D-DISCONNECT` to receiving MSs.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - Local simplex `U-DISCONNECT` still sends prompt `D-RELEASE(UserRequestedDisconnection)` to the initiator.
+  - Peer clear now waits for existing private-simplex tail drain, then uses `D-DISCONNECT(UserRequestedDisconnection)` rather than peer `D-RELEASE`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Tail-drain completion now starts the existing reporter-tracked `D-DISCONNECT -> U-RELEASE` state machine for the peer.
+  - Existing timeout behaviour is preserved: if peer `U-RELEASE` never arrives, BS closes locally after the bounded guard without sending another peer clear PDU.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated full private setup/release workflow, MXP600 field regressions, stale PTT/disconnect windows, pending release, call-id wrap, and called-party-disconnect coverage to assert tail-drained peer `D-DISCONNECT`, peer `U-RELEASE`, and no premature circuit close.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked test_simple_private_call_full_direct_setup_and_release_workflow -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked mxp600` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked p2p` passed: 82 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked private` passed: 20 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Commit and deploy directly to `/home/chris/nexus-bs/nexus-bs`.
+- Clear volatile journal.
+- Repeat exactly one local private simplex test: `2260082 -> 2260618`, one PTT each direction, close from `2260082`.
+- Expected log shape: initiator `D-RELEASE(UserRequestedDisconnection)`, tail-drained peer `D-DISCONNECT(UserRequestedDisconnection)`, optional peer `U-RELEASE`, no fallback peer `D-RELEASE`, no BS restart.
+- Required RF result: no false `No Answer` on `2260618` and no Motorola soft reboot.
+
 ## 2026-06-07 21:41 EEST - Private simplex caller D-CONNECT kept compact for STCH recovery
 
 Component in simple technical terms:
