@@ -1,5 +1,37 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 07:58 EEST - Nexus-BS v0.1.57 RF-good private simplex checkpoint
+
+Component in simple technical terms:
+
+- Release identity is the version/name layer used by binaries, dashboard, control, telemetry, User-Agent, docs, example config, and systemd descriptions.
+- This checkpoint does not change CMCE/UMAC/LLC TETRA protocol behavior.
+- The protected RF-good protocol base is commit `63c3b2f` (`Fix private simplex called connect ack delivery`).
+
+RF result:
+
+- Field report: private simplex P2P is now perfect on the current `63c3b2f` behavior.
+- Do not regress the private simplex setup path without first re-reading the ETSI private-call clauses and this checkpoint.
+
+ETSI clause scope:
+
+- The protected behavior is the private simplex setup delivery path already documented below against EN 300 392-2 clauses 14.5.1.1.1, 14.5.1.1.2, 14.5.1.2.1, and Annex D.4.
+- This release bump is metadata only and is not formal ETSI/TETRA certification.
+
+Patch:
+
+- Bumped Nexus-BS release identity from `v0.1.56` to `v0.1.57`.
+- Updated workspace version, Cargo lockfile package versions, product identity tests, dashboard expectations, control/telemetry subprotocol tests, README, example config, and systemd descriptions.
+
+Verification:
+
+- `cargo test -p tetra-core --locked` -> 47 passed.
+- `cargo test -p tetra-entities net_control --locked` -> 22 passed.
+- `cargo test -p tetra-entities net_telemetry --locked` -> 8 passed, 5 ignored transport tests.
+- `cargo test -p tetra-entities net_dashboard --locked` -> 53 passed.
+- `cargo check -p tetra-core -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
 ## 2026-06-07 01:58 EEST - Private simplex called-leg delivery switched to Annex D.4 unacknowledged repeat path
 
 Component in simple technical terms:
