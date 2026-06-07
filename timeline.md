@@ -10994,3 +10994,59 @@ Next RF gate:
 - Clear volatile journal before test.
 - Repeat private simplex `2260616 -> 2260618`.
 - Watch specifically for absence of `received ACK ... before a complete UMAC transmission. Ignoring`, absence of `U-DISCONNECT(InvalidCallIdentifier)` from `2260618`, and successful caller/called `D-CONNECT` activation.
+
+## 2026-06-07 09:24 EEST - Private simplex connected notification without release-cause regression
+
+Context:
+
+- User reported the current RF-good base has first-PTT voice from the initiating PTT, but Motorola still shows `No answer` instead of a normal disconnected/end-call UI at private simplex close.
+- Agents were closed/restarted for a focused read-only audit. The ETSI audit rejected changing the peer-facing RF release cause from `UserRequestedDisconnection` to `SwmiRequestedDisconnection`; clause 14.5.1.3.1/14.5.1.3.3 allow peer `D-RELEASE`, but table 14.55 still identifies the reason as user-requested disconnection.
+- Live log for `2260082 -> 2260618`, `call_id=4`, showed the RF release path was already an established-call close:
+  - `U-DISCONNECT` from `2260082` while CMCE state was `Active`;
+  - prompt `D-RELEASE(UserRequestedDisconnection)` to `2260082`;
+  - tail-drained peer `D-RELEASE(UserRequestedDisconnection)` to `2260618`;
+  - UMAC circuit closed only after release delivery.
+- The same log confirmed first-PTT recovery behaviour remained the current best base:
+  - caller `D-CONNECT` current-channel was not L2-ACKed;
+  - assigned-channel recovery `D-CONNECT` was ACKed;
+  - `FloorGranted` was emitted only after caller `D-CONNECT` ACK;
+  - deferred private media then flowed with speech present.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.1.1/14.5.1.1.2: individual call setup uses `D-CONNECT ACKNOWLEDGE`/`D-CONNECT` to carry transmit state and enter active call.
+- EN 300 392-2 clause 14.5.1.2.2: most downlink CC PDUs may carry a Notification indicator to inform the user about offered or connected service.
+- EN 300 392-9 clause 7.2.2 notification value `19`: `Called user connected`.
+- EN 300 392-2 clause 14.5.1.3.1/14.5.1.3.3: normal private-call close remains `U-DISCONNECT` followed by `D-RELEASE`; peer may also be informed by `D-RELEASE`, with no response expected.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Added `NOTIFICATION_CALLED_USER_CONNECTED = 19`.
+  - Local private `D-CONNECT ACKNOWLEDGE` to the called MS now carries notification indicator `19`.
+  - Local private caller `D-CONNECT` now carries notification indicator `19`.
+  - No changes to `D-RELEASE`, `D-DISCONNECT`, floor grants, caller `D-CONNECT` retry/recovery, or media routing.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Extended the full simple private setup/release workflow to assert notification indicator `19` on both connect PDUs.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs --locked test_simple_private_call_full_direct_setup_and_release_workflow -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked p2p` passed: 82 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked private` passed: 19 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo fmt --package tetra-entities` completed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Commit and deploy directly to `/home/chris/nexus-bs/nexus-bs`.
+2. Clear volatile journal.
+3. Repeat local private simplex, preferably `2260082 -> 2260618` first because it is the latest good baseline.
+4. Required result:
+   - first initiating PTT still carries voice after caller `D-CONNECT` recovery;
+   - close remains established-call `D-RELEASE(UserRequestedDisconnection)`;
+   - peer Motorola should render normal end/disconnected state, not `No answer`;
+   - no Motorola reboot, no `PTT denied`, no `Network trouble`, no BS restart.
+5. If `No answer` persists, do not change release cause next. Inspect whether terminal UI saw notification indicator `19` in both connect PDUs and consider a separate `D-INFO` imminent-disconnection experiment with notification value `26` only after EN 300 392-9 semantics are rechecked.

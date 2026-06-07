@@ -28,6 +28,7 @@ const INDIVIDUAL_CONNECT_ACK_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * 18 * 4;
 const INDIVIDUAL_CONNECT_ACK_MAX_ATTEMPTS: u8 = 5;
 const INDIVIDUAL_CALLER_CONNECT_MAX_ATTEMPTS: u8 = 3;
 const PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS: u8 = 3;
+const NOTIFICATION_CALLED_USER_CONNECTED: u64 = 19;
 
 #[derive(Clone, Copy)]
 enum PendingConnectAckAction {
@@ -392,7 +393,11 @@ impl CcBsSubentity {
             // EN 300 392-2 14.8.43/table 14.81 raw value 0 (`false`
             // here) means the MS is allowed to request transmit permission.
             transmission_request_permission: false,
-            notification_indicator: None,
+            // EN 300 392-2 clause 14.5.1.2.2 permits downlink CC PDUs to
+            // carry EN 300 392-9 clause 7.2.2 notification value 19
+            // ("Called user connected"). Marking the direct private setup as
+            // connected keeps terminal UI state aligned with the active RF call.
+            notification_indicator: Some(NOTIFICATION_CALLED_USER_CONNECTED),
             facility: None,
             proprietary: None,
         };
@@ -685,7 +690,11 @@ impl CcBsSubentity {
             call_priority: None,
             basic_service_information: None,
             temporary_address: None,
-            notification_indicator: None,
+            // EN 300 392-2 clause 14.5.1.2.2 permits downlink CC PDUs to
+            // carry EN 300 392-9 clause 7.2.2 notification value 19
+            // ("Called user connected"). Marking the direct private setup as
+            // connected keeps terminal UI state aligned with the active RF call.
+            notification_indicator: Some(NOTIFICATION_CALLED_USER_CONNECTED),
             facility: None,
             proprietary: None,
         };

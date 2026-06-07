@@ -10141,6 +10141,32 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
         1,
         "simple private setup should send one repeated unacknowledged D-CONNECT-ACKNOWLEDGE to the called MS"
     );
+    let caller_connect = connect_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim),
+            _ => None,
+        })
+        .next()
+        .expect("simple private setup should include caller D-CONNECT");
+    let called_connect_ack = connect_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim),
+            _ => None,
+        })
+        .next()
+        .expect("simple private setup should include called D-CONNECT ACKNOWLEDGE");
+    assert_eq!(
+        caller_connect.notification_indicator,
+        Some(19),
+        "caller D-CONNECT should mark the direct private setup as called-user-connected"
+    );
+    assert_eq!(
+        called_connect_ack.notification_indicator,
+        Some(19),
+        "called D-CONNECT ACKNOWLEDGE should mark the direct private setup as connected"
+    );
     assert_eq!(
         count_d_tx_interrupt(&connect_msgs),
         0,
