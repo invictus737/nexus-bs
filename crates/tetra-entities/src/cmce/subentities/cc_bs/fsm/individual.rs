@@ -43,6 +43,12 @@ enum PrivateCalledConnectAckDelivery {
     AssignedChannelRecovery,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PrivateCallerDConnectDelivery {
+    CurrentChannel,
+    AssignedChannelRecovery,
+}
+
 impl PrivateCalledConnectAckDelivery {
     fn retry_for_attempt(attempt: u8) -> Self {
         match attempt {
@@ -80,6 +86,26 @@ impl PrivateCalledConnectAckDelivery {
         } else {
             Some(PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS)
         }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::CurrentChannel => "current-channel",
+            Self::AssignedChannelRecovery => "assigned-channel recovery",
+        }
+    }
+}
+
+impl PrivateCallerDConnectDelivery {
+    fn for_attempt(attempt: u8) -> Self {
+        match attempt {
+            1 => Self::CurrentChannel,
+            _ => Self::AssignedChannelRecovery,
+        }
+    }
+
+    fn stealing_permission(self) -> bool {
+        matches!(self, Self::AssignedChannelRecovery)
     }
 
     fn label(self) -> &'static str {
@@ -568,10 +594,11 @@ impl CcBsSubentity {
                     };
 
                     tracing::warn!(
-                        "CMCE: retrying caller D-CONNECT for call_id={} attempt {}/{} after missing L2 ACK before initial floor",
+                        "CMCE: retrying caller D-CONNECT for call_id={} attempt {}/{} via {} after missing L2 ACK before initial floor",
                         call_id,
                         attempts + 1,
-                        INDIVIDUAL_CALLER_CONNECT_MAX_ATTEMPTS
+                        INDIVIDUAL_CALLER_CONNECT_MAX_ATTEMPTS,
+                        PrivateCallerDConnectDelivery::for_attempt(attempts + 1).label()
                     );
                     let reporter = self.send_private_caller_d_connect_delivery_guard(
                         queue,
@@ -579,6 +606,7 @@ impl CcBsSubentity {
                         &call_snapshot,
                         cached,
                         called_ms_transmits_first,
+                        PrivateCallerDConnectDelivery::for_attempt(attempts + 1),
                     );
                     if let Some(pending) = self.pending_individual_connect_acks.get_mut(&call_id) {
                         pending.reporter = reporter;
@@ -608,7 +636,14 @@ impl CcBsSubentity {
             call.mark_caller_connect_ack_pending();
         }
 
-        let reporter = self.send_private_caller_d_connect_delivery_guard(queue, call_id, &call_snapshot, cached, called_ms_transmits_first);
+        let reporter = self.send_private_caller_d_connect_delivery_guard(
+            queue,
+            call_id,
+            &call_snapshot,
+            cached,
+            called_ms_transmits_first,
+            PrivateCallerDConnectDelivery::for_attempt(1),
+        );
         tracing::info!(
             "CMCE: caller D-CONNECT queued for call_id={}; waiting for caller L2 ACK before private call activation",
             call_id
@@ -630,6 +665,7 @@ impl CcBsSubentity {
         call_snapshot: &IndividualCall,
         cached: &CachedSetup,
         called_ms_transmits_first: bool,
+        delivery: PrivateCallerDConnectDelivery,
     ) -> TxReporter {
         let (_, calling_grant) = Self::private_connect_grants(call_snapshot.simplex_duplex, called_ms_transmits_first);
         let d_connect = DConnect {
@@ -655,8 +691,9 @@ impl CcBsSubentity {
         };
 
         tracing::info!(
-            "-> {:?} (caller leg after called D-CONNECT ACK BL-ACK, waiting for D-CONNECT local transmission before call activation)",
-            d_connect
+            "-> {:?} (caller leg after called D-CONNECT ACK BL-ACK, {} D-CONNECT, waiting for L2 ACK before call activation)",
+            d_connect,
+            delivery.label()
         );
         let mut connect_sdu = BitBuffer::new_autoexpand(30);
         d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
@@ -676,7 +713,7 @@ impl CcBsSubentity {
                 layer2service: Layer2Service::Acknowledged,
                 pdu_prio,
                 layer2_qos: 0,
-                stealing_permission: false,
+                stealing_permission: delivery.stealing_permission(),
                 stealing_repeats_flag: false,
                 unacked_bl_repetitions: None,
                 chan_alloc: Some(Self::private_connect_chan_alloc(

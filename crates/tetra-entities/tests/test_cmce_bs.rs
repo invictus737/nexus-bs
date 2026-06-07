@@ -9498,6 +9498,100 @@ fn test_p2p_caller_d_connect_transmitted_without_l2_ack_does_not_seed_initial_fl
 }
 
 #[test]
+fn test_p2p_caller_d_connect_missing_l2_ack_retries_on_assigned_channel_before_floor() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, dltime);
+    let first_caller_connect_msgs = drain_message_queue(&mut queue);
+
+    let first_d_connects: Vec<_> = first_caller_connect_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(first_d_connects.len(), 1);
+    assert_eq!(first_d_connects[0].0.main_address.ssi, TEST_ISSI);
+    assert!(
+        !first_d_connects[0].0.stealing_permission,
+        "ETSI EN 300 392-2 Annex D.4: first caller D-CONNECT with channel allocation uses current-channel ACK grant"
+    );
+    assert_eq!(first_d_connects[0].0.layer2service, Layer2Service::Acknowledged);
+    assert!(first_d_connects[0].0.chan_alloc.is_some());
+    assert_eq!(
+        count_umac_floor_granted(&first_caller_connect_msgs),
+        0,
+        "first caller D-CONNECT must not open private-simplex media until L2 ACK"
+    );
+
+    let first_reporter = d_connect_reporter(&first_caller_connect_msgs, TEST_ISSI);
+    first_reporter.mark_transmitted();
+    first_reporter.mark_lost();
+    cmce.tick_start(&mut queue, dltime.add_timeslots(4));
+    let retry_msgs = drain_message_queue(&mut queue);
+
+    let retry_d_connects: Vec<_> = retry_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(retry_d_connects.len(), 1);
+    assert_eq!(retry_d_connects[0].0.main_address.ssi, TEST_ISSI);
+    assert!(
+        retry_d_connects[0].0.stealing_permission,
+        "if the caller missed the current-channel ACK window after channel allocation, retry D-CONNECT on the assigned traffic channel using FACCH/STCH"
+    );
+    assert_eq!(retry_d_connects[0].0.layer2service, Layer2Service::Acknowledged);
+    assert_eq!(retry_d_connects[0].1.call_identifier, call_id);
+    assert!(retry_d_connects[0].0.chan_alloc.is_some());
+    assert_eq!(
+        count_umac_floor_granted(&retry_msgs),
+        0,
+        "assigned-channel recovery D-CONNECT still waits for the caller BL-ACK before FloorGranted"
+    );
+    assert_eq!(count_d_releases(&retry_msgs), 0);
+
+    let retry_reporter = d_connect_reporter(&retry_msgs, TEST_ISSI);
+    retry_reporter.mark_transmitted();
+    cmce.tick_start(&mut queue, dltime.add_timeslots(8));
+    let retry_no_ack_msgs = drain_message_queue(&mut queue);
+    assert_eq!(
+        count_umac_floor_granted(&retry_no_ack_msgs),
+        0,
+        "local FACCH transmission alone must not open private-simplex media"
+    );
+
+    retry_reporter.mark_acknowledged();
+    cmce.tick_start(&mut queue, dltime.add_timeslots(12));
+    let activated_msgs = drain_message_queue(&mut queue);
+    assert_eq!(
+        count_umac_floor_granted(&activated_msgs),
+        1,
+        "caller D-CONNECT BL-ACK on assigned-channel recovery activates the ETSI setup-granted floor"
+    );
+}
+
+#[test]
 fn test_p2p_caller_invalid_call_identifier_during_caller_connect_ack_pending_releases_without_active_teardown() {
     debug::setup_logging_verbose();
 

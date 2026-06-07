@@ -13,7 +13,9 @@ use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation
 use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
+use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
+use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
@@ -641,6 +643,17 @@ fn mac_u_signal_bl_ack_pdu_for_test(nr: u8) -> BitBuffer {
     pdu
 }
 
+fn mac_u_signal_bl_adata_pdu_for_test(nr: u8, ns: u8) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    MacUSignal { second_half_stolen: false }.to_bitbuf(&mut pdu);
+    BlAdata { has_fcs: false, nr, ns }.to_bitbuf(&mut pdu);
+    // A small payload proves pre-floor routing strips ambiguous TL-SDU data
+    // instead of duplicating it under both candidate ISSIs.
+    pdu.write_bits(0b10101, 5);
+    pdu.seek(0);
+    pdu
+}
+
 fn bl_ack_tma_sdu_for_test(nr: u8) -> BitBuffer {
     let mut pdu = BitBuffer::new_autoexpand(8);
     BlAck { has_fcs: false, nr }.to_bitbuf(&mut pdu);
@@ -684,10 +697,39 @@ fn submit_stch_mac_u_signal_bl_ack(test: &mut ComponentTest, nr: u8) {
     });
 }
 
+fn submit_stch_mac_u_signal_bl_adata(test: &mut ComponentTest, nr: u8, ns: u8) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: mac_u_signal_bl_adata_pdu_for_test(nr, ns),
+            block_num: PhyBlockNum::Block1,
+            logical_channel: LogicalChannel::Stch,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NAN,
+        }),
+    });
+}
+
 fn tma_unitdata_ind_addresses(msgs: &[SapMsg]) -> Vec<TetraAddress> {
     msgs.iter()
         .filter_map(|msg| match &msg.msg {
             SapMsgInner::TmaUnitdataInd(prim) => Some(prim.main_address),
+            _ => None,
+        })
+        .collect()
+}
+
+fn tma_unitdata_ind_pdu_types_and_lengths(msgs: &[SapMsg]) -> Vec<(LlcPduType, usize)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmaUnitdataInd(prim) => {
+                let pdu = prim.pdu.as_ref()?;
+                let pdu_type = pdu.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok())?;
+                Some((pdu_type, pdu.get_len()))
+            }
             _ => None,
         })
         .collect()
@@ -1489,6 +1531,35 @@ fn test_stch_bl_ack_before_private_floor_granted_routes_to_private_participants(
         addresses,
         vec![TetraAddress::issi(called_issi), TetraAddress::issi(caller_issi)],
         "EN 300 392-2 Annex D.4 and clauses 21.4.5/22.3.2.3: addressless pre-floor private BL-ACK on assigned-channel STCH must reach LLC for both candidate ISSI links before FloorGranted"
+    );
+}
+
+#[test]
+fn test_stch_bl_adata_before_private_floor_granted_routes_ack_only_to_private_participants() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 2_260_082;
+    let called_issi = 2_260_618;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    test.submit_message(private_call_open_msg(called_issi, caller_issi, traffic_ts));
+    submit_stch_mac_u_signal_bl_adata(&mut test, 1, 0);
+    test.run_stack(Some(1));
+
+    let msgs = test.dump_sinks();
+    let addresses = tma_unitdata_ind_addresses(&msgs);
+    assert_eq!(
+        addresses,
+        vec![TetraAddress::issi(called_issi), TetraAddress::issi(caller_issi)],
+        "EN 300 392-2 Annex D.4 and clauses 21.4.5/22.3.2.3: addressless pre-floor private BL-ADATA must expose its ACK to both candidate ISSI links before FloorGranted"
+    );
+    assert_eq!(
+        tma_unitdata_ind_pdu_types_and_lengths(&msgs),
+        vec![(LlcPduType::BlAck, 5), (LlcPduType::BlAck, 5)],
+        "pre-floor BL-ADATA payload is sender-ambiguous on STCH, so UMAC must strip it to ACK-only copies instead of duplicating TL-SDU data under both ISSIs"
     );
 }
 

@@ -1,5 +1,84 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 09:08 EEST - Private simplex caller D-CONNECT assigned-channel recovery
+
+Component in simple technical terms:
+
+- CMCE is the call-control state machine. It decides the private-call setup sequence and when UMAC may open the voice floor.
+- `D-CONNECT` is the downlink setup PDU sent to the calling MS after the called side has accepted and received its `D-CONNECT ACKNOWLEDGE`.
+- FACCH/STCH is the signalling path inside the assigned traffic channel. It is needed when a terminal has already moved away from MCCH after channel allocation.
+
+RF failure analysed:
+
+- `2260616 -> 2260618` with on/off-hook signalling succeeded: caller `D-CONNECT` was L2-ACKed and CMCE emitted `FloorGranted`.
+- `2260082 -> 2260618` with direct setup failed: called `D-CONNECT ACKNOWLEDGE` completed, but caller `D-CONNECT` to `2260082` was retransmitted and never L2-ACKed. UMAC correctly deferred/dropped ACELP before `FloorGranted`, producing the user-visible symptom: destination channel opened, but no voice.
+- The prior UMAC BL-ADATA ACK-attribution patch was not sufficient for this Motorola caller path; the remaining gap was CMCE retrying caller `D-CONNECT` only through the current-channel delivery path.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.2.1 says SwMI controls which MS may transmit and an MS may begin U-plane transmission only after permission.
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 require `D-CONNECT ACKNOWLEDGE`/`D-CONNECT` to indicate which party may transmit.
+- EN 300 392-2 Annex D.4 describes the same-cell direct setup race: after channel allocation, the BS may need to repeat/page on the assigned traffic channel until it receives layer-2 acknowledgement.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Added `PrivateCallerDConnectDelivery`.
+  - First caller `D-CONNECT` remains current-channel with acknowledged L2 service and channel allocation.
+  - Retry attempts after missing caller L2 ACK now use assigned-channel recovery (`stealing_permission=true`) so the same acknowledged `D-CONNECT` can be delivered via FACCH/STCH to a terminal that already moved to the traffic channel.
+  - U-plane floor remains blocked until the caller `D-CONNECT` reporter is L2-acknowledged.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added regression coverage proving caller `D-CONNECT` retry moves to assigned-channel recovery and still does not emit `FloorGranted` until the caller BL-ACK.
+
+## 2026-06-07 08:49 EEST - Private simplex pre-floor BL-ADATA ACK attribution fix
+
+Component in simple technical terms:
+
+- UMAC is the radio scheduler/adapter that receives STCH signalling on an assigned traffic channel and forwards its LLC payload upward.
+- LLC `BL-ACK` confirms a previous acknowledged downlink transfer, such as caller `D-CONNECT`.
+- LLC `BL-ADATA` can carry both an ACK number and new data. Before private-simplex `FloorGranted`, STCH has no ISSI field, so UMAC cannot know which private-call participant sent it.
+
+RF failure analysed:
+
+- In the failed `2260082 -> 2260618` private simplex call, CMCE sent called-side `D-CONNECT ACKNOWLEDGE`, then caller `D-CONNECT` to `2260082`.
+- The called Motorola opened the private channel, but the caller `D-CONNECT` L2 ACK never matched at LLC, so CMCE never emitted `FloorGranted` and UMAC deferred/dropped media instead of forwarding voice.
+- Current code already duplicated pure pre-floor `BL-ACK` to both private participants, but `BL-ADATA` remained attributed only to the temporary primary ISSI. If the caller's ACK arrived as `BL-ADATA`, LLC could see it under the wrong ISSI and the setup would stall.
+
+ETSI clause scope:
+
+- EN 300 392-2 Annex D.4 describes individual-call direct setup where the called side is moved to the assigned channel and the BS authorizes caller transmission after setup signalling progress.
+- EN 300 392-2 clause 21.4.5 carries MAC-U-SIGNAL on STCH without an explicit ISSI address.
+- EN 300 392-2 clause 22.3.2.3 treats `BL-ADATA` as carrying ACK state as part of basic-link acknowledged transfer.
+- EN 300 392-2 clause 14.5.1.2.1 keeps U-plane transmit permission under SwMI control; this patch does not open speech before CMCE `FloorGranted`.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Replaced pre-floor private ACK routing with an ACK-only routing path.
+  - Before private-simplex `FloorGranted`, both `BL-ACK` and `BL-ADATA` ACK responses are converted to ACK-only `BL-ACK` copies and delivered to both private-call ISSI candidates.
+  - Any ambiguous pre-floor `BL-ADATA` or `BL-ACK` payload is not duplicated under both ISSIs; only the ACK header is used to let LLC match pending `D-CONNECT`.
+  - Once `FloorGranted` exists, normal STCH routing by the known speaker remains unchanged.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added a regression test proving pre-floor `BL-ADATA` routes ACK-only copies to both participants and strips payload.
+  - Kept the pure `BL-ACK` candidate-routing guard.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs stch_bl_ --locked` -> 2 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p_caller_d_connect --locked` -> 1 passed.
+- `cargo test -p tetra-entities --test test_umac_bs private --locked` -> 19 passed.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` -> 81 passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` -> 82 passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Build locally and deploy direct to `/home/chris/nexus-bs`.
+- Clean journal and run one structured private simplex RF test, preferably `2260082 -> 2260618`, then read logs for `caller D-CONNECT L2-acknowledged` followed by `FloorGranted`.
+
 ## 2026-06-07 08:18 EEST - Private simplex Motorola caller D-CONNECT ACK attribution fix
 
 Component in simple technical terms:

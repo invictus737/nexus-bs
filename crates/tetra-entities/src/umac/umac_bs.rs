@@ -10,6 +10,7 @@ use tetra_pdus::cmce::{
 };
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
+use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::fields::bs_service_details::BsServiceDetails;
@@ -441,23 +442,53 @@ impl UmacBs {
         )
     }
 
-    fn pre_floor_private_ack_addrs(&self, ts: u8, sdu: &BitBuffer) -> Vec<TetraAddress> {
+    fn pre_floor_private_ack_routing(&self, ts: u8, sdu: &BitBuffer) -> Option<(Vec<TetraAddress>, BitBuffer)> {
         if !self.private_simplex_waiting_for_floor_grant(ts) || !Self::llc_sdu_is_ack_response(sdu) {
-            return Vec::new();
+            return None;
         }
 
-        if Self::tma_sdu_is_standalone_ack_only_bl_ack(sdu) {
-            let participants = self.channel_scheduler.ul_circuit_issi_participants(ts);
-            if !participants.is_empty() {
-                return participants;
+        let participants = self.channel_scheduler.ul_circuit_issi_participants(ts);
+        if participants.is_empty() {
+            return None;
+        }
+
+        // EN 300 392-2 Annex D.4 and clauses 21.4.5/22.3.2.3: before the
+        // private-simplex FloorGranted, STCH MAC-U-SIGNAL has no ISSI field.
+        // A BL-ACK or BL-ADATA may be the caller's L2 ACK for D-CONNECT even
+        // while the temporary bearer primary is the called ISSI. Pass only an
+        // ACK-only copy to LLC under each candidate address; do not duplicate
+        // any ambiguous BL-ADATA/BL-ACK payload before CMCE identifies the
+        // speaker.
+        Self::pre_floor_private_ack_only_sdu(sdu).map(|ack_sdu| (participants, ack_sdu))
+    }
+
+    fn pre_floor_private_ack_only_sdu(sdu: &BitBuffer) -> Option<BitBuffer> {
+        let mut probe = BitBuffer::from_bitbuffer(sdu);
+        match probe.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok())? {
+            LlcPduType::BlAck | LlcPduType::BlAckFcs => {
+                let ack = BlAck::from_bitbuf(&mut probe).ok()?;
+                let mut ack_sdu = BitBuffer::new_autoexpand(8);
+                BlAck {
+                    has_fcs: false,
+                    nr: ack.nr,
+                }
+                .to_bitbuf(&mut ack_sdu);
+                ack_sdu.seek(0);
+                Some(ack_sdu)
             }
+            LlcPduType::BlAdata | LlcPduType::BlAdataFcs => {
+                let ack = BlAdata::from_bitbuf(&mut probe).ok()?;
+                let mut ack_sdu = BitBuffer::new_autoexpand(8);
+                BlAck {
+                    has_fcs: false,
+                    nr: ack.nr,
+                }
+                .to_bitbuf(&mut ack_sdu);
+                ack_sdu.seek(0);
+                Some(ack_sdu)
+            }
+            _ => None,
         }
-
-        self.channel_scheduler
-            .ul_circuit_primary_addr(ts)
-            .filter(|addr| addr.ssi_type == SsiType::Issi)
-            .into_iter()
-            .collect()
     }
 
     fn private_simplex_waiting_for_floor_grant(&self, ts: u8) -> bool {
@@ -2278,10 +2309,13 @@ impl UmacBs {
         tracing::debug!("rx_ul_mac_u_signal: forwarding {} bit TM-SDU to LLC", sdu.get_len());
 
         let msg_dltime = self.dltime.add_timeslots(-2);
-        let main_addresses = self
-            .current_ul_signal_addr(msg_dltime.t)
-            .map(|addr| vec![addr])
-            .unwrap_or_else(|| self.pre_floor_private_ack_addrs(msg_dltime.t, &sdu));
+        let (main_addresses, routed_sdu) = if let Some(addr) = self.current_ul_signal_addr(msg_dltime.t) {
+            (vec![addr], sdu)
+        } else if let Some((addrs, ack_sdu)) = self.pre_floor_private_ack_routing(msg_dltime.t, &sdu) {
+            (addrs, ack_sdu)
+        } else {
+            (Vec::new(), sdu)
+        };
         if main_addresses.is_empty() {
             tracing::warn!(
                 "rx_ul_mac_u_signal: dropping STCH TM-SDU because no current ISSI speaker is known for UL ts {}",
@@ -2291,7 +2325,7 @@ impl UmacBs {
         }
         if main_addresses.len() > 1 {
             tracing::debug!(
-                "rx_ul_mac_u_signal: routing pre-floor private BL-ACK on UL ts {} to participant candidates {:?}",
+                "rx_ul_mac_u_signal: routing pre-floor private ACK response on UL ts {} to participant candidates {:?}",
                 msg_dltime.t,
                 main_addresses
             );
@@ -2300,16 +2334,16 @@ impl UmacBs {
         // EN 300 392-2 clauses 21.4.5 and 14.5.1.2.1/14.5.2.2.1: MAC-U-SIGNAL
         // carries U-plane signalling on STCH without an address field. Preserve
         // the current assigned-channel speaker identity when it is known. Before
-        // private-simplex FloorGranted, pure BL-ACK has no sender address, so
-        // route it to the participant candidates and let LLC match the pending
-        // acknowledged transfer by SSI/N(S).
+        // private-simplex FloorGranted, ACK responses have no sender address,
+        // so route an ACK-only copy to the participant candidates and let LLC
+        // match the pending acknowledged transfer by SSI/N(S).
         for main_address in main_addresses {
             queue.push_back(SapMsg {
                 sap: Sap::TmaSap,
                 src: TetraEntity::Umac,
                 dest: TetraEntity::Llc,
                 msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
-                    pdu: Some(sdu.clone()),
+                    pdu: Some(routed_sdu.clone()),
                     main_address,
                     scrambling_code: prim.scrambling_code,
                     endpoint_id: 0,
