@@ -690,11 +690,9 @@ impl CcBsSubentity {
             call_priority: None,
             basic_service_information: None,
             temporary_address: None,
-            // EN 300 392-2 clause 14.5.1.2.2 permits downlink CC PDUs to
-            // carry EN 300 392-9 clause 7.2.2 notification value 19
-            // ("Called user connected"). Marking the direct private setup as
-            // connected keeps terminal UI state aligned with the active RF call.
-            notification_indicator: Some(NOTIFICATION_CALLED_USER_CONNECTED),
+            // Keep caller D-CONNECT compact: assigned-channel recovery must
+            // fit FACCH/STCH with MAC-RESOURCE channel allocation.
+            notification_indicator: None,
             facility: None,
             proprietary: None,
         };

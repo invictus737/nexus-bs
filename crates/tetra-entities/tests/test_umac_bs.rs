@@ -10,6 +10,7 @@ use tetra_entities::lmac::components::{errorcontrol, scrambler};
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::cmce::enums::{call_timeout::CallTimeout, transmission_grant::TransmissionGrant};
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
+use tetra_pdus::cmce::pdus::d_connect::DConnect;
 use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
@@ -467,9 +468,42 @@ fn d_tx_ceased_sdu(call_id: u16) -> BitBuffer {
     sdu
 }
 
+fn private_caller_d_connect_sdu(call_id: u16, notification_indicator: Option<u64>) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(64);
+    DConnect {
+        call_identifier: call_id,
+        call_time_out: CallTimeout::T5m,
+        hook_method_selection: false,
+        simplex_duplex_selection: false,
+        transmission_grant: TransmissionGrant::Granted,
+        transmission_request_permission: false,
+        call_ownership: false,
+        call_priority: None,
+        basic_service_information: None,
+        temporary_address: None,
+        notification_indicator,
+        facility: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("serialize private caller D-CONNECT");
+    sdu.seek(0);
+    sdu
+}
+
 fn llc_wrapped_cmce_sdu(mut cmce_sdu: BitBuffer) -> BitBuffer {
     let mut sdu = BitBuffer::new_autoexpand(64);
     BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
+    sdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
+    let cmce_sdu_len = cmce_sdu.get_len();
+    sdu.copy_bits(&mut cmce_sdu, cmce_sdu_len);
+    sdu.seek(0);
+    sdu
+}
+
+fn llc_ack_wrapped_cmce_sdu(mut cmce_sdu: BitBuffer) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(64);
+    BlData { has_fcs: false, ns: 0 }.to_bitbuf(&mut sdu);
     sdu.write_bits(MleProtocolDiscriminator::Cmce.into_raw(), 3);
     let cmce_sdu_len = cmce_sdu.get_len();
     sdu.copy_bits(&mut cmce_sdu, cmce_sdu_len);
@@ -2650,6 +2684,91 @@ fn test_acked_channel_allocation_stealing_tma_uses_assigned_channel_stch() {
             Some(TmaReport::SuccessReservedOrStealing)
         ),
         "complete assigned-channel STCH recovery should report reserved/stealing success"
+    );
+}
+
+#[test]
+fn test_private_caller_d_connect_assigned_channel_recovery_fits_stch_when_compact() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 2_260_082;
+    let called_issi = 2_260_618;
+    let traffic_ts = 2;
+    let req_handle = 36;
+    let compact_sdu = llc_ack_wrapped_cmce_sdu(private_caller_d_connect_sdu(4, None));
+    let notified_sdu = llc_ack_wrapped_cmce_sdu(private_caller_d_connect_sdu(4, Some(19)));
+
+    let mut assigned = [false; 4];
+    assigned[traffic_ts as usize - 1] = true;
+    let tx_reporter = TxReporter::new_unacked();
+    let test_prim = TmaUnitdataReq {
+        req_handle,
+        pdu: compact_sdu.clone(),
+        main_address: TetraAddress::issi(caller_issi),
+        endpoint_id: 1,
+        pdu_prio: 6,
+        stealing_permission: true,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: Some(4),
+            timeslots: assigned,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: None,
+        }),
+        tx_reporter: Some(tx_reporter.clone()),
+    };
+
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(private_call_open_msg(called_issi, caller_issi, traffic_ts));
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(test_prim),
+    });
+    test.run_stack(Some(4));
+
+    let sink_msgs = test.dump_sinks();
+    let stch_resource = mac_resources_for_addr(&sink_msgs, TetraAddress::issi(caller_issi))
+        .into_iter()
+        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_some())
+        .map(|(_, resource)| resource)
+        .expect("compact caller D-CONNECT recovery should emit STCH MAC-RESOURCE");
+    let stch_header_len = stch_resource.compute_header_len();
+    assert!(
+        stch_header_len + compact_sdu.get_len() <= 124,
+        "compact caller D-CONNECT must fit FACCH/STCH with MAC-RESOURCE channel allocation"
+    );
+    assert!(
+        stch_header_len + notified_sdu.get_len() > 124,
+        "adding optional caller notification would reproduce the RF failure: MAC-RESOURCE header plus SDU no longer fits STCH"
+    );
+    assert_eq!(
+        stch_resource
+            .chan_alloc_element
+            .as_ref()
+            .expect("caller D-CONNECT recovery must preserve channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    assert_eq!(
+        stch_resource.usage_marker,
+        Some(4),
+        "EN 300 392-2 clauses 14.5.1.1.2 and Annex D.4: caller D-CONNECT assigned-channel recovery keeps the traffic usage marker"
+    );
+    assert_eq!(tx_reporter.get_state(), TxState::Transmitted);
+    assert!(
+        matches!(
+            tma_report_for_handle(&sink_msgs, req_handle),
+            Some(TmaReport::SuccessReservedOrStealing)
+        ),
+        "complete compact caller D-CONNECT STCH recovery should report reserved/stealing success"
     );
 }
 

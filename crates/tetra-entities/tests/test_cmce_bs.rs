@@ -9530,6 +9530,10 @@ fn test_p2p_caller_d_connect_missing_l2_ack_retries_on_assigned_channel_before_f
         .collect();
     assert_eq!(first_d_connects.len(), 1);
     assert_eq!(first_d_connects[0].0.main_address.ssi, TEST_ISSI);
+    assert_eq!(
+        first_d_connects[0].1.notification_indicator, None,
+        "caller D-CONNECT must remain compact for assigned-channel retry compatibility"
+    );
     assert!(
         !first_d_connects[0].0.stealing_permission,
         "ETSI EN 300 392-2 Annex D.4: first caller D-CONNECT with channel allocation uses current-channel ACK grant"
@@ -9557,6 +9561,10 @@ fn test_p2p_caller_d_connect_missing_l2_ack_retries_on_assigned_channel_before_f
         .collect();
     assert_eq!(retry_d_connects.len(), 1);
     assert_eq!(retry_d_connects[0].0.main_address.ssi, TEST_ISSI);
+    assert_eq!(
+        retry_d_connects[0].1.notification_indicator, None,
+        "assigned-channel recovery D-CONNECT must fit FACCH/STCH with MAC-RESOURCE"
+    );
     assert!(
         retry_d_connects[0].0.stealing_permission,
         "if the caller missed the current-channel ACK window after channel allocation, retry D-CONNECT on the assigned traffic channel using FACCH/STCH"
@@ -10158,9 +10166,8 @@ fn test_simple_private_call_full_direct_setup_and_release_workflow() {
         .next()
         .expect("simple private setup should include called D-CONNECT ACKNOWLEDGE");
     assert_eq!(
-        caller_connect.notification_indicator,
-        Some(19),
-        "caller D-CONNECT should mark the direct private setup as called-user-connected"
+        caller_connect.notification_indicator, None,
+        "caller D-CONNECT stays compact so assigned-channel recovery fits FACCH/STCH"
     );
     assert_eq!(
         called_connect_ack.notification_indicator,

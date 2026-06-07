@@ -1,5 +1,57 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-07 21:41 EEST - Private simplex caller D-CONNECT kept compact for STCH recovery
+
+Component in simple technical terms:
+
+- CMCE is the private-call control logic. It sends the called-side `D-CONNECT ACKNOWLEDGE`, then the caller-side `D-CONNECT`, and only opens the initial simplex voice floor after the caller leg is delivered.
+- UMAC/MAC is the radio scheduler. During private-call recovery it may need to send call-control signalling as FACCH/STCH inside the already assigned traffic channel.
+- `notification_indicator` is optional call-control UI/status information. It must not make an assigned-channel recovery PDU too large to fit the RF signalling slot.
+
+RF failure analysed:
+
+- The previous connected-notification patch put notification value `19` (`Called user connected`) on both the called `D-CONNECT ACKNOWLEDGE` and caller `D-CONNECT`.
+- In the failed `2260082 -> 2260618` private simplex RF test, the caller `D-CONNECT` missed its first current-channel L2 ACK and needed assigned-channel recovery.
+- UMAC reported the concrete packing failure: `MAC-RESOURCE hdr 76 + SDU 49 bits > 124`, then fell back to MCCH/SCH-F instead of FACCH/STCH.
+- The caller never acknowledged that `D-CONNECT`; CMCE released setup with `AcknowledgedServiceNotComplete`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 require `D-CONNECT ACKNOWLEDGE` and `D-CONNECT` to complete individual-call setup and carry the transmit permission state.
+- EN 300 392-2 clause 14.5.1.2.1 keeps U-plane transmit permission under SwMI control; Nexus-BS still opens private-simplex media only after caller `D-CONNECT` delivery.
+- EN 300 392-2 Annex D.4 describes the direct-call same-cell acknowledgement race and supports assigned-channel recovery after traffic channel assignment.
+- The connected notification is optional UI/status information; it is not allowed to break the mandatory caller setup delivery path. This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/individual.rs`
+  - Caller `D-CONNECT` now keeps `notification_indicator = None` so first delivery and assigned-channel retry remain compact.
+  - Called `D-CONNECT ACKNOWLEDGE` still carries notification value `19`; this preserves the Motorola UI hint on the called leg without increasing the caller recovery PDU.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added assertions that both the first caller `D-CONNECT` and the assigned-channel retry keep `notification_indicator = None`.
+  - Updated the full private setup/release workflow to preserve called ACK notification `19` while caller `D-CONNECT` remains compact.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added an RF-size regression proving acknowledged caller `D-CONNECT` with `notification_indicator = None` fits FACCH/STCH with `MAC-RESOURCE` channel allocation.
+  - The same regression proves adding optional notification `19` to caller `D-CONNECT` reproduces the over-capacity shape (`header + SDU > 124`).
+
+Verification:
+
+- `cargo fmt --package tetra-entities` completed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked test_private_caller_d_connect_assigned_channel_recovery_fits_stch_when_compact -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked test_p2p_caller_d_connect_missing_l2_ack_retries_on_assigned_channel_before_floor -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked test_simple_private_call_full_direct_setup_and_release_workflow -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked p2p` passed: 82 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked private` passed: 20 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Commit and deploy directly to `/home/chris/nexus-bs/nexus-bs`.
+- Clear volatile journal.
+- Repeat one controlled local private simplex test: `2260082 -> 2260618`, first PTT short voice, called side response, normal caller close.
+- Expected log shape: called `D-CONNECT ACKNOWLEDGE notification_indicator=Some(19)`, caller `D-CONNECT notification_indicator=None`, no `does not fit STCH`, assigned-channel retry ACKs if needed, then `FloorGranted`.
+
 ## 2026-06-07 09:08 EEST - Private simplex caller D-CONNECT assigned-channel recovery
 
 Component in simple technical terms:
