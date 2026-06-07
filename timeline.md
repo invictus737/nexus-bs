@@ -31,6 +31,17 @@ Patch:
 - `crates/tetra-entities/tests/test_cmce_bs.rs`
   - Added regression coverage proving caller `D-CONNECT` retry moves to assigned-channel recovery and still does not emit `FloorGranted` until the caller BL-ACK.
 
+RF gate after deploy:
+
+- Deployed commit `aa77b7c0` as build `v0.1.57-aa77b7c0` to `nexus-bs@chris.service`.
+- Test: `2260082 -> 2260618` private simplex, direct setup (`hook=false`).
+- First caller `D-CONNECT` on current-channel signalling missed L2 ACK and exhausted LLC retransmission/late-ACK grace.
+- CMCE retried caller `D-CONNECT` via assigned-channel recovery FACCH/STCH at `09:04:55.403`.
+- Caller `D-CONNECT` was L2-acknowledged at `09:04:55.504`, then CMCE activated call `call_id=4` and emitted `FloorGranted` for ISSI `2260082`.
+- Subsequent floor turns from both `2260082` and `2260618` produced `U-TX DEMAND`, `FloorGranted`, and `speech_present=true`.
+- Caller disconnect at `09:05:14.655` produced assigned-channel `D-RELEASE` to initiator and peer clear by `D-RELEASE` to `2260618`; UMAC closed DL/UL circuit for `ts=2`.
+- No `PTT denied`, `Network trouble`, `AcknowledgedServiceNotComplete`, BS crash, or systemd restart was observed in the RF log.
+
 ## 2026-06-07 08:49 EEST - Private simplex pre-floor BL-ADATA ACK attribution fix
 
 Component in simple technical terms:
