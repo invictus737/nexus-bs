@@ -11218,3 +11218,21 @@ Next RF gate:
    - no MXP600 soft reboot/reattach;
    - no `No Answer` if the terminal maps the established-call release correctly;
    - first PTT/media path remains unchanged from the current RF-good base.
+
+Tetra-Core/SmartConnect agent result:
+
+- Agent `Halley the 5th` completed read-only analysis and was closed.
+- `/Users/ctermure/Work/Tetra-Core` did not contain the raw `artifacts/smartconnect/...` captures referenced by docs; it contained docs, parsers, tests, and capture tools.
+- Tetra-Core itself labels SmartConnect/DIMETRA Connect as WIP/lab-only. Treat it as inspiration only, not ETSI evidence and not Motorola RF proof.
+- Useful transferable idea:
+  - SmartConnect private flow separates setup/provision/grant/ACK from media.
+  - Media/floor starts only after the accepting side has completed setup.
+  - Release/cleanup waits for queued media/release guards instead of tearing state down immediately after enqueue.
+- Nexus-BS already has the analogous RF gates and must preserve them:
+  - no traffic channel before called response;
+  - called `D-CONNECT ACKNOWLEDGE` before caller `D-CONNECT`;
+  - `FloorGranted` only after caller `D-CONNECT` delivery/L2 ACK;
+  - setup reject/no-answer stays setup-phase and does not arm media/floor;
+  - local simplex close with peer `D-RELEASE` must not wait for peer `U-RELEASE`.
+- Not useful for the RF fix:
+  - BEL byte layouts, UDP/1200 RTP PT96, SSRC/request-id formulas, `media_auth`, STUN, AES-GCM, synthetic lab auth, and native lab mode immediate grants.
