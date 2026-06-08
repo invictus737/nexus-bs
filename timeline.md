@@ -12240,6 +12240,16 @@ Next RF gate after deploy:
 2. Required field behaviour: rapid 2x PTT from `2260082` must not leave static/no-voice and must not kill the group floor state.
 3. Watch for `accepted_ul_media_since_floor` after each grant. If it remains `0`, continue below CMCE at real RF grant decode / LMAC / PHY timing; the local group positive-grant race is now guarded by reporter delivery.
 
+Commit/deploy:
+
+- Committed as `8344a89d` (`Gate group floor activation on grant transmission`).
+- Built locally only with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`; no Rust compile on TetraHS/Pi.
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+- Remote SHA-256: `374c973ef0e80c46681eb5e9ac12c91174491ce04235a8daaa8b832c4e1460e5`.
+- Restarted `nexus-bs@chris.service`; systemd reports `MainPID=83769`, `ActiveState=active`, `SubState=running`, `ActiveEnterTimestamp=Mon 2026-06-08 22:53:24 EEST`.
+- Startup banner shows `Build: v0.1.59-8344a89d`; `WebSocketTransport: connected, using Brew v1`; restart recovery restored local ISSIs `2260616`, `2260082`, and `2260618` with GSSI `226333`.
+- Journal was rotated/vacuumed after deploy for a clean RF gate; `journalctl -u nexus-bs@chris.service -n 20` returned `-- No entries --`.
+
 ## 2026-06-08 21:20 EEST - Group U-TX CEASED tail-drain before FloorReleased
 
 Field context:
