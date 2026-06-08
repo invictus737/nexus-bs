@@ -3324,6 +3324,18 @@ impl BsChannelScheduler {
                 }
             }
 
+            if group_positive_floor_grant_pending && (2..=4).contains(&ts.t) {
+                tracing::info!(
+                    "UMAC RF diag: AACH group-positive-grant pending ts={} dl_usage={} ul_usage={} hangtime={} circuit_usage={{dl:{:?},ul:{:?}}}",
+                    ts,
+                    aach.dl_usage,
+                    aach.ul_usage,
+                    self.hangtime[ts.t as usize - 1],
+                    dl_traffic_usage,
+                    ul_traffic_usage
+                );
+            }
+
             aach.to_bitbuf(&mut aach_bb);
         } else {
             // Fr18. EN 300 392-2 clauses 23.5.2.2.1 and 23.5.2.2.7 allow

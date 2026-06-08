@@ -1,5 +1,54 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-08 23:49 EEST - Group RF diagnostic proof logs for 2260082 MTP3550
+
+Field context:
+
+- Latest deployed functional patch was `8a15551` (`Omit group D-INFO reset channel allocation`), build `v0.1.59-8a155515`.
+- Active service after that deploy had no new GSSI/floor RF test in the journal yet; the last observed `2260082` failure was from the previous run before `8a15551`.
+- Previous failure signature stayed precise: CMCE granted `2260082`, UMAC activated floor, then `accepted_ul_media_since_floor=0`.
+
+Component in simple technical terms:
+
+- CMCE decides who may talk in the group.
+- UMAC/MAC puts that decision on RF as STCH `D-TX GRANTED`, channel allocation, random-access ACK, and AACH traffic/assigned-control hints.
+- LMAC/PHY proves whether the terminal actually sent valid TCH/S voice after the grant.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 b) defines `D-TX GRANTED(Granted)` as the transmit authorization and U-plane-on edge for the granted MS.
+- EN 300 392-2 clause 21.4.3.1 defines the random access acknowledgement flag in `MAC-RESOURCE`.
+- EN 300 392-2 clause 23.5 requires assigned-channel signalling, traffic use, and AACH slot usage to remain coherent.
+- This patch adds proof logging only; it does not claim formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Logs every STCH `D-TX GRANTED` diagnostic line with call id, address, transmission grant, RA ACK, usage marker, channel allocation, and whether it is the group requester positive grant.
+  - Logs timer-only group `D-INFO reset T310` when its redundant DL-only channel allocation is omitted.
+  - Logs the first accepted UL media after each floor grant, proving that LMAC/PHY delivered valid voice to UMAC.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Logs the actual AACH DL/UL usage when a group positive requester grant is pending for a traffic slot.
+
+Verification:
+
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs group_226333 --locked` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Deploy this diagnostic build.
+2. Test local GSSI `226333` with `2260618 -> 2260082`, `2260616 -> 2260082`, and rapid 2x PTT from `2260082`.
+3. Read logs from service start. Required proof:
+   - `STCH D-TX GRANTED ... addr=ISSI 2260082 ... ra_ack=true ... chan_alloc=... Both/Ul`.
+   - `AACH group-positive-grant pending ... dl_usage=Traffic(...) ul_usage=Traffic(...)`.
+   - If voice works, `first accepted UL media after floor ts=2 speaker=Some(ISSI 2260082)`.
+   - If inactivity still reports `accepted_ul_media_since_floor=0`, the remaining fault is not CMCE floor ownership; continue at terminal grant interpretation or LMAC/PHY burst acceptance.
+
 ## 2026-06-08 23:44 EEST - Group D-INFO reset T310 no longer repeats DL-only channel allocation
 
 Field evidence:

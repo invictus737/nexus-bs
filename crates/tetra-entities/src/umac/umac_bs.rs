@@ -449,6 +449,14 @@ impl UmacBs {
         if (1..=4).contains(&ts) {
             let idx = ts as usize - 1;
             self.ul_media_events_since_floor[idx] = self.ul_media_events_since_floor[idx].saturating_add(1);
+            if self.ul_media_events_since_floor[idx] == 1 {
+                tracing::info!(
+                    "UMAC RF diag: first accepted UL media after floor ts={} speaker={:?} dltime={}",
+                    ts,
+                    self.current_ul_signal_addr(ts),
+                    self.dltime
+                );
+            }
         }
     }
 
@@ -2611,6 +2619,42 @@ impl UmacBs {
                         };
                         mac_pdu.length_ind = (total_len / 8) as u8;
                         mac_pdu.fill_bits = fill_bits > 0;
+
+                        if let Some(grant) = d_tx_granted.as_ref() {
+                            tracing::info!(
+                                "UMAC RF diag: STCH D-TX GRANTED call_id={} ts={} addr={} grant={} ra_ack={} usage={:?} chan_alloc={:?} group_requester_positive={} omit_private_chan_alloc={} omit_group_timer_chan_alloc={} bits={{hdr:{},sdu:{},fill:{},total:{}}}",
+                                grant.call_identifier,
+                                ts,
+                                prim.main_address,
+                                grant.transmission_grant,
+                                mac_pdu.random_access_flag,
+                                usage_marker,
+                                mac_pdu.chan_alloc_element.as_ref().map(|ca| (
+                                    ca.ts_assigned,
+                                    ca.ul_dl_assigned,
+                                    ca.mon_pattern,
+                                    ca.frame18_mon_pattern
+                                )),
+                                is_group_requester_positive_floor_grant,
+                                omit_redundant_private_floor_chan_alloc,
+                                omit_group_timer_d_info_chan_alloc,
+                                header_len,
+                                sdu_len,
+                                fill_bits,
+                                total_len
+                            );
+                        } else if omit_group_timer_d_info_chan_alloc {
+                            tracing::info!(
+                                "UMAC RF diag: STCH D-INFO reset T310 ts={} addr={} usage={:?} omitted_dl_only_chan_alloc=true bits={{hdr:{},sdu:{},fill:{},total:{}}}",
+                                ts,
+                                prim.main_address,
+                                usage_marker,
+                                header_len,
+                                sdu_len,
+                                fill_bits,
+                                total_len
+                            );
+                        }
 
                         let mut stch_block = BitBuffer::new(STCH_CAP);
                         mac_pdu.to_bitbuf(&mut stch_block);
