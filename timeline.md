@@ -11800,3 +11800,65 @@ RF gate:
 1. User should retest `2260082` group call to GSSI `22699`.
 2. Expected: dashboard reports Brew v1; no repeated `BREW_TYPE_MALFORMED`/`server error type=0` on transmitted voice frames.
 3. If audio still fails but malformed errors disappear, inspect the LMAC full-slot ACELP vs raw Block2 path for that RF epoch.
+
+## 2026-06-08 14:18 EEST - Energy Economy auto policy
+
+Field context:
+
+- User asked why `2260082` and `2260618` showed EE/EG behavior and whether EE only negotiates at power-on.
+- Live logs showed two distinct cases:
+  - With live config `energy_saving_mode = "eg7"`, Nexus-BS imposed BS-initiated EG7 after registration for stations that did not request EE, then T352 could expire and fall back to StayAlive.
+  - During a later registration, a terminal requesting `Eg1` was allocated configured `Eg7`, which is ETSI-permitted but not the desired operator policy for mixed real terminals.
+- User decision: EE must be `auto`; BS must accept what the terminal requests, support all modes, and not impose an EE mode.
+
+Clause scope:
+
+- EN 300 392-2 clause 16.7.1 permits the BS to allocate a different energy saving mode than requested, but does not require it.
+- Nexus-BS `auto` is a local operational policy over the ETSI procedure: echo the terminal-requested StayAlive/EG1..EG7 value; when the terminal does not request EE, keep StayAlive and do not send a BS-initiated D-CHANGE OF ENERGY SAVING MODE REQUEST.
+- Clauses 16.10.9/16.10.10 define energy saving mode/information; clause 23.7.6/table 23.9 defines EG1..EG7 receive cycles and T.210 return-to-sleep behavior.
+
+Patch:
+
+- `crates/tetra-config/src/bluestation/sec_cell.rs`
+  - Added `ENERGY_SAVING_MODE_AUTO = 255` as internal config sentinel.
+  - Default energy saving mode is now auto.
+  - Parser accepts `"auto"`, `"terminal"`, `"terminal_request"`, `"ms"`, and `"ms_request"`.
+  - Explicit `stay_alive`/`off`/`0` and `eg1..eg7`/`1..7` remain supported.
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - Configured EE now maps to `Option<EnergySavingMode>`: `None` means auto.
+  - Auto accepts the MS-requested mode in `U-LOCATION UPDATE DEMAND` or `U-MM STATUS`.
+  - Auto keeps a new/no-request MS in StayAlive and does not enqueue BS-initiated EG/T352.
+  - Explicit configured EG still forces BS-initiated allocation for controlled lab tests.
+- `example_config/config.toml` and `README.md`
+  - Default documented config changed from `eg3` to `auto`.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Added tests proving example config auto does not impose EG without an MS request.
+  - Added tests proving example config auto accepts MS-requested EG1 in the location update accept.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated example config private-call sanity test to expect auto EE instead of EG3.
+
+Verification:
+
+- `cargo fmt --all` passed.
+- `cargo test -p tetra-config --lib energy_saving_mode --locked` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_mm_bs example_config_auto_energy_saving --locked` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_mm_bs bs_initiated_energy_saving --locked` passed: 7 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs example_config_simple_private_call --locked` passed: 1 test.
+- `cargo check -p tetra-config -p tetra-entities --tests --locked` passed.
+- `git diff --check` passed.
+
+Deploy:
+
+- Built locally only with `RUN_TESTS=0 scripts/nexus-bs-test-deploy.sh`; no Rust compile on TetraHS/Pi.
+- First deploy used the modified worktree build for RF validation, then live config was changed from `energy_saving_mode = "eg7"` to `"auto"` in `/home/chris/nexus-bs/config.toml`.
+- Clean committed redeploy followed with the same script, directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+- Restarted `nexus-bs@chris.service`; systemd reports `ActiveState=active`, `SubState=running`.
+- Startup banner after the clean redeploy no longer showed `-modified`.
+- Live post-restart behavior with config `auto`:
+  - `2260082` and `2260618` registered/affiliated without `MM: allocating energy saving mode Eg7 ... after registration`.
+  - `2260616` explicitly requested `Eg7`; Nexus-BS logged `MS 2260616 requested energy saving mode Eg7; accepting`.
+
+Next:
+
+1. Watch RF/dashboard EE display: `2260082`/`2260618` should remain StayAlive unless they request EG; `2260616` may show EG7 because it requested EG7.
+2. Continue P2P/group-call validation without touching the protected private-simplex setup path unless new RF evidence requires it.

@@ -219,6 +219,7 @@ struct TomlConfigRoot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bluestation::sec_cell::ENERGY_SAVING_MODE_AUTO;
 
     fn minimal_toml(extra_cell: &str) -> String {
         format!(
@@ -368,10 +369,10 @@ tx_gain_vga = 12.5
     }
 
     #[test]
-    fn test_energy_saving_mode_defaults_to_eg3() {
+    fn test_energy_saving_mode_defaults_to_auto() {
         let toml = minimal_toml("");
         let cfg = from_toml_str(&toml).expect("parse failed");
-        assert_eq!(cfg.cell.energy_saving_mode, 3);
+        assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
     }
 
     #[test]
@@ -381,8 +382,10 @@ tx_gain_vga = 12.5
             ("energy_saving_mode = 7", 7),
             ("energy_saving_mode = false", 0),
             ("energy_saving_mode = \"stay_alive\"", 0),
+            ("energy_saving_mode = \"auto\"", ENERGY_SAVING_MODE_AUTO),
             ("energy_saving_mode = \"eg1\"", 1),
             ("energy_saving_mode = \"eg7\"", 7),
+            ("energy_economy_group = \"auto\"", ENERGY_SAVING_MODE_AUTO),
             ("energy_economy_group = \"eg3\"", 3),
         ] {
             let toml = minimal_toml(input);
@@ -603,12 +606,12 @@ allowed_gssi_ranges = [
         // interruption conditional on SwMI support; the shipped example keeps
         // that support disabled unless the operator explicitly enables it.
         assert!(toml.contains("call_preemptive = false"));
-        assert!(toml.contains("energy_saving_mode = \"eg3\""));
+        assert!(toml.contains("energy_saving_mode = \"auto\""));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));
         assert!(!cfg.cell.transmission_interruption_enabled);
-        assert_eq!(cfg.cell.energy_saving_mode, 3);
+        assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
         assert!(!cfg.cell.sndcp_service);
         assert!(cfg.dashboard.is_some());
         assert_eq!(cfg.service_name.as_deref(), Some("nexus-bs"));

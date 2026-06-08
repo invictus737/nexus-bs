@@ -11,10 +11,11 @@ const MAX_24_BIT_SSI: u32 = 0x00FF_FFFF;
 ///
 /// EN 300 392-2 clauses 16.7.1, 16.10.9 and 16.10.10 define the SwMI/MM
 /// signalling for energy economy mode allocation, while clause 23.7.6/table
-/// 23.9 defines the resulting receive cycle. EG3 is a moderate default once
-/// lower-layer EG-aware scheduling is enabled; explicit StayAlive/off remains
-/// accepted for diagnostics and radios that need continuous monitoring.
-pub const DEFAULT_ENERGY_SAVING_MODE: u8 = 3;
+/// 23.9 defines the resulting receive cycle. `auto` is a local Nexus-BS policy:
+/// accept the MS-requested StayAlive/EG1..EG7 value and do not impose a
+/// BS-initiated energy economy allocation when the MS did not ask for one.
+pub const ENERGY_SAVING_MODE_AUTO: u8 = u8::MAX;
+pub const DEFAULT_ENERGY_SAVING_MODE: u8 = ENERGY_SAVING_MODE_AUTO;
 /// Default SDS-TL protocol identifier for text-message SDS broadcasts.
 ///
 /// EN 300 392-2 table 29.21 assigns 0x82 to text messaging. Vendor/home-screen
@@ -256,9 +257,10 @@ pub struct CfgCellInfo {
     pub periodic_registration_secs: u32,
 
     /// SwMI energy economy allocation.
+    /// 255 = local auto policy: accept the MS-requested mode and do not impose.
     /// 0 = StayAlive, 1..=7 = EG1..EG7 per EN 300 392-2 table 16.39.
-    /// Nexus-BS default: EG3. When non-zero, the BS allocates the configured
-    /// EG and lower layers schedule per the negotiated monitoring window.
+    /// When explicitly non-zero/non-auto, the BS allocates the configured EG
+    /// and lower layers schedule per the negotiated monitoring window.
     pub energy_saving_mode: u8,
 
     /// Remote control via SDS U-STATUS to ISSI 9999. None = disabled.
@@ -335,7 +337,7 @@ pub struct CellInfoDto {
     /// Periodic registration interval in seconds. 0 = disabled. Default: 3600.
     pub periodic_registration_secs: Option<u32>,
 
-    /// Energy economy allocation: "stay_alive"/0 or "eg1".."eg7"/1..7.
+    /// Energy economy allocation: "auto", "stay_alive"/0 or "eg1".."eg7"/1..7.
     #[serde(alias = "energy_economy_group")]
     pub energy_saving_mode: Option<Value>,
 
@@ -525,6 +527,7 @@ fn parse_energy_saving_mode(value: Option<Value>) -> Result<u8, String> {
         Value::String(s) => {
             let normalized = s.trim().to_ascii_lowercase().replace(['-', ' '], "_");
             match normalized.as_str() {
+                "auto" | "terminal" | "terminal_request" | "ms" | "ms_request" => Ok(ENERGY_SAVING_MODE_AUTO),
                 "0" | "off" | "none" | "stayalive" | "stay_alive" => Ok(0),
                 "1" | "eg1" => Ok(1),
                 "2" | "eg2" => Ok(2),
@@ -533,10 +536,10 @@ fn parse_energy_saving_mode(value: Option<Value>) -> Result<u8, String> {
                 "5" | "eg5" => Ok(5),
                 "6" | "eg6" => Ok(6),
                 "7" | "eg7" => Ok(7),
-                _ => Err("cell_info.energy_saving_mode must be stay_alive/off/0 or eg1..eg7/1..7".to_string()),
+                _ => Err("cell_info.energy_saving_mode must be auto, stay_alive/off/0, or eg1..eg7/1..7".to_string()),
             }
         }
-        _ => Err("cell_info.energy_saving_mode must be stay_alive/off/0 or eg1..eg7/1..7".to_string()),
+        _ => Err("cell_info.energy_saving_mode must be auto, stay_alive/off/0, or eg1..eg7/1..7".to_string()),
     }
 }
 

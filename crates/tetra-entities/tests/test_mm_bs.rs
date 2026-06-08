@@ -2,7 +2,7 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use tetra_config::bluestation::{CfgBrew, EnergySavingAssignment, StackConfig, StackMode, from_toml_str};
+use tetra_config::bluestation::{CfgBrew, ENERGY_SAVING_MODE_AUTO, EnergySavingAssignment, StackConfig, StackMode, from_toml_str};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
@@ -812,16 +812,15 @@ fn test_bs_initiated_energy_saving_stays_pending_until_ms_response() {
 }
 
 #[test]
-fn test_example_config_default_eg3_stays_pending_until_ms_response() {
+fn test_example_config_auto_energy_saving_does_not_impose_eg_without_ms_request() {
     debug::setup_logging_verbose();
     let issi = 2040819;
 
     let config_toml = include_str!("../../../example_config/config.toml");
     let config = from_toml_str(config_toml).expect("example config should parse");
     assert_eq!(
-        config.cell.energy_saving_mode,
-        EnergySavingMode::Eg3 as u8,
-        "example config must exercise the Nexus-BS EG3 operator default"
+        config.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO,
+        "example config must use Nexus-BS auto EE policy"
     );
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -835,41 +834,58 @@ fn test_example_config_default_eg3_stays_pending_until_ms_response() {
     assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
     assert!(
         accept.energy_saving_information.is_none(),
-        "BS-initiated EG3 allocation must not be marked accepted in D-LOCATION UPDATE ACCEPT before MS response"
+        "auto EE must not allocate energy saving when the MS did not request it"
     );
 
-    let status = extract_d_mm_status(&sink_msgs);
-    assert_eq!(status.status_downlink, StatusDownlink::ChangeOfEnergySavingModeRequest);
-    let esi = status
-        .energy_saving_information
-        .expect("BS-initiated D-MM STATUS request must carry EG3 energy saving information");
-    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg3);
-    assert_energy_saving_start_avoids_frame_18(esi.energy_saving_mode, esi.frame_number, esi.multiframe_number);
-
-    // EN 300 392-2 clause 16.7.1 allows BS-initiated energy economy changes,
-    // while clauses 16.10.9/16.10.10 carry the requested mode/start point. The
-    // MS response is what activates the assignment; until then lower layers
-    // must keep scheduling this MS as continuously reachable.
+    // Nexus-BS auto policy follows EN 300 392-2 clause 16.7.1 by only
+    // negotiating EE when the MS requests it. Absence of an MS request remains
+    // continuously reachable StayAlive, not a BS-imposed EG.
+    assert!(!contains_d_mm_status(&sink_msgs));
     assert!(
         !test.config.state_read().energy_saving.contains_key(&issi),
-        "default EG3 must stay pending until the MS accepts the BS-initiated request"
+        "auto EE must not create pending or active EG state without an MS request"
     );
+    assert_eq!(
+        debug_mm_client_energy(&mut test, issi),
+        Some((EnergySavingMode::StayAlive, None, None)),
+        "MM client state should remain StayAlive when no EE was requested"
+    );
+}
 
-    submit_u_mm_status_energy_saving(
-        &mut test,
-        issi,
-        StatusUplink::ChangeOfEnergySavingModeResponse,
-        EnergySavingMode::Eg3,
-    );
+#[test]
+fn test_example_config_auto_energy_saving_accepts_ms_requested_eg() {
+    debug::setup_logging_verbose();
+    let issi = 2040820;
+
+    let config_toml = include_str!("../../../example_config/config.toml");
+    let config = from_toml_str(config_toml).expect("example config should parse");
+    assert_eq!(config.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, Some(EnergySavingMode::Eg1));
     test.run_stack(Some(1));
-    assert_eq!(test.dump_sinks().len(), 0);
+    let sink_msgs = test.dump_sinks();
+
+    let accept = extract_location_update_accept(&sink_msgs);
+    assert_eq!(accept.location_update_accept_type, LocationUpdateAcceptType::ItsiAttach);
+    let esi = accept
+        .energy_saving_information
+        .expect("auto EE should answer the MS request in D-LOCATION UPDATE ACCEPT");
+    assert_eq!(esi.energy_saving_mode, EnergySavingMode::Eg1);
+    assert_energy_saving_start_avoids_frame_18(esi.energy_saving_mode, esi.frame_number, esi.multiframe_number);
+    assert!(
+        !contains_d_mm_status(&sink_msgs),
+        "MS-requested EE during registration is answered in D-LOCATION UPDATE ACCEPT, not a BS-initiated D-MM STATUS"
+    );
 
     let state = test.config.state_read();
     let assignment = state
         .energy_saving
         .get(&issi)
-        .expect("matching U-CHANGE response must activate the example-config EG3 assignment");
-    assert_eq!(assignment.mode, EnergySavingMode::Eg3 as u8);
+        .expect("auto EE should activate the MS-requested assignment carried in registration");
+    assert_eq!(assignment.mode, EnergySavingMode::Eg1 as u8);
     assert_eq!(assignment.frame, esi.frame_number);
     assert_eq!(assignment.multiframe, esi.multiframe_number);
 }
@@ -7465,6 +7481,16 @@ fn extract_d_mm_status(msgs: &[SapMsg]) -> DMmStatus {
             _ => None,
         })
         .expect("expected D-MM-STATUS")
+}
+
+fn contains_d_mm_status(msgs: &[SapMsg]) -> bool {
+    msgs.iter().any(|msg| match &msg.msg {
+        SapMsgInner::LmmMleUnitdataReq(prim) => {
+            let mut sdu = BitBuffer::from_bitstr(&prim.sdu.to_bitstr());
+            DMmStatus::from_bitbuf(&mut sdu).is_ok()
+        }
+        _ => false,
+    })
 }
 
 fn extract_mm_pdu_function_not_supported(msgs: &[SapMsg]) -> MmPduFunctionNotSupported {

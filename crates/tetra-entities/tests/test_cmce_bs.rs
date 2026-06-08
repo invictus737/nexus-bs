@@ -1,6 +1,6 @@
 mod common;
 
-use tetra_config::bluestation::{CfgBrew, SharedConfig, StackMode, from_toml_str};
+use tetra_config::bluestation::{CfgBrew, ENERGY_SAVING_MODE_AUTO, SharedConfig, StackMode, from_toml_str};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
@@ -10892,8 +10892,8 @@ fn test_example_config_simple_private_call_works_with_preemption_default_off() {
         "example config must keep call_preemptive/transmission_interruption_enabled default-off"
     );
     assert_eq!(
-        config.cell.energy_saving_mode, 3,
-        "example config must exercise Nexus-BS EG3 default while keeping ordinary private call setup available"
+        config.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO,
+        "example config must keep EE on auto while keeping ordinary private call setup available"
     );
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };

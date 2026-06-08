@@ -174,11 +174,12 @@ advanced_link = false
 # Simple private call works with this left off.
 call_preemptive = false
 
-# Energy economy allocation. Nexus-BS defaults to EG3: terminals may sleep
-# between scheduled monitoring windows, while the BS queues downlink signalling
-# for those windows. Use "stay_alive" for diagnostics or terminals that must
-# monitor continuously.
-energy_saving_mode = "eg3"
+# Energy economy allocation. "auto" accepts the terminal-requested
+# StayAlive/EG1..EG7 mode and does not impose a BS-initiated mode when the
+# terminal did not ask for one. Use explicit EG values only for controlled lab
+# forcing; use "stay_alive" for diagnostics or terminals that must monitor
+# continuously.
+energy_saving_mode = "auto"
 
 # Periodic registration watchdog interval in seconds.
 # This is not ETSI T351: EN 300 392-2 §16.11.1.1 defines T351 as the

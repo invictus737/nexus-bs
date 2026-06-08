@@ -3,7 +3,7 @@ use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
-use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
+use tetra_config::bluestation::{ENERGY_SAVING_MODE_AUTO, EnergySavingAssignment, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::{Type3FieldGeneric, delimiters, typed};
 use tetra_core::{BitBuffer, Layer2Service, MleHandle, Sap, SsiType, TdmaTime, TetraAddress, unimplemented_log};
@@ -886,16 +886,29 @@ impl MmBs {
         }
     }
 
-    fn configured_energy_saving_mode(&self) -> EnergySavingMode {
-        Self::energy_saving_mode_from_u8(self.config.config().cell.energy_saving_mode)
+    fn configured_energy_saving_mode(&self) -> Option<EnergySavingMode> {
+        let mode = self.config.config().cell.energy_saving_mode;
+        if mode == ENERGY_SAVING_MODE_AUTO {
+            None
+        } else {
+            Some(Self::energy_saving_mode_from_u8(mode))
+        }
     }
 
     fn select_energy_saving_mode(&self, requested: Option<EnergySavingMode>) -> EnergySavingMode {
-        let configured = self.configured_energy_saving_mode();
-        if requested == Some(EnergySavingMode::StayAlive) {
-            return EnergySavingMode::StayAlive;
+        match self.configured_energy_saving_mode() {
+            // Nexus-BS local auto policy: accept the MS-requested value from
+            // EN 300 392-2 clause 16.7.1, or keep StayAlive when the MS did not
+            // request energy economy.
+            None => requested.unwrap_or(EnergySavingMode::StayAlive),
+            Some(configured) => {
+                if requested == Some(EnergySavingMode::StayAlive) {
+                    EnergySavingMode::StayAlive
+                } else {
+                    configured
+                }
+            }
         }
-        configured
     }
 
     fn energy_saving_mode_from_u8(mode: u8) -> EnergySavingMode {
@@ -1963,7 +1976,7 @@ impl MmBs {
         }
 
         let configured_esm = self.configured_energy_saving_mode();
-        let energy_saving_assignment = if pdu.energy_saving_mode.is_some() || configured_esm == EnergySavingMode::StayAlive {
+        let energy_saving_assignment = if pdu.energy_saving_mode.is_some() || configured_esm == Some(EnergySavingMode::StayAlive) {
             let allocated_esm = self.select_energy_saving_mode(pdu.energy_saving_mode);
             let (esi, start_time) = self.allocate_energy_saving_information(prim.received_address.ssi, allocated_esm);
             if pdu.energy_saving_mode != Some(allocated_esm) {
@@ -1972,6 +1985,12 @@ impl MmBs {
                     prim.received_address.ssi,
                     pdu.energy_saving_mode,
                     allocated_esm
+                );
+            } else if let Some(requested_esm) = pdu.energy_saving_mode {
+                tracing::info!(
+                    "MS {} requested energy saving mode {:?}; accepting",
+                    prim.received_address.ssi,
+                    requested_esm
                 );
             }
             Some((esi, start_time))
@@ -2176,7 +2195,7 @@ impl MmBs {
         if let Some((ref esi, start_time)) = energy_saving_assignment {
             self.apply_energy_saving_information(issi, esi, start_time);
             esi_for_accept = Some(esi.clone());
-        } else if configured_esm != EnergySavingMode::StayAlive {
+        } else if let Some(configured_esm) = configured_esm.filter(|mode| *mode != EnergySavingMode::StayAlive) {
             if self.has_active_energy_saving_assignment(issi, configured_esm) {
                 // EN 300 392-2 clause 16.7.1 permits the BS to change or
                 // allocate an MS energy economy mode with D-MM STATUS. If the
