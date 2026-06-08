@@ -248,6 +248,15 @@ pub struct CfgCellInfo {
     /// currently has group-call transmit permission.
     pub transmission_interruption_enabled: bool,
 
+    /// Enable the Nexus-BS legacy GSSI compatibility profile.
+    ///
+    /// This is a local compatibility mode for older TETRA terminals that fail
+    /// repeated same-speaker hangtime retakes on an already assigned group
+    /// traffic channel. When enabled, no-queue local group overs are released
+    /// after D-TX CEASED instead of being kept for fast hangtime retake.
+    /// Default: false.
+    pub legacy_gssi_group_call: bool,
+
     /// Local SwMI periodic-registration watchdog interval in seconds.
     /// This is not ETSI T351: EN 300 392-2 §16.11.1.1 defines T351 as the
     /// 10 s MS-side registration response timer.
@@ -334,6 +343,12 @@ pub struct CellInfoDto {
     #[serde(alias = "call_preemptive")]
     pub transmission_interruption_enabled: Option<bool>,
 
+    /// Local compatibility mode for older terminals that do not reliably retake
+    /// same-speaker GSSI floor during hangtime.
+    #[serde(alias = "legacy_group_call")]
+    #[serde(alias = "legacy_group_same_speaker_retake")]
+    pub legacy_gssi_group_call: Option<bool>,
+
     /// Periodic registration interval in seconds. 0 = disabled. Default: 3600.
     pub periodic_registration_secs: Option<u32>,
 
@@ -414,6 +429,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         },
         ul_inactivity_secs: ci.ul_inactivity_secs.unwrap_or(3).clamp(1, 30),
         transmission_interruption_enabled: ci.transmission_interruption_enabled.unwrap_or(false),
+        legacy_gssi_group_call: ci.legacy_gssi_group_call.unwrap_or(false),
         periodic_registration_secs: {
             let v = ci.periodic_registration_secs.unwrap_or(3600);
             if v == 0 { 0 } else { v.clamp(60, 86400) }

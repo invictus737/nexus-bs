@@ -7727,6 +7727,246 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
 }
 
 #[test]
+fn test_legacy_gssi_group_tx_ceased_without_queue_releases_call_after_floor_ceased() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.legacy_gssi_group_call = true;
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    let (call_id, _active_ts, _active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_d_releases(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let release_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clauses 14.5.2.2.1(e) and 14.5.2.3: legacy mode first
+    // sends the normal end-of-transmission edge, then clears the maintained
+    // local group call so older MSs use fresh setup for the next over.
+    assert_eq!(count_d_tx_ceased(&release_msgs), 1);
+    assert_eq!(count_umac_floor_released(&release_msgs), 1);
+    assert_eq!(
+        count_d_releases(&release_msgs),
+        2,
+        "legacy no-handoff over should send FACCH and MCCH D-RELEASE"
+    );
+    assert_eq!(
+        count_d_tx_granted(&release_msgs),
+        0,
+        "legacy no-handoff over must not fast-regrant the old speaker"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "D-RELEASE reporter/guard must close the old circuit later, not before release delivery"
+    );
+
+    test.submit_message(build_u_setup_msg(LAB_ISSI_B, LAB_GROUP_GSSI));
+    test.run_stack(Some(1));
+    let fresh_setup_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_releases(&fresh_setup_msgs),
+        0,
+        "fresh same-GSSI setup during old release drain must not be rejected"
+    );
+    assert_eq!(count_d_call_proceedings(&fresh_setup_msgs), 1);
+    assert_eq!(count_d_connects(&fresh_setup_msgs), 1);
+    assert_eq!(count_d_setups(&fresh_setup_msgs), 1);
+    assert_eq!(count_umac_open(&fresh_setup_msgs), 1);
+}
+
+#[test]
+fn test_legacy_gssi_same_speaker_retake_during_tail_releases_instead_of_positive_fast_grant() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.legacy_gssi_group_call = true;
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_MXP600, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_d_releases(&ceased_start_msgs), 0);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let retake_msgs = test.dump_sinks();
+
+    let queued_grant = retake_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("same-speaker legacy retake during tail should be acknowledged as queued until tail clears");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "legacy same-speaker group retake queued during TX-CEASED tail",
+    );
+    assert_eq!(count_umac_floor_granted(&retake_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&retake_msgs), 0);
+    assert_eq!(count_d_releases(&retake_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let release_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_tx_granted(&release_msgs),
+        0,
+        "legacy same-speaker tail retake must not send the positive fast grant that old Motorola terminals fail to transmit on"
+    );
+    assert_eq!(count_d_tx_ceased(&release_msgs), 1);
+    assert_eq!(count_umac_floor_released(&release_msgs), 1);
+    assert_eq!(count_d_releases(&release_msgs), 2);
+    assert_eq!(count_umac_floor_granted(&release_msgs), 0);
+}
+
+#[test]
+fn test_legacy_gssi_group_keeps_different_speaker_tail_handoff() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.legacy_gssi_group_call = true;
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    let (call_id, _active_ts, _active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let _ceased_start_msgs = test.dump_sinks();
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let _queue_msgs = test.dump_sinks();
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let handoff_msgs = test.dump_sinks();
+
+    assert!(
+        handoff_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address == TetraAddress::issi(LAB_ISSI_A)
+                    && parse_d_tx_granted(prim).is_some_and(|pdu| pdu.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+        )),
+        "legacy GSSI mode must keep ETSI queued handoff to a different speaker"
+    );
+    assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
+    assert_eq!(count_d_releases(&handoff_msgs), 0);
+}
+
+#[test]
+fn test_legacy_gssi_group_skips_stale_same_speaker_retake_when_later_speaker_is_queued() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.legacy_gssi_group_call = true;
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_MXP600, LAB_GROUP_GSSI);
+    let (call_id, _active_ts, _active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let _ceased_start_msgs = test.dump_sinks();
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let stale_retake_msgs = test.dump_sinks();
+    assert!(
+        stale_retake_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address == TetraAddress::issi(LAB_ISSI_B)
+                    && parse_d_tx_granted(prim).is_some_and(|pdu| pdu.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+        )),
+        "legacy same-speaker retake should be held as queued during the tail"
+    );
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let later_speaker_queue_msgs = test.dump_sinks();
+    assert!(
+        later_speaker_queue_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address == TetraAddress::issi(LAB_ISSI_A)
+                    && parse_d_tx_granted(prim).is_some_and(|pdu| pdu.transmission_grant == TransmissionGrant::RequestQueued.into_raw() as u8)
+        )),
+        "later different speaker should also be queued while the old tail drains"
+    );
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let handoff_msgs = test.dump_sinks();
+
+    assert!(
+        handoff_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address == TetraAddress::issi(LAB_ISSI_A)
+                    && parse_d_tx_granted(prim).is_some_and(|pdu| pdu.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+        )),
+        "legacy GSSI mode must skip stale same-speaker retake and preserve handoff to the later speaker"
+    );
+    assert!(
+        !handoff_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address == TetraAddress::issi(LAB_ISSI_B)
+                    && parse_d_tx_granted(prim).is_some_and(|pdu| pdu.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+        )),
+        "legacy GSSI mode must not positively regrant the stale same-speaker retake"
+    );
+    assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
+    assert_eq!(count_d_releases(&handoff_msgs), 0);
+}
+
+#[test]
 fn test_group_tx_ceased_tail_drain_then_grants_requester_queued_during_tail() {
     debug::setup_logging_verbose();
 
@@ -11730,6 +11970,10 @@ fn test_example_config_simple_private_call_works_with_preemption_default_off() {
     assert!(
         !config.cell.transmission_interruption_enabled,
         "example config must keep call_preemptive/transmission_interruption_enabled default-off"
+    );
+    assert!(
+        config.cell.legacy_gssi_group_call,
+        "example config should explicitly enable the lab legacy GSSI compatibility profile"
     );
     assert_eq!(
         config.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO,

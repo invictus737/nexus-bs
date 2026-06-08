@@ -1,5 +1,82 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-09 02:18 EEST - Nexus-BS v0.1.60 release bump and mission-critical robustness goal
+
+Release scope:
+
+- Bumped current Nexus-BS identity from `v0.1.59` to `v0.1.60` across workspace metadata, lockfile package versions, README, example config, systemd samples, control/telemetry protocol tests and dashboard product-identity tests.
+- Commit/deploy target message: `fixed compatibility GSSI calls for legacy tetra terminals`.
+- This release is the current checkpoint for the legacy local GSSI group-call compatibility profile:
+  - parser default remains `legacy_gssi_group_call = false`;
+  - field/example profile explicitly enables `legacy_gssi_group_call = true`;
+  - local GSSI no-handoff overs send normal `D-TX CEASED`/floor release and then release the maintained group call so old Motorola/MR-era terminals do not reuse a silent same-channel hangtime retake;
+  - stale same-speaker tail retakes are skipped if a different speaker is queued, preserving normal group conversation turn-taking.
+
+Mission-critical project goal:
+
+- Treat 24x7/365 operation without downtime as the engineering target for Nexus-BS service hardening: robust local group call, private simplex/duplex, SDS, restart recovery, affiliation retention, group/scan stability, bounded queues, volatile/circular logging, systemd recovery and Pi appliance operation.
+- This is an operational reliability objective, not a formal uptime guarantee and not a formal ETSI/TETRA certification claim.
+- Every future TETRA protocol change still follows `/Users/ctermure/.codex/memories/tetra-etsi-compliance-law.md`: clause-scoped EN 300 392-2 analysis, focused tests, and no whole-stack certification claims without official conformance evidence.
+
+Secondary dashboard goal:
+
+- Move the operator dashboard out of the Rust binary as a separate Nexus-BS UI asset/application so it can be changed without recompiling the TETRA core.
+- Build a modern, mission-focused Nexus-BS dashboard: dense operational panels for RF health, service state, subscribers, affiliations, calls, SDS/WAP, Brew, logs and alarms; no marketing/landing-page layout and no obvious "vibe-coded" decorative UI.
+- The design reference is the operational discipline of professional TETRA management consoles such as Motorola DIMETRA-style and Rohill tetraNode-style dashboards, but the implementation, identity and wording must be Nexus-BS-owned and must not imply collaboration, sharing, or endorsement by FlowStation or any other upstream project.
+- Keep only useful controls. Remove or gray unsupported functionality until it is implemented and verified.
+
+## 2026-06-09 02:05 EEST - Legacy GSSI group-call compatibility mode for old Motorola retake
+
+Field trigger:
+
+- User narrowed the relevant RF test to old-terminal repeated PTT in local GSSI group call: first PTT works, second same-terminal PTT opens the assigned channel for about 15 s with no voice.
+- Fresh journal after `f78cf4e` showed the D-INFO/T310 hypothesis was wrong for the remaining failure: no immediate group `D-INFO reset T310` was emitted, but the same-speaker hangtime retake still received positive `D-TX GRANTED` and then timed out with `accepted_ul_media_since_floor=0`.
+- The failed path was a maintained-call/hangtime retake, not initial group setup. The initial `U-SETUP -> D-CONNECT/D-SETUP` path accepted UL media.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1(b): `D-TX GRANTED` remains the SwMI floor/transmit authorization during a maintained group call.
+- EN 300 392-2 clause 14.5.2.2.1(e): `U-TX CEASED` / `D-TX CEASED` end the current group transmission.
+- EN 300 392-2 clause 14.5.2.3: group call release uses `D-RELEASE`.
+- EN 300 392-2 clause 23.8.1 covers BS traffic-channel trunking policy. The new behavior is an explicit local compatibility profile, not a general ETSI requirement: after a no-handoff local over, release the maintained GSSI call instead of keeping it for fast same-channel hangtime retake.
+- This is not a formal conformance claim and is not the default parser behavior.
+
+Patch:
+
+- `crates/tetra-config/src/bluestation/sec_cell.rs`
+  - Added `cell_info.legacy_gssi_group_call` with aliases `legacy_group_call` and `legacy_group_same_speaker_retake`; default is `false` when omitted.
+- `example_config/config.toml`
+  - Explicitly enables `legacy_gssi_group_call = true` for the Nexus-BS field profile with older terminals.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - In legacy mode, a local GSSI no-handoff over sends normal tail-drained `D-TX CEASED`/internal `FloorReleased`, then starts `D-RELEASE`.
+  - If the same speaker queued a retake during the TX-ceased tail, the positive fast grant is suppressed and the old over is cleared instead.
+  - Different-speaker queued handoff remains unchanged.
+  - If a stale same-speaker retake is ahead of a different speaker in the tail queue, the stale retake is skipped and the different speaker receives the normal positive handoff grant; the call is not released prematurely.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - In legacy mode, a stale same-speaker `U-TX DEMAND` during no-active-speaker hangtime releases the maintained call instead of opening a silent positive-grant over.
+- Private simplex/P2P, duplex, SDS, parrot, UMAC grant encoding, RA ACK and LMAC voice decode were not changed.
+
+Verification:
+
+- `cargo test -p tetra-config --lib legacy_gssi --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs legacy_gssi --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_legacy_gssi_group_skips_stale_same_speaker_retake_when_later_speaker_is_queued --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_226333_same_speaker_retake_during_tx_ceased_tail_defers_positive_grant --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_tx_ceased_tail_drain_then_grants_requester_queued_during_tail --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_example_config_simple_private_call_works_with_preemption_default_off --locked` passed.
+- `cargo check -p tetra-config --locked` passed.
+- `cargo check -p tetra-entities --tests --locked` passed.
+- `cargo fmt --package tetra-config --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Deploy to `chris@192.168.1.179` using `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+2. Ensure runtime `config.toml` contains `legacy_gssi_group_call = true`.
+3. Clean volatile journal and restart service.
+4. Test only old-terminal repeated PTT on GSSI `226333`: same ISSI, PTT 1, release, PTT 2.
+5. Expected log shape after first `U-TX CEASED`: `D-TX CEASED`, `FloorReleased`, then `D-RELEASE`; the second PTT should appear as a fresh `U-SETUP` rather than positive same-call hangtime `D-TX GRANTED` followed by `accepted_ul_media_since_floor=0`.
+
 ## 2026-06-09 01:03 EEST - Suppress immediate group D-INFO reset T310 after floor grant
 
 Field trigger:

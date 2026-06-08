@@ -270,6 +270,7 @@ impl CcBsSubentity {
         let usage = call_snapshot.usage;
         let dest_ssi = call_snapshot.dest_gssi;
         let current_speaker = call_snapshot.source_issi;
+        let local_origin = matches!(&call_snapshot.origin, CallOrigin::Local { .. });
 
         let requester_affiliated = self.subscriber_affiliated_to_group(requesting_party.ssi, dest_ssi);
         if !requester_affiliated {
@@ -288,6 +289,27 @@ impl CcBsSubentity {
                 TransmissionGrant::NotGranted,
                 Some(current_speaker),
             );
+            return Ok(());
+        }
+
+        if self.config.config().cell.legacy_gssi_group_call
+            && local_origin
+            && matches!(state, GroupCallState::NoActiveSpeaker { .. })
+            && current_speaker == requesting_party.ssi
+        {
+            // EN 300 392-2 clause 14.5.2.2.1(b) makes D-TX GRANTED the floor
+            // authorization during a maintained group call. In the local legacy
+            // profile, same-speaker retake on a no-speaker hangtime allocation is
+            // deliberately not maintained: old Motorola MR5/MR19 class terminals
+            // can acknowledge this fast grant but fail to transmit TCH/S. Release
+            // the maintained call so the next PTT uses normal group setup
+            // signalling rather than opening a silent over.
+            tracing::info!(
+                "FSM: legacy GSSI group call mode releasing hangtime call_id={} before same-speaker retake by ISSI {}",
+                call_id,
+                requesting_party.ssi
+            );
+            self.release_group_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
             return Ok(());
         }
 

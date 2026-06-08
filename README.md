@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.59
+# Nexus-BS v0.1.60
 
 > **TETRA base station software for amateur radio operators and researchers.**
 > Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
@@ -129,6 +129,7 @@ colour_code = 1
 | `call_timeout_secs` | `120` | Max call duration before forced D-RELEASE (0 = unlimited) |
 | `ul_inactivity_secs` | `3` | UL silence before forced TX-CEASED (1–30s) |
 | `call_preemptive` | `false` | Enable CMCE D-TX INTERRUPT for configured pre-emptive group-call floor withdrawal. Alias: `transmission_interruption_enabled` |
+| `legacy_gssi_group_call` | `false` | Compatibility profile for older terminals that fail same-speaker GSSI hangtime retake; releases local no-handoff group overs so the next PTT starts fresh setup |
 | `energy_saving_mode` | `auto` | Energy economy policy used by MM/UMAC scheduling; `auto` accepts the terminal-requested StayAlive/EG1..EG7 mode, explicit `eg1`..`eg7` may be used for lab forcing, and `stay_alive` disables sleep |
 | `periodic_registration_secs` | `3600` | Local periodic-registration watchdog; `0` = disabled |
 | `allowed_gssi_ranges` | unset | Optional MM group provisioning ranges; unset accepts dynamic GSSIs, set ranges reject unprovisioned group attach as unknown group identity |
@@ -144,7 +145,7 @@ username = "admin"
 password = "changeme"
 
 # Optional: reserved git source path for future OTA updates.
-# OTA update is disabled in Nexus-BS v0.1.59.
+# OTA update is disabled in Nexus-BS v0.1.60.
 # source_dir = "/opt/nexus-bs"
 ```
 
@@ -230,7 +231,7 @@ Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
 
 ### WAP MVP over SDS
 
-Nexus-BS v0.1.59 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
+Nexus-BS v0.1.60 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
 
 From the flat install directory, send the default WML page to a terminal ISSI:
 

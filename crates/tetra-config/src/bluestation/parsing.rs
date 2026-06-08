@@ -415,6 +415,13 @@ tx_gain_vga = 12.5
     }
 
     #[test]
+    fn test_legacy_gssi_group_call_defaults_off() {
+        let toml = minimal_toml("");
+        let cfg = from_toml_str(&toml).expect("parse failed");
+        assert!(!cfg.cell.legacy_gssi_group_call);
+    }
+
+    #[test]
     fn test_restart_recovery_issis_parse_deduped_inside_local_ranges() {
         let cfg = from_toml_str(&minimal_toml(
             r#"
@@ -466,6 +473,19 @@ restart_recovery_issis = [1234]
             let toml = minimal_toml(input);
             let cfg = from_toml_str(&toml).expect("parse failed");
             assert!(!cfg.cell.transmission_interruption_enabled, "input: {input}");
+        }
+    }
+
+    #[test]
+    fn test_legacy_gssi_group_call_accepts_explicit_flag_and_aliases() {
+        for input in [
+            "legacy_gssi_group_call = true",
+            "legacy_group_call = true",
+            "legacy_group_same_speaker_retake = true",
+        ] {
+            let toml = minimal_toml(input);
+            let cfg = from_toml_str(&toml).expect("parse failed");
+            assert!(cfg.cell.legacy_gssi_group_call, "input: {input}");
         }
     }
 
@@ -606,11 +626,13 @@ allowed_gssi_ranges = [
         // interruption conditional on SwMI support; the shipped example keeps
         // that support disabled unless the operator explicitly enables it.
         assert!(toml.contains("call_preemptive = false"));
+        assert!(toml.contains("legacy_gssi_group_call = true"));
         assert!(toml.contains("energy_saving_mode = \"auto\""));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));
         assert!(!cfg.cell.transmission_interruption_enabled);
+        assert!(cfg.cell.legacy_gssi_group_call);
         assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
         assert!(!cfg.cell.sndcp_service);
         assert!(cfg.dashboard.is_some());
