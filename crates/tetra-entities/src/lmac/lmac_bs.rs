@@ -1,8 +1,10 @@
 use tetra_config::bluestation::{SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BurstType, PhyBlockNum, PhysicalChannel, Sap, TdmaTime, TrainingSequence};
-use tetra_saps::tmv::TmvUnitdataInd;
+use tetra_core::{BitBuffer, BurstType, PhyBlockNum, PhysicalChannel, Sap, SsiType, TdmaTime, TrainingSequence};
+use tetra_pdus::umac::pdus::mac_resource::MacResource;
+use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
+use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq};
 use tetra_saps::tp::{TpUnitdataInd, TpUnitdataReqSlot};
 use tetra_saps::{SapMsg, SapMsgInner};
 
@@ -33,6 +35,15 @@ impl Default for LmacTrafficChan {
 //     pub blk2_stolen: bool,
 // }
 
+const POST_GRANT_RX_DIAG_TIMESLOTS: i32 = 18 * 4;
+const POST_GRANT_RX_DIAG_MAX_EVENTS: u8 = 24;
+
+#[derive(Debug, Clone, Copy)]
+struct PostGrantRxDiag {
+    grant_time: TdmaTime,
+    remaining_events: u8,
+}
+
 pub struct LmacBs {
     /// Timeslot time, provided by upper layer and then maintained in sync here
     dltime: TdmaTime,
@@ -55,6 +66,9 @@ pub struct LmacBs {
     /// mark the second half as stolen; keep the exact UL time so a stale
     /// indication cannot be applied to a later TCH/S speech half-slot.
     blk2_stolen_at: [Option<TdmaTime>; 4],
+
+    /// Short RF diagnostic window after an uplink-capable STCH grant.
+    post_grant_rx_diag: [Option<PostGrantRxDiag>; 4],
     // Details about current burst, parsed from BBK broadcast block
     // cur_burst: CurBurst,
 }
@@ -85,6 +99,7 @@ impl LmacBs {
             dltime: TdmaTime::default(),
             uplink_phy_chan: [PhysicalChannel::Unallocated; 4],
             blk2_stolen_at: [None; 4],
+            post_grant_rx_diag: [None; 4],
         }
     }
 
@@ -203,19 +218,111 @@ impl LmacBs {
         }
     }
 
-    fn rx_blk_traffic(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel, ul_time: TdmaTime) {
+    fn diag_age(diag: PostGrantRxDiag, ul_time: TdmaTime) -> i32 {
+        diag.grant_time.age(ul_time)
+    }
+
+    fn maybe_arm_post_grant_rx_diag_from_dl_stch(&mut self, tx_time: TdmaTime, blk1: &TmvUnitdataReq) {
+        if blk1.logical_channel != LogicalChannel::Stch {
+            return;
+        }
+
+        let mut mac_probe = BitBuffer::from_bitbuffer(&blk1.mac_block);
+        let Ok(resource) = MacResource::from_bitbuf(&mut mac_probe) else {
+            return;
+        };
+        let Some(addr) = resource.addr else {
+            return;
+        };
+        if addr.ssi_type != SsiType::Issi {
+            return;
+        }
+        let uplink_allocated = resource
+            .chan_alloc_element
+            .as_ref()
+            .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both));
+        if !uplink_allocated {
+            return;
+        }
+
+        let Some(ts_idx) = Self::ul_ts_index(tx_time.t, "maybe_arm_post_grant_rx_diag_from_dl_stch") else {
+            return;
+        };
+        self.post_grant_rx_diag[ts_idx] = Some(PostGrantRxDiag {
+            grant_time: tx_time,
+            remaining_events: POST_GRANT_RX_DIAG_MAX_EVENTS,
+        });
+        tracing::info!(
+            "LMAC RF diag: armed post-grant UL window tx_time={} addr={} ra_ack={} usage={:?} chan_alloc={:?}",
+            tx_time,
+            addr,
+            resource.random_access_flag,
+            resource.usage_marker,
+            resource
+                .chan_alloc_element
+                .as_ref()
+                .map(|ca| (ca.ts_assigned, ca.ul_dl_assigned, ca.mon_pattern, ca.frame18_mon_pattern))
+        );
+    }
+
+    fn take_post_grant_rx_diag_event(&mut self, ul_time: TdmaTime) -> Option<PostGrantRxDiag> {
+        let ts_idx = Self::ul_ts_index(ul_time.t, "take_post_grant_rx_diag_event")?;
+        let mut diag = self.post_grant_rx_diag[ts_idx]?;
+        let age = Self::diag_age(diag, ul_time);
+        if !(0..=POST_GRANT_RX_DIAG_TIMESLOTS).contains(&age) {
+            if age > POST_GRANT_RX_DIAG_TIMESLOTS {
+                self.post_grant_rx_diag[ts_idx] = None;
+            }
+            return None;
+        }
+        if diag.remaining_events == 0 {
+            self.post_grant_rx_diag[ts_idx] = None;
+            return None;
+        }
+
+        diag.remaining_events = diag.remaining_events.saturating_sub(1);
+        if diag.remaining_events == 0 {
+            self.post_grant_rx_diag[ts_idx] = None;
+        } else {
+            self.post_grant_rx_diag[ts_idx] = Some(diag);
+        }
+        Some(diag)
+    }
+
+    fn log_post_grant_result(diag: Option<PostGrantRxDiag>, ul_time: TdmaTime, result: &str) {
+        if let Some(diag) = diag {
+            tracing::info!(
+                "LMAC RF diag: post-grant UL result grant_time={} age={} ul_time={} result={}",
+                diag.grant_time,
+                Self::diag_age(diag, ul_time),
+                ul_time,
+                result
+            );
+        }
+    }
+
+    fn rx_blk_traffic(
+        &mut self,
+        queue: &mut MessageQueue,
+        blk: TpUnitdataInd,
+        lchan: LogicalChannel,
+        ul_time: TdmaTime,
+        diag: Option<PostGrantRxDiag>,
+    ) {
         if lchan != LogicalChannel::TchS {
             tracing::trace!(
                 "rx_blk_traffic: ignoring unsupported traffic lchan={:?} blk_num={:?}",
                 lchan,
                 blk.block_num
             );
+            Self::log_post_grant_result(diag, ul_time, "drop_unsupported_traffic_lchan");
             return;
         }
         if blk.block_num == PhyBlockNum::Block2 {
             let data = blk.block.into_bitvec();
             if data.len() != 216 {
                 tracing::warn!("rx_blk_traffic: dropping raw TCH/S Block2 with {} bits; expected 216", data.len());
+                Self::log_post_grant_result(diag, ul_time, "drop_len");
                 return;
             }
             // EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5 require the BS to
@@ -238,6 +345,7 @@ impl LmacBs {
                 }),
             };
             queue.push_back(msg);
+            Self::log_post_grant_result(diag, ul_time, "forward_raw_block2");
             return;
         }
         if blk.block_num != PhyBlockNum::Both {
@@ -251,12 +359,14 @@ impl LmacBs {
                 lchan,
                 blk.block_num
             );
+            Self::log_post_grant_result(diag, ul_time, "drop_partial");
             return;
         }
 
         let (decoded, crc_ok) = errorcontrol::decode_tp(lchan, blk.block, self.scrambling_code);
         let Some(acelp_bits) = decoded else {
             tracing::warn!("rx_blk_traffic: decode_tp returned None");
+            Self::log_post_grant_result(diag, ul_time, "decode_none");
             return;
         };
 
@@ -267,6 +377,7 @@ impl LmacBs {
             // field, so fail closed instead of forwarding corrupt bits as
             // clean speech.
             tracing::debug!("rx_blk_traffic: CRC fail (BFI), dropping TCH/S frame on UL ts={}", ul_time.t);
+            Self::log_post_grant_result(diag, ul_time, "drop_crc");
             return;
         }
 
@@ -292,14 +403,23 @@ impl LmacBs {
             }),
         };
         queue.push_back(msg);
+        Self::log_post_grant_result(diag, ul_time, "forward_acelp");
     }
 
-    fn rx_blk_control(&mut self, queue: &mut MessageQueue, blk: TpUnitdataInd, lchan: LogicalChannel) -> bool {
+    fn rx_blk_control(
+        &mut self,
+        queue: &mut MessageQueue,
+        blk: TpUnitdataInd,
+        lchan: LogicalChannel,
+        ul_time: TdmaTime,
+        diag: Option<PostGrantRxDiag>,
+    ) -> bool {
         // AACH is a control channel but uses a completely different decode path
         // (decode_aach); decode_cp() below explicitly rejects it. Guard here so a future
         // routing change that sends AACH this way logs and drops instead of panicking.
         if !lchan.is_control_channel() || lchan == LogicalChannel::Aach {
             tracing::warn!("LMAC: rx_blk_control called with unsupported channel {:?}, ignoring", lchan);
+            Self::log_post_grant_result(diag, ul_time, "drop_unsupported_control_lchan");
             return false;
         }
 
@@ -314,6 +434,7 @@ impl LmacBs {
                 "LMAC: decode_cp returned None for {:?} despite scrambling code set, dropping",
                 lchan
             );
+            Self::log_post_grant_result(diag, ul_time, "decode_none_control");
             return false;
         };
 
@@ -327,6 +448,7 @@ impl LmacBs {
         // TODO FIXME, for now, we're not passing broken CRC msgs up to Lmac
         // If we see purpose, we may pass it up in the future
         if !crc_pass {
+            Self::log_post_grant_result(diag, ul_time, "control_crc_fail");
             return false;
         }
 
@@ -349,6 +471,7 @@ impl LmacBs {
         // We then don't know whether blk2 is also stolen, as that will be shown by the Umac
         // We thus push this with prio, and the umac will signal with prio if blk2 is stolen too
         queue.push_prio(m, MessagePrio::Immediate);
+        Self::log_post_grant_result(diag, ul_time, "forward_control");
         true
     }
 
@@ -376,6 +499,7 @@ impl LmacBs {
         let pchan = self.uplink_phy_chan[ts_idx];
         let block_num = prim.block_num;
         let mut block2_stolen = self.blk2_stolen_at[ts_idx] == Some(msg_dltime);
+        let diag = self.take_post_grant_rx_diag_event(msg_dltime);
         if self.blk2_stolen_at[ts_idx].is_some() && !block2_stolen {
             tracing::warn!(
                 "lmac_bs: dropping stale blk2_stolen marker for UL ts {} at {:?}; current uplink time is {:?}",
@@ -402,15 +526,30 @@ impl LmacBs {
         }
 
         let lchan = Self::determine_logical_channel_ul(&prim, pchan == PhysicalChannel::Tp, block2_stolen);
+        if let Some(diag) = diag {
+            tracing::info!(
+                "LMAC RF diag: post-grant UL candidate grant_time={} age={} ul_time={} pchan={:?} burst={:?} train={:?} block={:?} block2_stolen={} lchan={:?} rssi_dbfs={:.1}",
+                diag.grant_time,
+                Self::diag_age(diag, msg_dltime),
+                msg_dltime,
+                pchan,
+                prim.burst_type,
+                prim.train_type,
+                prim.block_num,
+                block2_stolen,
+                lchan,
+                prim.rssi_dbfs
+            );
+        }
 
         match lchan {
             LogicalChannel::Clch => {}
             LogicalChannel::TchS | LogicalChannel::Tch24 | LogicalChannel::Tch48 | LogicalChannel::Tch72 => {
-                self.rx_blk_traffic(queue, prim, lchan, msg_dltime)
+                self.rx_blk_traffic(queue, prim, lchan, msg_dltime, diag)
             }
             LogicalChannel::SchF | LogicalChannel::SchHu | LogicalChannel::Stch => {
                 let fallback_candidate = prim.clone();
-                let control_forwarded = self.rx_blk_control(queue, prim, lchan);
+                let control_forwarded = self.rx_blk_control(queue, prim, lchan, msg_dltime, diag);
                 if !control_forwarded && Self::should_fallback_non_traffic_nub_to_tch_s(&fallback_candidate, pchan) {
                     // EN 300 392-2 clauses 23.5.2.2.1 and 23.8.5 require the
                     // BS to accept TCH/S on an assigned traffic channel. During
@@ -426,7 +565,7 @@ impl LmacBs {
                         fallback_candidate.train_type,
                         fallback_candidate.block_num
                     );
-                    self.rx_blk_traffic(queue, fallback_candidate, LogicalChannel::TchS, msg_dltime);
+                    self.rx_blk_traffic(queue, fallback_candidate, LogicalChannel::TchS, msg_dltime, diag);
                 }
             }
             _ => {
@@ -475,6 +614,7 @@ impl LmacBs {
             return;
         };
         let blk2 = prim.blk2.take();
+        self.maybe_arm_post_grant_rx_diag_from_dl_stch(prim.ts, &blk1);
 
         // Determine train and burst type
         let (burst_type, train_type) = match blk1.logical_channel {

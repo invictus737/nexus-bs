@@ -1,5 +1,68 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-09 00:24 EEST - FlowStation upstream GSSI comparison and post-grant RF diagnostics
+
+Context:
+
+- User requested a dedicated agent to compare local Nexus-BS GSSI group-call handling with upstream FlowStation and to re-check the ETSI law before more fixes.
+- Reloaded `/Users/ctermure/.codex/memories/tetra-etsi-compliance-law.md` and `/Users/ctermure/.codex/memories/flowstation-tetra-eg-swmi-resume-2026-06-02.md`.
+- Spawned explorer agent `019ea914-bfa1-7d71-98f1-52269ee7dc7f` (`Mill the 6th`) for read-only FlowStation comparison.
+- Cloned upstream FlowStation read-only to `/private/tmp/flowstation-upstream-compare`, upstream commit `fcac34e`.
+- Local base was clean at `c6e6966` (`Make group timer D-INFO markerless`).
+
+Upstream comparison:
+
+- Upstream FlowStation activates internal UMAC/Brew `FloorGranted` immediately after queueing positive `D-TX GRANTED`; Nexus-BS gates group floor activation on the positive requester grant `TxReporter`.
+- Upstream requester STCH drops MAC channel allocation and marks any ISSI-addressed STCH as random-access response; Nexus-BS preserves real/request-ready RA ACK and carries the uplink-capable requester allocation.
+- Upstream hangtime AACH remains `AssignedControl`/`AssignedOnly` while STCH retake is queued; Nexus-BS advertises `Traffic(...)` while a positive group requester grant is pending.
+- Upstream has no group `D-INFO reset T310`; Nexus-BS adds timer signalling but `c6e6966` strips channel allocation and usage marker over the air.
+- Upstream LMAC can classify NTS2 Block2 as STCH when the local marker says non-traffic; Nexus-BS treats non-stolen NTS2 Block2 as TCH/S and preserves raw Block2.
+- Conclusion: upstream is not a safer behavior source for the current Motorola GSSI bug. The remaining fault is below CMCE grant ownership unless RF logs prove the immediate timer `D-INFO` confuses the terminal.
+
+Clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1(b): positive `D-TX GRANTED` is the transmit/floor authorization.
+- EN 300 392-2 clause 14.5.2.2.1(e): `U-TX CEASED` / `D-TX CEASED` end the current transmission.
+- EN 300 392-2 clause 14.5.2.2.2(c): `D-INFO reset T310` is timer signalling, not transmit authorization.
+- EN 300 392-2 clause 21.4.3.1: MAC random-access acknowledgement flag must reflect real RA acknowledgement.
+- EN 300 392-2 clauses 23.5, 23.8.4.1.4, and 23.8.5: assigned-channel timing, STCH/TCH half-slot interpretation, and TCH/S half-slot preservation.
+- This is clause-scoped engineering evidence only, not formal TETRA certification.
+
+Diagnostic-only patch:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added `UMAC RF diag: selected STCH D-TX GRANTED ...` when the scheduler actually selects a positive `D-TX GRANTED` STCH for transmission.
+  - Fields include tx time, address, call id, grant value, RA ACK, usage marker, channel allocation, active UL primary address, STCH priority, and whether speech was present.
+- `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - Added a bounded 18-frame / 24-event post-grant UL diagnostic window when LMAC transmits an ISSI-addressed STCH with uplink-capable channel allocation.
+  - Logs first post-grant UL candidates with pchan, burst type, train sequence, block number, `block2_stolen`, logical-channel decision, RSSI, and final result such as `forward_raw_block2`, `forward_acelp`, `control_crc_fail`, `drop_crc`, `drop_partial`, `drop_len`, or `decode_none`.
+  - No behavior changes: only additional INFO logs during a short post-grant diagnostic window.
+
+Verification:
+
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs group_226333 --locked` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` passed: 12 tests.
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Commit and deploy this diagnostic-only build locally to the BS with the normal local-build deploy path.
+2. Clean remote volatile journal, restart BS, then test GSSI `226333`: alternate PTT/floor between `2260618`, `2260616`, and Motorola `2260082`; include rapid/repeated PTT from `2260082`.
+3. For a failing Motorola turn, inspect this exact chain:
+   - `UMAC RF diag: STCH D-TX GRANTED ... group_requester_positive=true ... ra_ack=true ... chan_alloc=... Both`
+   - `UMAC RF diag: selected STCH D-TX GRANTED ...`
+   - `LMAC RF diag: armed post-grant UL window ...`
+   - `LMAC RF diag: post-grant UL candidate ...`
+   - `LMAC RF diag: post-grant UL result ...`
+   - either `UMAC RF diag: first accepted UL media after floor ...` or `UL inactivity timeout ... accepted_ul_media_since_floor=0`
+4. If no LMAC candidates appear after a coherent grant, suspect terminal not entering UL/RF timing/grant interpretation.
+5. If LMAC candidates appear but result is `control_crc_fail`, `drop_crc`, `drop_len`, or `decode_none`, continue in PHY/LMAC demod/decode path.
+6. If candidates forward to UMAC but `accepted_ul_media_since_floor` still stays zero, continue in UMAC TMD acceptance/routing.
+
 ## 2026-06-09 00:04 EEST - Timer-only group D-INFO now omits traffic usage marker
 
 Field evidence:

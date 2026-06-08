@@ -577,6 +577,42 @@ impl BsChannelScheduler {
             .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
     }
 
+    fn log_selected_stch_d_tx_granted_diag(&self, tx_ts: TdmaTime, block: &BitBuffer, fallback_addr: TetraAddress, tch_buf_present: bool) {
+        let mut mac_probe = BitBuffer::from_bitbuffer(block);
+        let Ok(resource) = MacResource::from_bitbuf(&mut mac_probe) else {
+            return;
+        };
+        let addr = resource.addr.unwrap_or(fallback_addr);
+        let mac_payload = BitBuffer::from_bitbuffer_pos(&mac_probe);
+        let Some(mut cmce_payload) = Self::cmce_dl_payload_from_tma_sdu(&mac_payload) else {
+            return;
+        };
+        let Ok(grant) = DTxGranted::from_bitbuf(&mut cmce_payload) else {
+            return;
+        };
+        if grant.transmission_grant != TransmissionGrant::Granted.into_raw() as u8 {
+            return;
+        }
+
+        let priority = Self::stealing_sched_priority(&DlSchedElem::Stealing(block.clone(), fallback_addr, None, None));
+        tracing::info!(
+            "UMAC RF diag: selected STCH D-TX GRANTED tx_ts={} addr={} call_id={} grant={} ra_ack={} usage={:?} chan_alloc={:?} ul_primary={:?} priority={:?} tch_buf_present={}",
+            tx_ts,
+            addr,
+            grant.call_identifier,
+            grant.transmission_grant,
+            resource.random_access_flag,
+            resource.usage_marker,
+            resource
+                .chan_alloc_element
+                .as_ref()
+                .map(|ca| (ca.ts_assigned, ca.ul_dl_assigned, ca.mon_pattern, ca.frame18_mon_pattern)),
+            self.ul_circuit_primary_addr(tx_ts.t),
+            priority,
+            tch_buf_present
+        );
+    }
+
     fn generate_hangtime_idle_schf(&self) -> BitBuffer {
         // Full-slot SCH/F carrying a Null PDU (idle).
         let mut buf = BitBuffer::new(SCH_F_CAP);
@@ -2751,6 +2787,10 @@ impl BsChannelScheduler {
                 (None, None, None, None)
             }
         };
+
+        if let (Some(block), Some(addr)) = (stch_opt.as_ref(), stealing_addr_opt) {
+            self.log_selected_stch_d_tx_granted_diag(ts, block, addr, tch_buf.is_some());
+        }
 
         // Warn about other queued signaling that can't be sent via stealing yet
         if stch_opt.is_none() && !self.dltx_queues[ts.t as usize - 1].is_empty() {
