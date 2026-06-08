@@ -11782,3 +11782,21 @@ Next deploy/test:
 2. Confirm dashboard shows `Brew v1` after reconnect.
 3. RF test: `2260082` group call to GSSI `22699`; expected Brew logs should no longer show repeated `server error type=0` for 56-byte voice frames.
 4. If `frames=0` still appears, inspect whether LMAC produced only raw Block2 half-slot media for that transmit epoch; do not change P2P/Parrot while debugging this.
+
+Deploy:
+
+- Amended release commit after finding stale `v0.1.58` in systemd sample descriptions.
+- Updated live `/etc/systemd/system/nexus-bs@.service` description to `Nexus-BS v0.1.59 TETRA base station service for %i` and ran `systemctl daemon-reload`.
+- Built locally only with `RUN_TESTS=0 scripts/nexus-bs-test-deploy.sh` after the focused local tests above had passed.
+- Copied directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+- Deployed commit marker: `9a75c837`.
+- Remote SHA-256: `67ac6c0a1141c09a390d5000794994eb7f13ff821b15cb90270b07a491f236d1`.
+- Restarted `nexus-bs@chris.service`; systemd reports `MainPID=77876`, `ActiveState=active`, `SubState=running`, `ActiveEnterTimestamp=Mon 2026-06-08 11:54:24 EEST`.
+- Startup banner reports `Version: Nexus-BS v0.1.59`, `Build: v0.1.59-9a75c837`.
+- Post-start Brew log reports `WebSocketTransport: connected, using Brew v1` and `BrewEntity: backhaul CONNECTED`.
+
+RF gate:
+
+1. User should retest `2260082` group call to GSSI `22699`.
+2. Expected: dashboard reports Brew v1; no repeated `BREW_TYPE_MALFORMED`/`server error type=0` on transmitted voice frames.
+3. If audio still fails but malformed errors disappear, inspect the LMAC full-slot ACELP vs raw Block2 path for that RF epoch.
