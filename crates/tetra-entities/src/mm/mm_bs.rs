@@ -4091,9 +4091,9 @@ impl TetraEntityTrait for MmBs {
                 continue;
             }
             // First expiry — send COMMAND and wait grace period (60s) for response.
-            // Do NOT remove_client here: keeping the client in registry preserves ESM
-            // and group state so the terminal re-registers cleanly without losing EE mode.
-            // Only notify Brew so it stops routing calls to this terminal until it re-registers.
+            // Do NOT remove_client or clear shared subscriber state here: keeping
+            // the route preserves active CMCE/Brew listeners while the MS answers
+            // the SwMI-initiated registration refresh from EN 300 392-2 §16.4.4.
             let last_handle = self.client_mgr.get_client_by_issi(issi).map(|c| c.last_handle).unwrap_or(0);
             self.send_d_location_update_command(queue, issi, last_handle);
             // EN 300 392-2 clause 16.8.6: registration overrides group
@@ -4107,12 +4107,11 @@ impl TetraEntityTrait for MmBs {
                 .get_client_by_issi(issi)
                 .map(|c| c.groups.iter().copied().collect())
                 .unwrap_or_default();
-            if !groups.is_empty() {
-                self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
-            }
-            self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
-            // Mark as detached in state but keep in client_mgr (preserves ESM + groups)
-            self.config.state_write().subscribers.deregister(issi);
+            tracing::info!(
+                "MM: preserving subscriber route for ISSI {} groups={:?} while periodic registration refresh is pending",
+                issi,
+                groups
+            );
         }
     }
 

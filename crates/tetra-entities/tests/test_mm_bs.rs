@@ -1446,10 +1446,10 @@ fn test_demand_location_update_after_periodic_command_reregisters_shared_subscri
     {
         let state = test.config.state_read();
         assert!(
-            !state.subscribers.is_registered(issi),
-            "first periodic expiry removes the shared subscriber while waiting for DemandLocationUpdating"
+            state.subscribers.is_registered(issi),
+            "first periodic expiry must preserve the shared subscriber while waiting for DemandLocationUpdating"
         );
-        assert!(state.subscribers.group_members(gssi).is_empty());
+        assert_eq!(state.subscribers.group_members(gssi), vec![issi]);
     }
 
     // EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4: the MS answers a
@@ -1488,7 +1488,7 @@ fn test_demand_location_update_after_periodic_command_without_group_report_reaff
     test.run_stack(Some(1));
     let command_msgs = test.dump_sinks();
     assert!(contains_location_update_command(&command_msgs));
-    assert!(!test.config.state_read().subscribers.is_registered(issi));
+    assert!(test.config.state_read().subscribers.is_registered(issi));
 
     // Some terminals return from coverage believing persistent group
     // affiliations are still valid and send DemandLocationUpdating without a
@@ -1526,7 +1526,7 @@ fn test_group_less_coverage_return_publishes_dashboard_group_snapshot() {
     test.run_stack(Some(1));
     let command_msgs = test.dump_sinks();
     assert!(contains_location_update_command(&command_msgs));
-    assert!(!test.config.state_read().subscribers.is_registered(issi));
+    assert!(test.config.state_read().subscribers.is_registered(issi));
     let _ = drain_telemetry(&telemetry);
 
     // EN 300 392-2 clauses 16.9.2.8/16.9.3.4 let the MS answer the
@@ -1582,10 +1582,10 @@ fn test_standalone_group_attach_after_periodic_command_restores_shared_subscribe
     {
         let state = test.config.state_read();
         assert!(
-            !state.subscribers.is_registered(issi),
-            "first periodic expiry keeps the MM client known but clears shared routing state"
+            state.subscribers.is_registered(issi),
+            "first periodic expiry keeps shared routing state while waiting for re-registration"
         );
-        assert!(state.subscribers.group_members(initial_group).is_empty());
+        assert_eq!(state.subscribers.group_members(initial_group), vec![issi]);
     }
 
     // EN 300 392-2 clauses 16.4.3 and 16.8.2 make standalone group
@@ -1606,17 +1606,16 @@ fn test_standalone_group_attach_after_periodic_command_restores_shared_subscribe
     assert!(downlink[0].group_identity_attachment.is_some());
 
     let updates = subscriber_updates(&sink_msgs);
-    assert_eq!(updates.len(), 2);
-    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
-    assert_eq!(updates[0].issi, issi);
-    assert!(updates[0].groups.is_empty());
-    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
-    assert_eq!(updates[1].issi, issi);
-    assert_eq!(updates[1].groups, vec![new_group]);
+    assert!(
+        updates
+            .iter()
+            .all(|update| update.action != BrewSubscriberAction::Deregister && update.action != BrewSubscriberAction::Register),
+        "periodic refresh grace must not force a subscriber route drop/re-create, got {updates:?}"
+    );
 
     let state = test.config.state_read();
     assert!(state.subscribers.is_registered(issi));
-    assert!(state.subscribers.group_members(initial_group).is_empty());
+    assert_eq!(state.subscribers.group_members(initial_group), vec![issi]);
     assert_eq!(state.subscribers.group_members(new_group), vec![issi]);
 }
 
@@ -2923,10 +2922,10 @@ fn test_group_report_request_restores_shared_state_before_reporting_cached_group
     {
         let state = test.config.state_read();
         assert!(
-            !state.subscribers.is_registered(issi),
-            "first periodic expiry should clear shared routing state while MM waits for re-registration"
+            state.subscribers.is_registered(issi),
+            "first periodic expiry should preserve shared routing state while MM waits for re-registration"
         );
-        assert!(state.subscribers.group_members(group).is_empty());
+        assert_eq!(state.subscribers.group_members(group), vec![issi]);
     }
 
     submit_attach_detach_group_report_request(&mut test, issi);
@@ -2944,13 +2943,10 @@ fn test_group_report_request_restores_shared_state_before_reporting_cached_group
     assert_eq!(downlink[0].gssi, Some(group));
 
     let updates = subscriber_updates(&sink_msgs);
-    assert_eq!(updates.len(), 2);
-    assert_eq!(updates[0].action, BrewSubscriberAction::Register);
-    assert_eq!(updates[0].issi, issi);
-    assert!(updates[0].groups.is_empty());
-    assert_eq!(updates[1].action, BrewSubscriberAction::Affiliate);
-    assert_eq!(updates[1].issi, issi);
-    assert_eq!(updates[1].groups, vec![group]);
+    assert!(
+        updates.is_empty(),
+        "group report during periodic refresh grace should not re-register or re-affiliate an already preserved route, got {updates:?}"
+    );
 
     let state = test.config.state_read();
     assert!(state.subscribers.is_registered(issi));
@@ -4240,10 +4236,10 @@ fn test_periodic_registration_grace_expiry_rejects_and_removes_groups_energy_and
     {
         let state = test.config.state_read();
         assert!(
-            !state.subscribers.is_registered(issi),
-            "first periodic expiry clears shared routing while the SwMI waits for re-registration"
+            state.subscribers.is_registered(issi),
+            "first periodic expiry preserves shared routing while the SwMI waits for re-registration"
         );
-        assert!(state.subscribers.group_members(active_group).is_empty());
+        assert_eq!(state.subscribers.group_members(active_group), vec![issi]);
         assert!(
             state.energy_saving.contains_key(&issi),
             "grace period keeps the cached EG assignment available for a timely DemandLocationUpdating response"

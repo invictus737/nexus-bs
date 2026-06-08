@@ -11862,3 +11862,60 @@ Next:
 
 1. Watch RF/dashboard EE display: `2260082`/`2260618` should remain StayAlive unless they request EG; `2260616` may show EG7 because it requested EG7.
 2. Continue P2P/group-call validation without touching the protected private-simplex setup path unless new RF evidence requires it.
+
+## 2026-06-08 15:30 EEST - RF glitch log audit: frame 18 ruled down, periodic registration route preserved
+
+Field context:
+
+- User asked to inspect live logs because recent RF glitches might be related to frame 18.
+- Live service `nexus-bs@chris.service` had been running since `2026-06-08 14:21:01 EEST`, build `v0.1.59-6a846240`.
+- Live config had `energy_saving_mode = "auto"`, `periodic_registration_secs = 3600`, and `frame_18_ext = true`.
+
+Log findings:
+
+- No live journal entries from the last restart matched `frame_18`, `frame 18`, or direct frame-18 failure markers.
+- `Failed parsing MacAccess: BufferEnded { field: Some("ssi") }` appeared only a few times shortly after startup and around `14:37-14:39`; this looks like malformed/random-access RF decode noise, not direct frame-18 evidence.
+- The repeated `CircuitMgr: dropping oldest queued DL ACELP block ... media queue reached 18 block(s)` around `15:18:14-15:18:18` is not frame 18. That `18` is the per-timeslot DL media queue cap.
+- The same window showed Brew jitter/backlog and `rx_tmd_prim: dropping DL voice on inactive circuit ts=2 src=Brew`, meaning IP/Brew voice arrived after the UMAC circuit had closed.
+- At `15:21:02`, `2260616` hit the local periodic-registration watchdog while a GSSI/Brew call was active. The old first-expiry path sent `D-LOCATION-UPDATE-COMMAND` and immediately published `Deaffiliate` + `Deregister`, which could make CMCE/Brew drop listeners or active group calls before the 60 s grace window expired.
+
+Frame-18 audit:
+
+- `frame_18_ext` is present in config, but UMAC does not advertise full frame-18 receive support in MAC-SYNC unless the stack supports it.
+- Assigned-channel traffic treats frame 18 as non-traffic; TCH/S and FACCH/STCH wait for a non-frame-18 opportunity.
+- Brew and Parrot playout skip frame 18; Energy Economy assignment avoids start/recurrent receive windows on frame 18.
+- Clause-scoped reasoning: EN 300 392-2 21.4.6.5/21.4.7.2 frame-18 signalling and 23.7.6/T.210 energy-economy scheduling are handled conservatively here. This is not formal certification evidence.
+
+Patch:
+
+- `crates/tetra-entities/src/mm/mm_bs.rs`
+  - First local periodic-registration expiry now sends `D-LOCATION-UPDATE-COMMAND`, abandons stale SwMI group transactions, and marks the 60 s pending window, but preserves the shared subscriber/GSSI route in CMCE/Brew.
+  - Final removal remains on second expiry/no response: `D-LOCATION-UPDATE-REJECT(ExpiryOfTimer)`, energy-saving cleanup, subscriber deaffiliate/deregister.
+- `crates/tetra-entities/tests/test_mm_bs.rs`
+  - Updated periodic-registration tests so first expiry must preserve registration and group membership.
+  - Kept grace-expiry coverage proving final reject/removal still deaffiliates/deregisters after no response.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 16.4.4 permits SwMI-initiated location update using `D-LOCATION-UPDATE-COMMAND`.
+- Clauses 16.9.2.8 and 16.9.3.4 cover the MS response to that command.
+- Clause 16.8.x group identity validity supports keeping accepted persistent groups valid until explicit detach/replacement or real timeout/removal; a first refresh command is not itself proof that the MS left the cell.
+
+Verification:
+
+- `cargo fmt --all` passed.
+- `cargo test -p tetra-entities --test test_mm_bs periodic_registration --locked` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_mm_bs periodic_command --locked` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_mm_bs group_less_coverage_return --locked` passed: 1 test.
+- `cargo test -p tetra-entities --test test_mm_bs group_report_request_restores --locked` passed: 1 test.
+- `cargo test -p tetra-entities --test test_mm_bs frame_18 --locked` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_umac_bs frame_18 --locked` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_mm_bs --locked` passed: 146 tests.
+- `cargo check -p tetra-entities --tests --locked` passed.
+- `git diff --check` passed before timeline update.
+
+Next:
+
+1. Commit and deploy this MM watchdog fix.
+2. Re-test live GSSI/Brew RF around the 3600 s periodic-registration boundary or temporarily lower `periodic_registration_secs` in a controlled test to prove no listener drop occurs during the grace window.
+3. Continue watching Brew jitter separately; queue cap `18 block(s)` is a media-buffer limit, not direct frame-18 evidence.
