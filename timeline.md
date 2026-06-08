@@ -11919,3 +11919,36 @@ Next:
 1. Commit and deploy this MM watchdog fix.
 2. Re-test live GSSI/Brew RF around the 3600 s periodic-registration boundary or temporarily lower `periodic_registration_secs` in a controlled test to prove no listener drop occurs during the grace window.
 3. Continue watching Brew jitter separately; queue cap `18 block(s)` is a media-buffer limit, not direct frame-18 evidence.
+
+## 2026-06-08 18:06 EEST - Frame-18 extension disabled in live/example config for RF isolation
+
+Field context:
+
+- User reported local `226333` group calls stopped flowing during three-terminal ping-pong testing and asked whether frame 18 could be involved.
+- Live logs for `226333` showed CMCE affiliation and floor grants were present, but UMAC repeatedly hit `UL inactivity timeout` after `D-TX GRANTED`; this points to missing/late valid UL TCH/S media after floor grant, not to a proven frame-18-extension advertisement fault.
+- To remove frame-18 ambiguity from live RF testing, the live config and example config now explicitly disable `frame_18_ext`.
+
+Patch/config:
+
+- `example_config/config.toml`
+  - Added `frame_18_ext = false` with a note that full all-slot frame-18 receive support must be implemented and verified before enabling.
+- `/home/chris/nexus-bs/config.toml`
+  - Changed live `frame_18_ext = true` to `frame_18_ext = false`.
+  - Restarted `nexus-bs@chris.service`; post-restart PID `80964`, service active/running.
+  - Post-restart live log showed `2260082`, `2260616`, and `2260618` registering/affiliating to `226333`.
+
+Clause scope:
+
+- EN 300 392-2 clause 21.4.6.5 frame-18 extension is kept disabled as the conservative operator default.
+- This does not claim formal certification; it simply removes an optional frame-18 behaviour from the test profile while the group-call U-plane timeout is investigated.
+
+Verification:
+
+- `cargo test -p tetra-config --lib bluestation::parsing --locked` passed: 29 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs example_config_simple_private_call --locked` passed: 1 test.
+- `git diff --check` passed before this timeline entry.
+
+Next:
+
+1. Retest local `226333` group ping-pong after the `18:05:40 EEST` restart.
+2. If calls still stop, focus on UMAC/LMAC U-plane after `D-TX GRANTED`: floor is granted, but valid TCH/S is not arriving before the local inactivity guard.

@@ -120,6 +120,11 @@ colour_code = 1
 # radios can synchronize their clocks. Daylight saving time is handled automatically.
 # timezone = "Europe/Bucharest"
 
+# Keep disabled unless full all-slot frame-18 receive support is implemented and
+# verified for the target terminals. Nexus-BS currently handles frame 18
+# conservatively for ETSI EN 300 392-2 fixed-frame signalling.
+frame_18_ext = false
+
 # Local SSI/GSSI exceptions for this cell. Traffic for these SSIs/GSSIs will not
 # leave the cell. Overrides any settings in the brew section, if enabled.
 # Incoming brew traffic on these values will also be rejected.
