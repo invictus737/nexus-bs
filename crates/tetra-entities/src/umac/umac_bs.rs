@@ -6,7 +6,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, TxState, unimplemented_log};
 use tetra_pdus::cmce::{
     enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
-    pdus::d_tx_granted::DTxGranted,
+    pdus::{d_info::DInfo, d_tx_granted::DTxGranted},
 };
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
@@ -1294,6 +1294,21 @@ impl UmacBs {
         DTxGranted::from_bitbuf(&mut payload).ok()
     }
 
+    fn tma_sdu_is_d_info_reset_t310(sdu: &BitBuffer) -> bool {
+        let Some(mut payload) = Self::cmce_dl_payload_from_tma_sdu(sdu) else {
+            return false;
+        };
+        DInfo::from_bitbuf(&mut payload).is_ok_and(|d_info| {
+            d_info.reset_call_time_out_timer_t310_
+                && d_info.call_time_out.is_none()
+                && d_info.call_time_out_set_up_phase_t301_t302_.is_none()
+                && d_info.new_call_identifier.is_none()
+                && d_info.call_ownership.is_none()
+                && d_info.modify.is_none()
+                && d_info.call_status.is_none()
+        })
+    }
+
     fn tma_sdu_has_acknowledged_basic_link_tx(sdu: &BitBuffer) -> bool {
         matches!(
             BitBuffer::from_bitbuffer(sdu)
@@ -2518,6 +2533,12 @@ impl UmacBs {
                     let omit_redundant_private_floor_chan_alloc = d_tx_granted
                         .as_ref()
                         .is_some_and(|grant| self.is_redundant_private_floor_grant_chan_alloc(&prim, ts, grant));
+                    let omit_group_timer_d_info_chan_alloc = prim.main_address.ssi_type == SsiType::Gssi
+                        && prim
+                            .chan_alloc
+                            .as_ref()
+                            .is_some_and(|chan_alloc| chan_alloc.ul_dl_assigned == UlDlAssignment::Dl)
+                        && Self::tma_sdu_is_d_info_reset_t310(&sdu);
                     let consume_ra_ack_without_chan_alloc = omit_redundant_private_floor_chan_alloc
                         && d_tx_granted
                             .as_ref()
@@ -2525,7 +2546,7 @@ impl UmacBs {
                     let mac_chan_alloc = prim
                         .chan_alloc
                         .as_ref()
-                        .filter(|_| !omit_redundant_private_floor_chan_alloc)
+                        .filter(|_| !omit_redundant_private_floor_chan_alloc && !omit_group_timer_d_info_chan_alloc)
                         .map(|chan_alloc| Self::cmce_to_mac_chanalloc(chan_alloc, self.config.config().cell.main_carrier));
                     let mut mac_pdu = MacResource {
                         fill_bits: false,

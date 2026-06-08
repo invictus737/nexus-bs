@@ -11,6 +11,7 @@ use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::cmce::enums::{call_timeout::CallTimeout, transmission_grant::TransmissionGrant};
 use tetra_pdus::cmce::fields::basic_service_information::BasicServiceInformation;
 use tetra_pdus::cmce::pdus::d_connect::DConnect;
+use tetra_pdus::cmce::pdus::d_info::DInfo;
 use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
@@ -464,6 +465,33 @@ fn d_tx_ceased_sdu(call_id: u16) -> BitBuffer {
     }
     .to_bitbuf(&mut sdu)
     .expect("serialize D-TX CEASED");
+    sdu.seek(0);
+    sdu
+}
+
+fn d_info_reset_t310_sdu(call_id: u16) -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(40);
+    DInfo {
+        call_identifier: call_id,
+        reset_call_time_out_timer_t310_: true,
+        poll_request: false,
+        new_call_identifier: None,
+        call_time_out: None,
+        call_time_out_set_up_phase_t301_t302_: None,
+        call_ownership: None,
+        modify: None,
+        call_status: None,
+        temporary_address: None,
+        notification_indicator: None,
+        poll_response_percentage: None,
+        poll_response_number: None,
+        dtmf: None,
+        facility: None,
+        poll_response_addresses: None,
+        proprietary: None,
+    }
+    .to_bitbuf(&mut sdu)
+    .expect("serialize D-INFO reset T310");
     sdu.seek(0);
     sdu
 }
@@ -4652,6 +4680,75 @@ fn test_group_requester_d_tx_granted_stch_consumes_ready_random_access_ack() {
         UlDlAssignment::Both
     );
     assert_eq!(grant_reporter.get_state(), TxState::Transmitted);
+}
+
+#[test]
+fn test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation() {
+    debug::setup_logging_verbose();
+
+    let speaker_issi = 2_260_616;
+    let gssi = 226_333;
+    let traffic_ts = 2;
+    let usage = 4;
+    let call_id = 6;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, speaker_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let reporter = TxReporter::new_unacked();
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 73,
+            pdu: llc_wrapped_cmce_sdu(d_info_reset_t310_sdu(call_id)),
+            main_address: TetraAddress::new(gssi, SsiType::Gssi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(usage),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Dl,
+                carrier: None,
+            }),
+            tx_reporter: Some(reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(16));
+    let sink_msgs = test.dump_sinks();
+    let resources = mac_resources_for_addr(&sink_msgs, TetraAddress::new(gssi, SsiType::Gssi));
+    let reset = resources
+        .iter()
+        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.usage_marker == Some(usage))
+        .unwrap_or_else(|| {
+            panic!(
+                "expected group D-INFO reset T310 on assigned-channel STCH; reporter={:?}; resources={resources:?}",
+                reporter.get_state()
+            )
+        });
+    assert!(
+        reset.1.chan_alloc_element.is_none(),
+        "EN 300 392-2 clauses 14.5.2.2.1 b) and 14.5.2.2.2 c): D-INFO reset T310 is timer signalling, not transmit authorization; it must not repeat a DL-only MAC channel allocation immediately after the requester grant"
+    );
+    assert!(
+        !reset.1.random_access_flag,
+        "group timer signalling must not acknowledge one MS random access to the whole GSSI"
+    );
+    assert_eq!(reporter.get_state(), TxState::Transmitted);
 }
 
 #[test]

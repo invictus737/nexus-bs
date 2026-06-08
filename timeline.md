@@ -1,5 +1,54 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-08 23:44 EEST - Group D-INFO reset T310 no longer repeats DL-only channel allocation
+
+Field evidence:
+
+- RF test after commit `68bfc82` still failed on `2260082` Motorola MTP3550 MR19.9.
+- Logs showed no `PTT denied`: `2260082` sent `U-TX DEMAND`, received individual `D-TX GRANTED(Granted)`, and UMAC activated the floor after reporter transmission.
+- Failure remained `accepted_ul_media_since_floor=0`, followed by one regrant and then forced TX ceased.
+- `2260618` worked in the same call sequence, so the remaining issue is terminal-specific interpretation of immediate post-grant MAC signalling, not generic CMCE floor ownership.
+
+Component in simple technical terms:
+
+- `D-INFO reset T310` only resets the group call timeout timer. It is not permission to talk.
+- The BS was still carrying a DL-only MAC channel allocation with this timer-only D-INFO on assigned-channel STCH.
+- A strict older Motorola can interpret that DL-only allocation immediately after its UL/Both requester grant as a receive-only reconfiguration.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 b) makes individually addressed `D-TX GRANTED(Granted)` the transmit authorization and U-plane-on trigger for the granted MS.
+- EN 300 392-2 clause 14.5.2.2.2 c) allows D-INFO to reset T310, but it does not grant transmit permission.
+- EN 300 392-2 clause 23.5 requires assigned-channel MAC signalling to stay coherent with the CC procedure.
+- This is clause-scoped engineering hardening, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Detects group-addressed D-INFO reset T310 on FACCH/STCH.
+  - Keeps CMCE `chan_alloc` as local routing metadata to choose the assigned traffic timeslot.
+  - Omits the MAC channel-allocation element from the over-air MAC-RESOURCE for this timer-only D-INFO.
+  - Leaves `D-TX GRANTED`, `D-TX CEASED`, private/P2P, SDS, and parrot paths unchanged.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added `test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation`.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_umac_bs test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_requester_d_tx_granted_stch_consumes_ready_random_access_ack --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs group_226333 --locked` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Deploy this patch and retest GSSI `226333` with `2260082` retaking floor after `2260618`.
+- Expected improvement: after `D-TX GRANTED(Granted)` to `2260082`, no immediate DL-only timer D-INFO channel allocation should override the granted MS's transmit state.
+- If `accepted_ul_media_since_floor=0` still repeats, next layer is RF/PHY/LMAC burst decode or terminal not transmitting despite coherent CC/MAC grant ordering.
+
 ## 2026-06-08 23:32 EEST - Group requester grant AACH/RA ACK hardening for Motorola MTP3550 MR19.9
 
 Component in simple technical terms:
