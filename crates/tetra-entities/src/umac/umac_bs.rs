@@ -2536,7 +2536,7 @@ impl UmacBs {
                     // Build MAC-RESOURCE PDU for the STCH half-slot (124 type1 bits).
                     const STCH_CAP: usize = 124;
 
-                    let usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
+                    let requested_usage_marker = prim.chan_alloc.as_ref().and_then(|ca| ca.usage);
                     let d_tx_granted = Self::d_tx_granted_from_tma_sdu(&sdu);
                     let omit_redundant_private_floor_chan_alloc = d_tx_granted
                         .as_ref()
@@ -2547,6 +2547,17 @@ impl UmacBs {
                             .as_ref()
                             .is_some_and(|chan_alloc| chan_alloc.ul_dl_assigned == UlDlAssignment::Dl)
                         && Self::tma_sdu_is_d_info_reset_t310(&sdu);
+                    let usage_marker = if omit_group_timer_d_info_chan_alloc {
+                        // EN 300 392-2 clause 14.5.2.2.2 c): D-INFO reset T310
+                        // is timer signalling, not assigned-channel authorization.
+                        // Keep the CMCE channel allocation only as local routing
+                        // metadata; on air this timer-only GSSI STCH must not
+                        // carry either a channel allocation or a traffic usage
+                        // marker immediately after D-TX GRANTED.
+                        None
+                    } else {
+                        requested_usage_marker
+                    };
                     let consume_ra_ack_without_chan_alloc = omit_redundant_private_floor_chan_alloc
                         && d_tx_granted
                             .as_ref()

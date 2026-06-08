@@ -4683,7 +4683,7 @@ fn test_group_requester_d_tx_granted_stch_consumes_ready_random_access_ack() {
 }
 
 #[test]
-fn test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation() {
+fn test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation_and_usage_marker() {
     debug::setup_logging_verbose();
 
     let speaker_issi = 2_260_616;
@@ -4733,16 +4733,22 @@ fn test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation() {
     let resources = mac_resources_for_addr(&sink_msgs, TetraAddress::new(gssi, SsiType::Gssi));
     let reset = resources
         .iter()
-        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.usage_marker == Some(usage))
+        .find(|(logical_channel, resource)| {
+            *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_none() && resource.usage_marker.is_none()
+        })
         .unwrap_or_else(|| {
             panic!(
-                "expected group D-INFO reset T310 on assigned-channel STCH; reporter={:?}; resources={resources:?}",
+                "expected timer-only group D-INFO reset T310 on assigned-channel STCH; reporter={:?}; resources={resources:?}",
                 reporter.get_state()
             )
         });
     assert!(
         reset.1.chan_alloc_element.is_none(),
         "EN 300 392-2 clauses 14.5.2.2.1 b) and 14.5.2.2.2 c): D-INFO reset T310 is timer signalling, not transmit authorization; it must not repeat a DL-only MAC channel allocation immediately after the requester grant"
+    );
+    assert!(
+        reset.1.usage_marker.is_none(),
+        "EN 300 392-2 clauses 14.5.2.2.1 b), 14.5.2.2.2 c) and 23.5: timer-only D-INFO reset T310 must not carry the traffic usage marker immediately after the requester grant"
     );
     assert!(
         !reset.1.random_access_flag,

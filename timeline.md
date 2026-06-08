@@ -1,5 +1,60 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-09 00:04 EEST - Timer-only group D-INFO now omits traffic usage marker
+
+Field evidence:
+
+- RF logs on build `v0.1.59-29bc9172` showed the issue is broader than `2260082` MTP3550 MR19.9.
+- A newly powered older Motorola MTP850 MR5.14 using ISSI `2260616` reproduced the same group-call failure on GSSI `226333`.
+- Pattern for both Motorola terminals:
+  - initial group call setup can pass voice and logs `first accepted UL media`;
+  - after `D-TX CEASED`, the terminal sends `U-TX DEMAND`;
+  - SwMI sends individual `D-TX GRANTED(Granted)` with `ra_ack=true`, `chan_alloc=Both`, and AACH `Traffic(...)`;
+  - immediately after that, group-addressed `D-INFO reset T310` is sent as timer signalling;
+  - no valid TCH/S reaches UMAC, ending in `accepted_ul_media_since_floor=0`.
+
+Component in simple technical terms:
+
+- `D-TX GRANTED` tells one terminal it may speak.
+- `D-INFO reset T310` only refreshes the group call timer; it is not another floor grant.
+- The previous patch removed the DL-only channel allocation from this timer D-INFO, but the MAC resource still carried the traffic usage marker. Older Motorola terminals appear to treat that immediate GSSI timer STCH as a conflicting assigned-channel hint.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 b) makes the individually addressed `D-TX GRANTED(Granted)` the transmit authorization and U-plane-on trigger.
+- EN 300 392-2 clause 14.5.2.2.2 c) allows `D-INFO` to reset T310, but that message is timer signalling, not transmit authorization.
+- EN 300 392-2 clause 23.5 requires assigned-channel signalling to stay coherent with the call-control state.
+- EN 300 392-2 clause 21.4.3.1 keeps RA ACK semantics on the requester grant.
+- This is clause-scoped engineering hardening, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - For group-addressed `D-INFO reset T310` on assigned-channel STCH, keeps the CMCE channel allocation only as local routing metadata.
+  - Omits both over-air MAC channel allocation and over-air MAC `usage_marker` for that timer-only D-INFO.
+  - Leaves requester `D-TX GRANTED(Granted)` unchanged: RA ACK, `Both` channel allocation, usage marker, and AACH traffic indication stay intact.
+  - Leaves private/P2P, SDS, duplex, and parrot paths unchanged.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Extended the D-INFO regression test to require both `chan_alloc_element=None` and `usage_marker=None`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_d_info_reset_t310_stch_omits_dl_only_channel_allocation_and_usage_marker --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs group_226333 --locked` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Deploy this patch.
+2. Test GSSI `226333` as a group call only: open group call, alternate floor with PTT from `2260618`, `2260082`, and old Motorola `2260616`, including rapid repeated PTT from the Motorola terminals.
+3. Expected log after requester grant: `STCH D-INFO reset T310 ... usage=None omitted_dl_only_chan_alloc=true`.
+4. Expected RF behaviour: after `D-TX GRANTED(Granted)` to the requester, valid TCH/S should appear as `first accepted UL media after floor`.
+5. If `accepted_ul_media_since_floor=0` persists with `usage=None`, continue with scheduler-selected-STCH and LMAC/PHY post-grant diagnostics; do not change CMCE/P2P/SDS/parrot.
+
 ## 2026-06-08 23:49 EEST - Group RF diagnostic proof logs for 2260082 MTP3550
 
 Field context:
@@ -42,7 +97,7 @@ Verification:
 Next RF gate:
 
 1. Deploy this diagnostic build.
-2. Test local GSSI `226333` with `2260618 -> 2260082`, `2260616 -> 2260082`, and rapid 2x PTT from `2260082`.
+2. Test local GSSI `226333` as a group call: open the group, alternate floor with PTT from `2260618`, `2260616`, and `2260082`, then rapid 2x PTT from `2260082`.
 3. Read logs from service start. Required proof:
    - `STCH D-TX GRANTED ... addr=ISSI 2260082 ... ra_ack=true ... chan_alloc=... Both/Ul`.
    - `AACH group-positive-grant pending ... dl_usage=Traffic(...) ul_usage=Traffic(...)`.
