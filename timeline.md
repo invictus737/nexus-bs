@@ -12014,3 +12014,52 @@ RF gate:
 Limit:
 
 - The local-speaker self-demotion guard is guaranteed only up to `100` local listeners. Above that, the old GSSI listener notification remains intentionally enabled for bounded airtime/resource use.
+
+## 2026-06-08 19:21 EEST - Bounded current-speaker regrant after group UL inactivity
+
+Field context:
+
+- After deploying commit `ad85935`, the live RF log confirmed the intended local-listener delivery shape:
+  - `2260082` received individual `D-TX GRANTED(Granted)`.
+  - `2260618` and `2260616` received individual `D-TX GRANTED(GrantedToOtherUser)`.
+  - No immediate GSSI/self `GrantedToOtherUser` appeared for that local `226333` handoff.
+- The call still failed for `2260082`: after the positive grant, no valid UL TCH/S was accepted before the watchdog, and UMAC emitted `UL inactivity timeout`.
+- This means the previous patch removed the self-demotion candidate, but not the missed/corrupted grant or late uplink-start case.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1 requires the SwMI to grant transmit permission before the MS starts U-plane traffic.
+- EN 300 392-2 clause 23.5.2.2.7 says that if the BS does not receive an uplink message after an individual grant, the BS may send another slot granting PDU to the same MS because the MS may have missed the downlink grant or the uplink may have been corrupted.
+- Nexus-BS now applies this as a bounded group-call robustness guard: one regrant per current group floor epoch, only when there is no queued requester. If a queued requester exists, the existing ETSI floor handoff behavior remains unchanged.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/call.rs`
+  - Added `ul_inactivity_regrant_used` to `ActiveCall`.
+  - Resets on `grant_floor` and `enter_hangtime`.
+  - Allows exactly one current-speaker regrant per floor epoch.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - On group `UL inactivity` with no queued requester, first timeout re-sends individual `D-TX GRANTED(Granted)` to the current speaker and sends internal `FloorGranted` to UMAC to restart the local guard.
+  - It does not repeat listener notifications or D-INFO because the floor owner has not changed.
+  - A second timeout in the same floor epoch still sends `D-TX CEASED`/`FloorReleased`.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added `test_group_ul_inactivity_regrants_current_speaker_once_before_tx_ceased`.
+  - Kept `test_group_ul_inactivity_hands_floor_to_queued_requester` unchanged for queued waiter handoff.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_ul_inactivity_regrants_current_speaker_once_before_tx_ceased --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_ul_inactivity --locked` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` passed: 72 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` passed: 84 tests.
+- `cargo test -p tetra-entities --test test_umac_bs group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` passed: 11 tests.
+
+RF gate:
+
+1. Deploy this patch and repeat `226333` with `2260082` holding/re-entering PTT.
+2. Expected log if first grant is missed:
+   - first timeout: `regranting current speaker ISSI 2260082 before forced TX ceased`;
+   - no immediate `D-TX CEASED`;
+   - if the regrant is decoded, valid TCH/S should arrive before the second timeout.
+3. If the second timeout still occurs with no TCH/S, next layer is RF/LMAC decode or Motorola grant decode timing, not CMCE floor ownership.

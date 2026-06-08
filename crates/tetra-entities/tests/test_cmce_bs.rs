@@ -6557,6 +6557,88 @@ fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
 }
 
 #[test]
+fn test_group_ul_inactivity_regrants_current_speaker_once_before_tx_ceased() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_ul_inactivity_timeout_msg(active_ts));
+    test.run_stack(Some(1));
+    let first_timeout_msgs = test.dump_sinks();
+
+    // EN 300 392-2 clause 23.5.2.2.7 allows a bounded regrant if no uplink
+    // arrives after the individual grant. For field radios, this avoids
+    // turning one missed/corrupted D-TX GRANTED into an immediate floor loss.
+    assert_eq!(count_d_tx_ceased(&first_timeout_msgs), 0);
+    assert_eq!(count_umac_floor_released(&first_timeout_msgs), 0);
+
+    let regrant = first_timeout_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("first inactivity timeout should regrant the current group speaker");
+    assert_eq!(regrant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        regrant.0,
+        &regrant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "group inactivity current-speaker regrant",
+    );
+    assert_eq!(
+        first_timeout_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .count(),
+        1,
+        "regrant must not repeat listener notifications while the floor owner is unchanged"
+    );
+    assert!(first_timeout_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == LAB_ISSI_B
+                && *dest_gssi == LAB_GROUP_GSSI
+                && *ts == active_ts
+        )
+    }));
+
+    test.submit_message(build_ul_inactivity_timeout_msg(active_ts));
+    test.run_stack(Some(1));
+    let second_timeout_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_tx_granted(&second_timeout_msgs),
+        0,
+        "second inactivity timeout in the same floor epoch must not regrant forever"
+    );
+    assert_eq!(count_d_tx_ceased(&second_timeout_msgs), 1);
+    assert_eq!(count_umac_floor_released(&second_timeout_msgs), 1);
+}
+
+#[test]
 fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     debug::setup_logging_verbose();
 

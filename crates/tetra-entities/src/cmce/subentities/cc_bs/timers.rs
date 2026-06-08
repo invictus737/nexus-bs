@@ -712,6 +712,50 @@ impl CcBsSubentity {
                 });
             }
         } else {
+            let (current_speaker, regrant_current_speaker) = {
+                let call = self.active_calls.get_mut(&call_id).unwrap();
+                let current_speaker = call.source_issi;
+                (current_speaker, call.mark_ul_inactivity_regrant_if_unused())
+            };
+
+            if regrant_current_speaker {
+                tracing::warn!(
+                    "UL inactivity timeout on ts={} for group call_id={}, regranting current speaker ISSI {} before forced TX ceased",
+                    ts,
+                    call_id,
+                    current_speaker
+                );
+
+                // EN 300 392-2 clause 23.5.2.2.7 permits the BS to re-send a
+                // grant when no uplink message is received after an individual
+                // grant, because the downlink grant may have been missed or
+                // the uplink may have been corrupted. Keep this bounded to one
+                // regrant per floor epoch; do not re-notify group listeners,
+                // because the floor owner has not changed.
+                self.fsm_send_d_tx_granted_individual(
+                    queue,
+                    call_id,
+                    TetraAddress::issi(current_speaker),
+                    ts,
+                    usage,
+                    TransmissionGrant::Granted,
+                    Some(current_speaker),
+                );
+
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi: current_speaker,
+                        dest_gssi,
+                        ts,
+                    }),
+                });
+                return;
+            }
+
             tracing::warn!("UL inactivity timeout on ts={}, forcing TX ceased for call_id={}", ts, call_id);
             {
                 let call = self.active_calls.get_mut(&call_id).unwrap();

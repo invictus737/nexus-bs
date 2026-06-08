@@ -75,6 +75,7 @@ pub(super) struct ActiveCall {
     pub(super) usage: u8,
     pub(super) tx_active: bool,
     pub(super) hangtime_start: Option<TdmaTime>,
+    ul_inactivity_regrant_used: bool,
     queued_floor_demands: VecDeque<TetraAddress>,
     queued_floor_demand_ssis: HashSet<u32>,
     pub(super) brew_uuid: Option<uuid::Uuid>,
@@ -102,6 +103,7 @@ impl ActiveCall {
             usage,
             tx_active: true,
             hangtime_start: None,
+            ul_inactivity_regrant_used: false,
             queued_floor_demands: VecDeque::new(),
             queued_floor_demand_ssis: HashSet::new(),
             brew_uuid: None,
@@ -129,6 +131,7 @@ impl ActiveCall {
             usage,
             tx_active: true,
             hangtime_start: None,
+            ul_inactivity_regrant_used: false,
             queued_floor_demands: VecDeque::new(),
             queued_floor_demand_ssis: HashSet::new(),
             brew_uuid: Some(brew_uuid),
@@ -167,6 +170,7 @@ impl ActiveCall {
     pub(super) fn enter_hangtime(&mut self, now: TdmaTime) {
         self.tx_active = false;
         self.hangtime_start = Some(now);
+        self.ul_inactivity_regrant_used = false;
     }
 
     /// Reset the call timeout clock. Called when a new network speaker takes the floor so that
@@ -182,6 +186,15 @@ impl ActiveCall {
         self.source_issi = source_issi;
         self.tx_active = true;
         self.hangtime_start = None;
+        self.ul_inactivity_regrant_used = false;
+    }
+
+    pub(super) fn mark_ul_inactivity_regrant_if_unused(&mut self) -> bool {
+        if self.ul_inactivity_regrant_used {
+            return false;
+        }
+        self.ul_inactivity_regrant_used = true;
+        true
     }
 
     pub(super) fn queue_tx_demand(&mut self, requester: TetraAddress) -> TxDemandQueueResult {
