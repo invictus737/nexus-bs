@@ -1,5 +1,51 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-09 01:03 EEST - Suppress immediate group D-INFO reset T310 after floor grant
+
+Field trigger:
+
+- RF test on deployed `v0.1.59-95e9a819` failed on local GSSI `226333`.
+- Full service journal from current restart showed call_id `4`: initial group setup from ISSI `2260616` accepted UL media, but the post-`D-TX CEASED` retake from the same ISSI received a positive requester `D-TX GRANTED` and then timed out with `accepted_ul_media_since_floor=0`.
+- The failing retake emitted the immediate timer-only group `D-INFO reset T310` after the positive requester grant and listener grants. The successful initial setup did not use this timer D-INFO path.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1(b): positive `D-TX GRANTED` is the floor/transmit authorization.
+- EN 300 392-2 clause 14.5.2.2.2(c): `D-INFO reset T310` is timer signalling, not transmit authorization.
+- EN 300 392-2 clauses 14.7.1.8 and 14.8.37 define the D-INFO reset field, but do not require SwMI to inject it immediately after each floor grant.
+- Therefore the BS can keep its local call timeout fresh without placing a timer-only group D-INFO into the first post-grant assigned-channel FACCH/STCH frames.
+- This is compatibility hardening for Motorola MR5/MR19 retake behaviour; it is not a formal conformance claim.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Replaced `send_group_d_info_reset_t310_facch(...)` with `reset_group_t310_after_floor_grant(call_id)`.
+  - The function now resets local SwMI T310 state only and logs that no timer-only D-INFO is emitted on FACCH.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - All group floor grant/handoff/regrant paths now call the local reset helper instead of queueing a group D-INFO PDU.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated group handoff/retake tests to assert that floor grants do not emit `D-INFO reset T310` on FACCH.
+- Private simplex/P2P, duplex, SDS, parrot, LMAC voice decode, RA ACK, AACH, and `D-TX GRANTED` ordering were not changed.
+
+Verification:
+
+- `cargo check -p tetra-entities --tests --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` passed before cleanup: 75 tests.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` passed: 12 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_tx_ceased_hands_floor_to_queued_requester --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs group_d_info_reset_t310 --locked` passed.
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Deploy this build directly to testing with the normal local-build deploy script.
+2. Clean remote journal, restart BS, and test GSSI `226333`.
+3. Expected log difference: after `UMAC RF diag: STCH D-TX GRANTED ... group_requester_positive=true`, no `UMAC RF diag: STCH D-INFO reset T310` should appear.
+4. Required field behaviour: repeated/rapid PTT from Motorola MR5/MR19 must enter valid UL media; if it still fails with `accepted_ul_media_since_floor=0`, continue at LMAC/PHY post-grant observation.
+
 ## 2026-06-09 00:24 EEST - FlowStation upstream GSSI comparison and post-grant RF diagnostics
 
 Context:
@@ -12515,6 +12561,40 @@ Commit/deploy:
 - Restarted `nexus-bs@chris.service`; systemd reports `MainPID=83769`, `ActiveState=active`, `SubState=running`, `ActiveEnterTimestamp=Mon 2026-06-08 22:53:24 EEST`.
 - Startup banner shows `Build: v0.1.59-8344a89d`; `WebSocketTransport: connected, using Brew v1`; restart recovery restored local ISSIs `2260616`, `2260082`, and `2260618` with GSSI `226333`.
 - Journal was rotated/vacuumed after deploy for a clean RF gate; `journalctl -u nexus-bs@chris.service -n 20` returned `-- No entries --`.
+
+## 2026-06-09 00:32 EEST - Upstream FlowStation GSSI group-call comparison
+
+Scope:
+
+- Reloaded ETSI compliance law before protocol analysis.
+- Assigned telecom explorer agent to compare upstream FlowStation clone `/private/tmp/flowstation-upstream-compare` at `fcac34e` against local Nexus-BS `95e9a81`.
+- Read-only comparison only; no code changed.
+
+Clause-scoped comparison:
+
+- EN 300 392-2 clause 14.5.2.2.1(b): group floor authorization is `D-TX GRANTED`.
+  - Upstream emits internal `FloorGranted` immediately after enqueueing the grant.
+  - Nexus-BS waits for the positive requester grant `TxReporter` before UMAC/Brew floor activation.
+  - Local ordering is safer; do not restore upstream here.
+- EN 300 392-2 clauses 21.4.3.1 and 23.5: RA ACK/AACH/channel allocation must be coherent with assigned-channel usage.
+  - Upstream STCH grant path has simpler RA handling and no requester-specific uplink-capable channel allocation in the stolen `MAC-RESOURCE`.
+  - Nexus-BS carries `UlDlAssignment::Both` for the positive requester grant and only uses pending/ready RA ACK state.
+  - Local path is safer for real terminals.
+- EN 300 392-2 clauses 23.8.4.1.4 and 23.8.5: NTS2 Block2 remains TCH/S unless first-half MAC says it is stolen; bearer tail ordering must be preserved.
+  - Upstream ignores partial TCH/S and cannot preserve raw Block2.
+  - Nexus-BS forwards valid raw Block2 and tail-drains group `U-TX CEASED` before `FloorReleased`.
+  - Local path is safer.
+- EN 300 392-2 clause 14.5.2.2.2(c): `D-INFO reset T310` is timer signalling, not transmit authorization.
+  - Upstream has no comparable group timer reset path.
+  - Nexus-BS sends timer-only `D-INFO reset T310` after grants, with on-air channel allocation/usage marker stripped.
+  - This remains the only credible compatibility A/B suspect if RF logs show grants are transmitted but Motorola terminals do not enter valid uplink.
+
+Conclusion:
+
+- Upstream FlowStation does not contain a safer GSSI group-call implementation to restore wholesale.
+- Keep the local Nexus-BS CMCE/UMAC/LMAC hardening.
+- Next evidence gate is RF logging from current deploy: correlate `UMAC RF diag: selected STCH D-TX GRANTED`, `LMAC RF diag: armed post-grant UL window`, post-grant candidates/results, and UMAC `first accepted UL media` or inactivity timeout.
+- If grants/AACH are coherent and no valid post-grant UL appears, test a default-off compatibility switch to suppress/defer group `D-INFO reset T310` after positive floor grant. Label that as terminal compatibility, not ETSI baseline.
 
 ## 2026-06-08 21:20 EEST - Group U-TX CEASED tail-drain before FloorReleased
 

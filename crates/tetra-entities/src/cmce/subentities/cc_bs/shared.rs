@@ -1478,7 +1478,7 @@ impl CcBsSubentity {
                 pending.ts,
                 pending.usage,
             );
-            self.send_group_d_info_reset_t310_facch(queue, pending.call_id, pending.dest_gssi, pending.ts, pending.usage);
+            self.reset_group_t310_after_floor_grant(pending.call_id);
             self.refresh_group_cached_d_setup_speaker(pending.call_id, requester.ssi);
 
             self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
@@ -2341,8 +2341,8 @@ impl CcBsSubentity {
         }
     }
 
-    /// Reset the group-call T310 timer for MSs following an active group call.
-    pub(super) fn send_group_d_info_reset_t310_facch(&mut self, queue: &mut MessageQueue, call_id: u16, dest_gssi: u32, ts: u8, usage: u8) {
+    /// Reset the local group-call T310 timer after a floor grant.
+    pub(super) fn reset_group_t310_after_floor_grant(&mut self, call_id: u16) {
         let call_timeout = self
             .active_calls
             .get_mut(&call_id)
@@ -2357,42 +2357,18 @@ impl CcBsSubentity {
         }
 
         // EN 300 392-2 clauses 14.5.2.2.2(c), 14.7.1.8 and 14.8.37:
-        // D-INFO with Reset call time-out timer = 1 restarts T310 using the
-        // current call-timeout value. Keep the PDU compact and group-addressed
-        // on assigned-channel FACCH/STCH so listeners reset the same timer the
-        // SwMI just reset locally after a real floor grant. This timer refresh
-        // is not transmit authorization; clause 14.5.2.2.1 grants UL only with
-        // the individually addressed D-TX GRANTED, so keep the group reset
-        // downlink-only and avoid refreshing a GSSI uplink marker during the
-        // first speech frames of a new floor epoch.
-        let pdu = DInfo {
-            call_identifier: call_id,
-            reset_call_time_out_timer_t310_: true,
-            poll_request: false,
-            new_call_identifier: None,
-            call_time_out: None,
-            call_time_out_set_up_phase_t301_t302_: None,
-            call_ownership: None,
-            modify: None,
-            call_status: None,
-            temporary_address: None,
-            notification_indicator: None,
-            poll_response_percentage: None,
-            poll_response_number: None,
-            dtmf: None,
-            facility: None,
-            poll_response_addresses: None,
-            proprietary: None,
-        };
-
-        tracing::debug!("-> D-INFO reset T310 (FACCH) {:?}", pdu);
-        let mut sdu = BitBuffer::new_autoexpand(32);
-        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DInfo reset T310");
-        sdu.seek(0);
-
-        let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
-        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
-        queue.push_back(msg);
+        // D-INFO with Reset call time-out timer = 1 can restart T310 at the
+        // MS, but it is timer signalling, not the transmit authorization from
+        // clause 14.5.2.2.1(b). Real Motorola MR5/MR19 field tests showed
+        // that injecting timer-only group D-INFO immediately after the
+        // requester grant can leave the new over with no valid uplink media.
+        // Keep the SwMI's local call timeout fresh and leave the first
+        // post-grant assigned-channel FACCH/STCH frames dedicated to floor
+        // control and traffic.
+        tracing::debug!(
+            "CMCE: reset local group T310 after floor grant call_id={} without emitting timer-only D-INFO on FACCH",
+            call_id
+        );
     }
 
     /// Send D-TX GRANTED via FACCH stealing on the group traffic channel.

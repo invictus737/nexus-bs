@@ -1499,45 +1499,11 @@ fn d_info_reset_t310_prims(msgs: &[SapMsg]) -> Vec<(&LcmcMleUnitdataReq, DInfo)>
         .collect()
 }
 
-fn assert_one_group_d_info_reset_t310(msgs: &[SapMsg], call_id: u16, gssi: u32, ts: u8, usage: u8, context: &str) {
+fn assert_no_group_d_info_reset_t310(msgs: &[SapMsg], context: &str) {
     let resets = d_info_reset_t310_prims(msgs);
-    assert_eq!(resets.len(), 1, "{context}: expected one group D-INFO reset T310");
-    let (prim, d_info) = &resets[0];
-    assert_eq!(d_info.call_identifier, call_id, "{context}: D-INFO call id");
-    assert!(d_info.reset_call_time_out_timer_t310_, "{context}: reset T310 bit");
-    assert!(!d_info.poll_request, "{context}: no acknowledged-group poll request");
     assert!(
-        d_info.call_time_out.is_none(),
-        "{context}: reset uses existing T310 value instead of changing timeout"
-    );
-    assert_eq!(
-        prim.main_address,
-        TetraAddress::new(gssi, SsiType::Gssi),
-        "{context}: group address"
-    );
-    assert!(
-        prim.stealing_permission,
-        "{context}: D-INFO reset should use assigned-channel FACCH/STCH"
-    );
-    assert_eq!(
-        prim.layer2service,
-        Layer2Service::Unacknowledged,
-        "{context}: group reset is unacknowledged"
-    );
-    assert_eq!(
-        prim.unacked_bl_repetitions,
-        Some(0),
-        "{context}: reset T310 floor-control signalling must not repeat stale BL-UDATA"
-    );
-    let chan_alloc = prim
-        .chan_alloc
-        .as_ref()
-        .unwrap_or_else(|| panic!("{context}: D-INFO reset should carry channel allocation"));
-    assert_chan_alloc_matches_circuit(chan_alloc, ts, usage, context);
-    assert_eq!(
-        chan_alloc.ul_dl_assigned,
-        UlDlAssignment::Dl,
-        "{context}: D-INFO reset is timer signalling for group listeners, not transmit authorization"
+        resets.is_empty(),
+        "{context}: floor grant must not emit timer-only group D-INFO reset T310 on FACCH"
     );
 }
 
@@ -5578,7 +5544,7 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
-    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
+    let (call_id, _, _) = start_group_call_with_circuit(&mut test);
 
     test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -5631,14 +5597,7 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         0,
         "queued group floor handoff must not inject an immediate back-up D-SETUP over the first speech frames"
     );
-    assert_one_group_d_info_reset_t310(
-        &ceased_msgs,
-        call_id,
-        TEST_GSSI,
-        active_ts,
-        active_usage,
-        "queued U-TX-CEASED handoff",
-    );
+    assert_no_group_d_info_reset_t310(&ceased_msgs, "queued U-TX-CEASED handoff");
 
     assert!(
         ceased_msgs
@@ -6688,14 +6647,7 @@ fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
         0,
         "queued timeout handoff must not inject an immediate back-up D-SETUP over the first speech frames"
     );
-    assert_one_group_d_info_reset_t310(
-        &timeout_msgs,
-        call_id,
-        LAB_GROUP_GSSI,
-        active_ts,
-        active_usage,
-        "UL inactivity queued handoff",
-    );
+    assert_no_group_d_info_reset_t310(&timeout_msgs, "UL inactivity queued handoff");
 
     assert_eq!(
         count_umac_floor_granted(&timeout_msgs),
@@ -8148,7 +8100,7 @@ fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
         prim.main_address == TetraAddress::issi(TEST_ISSI)
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
-    assert_one_group_d_info_reset_t310(&demand_msgs, call_id, TEST_GSSI, active_ts, active_usage, "hangtime floor retake");
+    assert_no_group_d_info_reset_t310(&demand_msgs, "hangtime floor retake");
     assert_eq!(
         count_umac_floor_granted(&demand_msgs),
         0,
