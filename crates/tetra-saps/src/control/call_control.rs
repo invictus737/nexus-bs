@@ -8,6 +8,8 @@ use crate::control::enums::circuit_mode_type::CircuitModeType;
 pub enum CircuitDlMediaSource {
     /// Downlink media comes from local UL loopback (classic BS group/simplex behavior).
     LocalLoopback,
+    /// Downlink media is generated locally by CMCE after recording UL frames.
+    LocalParrot,
     /// Downlink media is supplied by SwMI over the network bridge (Brew/TetraPack).
     SwMI,
 }

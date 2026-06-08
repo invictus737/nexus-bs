@@ -21,6 +21,9 @@ const INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 // EN 300 392-2 table 20.54 defines priority 7 as the highest TMA priority.
 // Keep this restricted to time-critical floor-control signalling.
 const CMCE_FLOOR_CONTROL_PDU_PRIO: i32 = 7;
+// EN 300 392-2 clause 14.5.1.2.2 f references EN 300 392-9 notification
+// value 26 as "Notice of imminent call disconnection".
+const NOTIFICATION_IMMINENT_CALL_DISCONNECTION: u64 = 26;
 
 // EN 300 392-2 table 14.33 uses pointer 0 for an unsupported whole PDU.
 // Non-zero pointers below are bit offsets into the received-PDU extract, which
@@ -59,6 +62,7 @@ impl CcBsSubentity {
             group_listeners: HashMap::new(),
             telemetry: None,
             echo_session: None,
+            parrot_session: None,
         }
     }
 
@@ -78,12 +82,63 @@ impl CcBsSubentity {
         }
     }
 
+    pub fn handle_parrot_ul_frame(
+        &mut self,
+        _queue: &mut MessageQueue,
+        ts: u8,
+        data: Vec<u8>,
+        raw_tch_s_block: Option<tetra_core::PhyBlockNum>,
+    ) -> bool {
+        let Some(session) = self.parrot_session.as_mut() else {
+            return false;
+        };
+        if !session.owns_ts(ts) {
+            return false;
+        }
+        if session.record_ul_frame(ts, data, raw_tch_s_block) {
+            tracing::trace!(
+                "CMCE: parrot service recorded frame call_id={} ts={} frames={}",
+                session.call_id,
+                ts,
+                session.recorded_len()
+            );
+        } else {
+            tracing::trace!(
+                "CMCE: parrot service consumed late/non-recording UL frame call_id={} ts={}",
+                session.call_id,
+                ts
+            );
+        }
+        true
+    }
+
+    pub(super) fn drive_parrot_session(&mut self, queue: &mut MessageQueue) {
+        let Some(session) = self.parrot_session.as_mut() else {
+            return;
+        };
+        if let Some(msg) = session.next_playback_msg(self.dltime) {
+            queue.push_back(msg);
+        }
+        if session.take_playback_finished() {
+            let call_id = session.call_id;
+            let caller_issi = session.caller_issi();
+            tracing::info!("CMCE: parrot playback complete, releasing call_id={}", call_id);
+            self.release_individual_call_to_issi(queue, call_id, DisconnectCause::SwmiRequestedDisconnection, caller_issi);
+        }
+    }
+
     /// Release echo session if it owns `call_id`.
     pub fn release_echo_session_if_matches(&mut self, call_id: u16) {
         if let Some(ref s) = self.echo_session {
             if s.call_id == call_id {
                 tracing::info!("CMCE: echo service session released (call_id={})", call_id);
                 self.echo_session = None;
+            }
+        }
+        if let Some(ref s) = self.parrot_session {
+            if s.call_id == call_id {
+                tracing::info!("CMCE: parrot service session released (call_id={})", call_id);
+                self.parrot_session = None;
             }
         }
     }
@@ -161,6 +216,9 @@ impl CcBsSubentity {
         ids.extend(self.pending_individual_releases.keys().copied());
         ids.extend(self.circuits.active_call_ids());
         if let Some(session) = &self.echo_session {
+            ids.insert(session.call_id);
+        }
+        if let Some(session) = &self.parrot_session {
             ids.insert(session.call_id);
         }
 
@@ -420,10 +478,18 @@ impl CcBsSubentity {
     }
 
     pub(super) fn build_d_release(call_identifier: u16, disconnect_cause: DisconnectCause) -> BitBuffer {
+        Self::build_d_release_with_notification(call_identifier, disconnect_cause, None)
+    }
+
+    pub(super) fn build_d_release_with_notification(
+        call_identifier: u16,
+        disconnect_cause: DisconnectCause,
+        notification_indicator: Option<u64>,
+    ) -> BitBuffer {
         let pdu = DRelease {
             call_identifier,
             disconnect_cause,
-            notification_indicator: None,
+            notification_indicator,
             facility: None,
             proprietary: None,
         };
@@ -437,6 +503,54 @@ impl CcBsSubentity {
 
     pub(super) fn build_d_release_from_d_setup(d_setup_pdu: &DSetup, disconnect_cause: DisconnectCause) -> BitBuffer {
         Self::build_d_release(d_setup_pdu.call_identifier, disconnect_cause)
+    }
+
+    fn build_d_info_imminent_call_disconnection(call_id: u16) -> BitBuffer {
+        let pdu = DInfo {
+            call_identifier: call_id,
+            reset_call_time_out_timer_t310_: false,
+            poll_request: false,
+            new_call_identifier: None,
+            call_time_out: None,
+            call_time_out_set_up_phase_t301_t302_: None,
+            call_ownership: None,
+            modify: None,
+            call_status: None,
+            temporary_address: None,
+            notification_indicator: Some(NOTIFICATION_IMMINENT_CALL_DISCONNECTION),
+            poll_response_percentage: None,
+            poll_response_number: None,
+            dtmf: None,
+            facility: None,
+            poll_response_addresses: None,
+            proprietary: None,
+        };
+        tracing::info!("-> {:?} (imminent private-call disconnection)", pdu);
+
+        let mut sdu = BitBuffer::new_autoexpand(48);
+        pdu.to_bitbuf(&mut sdu).expect("Failed to serialize DInfo");
+        sdu.seek(0);
+        sdu
+    }
+
+    fn push_established_individual_release_imminent_notice(
+        queue: &mut MessageQueue,
+        call_id: u16,
+        address: TetraAddress,
+        ts: u8,
+        usage: u8,
+    ) {
+        // EN 300 392-2 14.5.1.2.2 f: before actual call disconnection the
+        // SwMI may send D-INFO with "Notice of imminent call disconnection".
+        // Keep this on the assigned FACCH/STCH and ahead of D-RELEASE.
+        queue.push_back(Self::build_sapmsg_stealing_ul_dl_with_repetitions(
+            Self::build_d_info_imminent_call_disconnection(call_id),
+            address,
+            ts,
+            Some(usage),
+            UlDlAssignment::Dl,
+            Some(0),
+        ));
     }
 
     /// EN 300 392-2 clauses 14.5.1.3.2 and 14.5.2.3.2 require a D-RELEASE
@@ -1485,7 +1599,14 @@ impl CcBsSubentity {
         disconnect_cause: DisconnectCause,
         peer_issi: u32,
     ) {
-        let reporters = self.send_established_individual_release_pdus(queue, call_id, call, disconnect_cause, Some(peer_issi));
+        let reporters = self.send_established_individual_release_pdus_with_notice(
+            queue,
+            call_id,
+            call,
+            disconnect_cause,
+            Some(peer_issi),
+            Some(peer_issi),
+        );
         if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
             pending.peer_release_reporters.extend(reporters);
             self.complete_individual_disconnect_if_ready(queue, call_id);
@@ -2188,10 +2309,23 @@ impl CcBsSubentity {
     }
 
     fn build_individual_release_sdu(&self, call_id: u16, disconnect_cause: DisconnectCause) -> BitBuffer {
+        self.build_individual_release_sdu_with_notification(call_id, disconnect_cause, None)
+    }
+
+    fn build_individual_release_sdu_with_notification(
+        &self,
+        call_id: u16,
+        disconnect_cause: DisconnectCause,
+        notification_indicator: Option<u64>,
+    ) -> BitBuffer {
         if let Some(cached) = self.cached_setups.get(&call_id) {
-            Self::build_d_release_from_d_setup(&cached.pdu, disconnect_cause)
+            if notification_indicator.is_some() {
+                Self::build_d_release_with_notification(cached.pdu.call_identifier, disconnect_cause, notification_indicator)
+            } else {
+                Self::build_d_release_from_d_setup(&cached.pdu, disconnect_cause)
+            }
         } else {
-            Self::build_d_release(call_id, disconnect_cause)
+            Self::build_d_release_with_notification(call_id, disconnect_cause, notification_indicator)
         }
     }
 
@@ -2299,6 +2433,18 @@ impl CcBsSubentity {
         disconnect_cause: DisconnectCause,
         release_to_issi: Option<u32>,
     ) -> Vec<TxReporter> {
+        self.send_established_individual_release_pdus_with_notice(queue, call_id, call, disconnect_cause, release_to_issi, None)
+    }
+
+    fn send_established_individual_release_pdus_with_notice(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        call: &IndividualCall,
+        disconnect_cause: DisconnectCause,
+        release_to_issi: Option<u32>,
+        imminent_notice_to_issi: Option<u32>,
+    ) -> Vec<TxReporter> {
         let mut reporters = Vec::new();
 
         let send_calling_leg = !call.calling_over_brew && release_to_issi.map_or(true, |issi| issi == call.calling_addr.ssi);
@@ -2309,8 +2455,20 @@ impl CcBsSubentity {
             // Established individual calls already have an assigned channel;
             // keep release on FACCH/STCH with a reporter so the same MS does
             // not receive duplicate D-RELEASE copies on MCCH.
+            let notification = if imminent_notice_to_issi == Some(call.calling_addr.ssi) {
+                Self::push_established_individual_release_imminent_notice(
+                    queue,
+                    call_id,
+                    call.calling_addr,
+                    call.calling_ts,
+                    call.calling_usage,
+                );
+                Some(NOTIFICATION_IMMINENT_CALL_DISCONNECTION)
+            } else {
+                None
+            };
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
-                self.build_individual_release_sdu(call_id, disconnect_cause),
+                self.build_individual_release_sdu_with_notification(call_id, disconnect_cause, notification),
                 call.calling_addr,
                 call.calling_ts,
                 Some(call.calling_usage),
@@ -2326,8 +2484,20 @@ impl CcBsSubentity {
             // EN 300 392-2 clause 14.5.1.3.1 permits clearing the peer with
             // D-RELEASE; in an established call it belongs on the assigned
             // channel rather than as an additional MCCH fallback duplicate.
+            let notification = if imminent_notice_to_issi == Some(call.called_addr.ssi) {
+                Self::push_established_individual_release_imminent_notice(
+                    queue,
+                    call_id,
+                    call.called_addr,
+                    call.called_ts,
+                    call.called_usage,
+                );
+                Some(NOTIFICATION_IMMINENT_CALL_DISCONNECTION)
+            } else {
+                None
+            };
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
-                self.build_individual_release_sdu(call_id, disconnect_cause),
+                self.build_individual_release_sdu_with_notification(call_id, disconnect_cause, notification),
                 call.called_addr,
                 call.called_ts,
                 Some(call.called_usage),

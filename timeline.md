@@ -1,5 +1,99 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-08 01:15 EEST - Nexus-BS v0.1.58 Parrot/P2P field checkpoint
+
+Release note:
+
+- Bumped Nexus-BS release identity from `v0.1.57` to `v0.1.58`.
+- This release checkpoint preserves the current RF field result: Parrot/Papagal `99999` is treated as 100% OK for the current test build, and private P2P is treated as 99% working with the remaining Motorola-visible `No answer` final-clearance issue to be fixed.
+- This is not a formal ETSI/TETRA certification claim. It is a field checkpoint plus clause-scoped engineering evidence for the touched behavior.
+
+Component in simple technical terms:
+
+- Product identity is the version shown by the binary banner, dashboard, User-Agent, control protocol, telemetry protocol, README, example config, and systemd samples.
+- It does not change the TETRA call-control or media procedure by itself.
+
+Patch:
+
+- `Cargo.toml` and `Cargo.lock` now identify workspace crates and binaries as `0.1.58`.
+- `tetra_core::PRODUCT_VERSION_TAG`, User-Agent, control protocol and telemetry protocol track `v0.1.58`.
+- Dashboard identity tests, README, example config, and systemd sample descriptions now reference `Nexus-BS v0.1.58`.
+
+Verification:
+
+- `cargo check -p tetra-core -p tetra-entities -p tetra-saps --tests` passed and refreshed `Cargo.lock`.
+- `cargo test -p tetra-core --locked product_identity_tracks_workspace_version` passed.
+- `cargo test -p tetra-entities --locked product` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed.
+- `cargo check -p tetra-core -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+
+Deploy:
+
+- Built locally with `scripts/nexus-bs-test-deploy.sh` using `RUN_TESTS=0` after the focused locked verification above.
+- Deployed directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup was created.
+- Live SHA-256 on `chris@192.168.1.179`: `fb299c08a2ce2787a379594d43d64cb720422e1dd9b42e7c19b7efcf9b5139f4`.
+- Service `nexus-bs@chris.service` active/running with PID `77133`, active since `2026-06-08 11:12:03 EEST`.
+- Startup banner reports `Version: Nexus-BS v0.1.58`, build `v0.1.58-9773aee2-modified`.
+
+## 2026-06-08 01:05 EEST - Papagal 99999 isolated Hytera compatibility gate
+
+Component in simple technical terms:
+
+- CMCE Parrot/Papagal is the local virtual private-call service on ISSI `99999`.
+- It answers a simplex private call, records the caller's uplink TCH/S voice frames, plays the exact frames back after PTT release, then clears only the real caller leg.
+- UMAC is the media scheduler that converts those recorded TCH/S frames back to downlink traffic on the assigned timeslot.
+
+RF problem reported:
+
+- Hytera `2260616 -> 99999` Parrot playback sounded bad and displayed `call modified`.
+- Normal private simplex P2P and group call audio were reported very good, so this stage must stay isolated to Parrot and must not alter normal P2P or GSSI media paths.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.1.1.1 says the SwMI may answer a U-SETUP with D-CALL PROCEEDING, D-ALERT, or D-CONNECT during mobile-originated call setup.
+- EN 300 392-2 table 14.62 defines the hook method selection IE: `0` direct through-connect, `1` on/off-hook signalling.
+- EN 300 392-2 clause 14.5.1.1.1 says if D-CALL PROCEEDING, D-ALERT, or D-CONNECT indicates a service different from the one requested, the user application may treat the call as changed.
+- Therefore the Parrot virtual service now preserves the caller's requested hook method in D-CALL PROCEEDING and D-CONNECT instead of forcing direct through-connect.
+- EN 300 392-2 note near clause 23.5.4.3.1 warns that a simplex MS should not attempt simultaneous transmit and receive on one circuit-mode call. Parrot playback remains after U-TX CEASED, not while the caller is still transmitting, and the virtual-speaker grant is DL-only because ISSI `99999` is not an RF peer needing uplink.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Parrot D-CALL PROCEEDING and D-CONNECT preserve `U-SETUP.hook_method_selection`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Parrot playback announces the virtual speaker with D-TX GRANTED/GrantedToOtherUser using `UlDlAssignment::Dl`, so Hytera-class callers are receive-only while the virtual peer plays back audio.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/parrot.rs`
+  - Playback now skips frame 18 because the current UMAC scheduler does not send circuit traffic there.
+  - Playback waits a short guard after the D-TX GRANTED/FACCH handoff before sending the first recorded TCH/S frame.
+  - Release waits a short drain guard after the final queued playback frame so CMCE does not close the local circuit before UMAC/LMAC can transmit the tail.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - LocalParrot downlink playback uses the `_from_ul` TCH/S scheduling path for both ACELP and raw Block2, matching the working UMAC timing/source path used by local P2P/group media.
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Per-frame FACCH/STCH and raw TCH/S preservation logs were demoted from INFO to DEBUG to reduce voice-test log pressure.
+- `crates/tetra-entities/src/phy/phy_bs.rs`
+  - Per-burst `rx_tpsap_prim got NormalTrainSeq...` logging was demoted from INFO to DEBUG to avoid CPU/log pressure during voice tests.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked test_tmd_dl_req_raw_block2_playback_preserves_tch_s_halfslot -- --exact` passed.
+- `cargo check -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+- Live deploy SHA on `chris@192.168.1.179` is `c63beaecb3dc70a3c409b5e8ce69094f8839421ca91266a48b1cdd32d61d371f`, active since `2026-06-08 01:05:03 EEST`.
+- The RF gate is armed against this live build; the volatile journal was rotated/vacuumed immediately before asking for the Hytera `2260616 -> 99999` test.
+
+Next RF gate:
+
+- Test only Hytera `2260616 -> 99999`.
+- Expected log shape: `U-SETUP ... called_party=99999 ... hook=true`, Parrot D-CALL PROCEEDING/D-CONNECT with `hook_method_selection: true`, `D-TX GRANTED/GrantedToOtherUser` with DL-only allocation, `U-TX CEASED (parrot) ... starting paced playback`, then `parrot playback complete, releasing`.
+- Required RF result: no `call modified`, playback intelligible, no regression in P2P/group.
+
 ## 2026-06-07 22:00 EEST - Private simplex peer clear restored to tail-drained D-DISCONNECT
 
 Component in simple technical terms:
@@ -11236,3 +11330,405 @@ Tetra-Core/SmartConnect agent result:
   - local simplex close with peer `D-RELEASE` must not wait for peer `U-RELEASE`.
 - Not useful for the RF fix:
   - BEL byte layouts, UDP/1200 RTP PT96, SSRC/request-id formulas, `media_auth`, STUN, AES-GCM, synthetic lab auth, and native lab mode immediate grants.
+
+## 2026-06-07 23:40 EEST - Private simplex peer release notification and Parrot/Papagal 99999 MVP
+
+Context:
+
+- RF user report after the last deployed private-simplex close work: Motorola still rendered `No answer` on some established-call close paths.
+- Do not repeat the previous loops:
+  - peer `D-DISCONNECT` on local simplex close can reboot MXP600;
+  - blind release-cause changes did not prove a stable fix;
+  - setup/media path around the RF-good base must remain unchanged.
+- User also requested a separate Parrot/Papagal simplex service on ISSI `99999`, limited to 20 seconds, which records what the caller says, plays it back as a P2P-like response, then closes.
+
+Clause-scoped ETSI check:
+
+- EN 300 392-2 clause 14.5.1.3.1: the MS that sends `U-DISCONNECT` waits for `D-RELEASE`; the other MS may be informed by `D-DISCONNECT` or `D-RELEASE`.
+- EN 300 392-2 clause 14.5.1.3.3: `D-RELEASE` expects no MS response; `D-DISCONNECT` expects `U-RELEASE`.
+- EN 300 392-2 clause 14.5.1.2.2 f: before actual disconnection the SwMI may send `D-INFO` with notification "Notice of imminent call disconnection".
+- EN 300 392-2 table 14.12 / local PDU implementation: `D-RELEASE` also carries an optional Notification indicator.
+- Notification value `26` remains project evidence from EN 300 392-9 notes/tests and must not be described as full-stack certification evidence until the 392-9 source is rechecked.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added `D-INFO` imminent-disconnection helper.
+  - Added `D-RELEASE` builder support for optional `notification_indicator`.
+  - Local simplex caller hangup still sends prompt `D-RELEASE` to the requester without extra `D-INFO`.
+  - Tail-drained peer clear now sends `D-INFO(notification=26)` before peer `D-RELEASE(notification=26)`.
+  - Setup, `D-CONNECT ACK`, caller `D-CONNECT`, floor grants, and media gating were not changed.
+- `crates/tetra-saps/src/control/call_control.rs`
+  - Added `CircuitDlMediaSource::LocalParrot` so UMAC can distinguish Parrot media from normal group/simplex `LocalLoopback` and network `SwMI`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/parrot.rs`
+  - New isolated Parrot/Papagal session implementation for ISSI `99999`.
+  - Records validated incoming TMD frames, capped at 20 seconds (`18 * 20 = 360` TCH/S frames).
+  - Plays frames back paced by TDMA timeslot, one frame per owned traffic opportunity.
+  - Releases only the real caller leg after playback; it does not treat `99999` as a real RF peer.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Routes P2P setup to `99999` into `fsm_on_u_setup_parrot`.
+  - Rejects duplex setup to `99999`; Parrot MVP is simplex-only.
+  - Opens a local `LocalParrot` circuit and seeds caller floor; no Brew routing.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - On caller `U-TX CEASED`, starts Parrot playback, marks virtual source `99999`, sends `D-TX GRANTED` as "other user transmitting" to caller.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Drives Parrot playback in `tick_start`.
+  - If UL inactivity fires before `U-TX CEASED`, starts playback instead of falling into generic P2P floor release.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - `LocalParrot` UL media is forwarded to CMCE as `TmdCircuitDataInd` and not looped to DL immediately.
+  - `TmdCircuitDataReq` now honors `raw_tch_s_block`; raw Block2 is scheduled with the existing raw TCH/S half-slot path.
+  - ACELP DL requests are normalized through existing `pack_ul_acelp_bits`, so 274 one-bit-per-byte frames and 35-byte packed frames are both handled safely.
+- Tests:
+  - Added CMCE Parrot setup/reject/playback/release tests.
+  - Added UMAC LocalParrot ACELP/raw no-loopback tests.
+  - Added raw Block2 `TmdCircuitDataReq` playback preservation test.
+  - Added unit test for the 20-second Parrot recording cap.
+  - Updated private-simplex close tests to assert no `D-INFO` on requester ACK and peer `D-INFO(26)` + peer `D-RELEASE(notification=26)`.
+
+Verification:
+
+- `cargo fmt --package tetra-saps --package tetra-entities` passed.
+- `cargo check -p tetra-saps -p tetra-entities --tests --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 3 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 2 tests.
+- `cargo test -p tetra-entities --lib parrot --locked` passed: 1 test.
+- `cargo test -p tetra-entities --test test_umac_bs --locked test_tmd_dl_req_raw_block2_playback_preserves_tch_s_halfslot -- --exact` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked p2p` passed: 84 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked voice` passed: 5 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked mxp600 -- --nocapture` passed before the broader `p2p` run.
+- `git diff --check` passed.
+
+Next RF gate:
+
+1. Build locally only; deploy directly to test Pi with the approved Nexus-BS deploy path.
+2. Clear volatile journal.
+3. Test normal private simplex first (`2260082`/`2260618` or current available pair):
+   - first PTT/media path must remain as previous RF-good base;
+   - close should show normal disconnected/end state, not `No answer`;
+   - no MXP600 reboot/reattach.
+4. Test Parrot:
+   - call ISSI `99999`;
+   - speak less than 20 seconds;
+   - release PTT;
+   - terminal should hear exact recorded speech replay from virtual peer `99999`;
+   - call should then close from SwMI side.
+5. If `No answer` persists, do not alter setup/media path or alternate `D-DISCONNECT`/`D-RELEASE` loops. Inspect the actual final downlink sequence and consider whether notification value `26` needs EN 300 392-9 revalidation or vendor-specific guarded handling.
+
+## 2026-06-07 23:15 EEST - Parrot/Papagal RF hang recovery and floor-grant flood fix
+
+Field result:
+
+- RF test to ISSI `99999` made Nexus-BS unusable without a clean call release.
+- Service did not crash immediately, but the old process later failed to stop gracefully and systemd killed it after stop timeout.
+- Log evidence showed Parrot call `call_id=5` on TS3 recorded 141 frames and started playback, but there was no `parrot playback complete` / release cleanup.
+- During recording, every validated TCH/S frame emitted a `FloorGranted` to UMAC. That flooded control state on the Parrot circuit and was not needed because setup already grants the caller floor.
+
+Clause-scoped ETSI check:
+
+- Parrot is a local SwMI test service on virtual ISSI `99999`; it is not a normal RF peer and does not change the protected real-terminal P2P setup/media path.
+- Release still uses the existing individual-call `D-RELEASE` mechanism for the real caller leg, matching EN 300 392-2 clause 14.5.1.3.3 behavior for SwMI-side release.
+- This remains clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/parrot.rs`
+  - Recording remains capped at 20 seconds / 360 TCH/S frames.
+  - Added playback start timestamp and a bounded playback guard (`20s + 2s`) so Parrot cannot hold a circuit indefinitely.
+  - Added unit coverage for forced playback completion if the guard expires.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Removed per-frame Parrot `FloorGranted` refresh during recording. Setup already grants floor; recording should only store media.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - `U-TX CEASED` now starts Parrot playback with the current TDMA time so the guard can run.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - UL-inactivity fallback playback start also records the current TDMA time.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Added RF-like test with 141 recorded frames:
+    - no recording-time floor-grant flood;
+    - exact playback count;
+    - `D-RELEASE` to the real caller;
+    - UMAC close / `CallEnded` cleanup after reporter completion.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo test -p tetra-entities --lib parrot --locked` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 2 tests.
+- `cargo check -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+
+Deploy:
+
+- Built locally for AArch64; no compile on TetraHS/Pi.
+- First scripted deploy hit remote stop timeout because the old stuck service did not exit; systemd killed old PID `62544`.
+- Copied new binary manually to `/home/chris/nexus-bs/nexus-bs`.
+- Remote SHA-256 after deploy: `6f92c0879871dd96ea0e0ebe89eac8a8e1fc56f3927668f24e4b72766f45591b`.
+- Restarted `nexus-bs@chris.service`; service active/running with PID `63492`.
+- Cleared volatile journal for the next RF test.
+
+Next RF gate:
+
+1. Test Parrot again: private simplex call to `99999`, speak under 20 seconds, release PTT.
+2. Expected: no BS hang, no per-frame floor-grant flood, playback occurs, then call releases.
+3. After user says `gata papagal`, inspect journal for `parrot playback complete`, release cleanup, and absence of repeated `UMAC floor granted` lines during recording.
+
+## 2026-06-07 23:34 EEST - Parrot non-blocking playback and CPU spin hardening
+
+Field/CPU context:
+
+- User reported one core held near 100% after the Parrot RF test.
+- Live old PID `64630` showed process CPU around `134%` earlier and a stop timeout; systemd later killed it on deploy stop after SIGTERM did not complete.
+- After the final redeploy, `nexus-bs@chris.service` is active/running as PID `66946`.
+- Remote binary SHA-256: `8598f46dfdd50f4d7bd270171f5b97c073231e54daf0d88f6d7c2d078a7f8c7c`.
+- Post-start CPU thread sample:
+  - main `nexus-bs` thread about `51.8%`;
+  - `brew-worker` about `1.2%`;
+  - `dashboard-log` about `2.6%`;
+  - other worker threads near zero.
+- Conclusion: the previous post-Parrot high CPU/futex churn is not present after this patch. The remaining main-thread CPU is the radio/TDMA loop, not an observed Parrot playback flood.
+
+Clause-scoped ETSI check:
+
+- Parrot ISSI `99999` remains a local SwMI test service, not a real RF peer and not part of the protected normal P2P path.
+- Release still uses caller-facing individual-call `D-RELEASE` and bounded assigned-channel release cleanup, aligned with EN 300 392-2 individual call clearing principles in clause 14.5.1.3. This is engineering evidence only, not formal certification.
+- Normal private P2P setup/media code was not intentionally changed by this patch.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/parrot.rs`
+  - Playback remains TDMA-paced: at most one recorded frame is emitted when `dltime.t == session.ts`.
+  - `finish_without_playback()` no longer marks `playback_finished`, preventing duplicate release from the fail-safe path.
+  - Added `owns_ts()` so CMCE can consume late Parrot-owned UL frames without recording them.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - `handle_parrot_ul_frame()` now returns consumed for all Parrot-owned traffic-slot UL while a Parrot session exists.
+  - Frames are recorded only in `Recording`; late frames in `Playing/Releasing` are consumed locally and do not leak to Brew.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - On Parrot `U-TX CEASED`, if frames exist, start paced playback instead of immediate release.
+  - If no frames exist, release caller cleanly.
+  - During playback, CMCE floor holder becomes virtual ISSI `99999`; UMAC receives one virtual `FloorGranted`.
+  - The real caller also receives assigned-channel `D-TX GRANTED` with `GrantedToOtherUser`, so terminal floor/UI state follows the virtual peer during playback.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - UL-inactivity fallback mirrors `U-TX CEASED`: recorded frames trigger paced playback; empty recordings release cleanly.
+  - The timeout fallback also sends the caller `D-TX GRANTED GrantedToOtherUser` before virtual playback.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Parrot tests now prove no same-drain playback flood, exact frame replay order/metadata, no late-UL Brew leak, caller-only release, and bounded RF-length pacing.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo test -p tetra-entities --lib parrot --locked` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 2 tests.
+- `cargo check -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+
+Deploy:
+
+- Build was local only; no Rust compile on the Pi/TetraHS.
+- Initial `RUN_TESTS=0 scripts/nexus-bs-test-deploy.sh` built successfully but timed out during remote service stop because the old service did not exit before systemd kill.
+- Manual direct deploy then copied `target/aarch64-unknown-linux-gnu/release/nexus-bs` to `/home/chris/nexus-bs/nexus-bs`, with no backup binary.
+- Final D-TX-GRANTED patch was rebuilt locally with the remembered `cargo zigbuild` command, service stopped cleanly to `inactive/dead`, binary copied directly to `/home/chris/nexus-bs/nexus-bs`, and service restarted.
+- `systemctl show` reports `ActiveState=active`, `SubState=running`, `Result=success`, `MainPID=66946`.
+
+Next RF gate:
+
+1. User can test Parrot: private simplex call to ISSI `99999`, speak under 20 seconds, release PTT.
+2. Expected: terminal hears paced playback; BS stays responsive; call releases after playback.
+3. After test, inspect logs for `starting paced playback`, `parrot playback complete`, caller-facing `DRelease`, UMAC `Close`/`CallEnded`, and no CPU jump over one core.
+
+## 2026-06-08 00:19 EEST - Parrot dashboard Calls/Last Heard telemetry
+
+Field context:
+
+- User reported that after Parrot tests, TS3 still showed traffic in the dashboard, and requested that the Papagal service appear in both `Calls` and `Last Heard`.
+- Log evidence from the previous stage showed CMCE/UMAC closing the Parrot TS3 circuit correctly, so this stage treats the visible gap as dashboard telemetry/representation, not as an RF circuit leak.
+
+Clause-scoped ETSI check:
+
+- This patch does not alter air-interface PDU order, grants, media, timers, or release behavior.
+- It only emits the same internal `IndividualCallStarted` observability event already used by normal private calls after the local SwMI Parrot call state is created.
+- Parrot ISSI `99999` remains a local SwMI test service. This is dashboard/status evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - `fsm_on_u_setup_parrot()` now emits `TelemetryEvent::IndividualCallStarted` with caller ISSI, called ISSI `99999`, `simplex=true`, and the allocated traffic TS.
+  - Normal RF P2P setup path remains untouched.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Parrot setup test now attaches a telemetry sink to CMCE and proves the `IndividualCallStarted` event is emitted.
+  - The emitted event is fed through `DashboardServer::handle_telemetry()` and asserted to populate both dashboard `Calls` and `Last Heard`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 2 tests.
+- `cargo check -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+
+Deploy:
+
+- Built locally for AArch64 with the remembered Nexus-BS `cargo zigbuild` command; no Rust compile on the Pi/TetraHS.
+- Local SHA-256: `ce4275b80aa047eae9be3715830e488e2457e2fde7ed97742e9165d880575569`.
+- Stopped `nexus-bs@chris.service` cleanly.
+- Copied the binary directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+- Remote SHA-256 matches local: `ce4275b80aa047eae9be3715830e488e2457e2fde7ed97742e9165d880575569`.
+- Restarted `nexus-bs@chris.service`; systemd reports `ActiveState=active`, `SubState=running`, `Result=success`, `MainPID=71192`.
+- Startup log showed Nexus-BS `v0.1.57` and restart recovery/registration for local ISSIs `2260082`, `2260618`, and `2260616`, with CMCE affiliations to GSSI `226333`.
+
+RF/UI gate:
+
+- Call ISSI `99999`.
+- Expected: dashboard `Calls` shows an active individual/simplex call from the caller to `99999` while the call is active.
+- Expected: dashboard `Last Heard` gets an entry from the caller ISSI to destination `99999` with activity `call_individual`.
+
+## 2026-06-08 00:26 EEST - Parrot playback DL-only grant for virtual peer
+
+Field context:
+
+- User reported Parrot/Papagal audio was truncated earlier than the 20 second cap and sounded like the radio microphone/duplex echo-cancel path was active during playback.
+- Live log for the latest post-deploy RF test showed:
+  - `U-SETUP` to `99999` at `00:21:15.260`.
+  - `U-TX CEASED` from ISSI `2260616` at `00:21:23.037`.
+  - Parrot started playback with `recorded_frames=129`, which is about 7.2 seconds at 18 TCH/S frames/sec.
+  - Therefore this observed playback length was caused by the terminal sending `U-TX CEASED`, not by the 20 second recording cap.
+- The playback floor handoff did reveal a real bug: Parrot sent `D-TX GRANTED = GrantedToOtherUser` while also carrying channel allocation `UlDlAssignment::Both`.
+
+Clause-scoped ETSI check:
+
+- EN 300 392-2 clause 14.5.1.2.1 says `D-TX GRANTED` with `transmission granted to another user` switches the MS to U-plane receive, not transmit.
+- For a virtual local service (`99999`) there is no RF uplink peer, so the caller-facing playback grant should keep the assigned channel downlink-only.
+- Normal real-terminal P2P floor handoff remains untouched; that code still uses the existing bidirectional allocation policy for two real MS legs.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/uplink.rs`
+  - On Parrot `U-TX CEASED`, playback `D-TX GRANTED(GrantedToOtherUser)` now carries `UlDlAssignment::Dl` instead of `Both`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - The UL-inactivity fallback path for Parrot playback now uses the same downlink-only allocation.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Parrot playback test now asserts the caller receives `D-TX GRANTED = GrantedToOtherUser` with FACCH/STCH channel allocation `Dl`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 2 tests.
+- `cargo check -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+
+Next deploy/test:
+
+- Built locally and deployed directly to `/home/chris/nexus-bs/nexus-bs`.
+- Local and remote SHA-256: `029aeac5cf2796cc1040ce483159752c9f1fedce0cbbd11e2e58ee17114c84ae`.
+- Restarted `nexus-bs@chris.service`; systemd reports `ActiveState=active`, `SubState=running`, `Result=success`, `MainPID=71973`.
+- Startup log showed restart recovery and affiliation for `2260082`, `2260616`, and `2260618` to GSSI `226333`.
+- RF gate: call `99999`, speak while holding PTT, release PTT.
+- Expected: playback starts only after `U-TX CEASED`; audio should sound receive-only, not duplex/echo-cancel-like.
+- If the terminal still sends `U-TX CEASED` before the operator releases PTT, inspect exact MS timer/floor behavior next; do not change normal P2P.
+
+## 2026-06-08 00:35 EEST - Parrot Hytera/Motorola hook-method normalization
+
+Field context:
+
+- User ran two Parrot/Papagal RF tests and reported: Hytera playback sounded bad, Motorola playback sounded OK.
+- Live log on deployed SHA `029aeac5cf2796cc1040ce483159752c9f1fedce0cbbd11e2e58ee17114c84ae` showed three current-service Parrot calls after service start:
+  - `00:28:22` Hytera `2260616 -> 99999`, `U-SETUP ... simplex=true hook=true`, call `4`, TS2, `recorded_frames=83`.
+  - `00:28:41` Hytera `2260616 -> 99999`, `U-SETUP ... simplex=true hook=true`, call `5`, TS2, `recorded_frames=176`.
+  - `00:29:10` Motorola `2260082 -> 99999`, `U-SETUP ... simplex=true hook=false`, call `6`, TS2, `recorded_frames=167`.
+- All three calls used the same `LocalParrot` media path, same TS2, no Brew route, playback started after `U-TX CEASED`, and CMCE/UMAC released the circuit cleanly.
+- The material signalling difference was therefore `hook_method_selection`: Hytera requested hook signalling, Motorola requested direct through-connect.
+
+Clause-scoped ETSI check:
+
+- EN 300 392-2 table 14.62 defines `hook_method_selection=0` as direct through-connect and `hook_method_selection=1` as hook on/off signalling.
+- EN 300 392-2 clauses 14.5.1.1.1 and 14.5.1.1.2 separate direct setup from called-user alert/answer handling.
+- Parrot ISSI `99999` is an automatic local SwMI test service with no real called user to answer on/off-hook; for this service only, the BS should respond as direct through-connect even if the caller requested hook signalling.
+- Normal private P2P remains untouched. This is clause-scoped engineering evidence, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/setup.rs`
+  - Removed a misplaced Parrot comment from the normal local setup path.
+  - In `fsm_on_u_setup_parrot()`, `D-CALL PROCEEDING` and `D-CONNECT` are now explicitly sent with `hook_method_selection=false`.
+  - The ETSI comment is kept only inside the Parrot handler, so normal RF P2P retains the caller/called hook method semantics.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Parrot setup test now sends a Hytera-like `U-SETUP hook_method_selection=true`.
+  - Test asserts Parrot replies with `D-CALL PROCEEDING hook=false` and `D-CONNECT hook=false`.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs --locked parrot` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked parrot` passed: 2 tests.
+- `cargo check -p tetra-entities -p tetra-saps --tests --locked` passed.
+- `git diff --check` passed.
+
+Next deploy/test:
+
+1. Build locally only with the remembered AArch64 Nexus-BS command or `scripts/nexus-bs-test-deploy.sh`.
+2. Deploy directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+3. Retest Hytera `2260616 -> 99999` first. Expected log after deploy: `U-SETUP ... hook=true`, but `CMCE: parrot service -> DConnect ... hook_method_selection: false`.
+4. If Hytera playback is still bad after hook normalization, inspect raw recorded/playback frame metadata next; do not touch normal P2P while debugging Parrot.
+
+Deploy:
+
+- Ran `RUN_TESTS=0 scripts/nexus-bs-test-deploy.sh` after focused local tests had already passed.
+- Build was local AArch64 only; no Rust compile on TetraHS/Pi.
+- Old service stopped cleanly and deregistered `2260082`, `2260616`, and `2260618`.
+- Copied the binary directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+- Deployed commit marker: `9773aee2`.
+- Local/remote SHA-256: `c944ba8223a00b659ce7b171f2dbe9f64360e4b97d0fc04c2f0997679cd2092f`.
+- Restarted `nexus-bs@chris.service`; systemd reports `MainPID=73250`, `ActiveState=active`, `SubState=running`, `Result=success`, `NRestarts=0`.
+- Startup log showed restart recovery and re-registration/affiliation for `2260616`, `2260082`, and `2260618` to GSSI `226333`.
+
+Current RF gate:
+
+1. Ask user to test Hytera `2260616 -> 99999`, speak briefly under 20 seconds, release PTT.
+2. Required log evidence: `U-SETUP ... hook=true`, followed by `CMCE: parrot service -> DConnect ... hook_method_selection: false`.
+3. Expected RF behavior: playback quality should match Motorola more closely; playback still starts only after `U-TX CEASED`.
+4. If still bad, compare recorded/playback frame metadata and raw/ACELP packing for Hytera only; keep normal private P2P untouched.
+
+## 2026-06-08 00:43 EEST - PHY NormalTrainSeq log flood demoted
+
+Field context:
+
+- User reported excessive dashboard/journal lines like:
+  - `rx_tpsap_prim got NormalTrainSeq1 in fullslot`
+  - `rx_tpsap_prim got NormalTrainSeq2 in fullslot`
+- These are normal PHY receive burst detections on the raw radio timeslot path. At `INFO`, they can appear once per active timeslot and overload useful BS logs.
+
+Clause-scoped ETSI check:
+
+- No TETRA protocol behavior changed. This patch only changes logging verbosity after PHY burst detection and before the existing LMAC handoff.
+- NormalTrainSeq handling, slot splitting, LMAC/UMAC routing, grants, timers, and CMCE signalling are untouched.
+
+Patch:
+
+- `crates/tetra-entities/src/phy/phy_bs.rs`
+  - Demoted the three high-rate receive-burst logs from `tracing::info!` to `tracing::debug!`:
+    - fullslot;
+    - subslot1;
+    - subslot2.
+
+Verification:
+
+- `cargo fmt --package tetra-entities` passed.
+- `cargo check -p tetra-entities --tests --locked` passed.
+- `git diff --check` passed.
+
+Deploy:
+
+- Built locally only with `RUN_TESTS=0 scripts/nexus-bs-test-deploy.sh`; no Rust compile on TetraHS/Pi.
+- Copied directly to `/home/chris/nexus-bs/nexus-bs`; no remote binary backup.
+- Deployed commit marker: `9773aee2`.
+- Remote SHA-256: `e36c36eb511266ac3337d5f0fa5f79357e4cc2319cef88593b232aa31e92391e`.
+- Restarted `nexus-bs@chris.service`; systemd reports `MainPID=73498`, `ActiveState=active`, `SubState=running`, `Result=success`, `NRestarts=0`.
+- Post-restart journal grep since `2026-06-08 00:43:11` for `rx_tpsap_prim got` returned no entries.
+
+Next:
+
+- Continue RF Parrot test with Hytera `2260616 -> 99999`.
+- If low-level PHY burst evidence is needed again, temporarily run with debug logging or add a bounded/rate-limited diagnostic, not high-rate `INFO`.

@@ -571,6 +571,12 @@ impl CcBsSubentity {
             return;
         }
 
+        // ── Parrot/Papagal simplex test service (ISSI 99999) ────────────────
+        if called_ssi == crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI {
+            self.fsm_on_u_setup_parrot(queue, message, pdu, calling_party);
+            return;
+        }
+
         // ── Echo service (ISSI 999) ──────────────────────────────────────────
         if called_ssi == crate::cmce::subentities::cc_bs::echo::ECHO_ISSI {
             self.fsm_on_u_setup_echo(queue, message, pdu, calling_party);
@@ -1079,6 +1085,205 @@ impl CcBsSubentity {
             }
         }
     }
+
+    /// Handle U-SETUP toward ISSI 99999 — local Parrot/Papagal simplex service.
+    /// The service records caller UL speech, plays it back after U-TX CEASED,
+    /// then releases only the real caller leg.
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_setup_parrot(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: &SapMsg,
+        pdu: &USetup,
+        calling_party: TetraAddress,
+    ) {
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            tracing::error!("BUG: unexpected message in fsm_on_u_setup_parrot");
+            return;
+        };
+
+        if pdu.simplex_duplex_selection {
+            tracing::info!(
+                "CMCE: parrot service rejecting duplex U-SETUP from ISSI {}; service is simplex-only",
+                calling_party.ssi
+            );
+            Self::reject_u_setup_before_call_id(
+                queue,
+                calling_party,
+                prim.handle,
+                prim.link_id,
+                prim.endpoint_id,
+                DisconnectCause::IncompatibleTrafficCase,
+            );
+            return;
+        }
+
+        if self.parrot_session.is_some() {
+            tracing::info!("CMCE: parrot service busy, rejecting call from ISSI {}", calling_party.ssi);
+            Self::reject_u_setup_before_call_id(
+                queue,
+                calling_party,
+                prim.handle,
+                prim.link_id,
+                prim.endpoint_id,
+                DisconnectCause::CalledPartyBusy,
+            );
+            return;
+        }
+
+        let occupied_call_ids = self.occupied_call_ids();
+        let circuit = {
+            let mut state = self.config.state_write();
+            match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
+                Direction::Both,
+                pdu.basic_service_information.communication_type,
+                pdu.simplex_duplex_selection,
+                &mut state.timeslot_alloc,
+                TimeslotOwner::Cmce,
+                &occupied_call_ids,
+            ) {
+                Ok(circuit) => circuit.clone(),
+                Err(err) => {
+                    tracing::warn!("CMCE: parrot service failed to allocate circuit: {:?}", err);
+                    Self::reject_u_setup_before_call_id(
+                        queue,
+                        calling_party,
+                        prim.handle,
+                        prim.link_id,
+                        prim.endpoint_id,
+                        DisconnectCause::CongestionInInfrastructure,
+                    );
+                    return;
+                }
+            }
+        };
+
+        let call_id = circuit.call_id;
+        let ts = circuit.ts;
+        let usage = circuit.usage;
+        let parrot_addr = TetraAddress::new(crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI, SsiType::Issi);
+
+        tracing::info!(
+            "CMCE: parrot service answering call_id={} caller={} ts={}",
+            call_id,
+            calling_party.ssi,
+            ts
+        );
+
+        Self::signal_umac_circuit_open_with_secondary(
+            queue,
+            &circuit,
+            None,
+            CircuitDlMediaSource::LocalParrot,
+            Some(calling_party),
+            vec![parrot_addr],
+        );
+
+        // EN 300 392-2 table 14.62 carries the selected hook method. Preserve
+        // the caller's setup method for this virtual service so terminals do
+        // not render the local Parrot answer as a modified private call.
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T10s, pdu.hook_method_selection);
+
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: self.config_call_timeout(),
+            hook_method_selection: pdu.hook_method_selection,
+            simplex_duplex_selection: false,
+            transmission_grant: TransmissionGrant::Granted,
+            transmission_request_permission: false,
+            call_ownership: true,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+        tracing::info!("CMCE: parrot service -> {:?}", d_connect);
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize parrot DConnect");
+        connect_sdu.seek(0);
+
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: prim.handle,
+                endpoint_id: prim.endpoint_id,
+                link_id: prim.link_id,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
+                chan_alloc: Some(CmceChanAllocReq {
+                    usage: Some(usage),
+                    alloc_type: ChanAllocType::Replace,
+                    carrier: None,
+                    timeslots,
+                    ul_dl_assigned: UlDlAssignment::Both,
+                }),
+                main_address: calling_party,
+                tx_reporter: None,
+            }),
+        });
+
+        self.parrot_session = Some(crate::cmce::subentities::cc_bs::parrot::ParrotSession::new(
+            ts,
+            call_id,
+            calling_party,
+        ));
+
+        self.individual_calls.insert(
+            call_id,
+            IndividualCall {
+                calling_addr: calling_party,
+                called_addr: parrot_addr,
+                calling_handle: prim.handle,
+                calling_link_id: prim.link_id,
+                calling_endpoint_id: prim.endpoint_id,
+                called_handle: None,
+                called_link_id: None,
+                called_endpoint_id: None,
+                calling_ts: ts,
+                called_ts: ts,
+                calling_usage: usage,
+                called_usage: usage,
+                simplex_duplex: false,
+                request_to_transmit_send_data: pdu.request_to_transmit_send_data,
+                state: IndividualCallState::Active,
+                setup_timer_started: None,
+                setup_timeout: None,
+                active_timer_started: Some(self.dltime),
+                call_timeout: self.config_call_timeout(),
+                called_over_brew: false,
+                calling_over_brew: false,
+                brew_uuid: None,
+                network_call: None,
+                connect_request_sent: false,
+                floor_holder: Some(calling_party.ssi),
+                last_floor_holder: Some(calling_party.ssi),
+                queued_tx_demand: None,
+            },
+        );
+
+        self.emit(crate::net_telemetry::TelemetryEvent::IndividualCallStarted {
+            call_id,
+            calling_issi: calling_party.ssi,
+            called_issi: crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI,
+            simplex: true,
+            ts,
+        });
+
+        if let Some(session) = &self.parrot_session {
+            queue.push_back(session.floor_granted_msg());
+        }
+    }
+
     /// Handle U-SETUP toward ISSI 999 — local echo service.
     /// Answers immediately with DConnect (full-duplex), no Brew involved.
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_setup_echo(

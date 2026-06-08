@@ -47,9 +47,11 @@ mod echo;
 mod fsm;
 mod ingress;
 mod network;
+mod parrot;
 mod shared;
 mod timers;
 use echo::EchoSession;
+use parrot::ParrotSession;
 
 use call::{ActiveCall, CallOrigin, GroupCallState, IndividualCall, IndividualCallState, TxDemandQueueResult};
 use fsm::{GroupTransitionError, IndividualTransitionError};
@@ -194,4 +196,6 @@ pub struct CcBsSubentity {
     telemetry: Option<crate::net_telemetry::channel::TelemetrySink>,
     /// Active echo service session (ISSI 999), if any
     echo_session: Option<EchoSession>,
+    /// Active local Parrot/Papagal simplex service session (ISSI 99999), if any.
+    parrot_session: Option<ParrotSession>,
 }

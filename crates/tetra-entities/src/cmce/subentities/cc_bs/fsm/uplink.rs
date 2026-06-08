@@ -239,6 +239,46 @@ impl CcBsSubentity {
                 return;
             }
 
+            if call.called_addr.ssi == crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI {
+                let Some(session) = self.parrot_session.as_mut() else {
+                    tracing::warn!("U-TX CEASED for parrot call_id={} but no parrot session exists", call_id);
+                    return;
+                };
+                let recorded = session.recorded_len();
+                if recorded == 0 {
+                    let _ = session.finish_without_playback();
+                    tracing::warn!(
+                        "U-TX CEASED (parrot) call_id={} from ISSI {} -> no recorded frames, releasing",
+                        call_id,
+                        sender.ssi
+                    );
+                    self.release_individual_call_to_issi(queue, call_id, DisconnectCause::SwmiRequestedDisconnection, sender.ssi);
+                } else if session.start_playback(self.dltime) {
+                    tracing::info!(
+                        "U-TX CEASED (parrot) call_id={} from ISSI {} -> starting paced playback; recorded_frames={}",
+                        call_id,
+                        sender.ssi,
+                        recorded
+                    );
+                    if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                        call.floor_holder = Some(crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI);
+                        call.last_floor_holder = Some(crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI);
+                    }
+                    Self::push_individual_d_tx_granted(
+                        queue,
+                        call_id,
+                        sender,
+                        sender_ts,
+                        sender_usage,
+                        UlDlAssignment::Dl,
+                        TransmissionGrant::GrantedToOtherUser,
+                        crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI,
+                    );
+                    queue.push_back(session.playback_floor_granted_msg());
+                }
+                return;
+            }
+
             let queued_requester = call.queued_tx_demand;
 
             if queued_requester.is_some() {

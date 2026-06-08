@@ -43,6 +43,7 @@ impl CcBsSubentity {
         self.check_individual_disconnect_pending_timeout(queue);
         self.drain_pending_individual_connect_acks(queue);
         self.drain_pending_network_individual_connects(queue);
+        self.drive_parrot_session(queue);
 
         // ETSI T310 equivalent for active calls.
         self.check_call_timeout_expiry(queue);
@@ -374,6 +375,58 @@ impl CcBsSubentity {
             .map(|(id, _)| *id);
 
         if let Some(call_id) = individual_call_id {
+            if self
+                .individual_calls
+                .get(&call_id)
+                .is_some_and(|call| call.called_addr.ssi == crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI)
+            {
+                let Some(call) = self.individual_calls.get(&call_id).cloned() else {
+                    return;
+                };
+                let Some(session) = self.parrot_session.as_mut() else {
+                    tracing::warn!("UL inactivity timeout for parrot call_id={} but no parrot session exists", call_id);
+                    return;
+                };
+                let recorded = session.recorded_len();
+                if recorded == 0 {
+                    let _ = session.finish_without_playback();
+                    tracing::warn!(
+                        "UL inactivity timeout on parrot ts={} call_id={} -> no recorded frames, releasing",
+                        ts,
+                        call_id
+                    );
+                    self.release_individual_call_to_issi(
+                        queue,
+                        call_id,
+                        DisconnectCause::SwmiRequestedDisconnection,
+                        call.calling_addr.ssi,
+                    );
+                } else if session.start_playback(self.dltime) {
+                    tracing::warn!(
+                        "UL inactivity timeout on parrot ts={} call_id={} -> starting paced playback; recorded_frames={}",
+                        ts,
+                        call_id,
+                        recorded
+                    );
+                    if let Some(call) = self.individual_calls.get_mut(&call_id) {
+                        call.floor_holder = Some(crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI);
+                        call.last_floor_holder = Some(crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI);
+                    }
+                    Self::push_individual_d_tx_granted(
+                        queue,
+                        call_id,
+                        call.calling_addr,
+                        call.calling_ts,
+                        call.calling_usage,
+                        UlDlAssignment::Dl,
+                        TransmissionGrant::GrantedToOtherUser,
+                        crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI,
+                    );
+                    queue.push_back(session.playback_floor_granted_msg());
+                }
+                return;
+            }
+
             let (
                 holder_ssi,
                 holder_addr,

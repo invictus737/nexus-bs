@@ -1,4 +1,4 @@
-# Legacy single-user sample systemd service file for Nexus-BS v0.1.57.
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.58.
 #
 # New deployments should prefer:
 #   contrib/systemd/nexus-bs@.service
@@ -25,7 +25,7 @@
 # - see log with "journalctl -u nexus-bs --output=cat -f"
 
 [Unit]
-Description=Nexus-BS v0.1.57 TETRA base station service
+Description=Nexus-BS v0.1.58 TETRA base station service
 # network-online.target ensures the interface is UP and routable,
 # not just "declared active" like network.target.
 After=network-online.target

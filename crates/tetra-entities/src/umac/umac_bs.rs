@@ -521,7 +521,10 @@ impl UmacBs {
         if !(1..=4).contains(&ts) || !self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
             return false;
         }
-        if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::SwMI {
+        if matches!(
+            self.channel_scheduler.ul_circuit_dl_media_source(ts),
+            CircuitDlMediaSource::SwMI | CircuitDlMediaSource::LocalParrot
+        ) {
             return false;
         }
 
@@ -732,11 +735,15 @@ impl UmacBs {
         let dl_target_ts = match current_peer_ts {
             Some(peer_ts) => peer_ts,
             None => {
-                if self.channel_scheduler.ul_circuit_dl_media_source(media.ul_ts) == CircuitDlMediaSource::SwMI {
+                if matches!(
+                    self.channel_scheduler.ul_circuit_dl_media_source(media.ul_ts),
+                    CircuitDlMediaSource::SwMI | CircuitDlMediaSource::LocalParrot
+                ) {
                     tracing::debug!(
-                        "UMAC: dropping deferred private {} ul_ts={} because SwMI supplies DL media",
+                        "UMAC: dropping deferred private {} ul_ts={} because {:?} supplies DL media",
                         media.label(),
-                        media.ul_ts
+                        media.ul_ts,
+                        self.channel_scheduler.ul_circuit_dl_media_source(media.ul_ts)
                     );
                     return None;
                 }
@@ -2557,7 +2564,7 @@ impl UmacBs {
                         stch_block.copy_bits(&mut sdu, sdu_len);
                         fillbits::addition::write(&mut stch_block, Some(fill_bits));
 
-                        tracing::info!(
+                        tracing::debug!(
                             "rx_ul_tma_unitdata_req: FACCH stealing on ts {} (MAC-RESOURCE hdr {} + SDU {} + fill {} bits -> {} STCH bits)",
                             ts,
                             header_len,
@@ -2665,6 +2672,8 @@ impl UmacBs {
     }
 
     fn rx_tmd_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        use tetra_saps::control::call_control::CircuitDlMediaSource;
+
         tracing::trace!("rx_tmd_prim");
 
         let src = message.src;
@@ -2678,7 +2687,37 @@ impl UmacBs {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
-                    self.channel_scheduler.dl_schedule_tmd(ts, prim.data);
+                    if let Some(block_num) = prim.raw_tch_s_block {
+                        if block_num == PhyBlockNum::Block2 && prim.data.len() == 216 {
+                            if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::LocalParrot {
+                                self.channel_scheduler
+                                    .dl_schedule_raw_tch_s_half_slot_from_ul(ts, ts, None, block_num, prim.data);
+                            } else {
+                                self.channel_scheduler.dl_schedule_raw_tch_s_half_slot(ts, block_num, prim.data);
+                            }
+                        } else {
+                            tracing::warn!(
+                                "rx_tmd_prim: dropping DL raw TCH/S {:?} length {} on ts={} src={:?}",
+                                block_num,
+                                prim.data.len(),
+                                ts,
+                                src
+                            );
+                        }
+                    } else if let Some(packed_bits) = pack_ul_acelp_bits(&prim.data) {
+                        if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::LocalParrot {
+                            self.channel_scheduler.dl_schedule_tmd_from_ul(ts, ts, None, packed_bits);
+                        } else {
+                            self.channel_scheduler.dl_schedule_tmd(ts, packed_bits);
+                        }
+                    } else {
+                        tracing::warn!(
+                            "rx_tmd_prim: dropping unsupported DL voice length {} on ts={} src={:?}",
+                            prim.data.len(),
+                            ts,
+                            src
+                        );
+                    }
                 } else {
                     tracing::warn!(
                         "rx_tmd_prim: dropping DL voice on inactive circuit ts={} src={:?} dltime={}",
@@ -2762,6 +2801,37 @@ impl UmacBs {
                 // Forward valid full-slot ACELP UL voice to Brew (User plane) if loaded.
                 // Do this after validating the TMD payload so unsupported local
                 // media cannot mask inactivity or leak as clean speech to Brew.
+                if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::LocalParrot {
+                    match accepted_media {
+                        AcceptedUlMedia::RawTchSHalfSlot { block_num, type5_bits } => {
+                            queue.push_back(SapMsg {
+                                sap: Sap::TmdSap,
+                                src: TetraEntity::Umac,
+                                dest: TetraEntity::Cmce,
+                                msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                                    ts,
+                                    data: type5_bits,
+                                    raw_tch_s_block: Some(block_num),
+                                }),
+                            });
+                        }
+                        AcceptedUlMedia::AcElp { original_bits, .. } => {
+                            queue.push_back(SapMsg {
+                                sap: Sap::TmdSap,
+                                src: TetraEntity::Umac,
+                                dest: TetraEntity::Cmce,
+                                msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd {
+                                    ts,
+                                    data: original_bits,
+                                    raw_tch_s_block: None,
+                                }),
+                            });
+                        }
+                    }
+                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                    return;
+                }
+
                 if let AcceptedUlMedia::AcElp { original_bits, .. } = &accepted_media
                     && self.config.config().brew.is_some()
                 {
@@ -2792,11 +2862,17 @@ impl UmacBs {
                         peer_ts
                     }
                     None => {
-                        use tetra_saps::control::call_control::CircuitDlMediaSource;
-                        if self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::SwMI {
+                        if matches!(
+                            self.channel_scheduler.ul_circuit_dl_media_source(ts),
+                            CircuitDlMediaSource::SwMI | CircuitDlMediaSource::LocalParrot
+                        ) {
                             // Circuit call via Brew: DL comes from TetraPack, not local loopback.
                             // Suppress UL->DL reflection so the caller doesn't hear their own voice.
-                            tracing::debug!("rx_tmd_prim: circuit call ts={}, suppressing local UL loopback (SwMI)", ts);
+                            tracing::debug!(
+                                "rx_tmd_prim: circuit call ts={}, suppressing local UL loopback ({:?})",
+                                ts,
+                                self.channel_scheduler.ul_circuit_dl_media_source(ts)
+                            );
                             if delivered_media {
                                 self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                             }

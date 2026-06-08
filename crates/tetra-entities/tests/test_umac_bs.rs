@@ -39,7 +39,7 @@ use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
 use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaUnitdataReq};
-use tetra_saps::tmd::TmdCircuitDataInd;
+use tetra_saps::tmd::{TmdCircuitDataInd, TmdCircuitDataReq};
 use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq, enums::logical_chans::LogicalChannel};
 use tetra_saps::tp::TpUnitdataInd;
 
@@ -540,6 +540,26 @@ fn private_call_open_msg_with_peer(active_issi: u32, peer_issi: u32, ts: u8, pee
     }
 }
 
+fn local_parrot_open_msg(caller_issi: u32, ts: u8) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::LocalParrot,
+            active_addr: Some(TetraAddress::issi(caller_issi)),
+            active_secondary_addrs: vec![TetraAddress::issi(99_999)],
+        })),
+    }
+}
+
 fn submit_ul_voice_frame(test: &mut ComponentTest, ts: u8, data: Vec<u8>) {
     test.submit_message(SapMsg {
         sap: Sap::TmdSap,
@@ -563,6 +583,15 @@ fn submit_ul_raw_tch_s_block2(test: &mut ComponentTest, ts: u8, data: Vec<u8>) {
             data,
             raw_tch_s_block: Some(PhyBlockNum::Block2),
         }),
+    });
+}
+
+fn submit_dl_tmd_req(test: &mut ComponentTest, ts: u8, data: Vec<u8>, raw_tch_s_block: Option<PhyBlockNum>) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmdCircuitDataReq(TmdCircuitDataReq { ts, data, raw_tch_s_block }),
     });
 }
 
@@ -833,6 +862,134 @@ fn test_group_ul_voice_loopback_preserves_tch_s_bits() {
         traffic_ts,
         &ul_bits,
         "EN 300 392-2 clauses 14.5.2.1.3, 14.5.2.2.1 and 23.5: group-call UL speech must be reflected to the assigned DL TCH/S without bit corruption",
+    );
+}
+
+#[test]
+fn test_local_parrot_ul_acelp_forwards_to_cmce_without_dl_loopback() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x2201;
+    let traffic_ts = 2;
+    let call_id = 99;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce, TetraEntity::Lmac]);
+
+    test.submit_message(local_parrot_open_msg(caller_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, caller_issi, 99_999, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let ul_bits = acelp_test_bits();
+    submit_ul_voice_frame(&mut test, traffic_ts, ul_bits.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let parrot_frames: Vec<_> = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) if msg.dest == TetraEntity::Cmce => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parrot_frames.len(), 1);
+    assert_eq!(parrot_frames[0].ts, traffic_ts);
+    assert_eq!(parrot_frames[0].data, ul_bits);
+    assert_eq!(parrot_frames[0].raw_tch_s_block, None);
+    assert!(
+        collect_dl_tch_bits(&msgs, traffic_ts).is_empty(),
+        "LocalParrot must not immediately loop caller UL speech back to DL"
+    );
+}
+
+#[test]
+fn test_local_parrot_ul_raw_block2_forwards_to_cmce_without_dl_loopback() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x2201;
+    let traffic_ts = 2;
+    let call_id = 100;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Cmce, TetraEntity::Lmac]);
+
+    test.submit_message(local_parrot_open_msg(caller_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, caller_issi, 99_999, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 5 + 1) % 2) as u8).collect();
+    submit_ul_raw_tch_s_block2(&mut test, traffic_ts, raw_block2.clone());
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    let parrot_frames: Vec<_> = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) if msg.dest == TetraEntity::Cmce => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(parrot_frames.len(), 1);
+    assert_eq!(parrot_frames[0].ts, traffic_ts);
+    assert_eq!(parrot_frames[0].data, raw_block2);
+    assert_eq!(parrot_frames[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
+    assert!(
+        collect_dl_raw_tch_block2_bits(&msgs, traffic_ts).is_empty(),
+        "LocalParrot must not immediately loop raw caller UL speech back to DL"
+    );
+}
+
+#[test]
+fn test_tmd_dl_req_acelp_parrot_playback_preserves_tch_s_bits() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x2201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(local_parrot_open_msg(caller_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let acelp_bits = acelp_test_bits();
+    submit_dl_tmd_req(&mut test, traffic_ts, acelp_bits.clone(), None);
+    test.run_stack(Some(12));
+
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        traffic_ts,
+        &acelp_bits,
+        "LocalParrot TmdCircuitDataReq playback must preserve complete ACELP TCH/S bits",
+    );
+}
+
+#[test]
+fn test_tmd_dl_req_raw_block2_playback_preserves_tch_s_halfslot() {
+    debug::setup_logging_verbose();
+
+    let caller_issi = 0x2201;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(local_parrot_open_msg(caller_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 7 + 1) % 2) as u8).collect();
+    submit_dl_tmd_req(&mut test, traffic_ts, raw_block2.clone(), Some(PhyBlockNum::Block2));
+    test.run_stack(Some(12));
+
+    let observed = collect_dl_raw_tch_block2_bits(&test.dump_sinks(), traffic_ts);
+    assert!(
+        observed.iter().any(|bits| bits == &raw_block2),
+        "TmdCircuitDataReq raw Block2 playback must preserve exact 216-bit TCH/S half-slot"
     );
 }
 

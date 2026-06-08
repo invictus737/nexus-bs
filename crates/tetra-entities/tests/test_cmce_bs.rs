@@ -4,8 +4,10 @@ use tetra_config::bluestation::{CfgBrew, SharedConfig, StackMode, from_toml_str}
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
-use tetra_core::{BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
+use tetra_core::{BitBuffer, Direction, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
 use tetra_entities::cmce::cmce_bs::CmceBs;
+use tetra_entities::net_dashboard::DashboardServer;
+use tetra_entities::net_telemetry::{TelemetryEvent, TelemetrySource, telemetry_channel};
 use tetra_entities::{MessageQueue, TetraEntityTrait};
 use tetra_pdus::cmce::enums::call_timeout::CallTimeout;
 use tetra_pdus::cmce::enums::cmce_pdu_type_dl::CmcePduTypeDl;
@@ -165,6 +167,10 @@ fn drain_message_queue(queue: &mut MessageQueue) -> Vec<SapMsg> {
         msgs.push(msg);
     }
     msgs
+}
+
+fn drain_telemetry(source: &TelemetrySource) -> Vec<TelemetryEvent> {
+    std::iter::from_fn(|| source.try_recv()).collect()
 }
 
 fn cmce_bs_mut(test: &mut ComponentTest) -> &mut CmceBs {
@@ -969,6 +975,15 @@ fn build_u_tx_ceased_msg(calling_issi: u32, call_id: u16) -> SapMsg {
     }
 }
 
+fn build_tmd_ind_to_cmce(ts: u8, data: Vec<u8>, raw_tch_s_block: Option<PhyBlockNum>) -> SapMsg {
+    SapMsg {
+        sap: Sap::TmdSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::TmdCircuitDataInd(tetra_saps::tmd::TmdCircuitDataInd { ts, data, raw_tch_s_block }),
+    }
+}
+
 fn dl_pdu_type(prim: &LcmcMleUnitdataReq) -> Option<CmcePduTypeDl> {
     prim.sdu.peek_bits(5).and_then(|raw| CmcePduTypeDl::try_from(raw).ok())
 }
@@ -1496,6 +1511,69 @@ fn assert_established_p2p_release_pdus_to(msgs: &[SapMsg], call_id: u16, disconn
     let mut expected = expected_ssis.to_vec();
     expected.sort_unstable();
     assert_eq!(facch_ssis, expected);
+}
+
+fn assert_imminent_disconnect_d_info_to(msgs: &[SapMsg], call_id: u16, expected_ssis: &[u32]) {
+    let infos: Vec<_> = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_info(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        infos.len(),
+        expected_ssis.len(),
+        "Established P2P release should precede D-RELEASE with one D-INFO imminent-disconnection notice per expected MS leg"
+    );
+
+    let mut facch_ssis = Vec::new();
+    for (prim, d_info) in infos {
+        assert_eq!(d_info.call_identifier, call_id);
+        assert_eq!(
+            d_info.notification_indicator,
+            Some(26),
+            "EN 300 392-2 clause 14.5.1.2.2 f: D-INFO should carry EN 300 392-9 notification 26"
+        );
+        assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
+        assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
+        assert!(
+            prim.stealing_permission,
+            "imminent-disconnection D-INFO should use assigned-channel FACCH/STCH"
+        );
+        facch_ssis.push(prim.main_address.ssi);
+    }
+
+    facch_ssis.sort_unstable();
+    let mut expected = expected_ssis.to_vec();
+    expected.sort_unstable();
+    assert_eq!(facch_ssis, expected);
+}
+
+fn assert_no_d_info(msgs: &[SapMsg]) {
+    assert!(
+        !msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_info(prim).is_some())),
+        "message set should not include D-INFO"
+    );
+}
+
+fn assert_release_notification_to(msgs: &[SapMsg], expected_issi: u32, expected_notification: Option<u64>) {
+    let release = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address.ssi == expected_issi)
+        .unwrap_or_else(|| panic!("expected D-RELEASE to ISSI {expected_issi}"));
+
+    assert_eq!(
+        release.1.notification_indicator, expected_notification,
+        "unexpected D-RELEASE notification indicator for ISSI {expected_issi}"
+    );
 }
 
 fn assert_established_p2p_disconnect_pdu_to(msgs: &[SapMsg], call_id: u16, disconnect_cause: DisconnectCause, expected_issi: u32) {
@@ -4794,7 +4872,10 @@ fn test_u_call_restore_unsupported_returns_function_not_supported_without_circui
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
     let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
-    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Umac]);
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
 
     test.submit_message(build_u_call_restore_msg(TEST_ISSI, 0x123, TEST_CALLED_ISSI));
     test.run_stack(Some(1));
@@ -8367,6 +8448,8 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
         DisconnectCause::UserRequestedDisconnection,
         &[TEST_ISSI],
     );
+    assert_no_d_info(&initiator_release_msgs);
+    assert_release_notification_to(&initiator_release_msgs, TEST_ISSI, None);
     assert_eq!(count_d_disconnects(&initiator_release_msgs), 0);
     let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
     assert_eq!(release_ack_reporters.len(), 1);
@@ -8380,6 +8463,8 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
         DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
+    assert_imminent_disconnect_d_info_to(&peer_release_msgs, call_id, &[TEST_CALLED_ISSI]);
+    assert_release_notification_to(&peer_release_msgs, TEST_CALLED_ISSI, Some(26));
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
     assert_eq!(peer_release_reporters.len(), 1);
 
@@ -8512,6 +8597,362 @@ fn test_p2p_busy_calling_party_echo_setup_rejects_with_dummy_call_id() {
     // clause 14.5.1.1.2 idle-state gating applies before local service
     // routing, so echo must not create a parallel call for a busy caller.
     assert_p2p_setup_rejected_with_dummy_call_id_and_cause(&msgs, TEST_ISSI, DisconnectCause::NoIdleCcEntity);
+}
+
+#[test]
+fn test_p2p_setup_to_parrot_99999_opens_separate_local_simplex_service() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let (telemetry_sink, telemetry_source) = telemetry_channel();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.register_entity(CmceBs::new(test.config.clone(), Some(telemetry_sink), None));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew]);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let mut setup = default_p2p_u_setup();
+    setup.called_party_ssi = Some(99_999);
+    setup.hook_method_selection = true;
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, setup));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert_eq!(count_d_call_proceedings(&msgs), 1);
+    let d_call_proceeding = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_ISSI => parse_d_call_proceeding(prim),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should answer caller with D-CALL PROCEEDING");
+    assert!(
+        d_call_proceeding.hook_method_selection,
+        "parrot should preserve the caller hook method so Hytera-class terminals do not render call modified"
+    );
+    let d_connect = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_ISSI => parse_d_connect(prim),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should answer caller with D-CONNECT");
+    assert_eq!(d_connect.transmission_grant, TransmissionGrant::Granted);
+    assert!(
+        d_connect.hook_method_selection,
+        "parrot should preserve the caller hook method so the setup is not signalled as modified"
+    );
+    assert!(!d_connect.simplex_duplex_selection, "parrot service is simplex-only");
+
+    let open = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should open a UMAC circuit");
+    assert_eq!(open.peer_ts, None);
+    assert_eq!(open.dl_media_source, CircuitDlMediaSource::LocalParrot);
+    assert_eq!(open.active_addr, Some(TetraAddress::issi(TEST_ISSI)));
+    assert_eq!(open.active_secondary_addrs, vec![TetraAddress::issi(99_999)]);
+    let parrot_ts = open.ts;
+    assert_eq!(count_umac_floor_granted(&msgs), 1);
+    assert!(
+        !msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { .. })
+        )),
+        "parrot is a local CMCE test service and must not route through Brew"
+    );
+
+    assert!(cmce_debug_active_call_ids(&mut test).contains(&d_connect.call_identifier));
+
+    let events = drain_telemetry(&telemetry_source);
+    let start_event = events
+        .iter()
+        .find_map(|event| match event {
+            TelemetryEvent::IndividualCallStarted {
+                call_id,
+                calling_issi,
+                called_issi,
+                simplex,
+                ts,
+            } => Some((*call_id, *calling_issi, *called_issi, *simplex, *ts)),
+            _ => None,
+        })
+        .expect("parrot setup should publish individual-call dashboard telemetry");
+    assert_eq!(start_event, (d_connect.call_identifier, TEST_ISSI, 99_999, true, parrot_ts));
+
+    let dashboard = DashboardServer::new("test.toml".to_string());
+    for event in events {
+        dashboard.handle_telemetry(event);
+    }
+    let state = dashboard.state.read().unwrap();
+    let calls = state.snapshot_calls();
+    let call = calls
+        .iter()
+        .find(|call| call.call_id == d_connect.call_identifier)
+        .expect("parrot call should be visible in dashboard Calls");
+    assert_eq!(call.call_type, "individual");
+    assert_eq!(call.caller_issi, TEST_ISSI);
+    assert_eq!(call.called_issi, 99_999);
+    assert!(call.simplex);
+    assert_eq!(call.ts, parrot_ts);
+    let last_heard = state
+        .last_heard
+        .front()
+        .expect("parrot call should be visible in dashboard Last Heard");
+    assert_eq!(last_heard.issi, TEST_ISSI);
+    assert_eq!(last_heard.activity, "call_individual");
+    assert_eq!(last_heard.dest, 99_999);
+}
+
+#[test]
+fn test_p2p_setup_to_parrot_99999_rejects_duplex_without_opening_circuit() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Umac]);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let mut setup = default_p2p_u_setup();
+    setup.called_party_ssi = Some(99_999);
+    setup.simplex_duplex_selection = true;
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, setup));
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert_p2p_setup_rejected_with_dummy_call_id_and_cause(&msgs, TEST_ISSI, DisconnectCause::IncompatibleTrafficCase);
+    assert_eq!(count_umac_open(&msgs), 0);
+}
+
+#[test]
+fn test_parrot_99999_records_replays_exact_frames_then_releases_caller() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Umac]);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    test.submit_message(build_u_setup_p2p_msg(TEST_ISSI, 99_999));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let d_connect = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should answer with D-CONNECT");
+    let call_id = d_connect.call_identifier;
+    let (traffic_ts, traffic_usage) = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some((circuit.ts, circuit.usage)),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should open a circuit");
+
+    let acelp_frame: Vec<u8> = (0..274).map(|idx| (idx % 2) as u8).collect();
+    let raw_block2: Vec<u8> = (0..216).map(|idx| ((idx * 5 + 1) % 2) as u8).collect();
+    test.submit_message(build_tmd_ind_to_cmce(traffic_ts, acelp_frame.clone(), None));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    test.submit_message(build_tmd_ind_to_cmce(traffic_ts, raw_block2.clone(), Some(PhyBlockNum::Block2)));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let playback_start_msgs = test.dump_sinks();
+    assert!(
+        !playback_start_msgs
+            .iter()
+            .any(|msg| matches!(&msg.msg, SapMsgInner::TmdCircuitDataReq(_))),
+        "parrot playback must not inject frames in the same router drain as U-TX CEASED"
+    );
+    assert!(
+        playback_start_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted { source_issi: 99_999, .. })
+        )),
+        "parrot playback starts with one virtual floor grant"
+    );
+    let (playback_grant_prim, playback_grant) = playback_start_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_ISSI => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .next()
+        .expect("parrot playback should notify the real caller that the virtual peer owns the floor");
+    assert_eq!(
+        TransmissionGrant::try_from(playback_grant.transmission_grant as u64),
+        Ok(TransmissionGrant::GrantedToOtherUser)
+    );
+    assert_d_tx_granted_facch_allocation(
+        playback_grant_prim,
+        &playback_grant,
+        traffic_ts,
+        traffic_usage,
+        UlDlAssignment::Dl,
+        "parrot playback virtual peer grant",
+    );
+    assert_eq!(
+        count_d_releases(&playback_start_msgs),
+        0,
+        "parrot must not release before paced playback has drained"
+    );
+
+    test.submit_message(build_tmd_ind_to_cmce(traffic_ts, vec![1; 274], None));
+    test.deliver_all_messages();
+    let late_ul_msgs = test.dump_sinks();
+    assert!(
+        !late_ul_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::TmdCircuitDataInd(prim) if prim.ts == traffic_ts
+        )),
+        "late UL media on a Parrot-owned timeslot must be consumed locally, not forwarded to Brew"
+    );
+
+    test.run_stack(Some(48));
+    let mut release_msgs = test.dump_sinks();
+    let playback: Vec<_> = release_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataReq(prim) => Some((prim.ts, prim.data.clone(), prim.raw_tch_s_block)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        playback,
+        vec![(traffic_ts, acelp_frame, None), (traffic_ts, raw_block2, Some(PhyBlockNum::Block2))],
+        "parrot playback must preserve recorded frame order and raw TCH/S block metadata"
+    );
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::SwmiRequestedDisconnection, &[TEST_ISSI]);
+    assert_release_notification_to(&release_msgs, TEST_ISSI, None);
+    assert!(
+        !release_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address.ssi == 99_999 && parse_d_release(prim).is_some()
+        )),
+        "parrot release must not address a non-existent RF peer 99999"
+    );
+
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1);
+    reporters[0].mark_transmitted();
+    test.run_stack(Some(8));
+    let cleanup_msgs = test.dump_sinks();
+    assert!(
+        count_umac_call_ended_or_close(&cleanup_msgs) >= 2,
+        "parrot release reporter completion should close the local UMAC circuit"
+    );
+    assert!(!cmce_debug_active_call_ids(&mut test).contains(&call_id));
+}
+
+#[test]
+fn test_parrot_99999_rf_length_recording_does_not_flood_floor_and_releases() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(vec![TetraEntity::Cmce], vec![TetraEntity::Mle, TetraEntity::Umac]);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    test.submit_message(build_u_setup_p2p_msg(TEST_ISSI, 99_999));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let call_id = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should answer with D-CONNECT");
+    let traffic_ts = setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit.ts),
+            _ => None,
+        })
+        .next()
+        .expect("parrot setup should open a circuit");
+
+    const RF_RECORDED_FRAMES: usize = 141;
+    for seq in 0..RF_RECORDED_FRAMES {
+        let frame: Vec<u8> = (0..274).map(|idx| ((idx + seq) % 2) as u8).collect();
+        test.submit_message(build_tmd_ind_to_cmce(traffic_ts, frame, None));
+    }
+    test.run_stack(Some(1));
+    let recording_msgs = test.dump_sinks();
+    assert_eq!(
+        count_umac_floor_granted(&recording_msgs),
+        0,
+        "parrot recording must not emit one FloorGranted per recorded TCH/S frame"
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let playback_start_msgs = test.dump_sinks();
+    let playback_count = playback_start_msgs
+        .iter()
+        .filter(|msg| matches!(&msg.msg, SapMsgInner::TmdCircuitDataReq(prim) if prim.ts == traffic_ts))
+        .count();
+    assert_eq!(
+        playback_count, 0,
+        "parrot must not inject RF-length playback frames in the same router drain as U-TX CEASED"
+    );
+    assert_eq!(
+        count_d_releases(&playback_start_msgs),
+        0,
+        "parrot must not release before RF-length playback has drained"
+    );
+
+    test.run_stack(Some(16));
+    let paced_msgs = test.dump_sinks();
+    let paced_playback_count = paced_msgs
+        .iter()
+        .filter(|msg| matches!(&msg.msg, SapMsgInner::TmdCircuitDataReq(prim) if prim.ts == traffic_ts))
+        .count();
+    assert!(
+        paced_playback_count <= 4,
+        "parrot playback must be TDMA-paced, not a busy-loop flood; got {paced_playback_count} frames in 16 ticks"
+    );
+
+    let mut release_msgs = Vec::new();
+    for _ in 0..220 {
+        test.run_stack(Some(4));
+        release_msgs.extend(test.dump_sinks());
+        if count_d_releases(&release_msgs) > 0 {
+            break;
+        }
+    }
+    assert_established_p2p_release_pdus_to(&release_msgs, call_id, DisconnectCause::SwmiRequestedDisconnection, &[TEST_ISSI]);
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "parrot RF-length release should keep the local circuit open until D-RELEASE is transmitted or guard expires"
+    );
+
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1);
+    reporters[0].mark_transmitted();
+    test.run_stack(Some(8));
+    let cleanup_msgs = test.dump_sinks();
+    assert!(
+        count_umac_call_ended_or_close(&cleanup_msgs) >= 2,
+        "parrot RF-length fail-safe must close the local UMAC circuit after release"
+    );
+    assert!(!cmce_debug_active_call_ids(&mut test).contains(&call_id));
 }
 
 #[test]
@@ -12851,6 +13292,8 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
         DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_A],
     );
+    assert_no_d_info(&initiator_release_msgs);
+    assert_release_notification_to(&initiator_release_msgs, LAB_ISSI_A, None);
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
@@ -12874,6 +13317,8 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
         DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
+    assert_imminent_disconnect_d_info_to(&peer_release_msgs, call_id, &[LAB_ISSI_MXP600]);
+    assert_release_notification_to(&peer_release_msgs, LAB_ISSI_MXP600, Some(26));
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
 
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
@@ -12965,6 +13410,8 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_release_after_peer_ceased_
         DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_A],
     );
+    assert_no_d_info(&initiator_release_msgs);
+    assert_release_notification_to(&initiator_release_msgs, LAB_ISSI_A, None);
     assert_eq!(
         count_d_disconnects(&initiator_release_msgs),
         0,
@@ -12986,6 +13433,8 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_release_after_peer_ceased_
         DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
+    assert_imminent_disconnect_d_info_to(&peer_release_msgs, call_id, &[LAB_ISSI_MXP600]);
+    assert_release_notification_to(&peer_release_msgs, LAB_ISSI_MXP600, Some(26));
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
 
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);

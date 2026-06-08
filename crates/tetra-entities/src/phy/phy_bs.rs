@@ -282,7 +282,7 @@ impl<D: RxTxDev> PhyBs<D> {
             if let Some(rx_slot) = rx_slot {
                 let mut slot_sent = false;
                 if rx_slot.slot.train_type != TrainingSequence::NotFound {
-                    tracing::info!(ts=%self.dltime, "rx_tpsap_prim got {:?} in fullslot", rx_slot.slot.train_type);
+                    tracing::debug!(ts=%self.dltime, "rx_tpsap_prim got {:?} in fullslot", rx_slot.slot.train_type);
 
                     if let Some(ul_rx_sender) = &self.ul_rx_sender {
                         // Log received data to file (non-blocking)
@@ -293,7 +293,7 @@ impl<D: RxTxDev> PhyBs<D> {
                     slot_sent = true;
                 }
                 if rx_slot.subslot1.train_type != TrainingSequence::NotFound {
-                    tracing::info!(ts=%self.dltime, "rx_tpsap_prim got {:?} in subslot1", rx_slot.subslot1.train_type);
+                    tracing::debug!(ts=%self.dltime, "rx_tpsap_prim got {:?} in subslot1", rx_slot.subslot1.train_type);
                     if slot_sent {
                         tracing::warn!("Sending same burst twice to LMAC");
                     }
@@ -306,7 +306,7 @@ impl<D: RxTxDev> PhyBs<D> {
                     slot_sent = true;
                 }
                 if rx_slot.subslot2.train_type != TrainingSequence::NotFound {
-                    tracing::info!(ts=%self.dltime, "rx_tpsap_prim got {:?} in subslot2", rx_slot.subslot2.train_type);
+                    tracing::debug!(ts=%self.dltime, "rx_tpsap_prim got {:?} in subslot2", rx_slot.subslot2.train_type);
                     if slot_sent {
                         tracing::warn!("Sending same burst twice to LMAC");
                     }

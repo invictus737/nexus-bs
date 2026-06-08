@@ -2049,6 +2049,7 @@ impl BsChannelScheduler {
 
     /// Return the DL media source policy for the UL circuit on `ts`.
     /// `LocalLoopback` = reflect UL back to DL (group/simplex calls).
+    /// `LocalParrot` = CMCE records UL media and feeds DL playback later.
     /// `SwMI` = DL audio comes from Brew/TetraPack; suppress local loopback.
     pub fn ul_circuit_dl_media_source(&self, ts: u8) -> CircuitDlMediaSource {
         if !(1..=4).contains(&ts) {
@@ -2896,7 +2897,7 @@ impl BsChannelScheduler {
                 // clause 23.8.5 permits filling the channel with C-plane Null
                 // PDUs instead of fabricating an unproven all-zero speech frame.
                 // NDB uses NormalTrainSeq2 for independent half-slot demodulation (EN 300 392-2, clause 23.5).
-                tracing::info!(
+                tracing::debug!(
                     "finalize_ts_for_tick: FACCH stealing on ts {} (stch={} bits, speech_present={})",
                     ts.t,
                     stch_buf.get_len(),
@@ -2916,7 +2917,7 @@ impl BsChannelScheduler {
                             scrambling_code: self.scrambling_code,
                         },
                         Some(DlTchBlock::RawTchSHalfSlot { block_num, type5_bits }) => {
-                            tracing::info!(
+                            tracing::debug!(
                                 "finalize_ts_for_tick: preserving raw TCH/S {:?} after FACCH on ts {}",
                                 block_num,
                                 ts.t
@@ -2957,7 +2958,7 @@ impl BsChannelScheduler {
                         // the timing and half-slot position of U-plane TCH. With no
                         // local FACCH pending, fill the stolen first half with a
                         // C-plane Null PDU and keep the received TCH/S in Block2.
-                        tracing::info!(
+                        tracing::debug!(
                             "finalize_ts_for_tick: preserving raw TCH/S {:?} with STCH Null first half on ts {}",
                             block_num,
                             ts.t

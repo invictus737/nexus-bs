@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.57
+# Nexus-BS v0.1.58
 
 > **TETRA base station software for amateur radio operators and researchers.**
 > Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
@@ -144,7 +144,7 @@ username = "admin"
 password = "changeme"
 
 # Optional: reserved git source path for future OTA updates.
-# OTA update is disabled in Nexus-BS v0.1.57.
+# OTA update is disabled in Nexus-BS v0.1.58.
 # source_dir = "/opt/nexus-bs"
 ```
 
@@ -230,7 +230,7 @@ Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
 
 ### WAP MVP over SDS
 
-Nexus-BS v0.1.57 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
+Nexus-BS v0.1.58 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
 
 From the flat install directory, send the default WML page to a terminal ISSI:
 

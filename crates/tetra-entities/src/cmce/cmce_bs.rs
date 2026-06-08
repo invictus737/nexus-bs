@@ -325,10 +325,16 @@ impl TetraEntityTrait for CmceBs {
             Sap::TmdSap => {
                 // UL voice frame — feed to echo session if active, and forward to Brew for FDX calls
                 if let SapMsgInner::TmdCircuitDataInd(ref prim) = message.msg {
+                    let consumed_by_parrot = self
+                        .cc
+                        .handle_parrot_ul_frame(queue, prim.ts, prim.data.clone(), prim.raw_tch_s_block);
                     self.cc.handle_echo_ul_frame(queue, prim.ts, prim.data.clone());
                     // Emit TS activity for dashboard visualizer
                     if let Some(ref sink) = self.telemetry {
                         let _ = sink.send(crate::net_telemetry::TelemetryEvent::TsVoiceActivity { ts: prim.ts });
+                    }
+                    if consumed_by_parrot {
+                        return;
                     }
                     // Forward UL audio to Brew so TetraPack receives the terminal's voice
                     queue.push_back(message);
