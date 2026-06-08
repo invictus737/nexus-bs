@@ -21,6 +21,7 @@ const INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 // EN 300 392-2 table 20.54 defines priority 7 as the highest TMA priority.
 // Keep this restricted to time-critical floor-control signalling.
 const CMCE_FLOOR_CONTROL_PDU_PRIO: i32 = 7;
+const MAX_LOCAL_LISTENER_INDIVIDUAL_FLOOR_GRANTS: usize = 100;
 // EN 300 392-2 clause 14.5.1.2.2 f references EN 300 392-9 notification
 // value 26 as "Notice of imminent call disconnection".
 const NOTIFICATION_IMMINENT_CALL_DISCONNECTION: u64 = 26;
@@ -2079,6 +2080,70 @@ impl CcBsSubentity {
         // DL-only on group FACCH: only the current speaker holds UL.
         let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
         queue.push_back(msg);
+    }
+
+    /// Notify group listeners that another MS has the floor without sending a
+    /// GSSI "granted to other user" copy back to the newly granted local MS.
+    pub(super) fn send_group_listener_d_tx_granted_facch(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        source_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+    ) {
+        let (source_is_local_member, listener_issis): (bool, Vec<u32>) = {
+            let state = self.config.state_read();
+            (
+                state.subscribers.contains_group_member(dest_gssi, source_issi),
+                state
+                    .subscribers
+                    .group_member_issis(dest_gssi)
+                    .filter(|issi| *issi != source_issi)
+                    .collect(),
+            )
+        };
+
+        if source_is_local_member && listener_issis.len() <= MAX_LOCAL_LISTENER_INDIVIDUAL_FLOOR_GRANTS {
+            if listener_issis.is_empty() {
+                tracing::debug!(
+                    "CMCE: no local group listener floor notification needed for GSSI {} source ISSI {}",
+                    dest_gssi,
+                    source_issi
+                );
+                return;
+            }
+
+            // EN 300 392-2 clause 14.5.2.2.1 requires the SwMI to announce the
+            // floor state. For local group speakers, avoid a GSSI
+            // GrantedToOtherUser PDU that the speaker itself also receives and
+            // may interpret as receive-only. Individual listener copies carry
+            // the same mandatory transmission-grant IE while excluding the
+            // granted speaker from this listener-only notification.
+            for listener_issi in listener_issis {
+                self.fsm_send_d_tx_granted_individual(
+                    queue,
+                    call_id,
+                    TetraAddress::new(listener_issi, SsiType::Issi),
+                    ts,
+                    usage,
+                    TransmissionGrant::GrantedToOtherUser,
+                    Some(source_issi),
+                );
+            }
+            return;
+        }
+
+        if source_is_local_member {
+            tracing::debug!(
+                "CMCE: using GSSI listener floor notification for GSSI {} with {} local listener(s), above individual fanout cap {}",
+                dest_gssi,
+                listener_issis.len(),
+                MAX_LOCAL_LISTENER_INDIVIDUAL_FLOOR_GRANTS
+            );
+        }
+        self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
     }
 
     /// Send D-TX INTERRUPT via FACCH stealing on the group traffic channel.

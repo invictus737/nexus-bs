@@ -11952,3 +11952,65 @@ Next:
 
 1. Retest local `226333` group ping-pong after the `18:05:40 EEST` restart.
 2. If calls still stop, focus on UMAC/LMAC U-plane after `D-TX GRANTED`: floor is granted, but valid TCH/S is not arriving before the local inactivity guard.
+
+## 2026-06-08 19:07 EEST - 2260082 group-floor self-demotion guard for local groups
+
+Field context:
+
+- User reported that `2260082` "died" when entering the `226333` group call.
+- Live service did not crash: `nexus-bs@chris.service` remained active with PID `80964`.
+- Live logs since the `18:05:40 EEST` restart showed the critical pattern:
+  - `2260616` started local GSSI `226333`, call `4`, on TS2.
+  - `2260082` sent `U-TX DEMAND`.
+  - CMCE sent individual `D-TX GRANTED(Granted)` to `2260082`.
+  - UMAC entered `FloorGranted` for `2260082`.
+  - On later `2260082` entries, no valid UL TCH/S arrived before the local guard, and UMAC raised `UL inactivity timeout`, forcing TX ceased.
+- Live config already had `energy_saving_mode = "auto"` and `frame_18_ext = false`, so this incident was not treated as BS-imposed EG7 or frame-18-extension behavior.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1 covers group floor control using `D-TX GRANTED`; clause 23.5 covers assigned-channel FACCH/STCH delivery.
+- The SwMI must grant the new transmitting MS and inform listeners. For local small groups, sending a GSSI `D-TX GRANTED(GrantedToOtherUser)` immediately after the speaker's individual positive grant can also be received by the newly granted MS because it is still a group member.
+- Nexus-BS now keeps the positive speaker grant individual, then informs only the other local listeners individually for groups up to the supported local fanout cap. This is a compatibility-safe delivery change over the same floor-control procedure; it is not formal ETSI certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added `send_group_listener_d_tx_granted_facch`.
+  - For local speakers with up to `100` local listeners, sends `GrantedToOtherUser` as individual listener FACCH/STCH copies, excluding the newly granted speaker.
+  - For more than `100` listeners or non-local source traffic, keeps the old one-GSSI listener grant to avoid unbounded fanout.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Group handoff/current-speaker/timeout paths now use the listener-safe helper.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated existing small-group expectations from one GSSI listener grant to per-ISSI listener grants.
+  - Added `226333` three-local-member regression: `2260616`, `2260082`, and `2260618`; handoff to `2260082` must not include GSSI/self `GrantedToOtherUser`.
+  - Added threshold regression: `source + 100 listeners` uses individual listener grants and no GSSI; `source + 101 listeners` intentionally uses the bounded GSSI fallback.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs group_226333 --locked` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_226333_three_local_members_listener_grants_exclude_new_speaker --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_group_local_listener_floor_grant_fanout_threshold --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group --locked` passed: 71 tests.
+- `cargo test -p tetra-entities --test test_umac_bs group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` passed: 84 tests.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` passed: 11 tests.
+- `cargo check -p tetra-entities --tests --locked` passed.
+
+RF gate:
+
+1. Deploy this build locally-built only, then restart `nexus-bs@chris.service`.
+2. Test exact sequence on GSSI `226333`:
+   - `2260616` starts/holds group floor.
+   - `2260082` presses PTT while `2260616` holds floor and is queued.
+   - `2260616` releases PTT.
+   - `2260082` should enter with voice, no static-only TX, no `PTT denied`, no `UL inactivity timeout`.
+3. After RF test, inspect logs for:
+   - individual positive grant to `2260082`;
+   - no immediate GSSI listener `GrantedToOtherUser` for the same local handoff;
+   - valid TCH/S from `2260082` before the inactivity guard.
+
+Limit:
+
+- The local-speaker self-demotion guard is guaranteed only up to `100` local listeners. Above that, the old GSSI listener notification remains intentionally enabled for bounded airtime/resource use.

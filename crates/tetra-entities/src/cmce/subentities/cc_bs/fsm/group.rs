@@ -163,7 +163,7 @@ impl CcBsSubentity {
         // signalling; this confirms that the already-current speaker still has
         // transmit permission and refreshes the local traffic scheduler.
         self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, usage, TransmissionGrant::Granted, Some(speaker.ssi));
-        self.send_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts, usage);
+        self.send_group_listener_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts, usage);
         self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
 
         queue.push_back(SapMsg {
@@ -289,7 +289,7 @@ impl CcBsSubentity {
                 TransmissionGrant::Granted,
                 Some(requesting_party.ssi),
             );
-            self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_listener_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
             self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
             self.refresh_group_cached_d_setup_speaker(call_id, requesting_party.ssi);
 
@@ -391,7 +391,7 @@ impl CcBsSubentity {
             TransmissionGrant::Granted,
             Some(requesting_party.ssi),
         );
-        self.send_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
+        self.send_group_listener_d_tx_granted_facch(queue, call_id, requesting_party.ssi, dest_addr.ssi, ts, usage);
         self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
         self.refresh_group_cached_d_setup_speaker(call_id, requesting_party.ssi);
 
@@ -507,7 +507,7 @@ impl CcBsSubentity {
                 TransmissionGrant::Granted,
                 Some(requester.ssi),
             );
-            self.send_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
+            self.send_group_listener_d_tx_granted_facch(queue, call_id, requester.ssi, dest_addr.ssi, ts, usage);
             self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
             self.refresh_group_cached_d_setup_speaker(call_id, requester.ssi);
 
@@ -699,7 +699,7 @@ impl CcBsSubentity {
             );
         }
 
-        self.send_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
+        self.send_group_listener_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
         self.send_group_d_info_reset_t310_facch(queue, call_id, dest_gssi, ts, usage);
         self.refresh_group_cached_d_setup_speaker(call_id, source_issi);
 

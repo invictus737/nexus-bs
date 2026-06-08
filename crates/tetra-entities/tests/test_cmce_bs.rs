@@ -4446,7 +4446,7 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
     assert_eq!(
         grants.len(),
         2,
-        "current-speaker repeated setup must explicitly reassert floor to the MS and group"
+        "current-speaker repeated setup must explicitly reassert floor to the MS and local listeners"
     );
     assert!(grants.iter().any(|(prim, grant)| {
         prim.main_address.ssi == TEST_ISSI
@@ -4455,13 +4455,12 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
             && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
     }));
     assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address.ssi == TEST_GSSI
-            && prim.main_address.ssi_type == SsiType::Gssi
+        prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI)
             && grant.call_identifier == active_call_id
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
     for (prim, grant) in &grants {
-        let expected_dir = if prim.main_address.ssi_type == SsiType::Issi {
+        let expected_dir = if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 {
             UlDlAssignment::Both
         } else {
             UlDlAssignment::Dl
@@ -4543,13 +4542,12 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
             && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
     }));
     assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address.ssi == TEST_GSSI
-            && prim.main_address.ssi_type == SsiType::Gssi
+        prim.main_address == TetraAddress::issi(TEST_ISSI)
             && grant.call_identifier == active_call_id
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
     for (prim, grant) in &grants {
-        let expected_dir = if prim.main_address.ssi_type == SsiType::Issi {
+        let expected_dir = if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 {
             UlDlAssignment::Both
         } else {
             UlDlAssignment::Dl
@@ -5196,7 +5194,7 @@ fn test_group_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_g
         assert_eq!(
             grants.len(),
             2,
-            "pre-emptive handoff should grant requester and inform group for priority {tx_demand_priority}"
+            "pre-emptive handoff should grant requester and inform local listeners for priority {tx_demand_priority}"
         );
         assert!(
             interrupts
@@ -5210,8 +5208,7 @@ fn test_group_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_g
                 && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
         }));
         assert!(grants.iter().any(|(_, prim, grant)| {
-            prim.main_address.ssi == TEST_GSSI
-                && prim.main_address.ssi_type == SsiType::Gssi
+            prim.main_address == TetraAddress::issi(TEST_ISSI)
                 && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
         }));
         for (_, prim, grant) in &grants {
@@ -5471,7 +5468,7 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
     assert_eq!(
         grants.len(),
         2,
-        "queued requester handoff should send D-TX-GRANTED to requester and group listeners"
+        "queued requester handoff should send D-TX-GRANTED to requester and local listeners"
     );
 
     let requester_grant = grants
@@ -5482,22 +5479,22 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
     assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
     assert_compact_d_tx_granted_facch(requester_grant.0, &requester_grant.1);
 
-    let group_grant = grants
+    let listener_grant = grants
         .iter()
-        .find(|(prim, _)| prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
-        .expect("expected group FACCH D-TX-GRANTED");
-    assert_eq!(group_grant.1.call_identifier, call_id);
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_ISSI))
+        .expect("expected listener FACCH D-TX-GRANTED");
+    assert_eq!(listener_grant.1.call_identifier, call_id);
     assert_eq!(
-        group_grant.1.transmission_grant,
+        listener_grant.1.transmission_grant,
         TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     );
-    assert_compact_d_tx_granted_facch(group_grant.0, &group_grant.1);
-    let group_alloc = group_grant
+    assert_compact_d_tx_granted_facch(listener_grant.0, &listener_grant.1);
+    let listener_alloc = listener_grant
         .0
         .chan_alloc
         .as_ref()
-        .expect("FACCH group grant should carry channel allocation");
-    assert_eq!(group_alloc.ul_dl_assigned, UlDlAssignment::Dl);
+        .expect("FACCH listener grant should carry channel allocation");
+    assert_eq!(listener_alloc.ul_dl_assigned, UlDlAssignment::Dl);
 
     assert_eq!(
         count_d_setups(&ceased_msgs),
@@ -6512,17 +6509,17 @@ fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
         "group UL inactivity handoff requester grant",
     );
 
-    let group_grant = grants
+    let listener_grant = grants
         .iter()
-        .find(|(prim, _)| prim.main_address == TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi))
-        .expect("group listeners should be told which MS now has the floor");
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_A))
+        .expect("local listener should be told which MS now has the floor");
     assert_eq!(
-        group_grant.1.transmission_grant,
+        listener_grant.1.transmission_grant,
         TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     );
     assert_d_tx_granted_facch_allocation(
-        group_grant.0,
-        &group_grant.1,
+        listener_grant.0,
+        &listener_grant.1,
         active_ts,
         active_usage,
         UlDlAssignment::Dl,
@@ -6628,6 +6625,14 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
         UlDlAssignment::Both,
         "226333 handoff to queued requester",
     );
+    assert!(
+        handoff_to_b_grants.iter().all(|(prim, grant)| {
+            prim.main_address != TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi)
+                && (prim.main_address != TetraAddress::issi(LAB_ISSI_B)
+                    || grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+        }),
+        "2260082 must not hear a GSSI/self GrantedToOtherUser immediately after its positive floor grant"
+    );
     assert_eq!(count_d_tx_ceased(&handoff_to_b_msgs), 0);
     assert_eq!(count_umac_floor_released(&handoff_to_b_msgs), 0);
     assert!(handoff_to_b_msgs.iter().any(|msg| {
@@ -6700,6 +6705,14 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
         UlDlAssignment::Both,
         "226333 handoff back to original speaker",
     );
+    assert!(
+        handoff_to_a_grants.iter().all(|(prim, grant)| {
+            prim.main_address != TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi)
+                && (prim.main_address != TetraAddress::issi(LAB_ISSI_A)
+                    || grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+        }),
+        "local group speaker must not receive listener-only GrantedToOtherUser after its positive floor grant"
+    );
     assert_eq!(count_d_tx_ceased(&handoff_to_a_msgs), 0);
     assert_eq!(count_umac_floor_released(&handoff_to_a_msgs), 0);
     assert!(handoff_to_a_msgs.iter().any(|msg| {
@@ -6747,6 +6760,223 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     assert_eq!(count_umac_floor_released(&current_speaker_retry_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&current_speaker_retry_msgs), 0);
     assert_eq!(count_umac_floor_granted(&current_speaker_retry_msgs), 1);
+}
+
+#[test]
+fn test_group_226333_three_local_members_listener_grants_exclude_new_speaker() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_MXP600, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let queued_msgs = test.dump_sinks();
+    let queued_grants: Vec<_> = queued_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(queued_grants.len(), 1);
+    assert_eq!(queued_grants[0].0.main_address, TetraAddress::issi(LAB_ISSI_B));
+    assert_eq!(
+        queued_grants[0].1.transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_A, call_id));
+    test.run_stack(Some(1));
+    let handoff_msgs = test.dump_sinks();
+    let handoff_grants: Vec<_> = handoff_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        handoff_grants.len(),
+        3,
+        "three-member local 226333 handoff should grant requester and notify the two other local listeners individually"
+    );
+    assert!(
+        handoff_grants
+            .iter()
+            .all(|(prim, _)| prim.main_address != TetraAddress::new(LAB_GROUP_GSSI, SsiType::Gssi)),
+        "local 226333 handoff must not send a GSSI listener grant that the new speaker can hear"
+    );
+
+    let requester_grant = handoff_grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("2260082 should receive the positive floor grant");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        requester_grant.0,
+        &requester_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "226333 three-member handoff to 2260082",
+    );
+
+    for listener_issi in [LAB_ISSI_A, LAB_ISSI_MXP600] {
+        let listener_grant = handoff_grants
+            .iter()
+            .find(|(prim, _)| prim.main_address == TetraAddress::issi(listener_issi))
+            .unwrap_or_else(|| panic!("listener ISSI {listener_issi} should receive GrantedToOtherUser"));
+        assert_eq!(
+            listener_grant.1.transmission_grant,
+            TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        );
+        assert_d_tx_granted_facch_allocation(
+            listener_grant.0,
+            &listener_grant.1,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Dl,
+            "226333 three-member local listener grant",
+        );
+    }
+
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
+}
+
+#[test]
+fn test_group_local_listener_floor_grant_fanout_threshold() {
+    debug::setup_logging_verbose();
+
+    for (member_count, expect_individual_listeners) in [(101_u32, true), (102_u32, false)] {
+        let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+        let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+        test.populate_entities(
+            vec![TetraEntity::Cmce],
+            vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+        );
+
+        let first_issi = 700_000_u32 + member_count * 1_000;
+        let current_speaker = first_issi;
+        let next_speaker = first_issi + 1;
+        for offset in 0..member_count {
+            let issi = first_issi + offset;
+            submit_subscriber_update(&mut test, issi, Vec::new(), BrewSubscriberAction::Register);
+            submit_subscriber_update(&mut test, issi, vec![TEST_GSSI], BrewSubscriberAction::Affiliate);
+        }
+        test.run_stack(Some((member_count as usize * 2) + 16));
+        let _ = test.dump_sinks();
+
+        let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, current_speaker, TEST_GSSI);
+
+        test.submit_message(build_u_tx_demand_msg(next_speaker, call_id));
+        test.run_stack(Some(1));
+        let queued_msgs = test.dump_sinks();
+        let queued_grants: Vec<_> = queued_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(queued_grants.len(), 1, "member_count={member_count}");
+        assert_eq!(queued_grants[0].0.main_address, TetraAddress::issi(next_speaker));
+        assert_eq!(
+            queued_grants[0].1.transmission_grant,
+            TransmissionGrant::RequestQueued.into_raw() as u8,
+            "member_count={member_count}"
+        );
+
+        test.submit_message(build_u_tx_ceased_msg(current_speaker, call_id));
+        test.run_stack(Some(1));
+        let handoff_msgs = test.dump_sinks();
+        let handoff_grants: Vec<_> = handoff_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+
+        let requester_grant = handoff_grants
+            .iter()
+            .find(|(prim, _)| prim.main_address == TetraAddress::issi(next_speaker))
+            .expect("queued requester should receive positive floor grant");
+        assert_eq!(
+            requester_grant.1.transmission_grant,
+            TransmissionGrant::Granted.into_raw() as u8,
+            "member_count={member_count}"
+        );
+        assert_d_tx_granted_facch_allocation(
+            requester_grant.0,
+            &requester_grant.1,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Both,
+            "local listener threshold requester grant",
+        );
+
+        if expect_individual_listeners {
+            assert_eq!(handoff_grants.len(), member_count as usize, "member_count={member_count}");
+            assert!(
+                handoff_grants
+                    .iter()
+                    .all(|(prim, _)| prim.main_address != TetraAddress::new(TEST_GSSI, SsiType::Gssi)),
+                "100 local listeners should not use GSSI fallback"
+            );
+            let listener_grants = handoff_grants
+                .iter()
+                .filter(|(prim, grant)| {
+                    prim.main_address.ssi_type == SsiType::Issi
+                        && prim.main_address.ssi != next_speaker
+                        && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+                })
+                .count();
+            assert_eq!(listener_grants, 100, "member_count={member_count}");
+        } else {
+            assert_eq!(handoff_grants.len(), 2, "member_count={member_count}");
+            let gssi_grant = handoff_grants
+                .iter()
+                .find(|(prim, _)| prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi))
+                .expect("101 local listeners should use bounded GSSI fallback");
+            assert_eq!(
+                gssi_grant.1.transmission_grant,
+                TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+                "member_count={member_count}"
+            );
+            assert_d_tx_granted_facch_allocation(
+                gssi_grant.0,
+                &gssi_grant.1,
+                active_ts,
+                active_usage,
+                UlDlAssignment::Dl,
+                "local listener threshold GSSI fallback grant",
+            );
+        }
+
+        assert!(
+            handoff_grants.iter().all(|(prim, grant)| {
+                prim.main_address != TetraAddress::issi(next_speaker)
+                    || grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
+            }),
+            "new local speaker must not receive GrantedToOtherUser as an ISSI copy"
+        );
+        assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+        assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
+    }
 }
 
 #[test]
@@ -7056,7 +7286,7 @@ fn test_group_tx_ceased_skips_deaffiliated_front_waiter_and_grants_next_fifo_wai
     assert_eq!(next_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
     assert!(
         handoff_grants.iter().all(|(prim, _)| {
-            prim.main_address.ssi == TEST_OTHER_ISSI || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+            prim.main_address == TetraAddress::issi(TEST_OTHER_ISSI) || prim.main_address == TetraAddress::issi(TEST_ISSI)
         }),
         "deaffiliated front waiter must not receive the handoff"
     );
@@ -7117,15 +7347,24 @@ fn test_group_queued_requester_u_tx_ceased_withdraws_before_handoff() {
             _ => None,
         })
         .collect();
-    assert_eq!(handoff_grants.len(), 2);
+    assert_eq!(handoff_grants.len(), 3);
     let next_handoff = handoff_grants
         .iter()
         .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_OTHER_ISSI))
         .expect("withdrawn queued requester must be skipped in favour of next FIFO waiter");
     assert_eq!(next_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
     assert!(
+        handoff_grants.iter().all(|(prim, grant)| {
+            prim.main_address != TetraAddress::issi(TEST_CALLED_ISSI)
+                || grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        }),
+        "withdrawn queued requester may remain a listener, but must not receive a positive floor grant"
+    );
+    assert!(
         handoff_grants.iter().all(|(prim, _)| {
-            prim.main_address.ssi == TEST_OTHER_ISSI || (prim.main_address.ssi == TEST_GSSI && prim.main_address.ssi_type == SsiType::Gssi)
+            prim.main_address == TetraAddress::issi(TEST_OTHER_ISSI)
+                || prim.main_address == TetraAddress::issi(TEST_ISSI)
+                || prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI)
         }),
         "withdrawn queued requester must not receive a later floor grant"
     );
@@ -7275,7 +7514,7 @@ fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
         prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
     }));
     assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+        prim.main_address == TetraAddress::issi(TEST_ISSI)
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
     assert_one_group_d_info_reset_t310(&demand_msgs, call_id, TEST_GSSI, active_ts, active_usage, "hangtime floor retake");
