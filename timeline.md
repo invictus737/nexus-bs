@@ -12063,3 +12063,38 @@ RF gate:
    - no immediate `D-TX CEASED`;
    - if the regrant is decoded, valid TCH/S should arrive before the second timeout.
 3. If the second timeout still occurs with no TCH/S, next layer is RF/LMAC decode or Motorola grant decode timing, not CMCE floor ownership.
+
+## 2026-06-08 19:38 EEST - UMAC diagnostic counter for post-grant UL media
+
+Field context:
+
+- Build `v0.1.59-484113c0` was deployed and immediately exercised on local GSSI `226333`.
+- The log showed `2260082` receiving the intended individual positive `D-TX GRANTED`, followed by the bounded current-speaker regrant.
+- No valid UMAC voice route appeared before the second inactivity timeout, so the remaining fault is below CMCE floor ownership: either STCH/FACCH grant delivery timing, LMAC/PHY decode/classification, or real RF/uplink timing for `2260082`.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1 keeps the group floor under SwMI control; the SwMI must not infer successful transmission merely because it queued a grant.
+- EN 300 392-2 clauses 23.5 and 23.8 require assigned-channel STCH/FACCH signalling and TCH/S media to be kept distinguishable. The next RF test therefore needs evidence of whether UMAC accepted any valid UL media after the floor grant.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Added `ul_media_events_since_floor`, a bounded per-timeslot diagnostic counter.
+  - Reset the counter on circuit open/close, floor release, call end, and each `FloorGranted`.
+  - Increment the counter only after UMAC validates a UL voice indication from LMAC as ACELP or raw TCH/S Block2.
+  - Include the counter in `UL inactivity timeout` warnings as `accepted_ul_media_since_floor=...`.
+
+Verification:
+
+- `cargo fmt --all --check` passed.
+- `cargo test -p tetra-entities --test test_umac_bs group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` passed: 11 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs group_ul_inactivity --locked` passed: 2 tests.
+- `cargo check -p tetra-entities --tests --locked` passed.
+
+RF gate:
+
+1. Deploy this diagnostic build and repeat GSSI `226333` with `2260082`.
+2. If timeout shows `accepted_ul_media_since_floor=0`, the BS did not accept any valid TCH/S after grant; inspect LMAC/PHY grant delivery and uplink decode.
+3. If timeout shows `accepted_ul_media_since_floor>0`, the BS accepted media but did not refresh/reroute it correctly; inspect UMAC deferred raw TCH/S flushing and DL scheduling.

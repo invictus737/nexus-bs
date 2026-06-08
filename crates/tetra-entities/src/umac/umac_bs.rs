@@ -81,6 +81,10 @@ pub struct UmacBs {
     /// as U-TX DEMAND / U-TX CEASED must inherit the speaker identity from
     /// the active circuit/floor state.
     current_ul_speaker: [Option<TetraAddress>; 4],
+    /// Small per-floor diagnostic counter for accepted UL media. This is used
+    /// only in timeout logs so RF tests can distinguish "no uplink decoded" from
+    /// "uplink decoded but later not routed".
+    ul_media_events_since_floor: [u16; 4],
     active_energy_saving_suspensions: HashMap<EnergySavingSuspensionKey, Vec<u32>>,
 }
 
@@ -237,6 +241,7 @@ impl UmacBs {
             last_ul_voice: [None; 4],
             pending_private_ul_media: std::array::from_fn(|_| VecDeque::new()),
             current_ul_speaker: [None; 4],
+            ul_media_events_since_floor: [0; 4],
             active_energy_saving_suspensions: HashMap::new(),
         }
     }
@@ -432,6 +437,19 @@ impl UmacBs {
             return None;
         }
         self.current_ul_speaker[ts as usize - 1]
+    }
+
+    fn reset_ul_media_diagnostic(&mut self, ts: u8) {
+        if (1..=4).contains(&ts) {
+            self.ul_media_events_since_floor[ts as usize - 1] = 0;
+        }
+    }
+
+    fn note_accepted_ul_media(&mut self, ts: u8) {
+        if (1..=4).contains(&ts) {
+            let idx = ts as usize - 1;
+            self.ul_media_events_since_floor[idx] = self.ul_media_events_since_floor[idx].saturating_add(1);
+        }
     }
 
     fn llc_sdu_is_ack_response(sdu: &BitBuffer) -> bool {
@@ -2770,6 +2788,7 @@ impl UmacBs {
                     tracing::warn!("rx_tmd_prim: unsupported UL voice length {} on ts={}, skipping", data.len(), ts);
                     return;
                 };
+                self.note_accepted_ul_media(ts);
 
                 let defer_ul_media_during_hangtime = self.can_defer_ul_media_during_hangtime(ts);
                 if self.channel_scheduler.is_hangtime(ts) && !defer_ul_media_during_hangtime {
@@ -3095,6 +3114,7 @@ impl UmacBs {
             if d == Direction::Ul && (1..=4).contains(&ts) {
                 self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 self.clear_current_ul_speaker(ts);
+                self.reset_ul_media_diagnostic(ts);
                 if let Some(speaker_addr) = Self::initial_ul_speaker_for_open_circuit(&circuit) {
                     self.set_current_ul_speaker(ts, speaker_addr);
                 }
@@ -3149,6 +3169,7 @@ impl UmacBs {
                     if d == Direction::Ul && (1..=4).contains(&ts) {
                         self.last_ul_voice[ts as usize - 1] = None;
                         self.clear_current_ul_speaker(ts);
+                        self.reset_ul_media_diagnostic(ts);
                     }
                     tracing::info!("  rx_control_circuit_close: Closed {:?} circuit for ts {}", d, ts);
                 }
@@ -3190,7 +3211,11 @@ impl UmacBs {
             };
 
             if timed_out {
-                tracing::warn!("UL inactivity timeout on ts={}, sending notification to CMCE", ts);
+                tracing::warn!(
+                    "UL inactivity timeout on ts={}, accepted_ul_media_since_floor={}, sending notification to CMCE",
+                    ts,
+                    self.ul_media_events_since_floor[idx]
+                );
                 self.last_ul_voice[idx] = None;
 
                 queue.push_back(SapMsg {
@@ -3229,6 +3254,7 @@ impl UmacBs {
                     // queued old-speaker TCH/S, so clear both affected slots.
                     self.last_ul_voice[floor_ts as usize - 1] = None;
                     self.clear_current_ul_speaker(floor_ts);
+                    self.reset_ul_media_diagnostic(floor_ts);
                 }
             }
             CallControl::FloorGranted {
@@ -3293,6 +3319,7 @@ impl UmacBs {
                         }
                     }
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                    self.reset_ul_media_diagnostic(ts);
                     tracing::info!(
                         "UMAC floor granted: call_id={} source_issi={} dest_gssi={} ul_ts={} peer_ts={:?} media_source={:?} private_participant_scoped={}",
                         call_id,
@@ -3312,6 +3339,7 @@ impl UmacBs {
                     self.channel_scheduler.set_hangtime(floor_ts, false);
                     self.last_ul_voice[floor_ts as usize - 1] = None;
                     self.clear_current_ul_speaker(floor_ts);
+                    self.reset_ul_media_diagnostic(floor_ts);
                 }
             }
 
