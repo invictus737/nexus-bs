@@ -1,5 +1,81 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-08 20:08 EEST - LMAC preserves NTS2 Block2 TCH/S without stolen marker
+
+Component in simple technical terms:
+
+- LMAC BS is the lower MAC receiver. It looks at the PHY burst training sequence and decides whether the received uplink bits are signalling (`STCH`) or voice traffic (`TCH/S`).
+- For NTS2 traffic bursts, the first half-slot is signalling; the second half-slot is voice unless the first-half MAC header explicitly says the second half is also stolen for signalling.
+- This patch targets the live `2260082` group-call symptom where CMCE/UMAC grant the floor, but `accepted_ul_media_since_floor=0` shows no valid voice reached UMAC after the grant.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 23.8.4.1.4 says that on uplink slots assigned for traffic, NTS2 means the first half slot is STCH, and the BS shall inspect MAC headers to know whether the second half is also stolen.
+- The same clause says if the second half slot is not stolen, the BS shall interpret the second half slot as TCH.
+- EN 300 392-2 clause 23.8.5 says the BS should preserve uplink traffic half-slot handling and replace stolen halves appropriately on downlink.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/lmac/lmac_bs.rs`
+  - Removed the stale local `!burst_is_traffic` guard that made NTS2 Block2 become STCH just because the local UL physical-channel marker still said CP/non-traffic.
+  - NTS2 Block2 is now STCH only when `blk2_stolen_at` matches the exact uplink time; otherwise it is raw `TCH/S` Block2.
+- `crates/tetra-entities/tests/test_lmac_bs.rs`
+  - Added a regression where Block2 bits are deliberately valid as STCH, but without an explicit second-half-stolen marker they must still be preserved as raw TCH/S and must not be consumed as control.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_lmac_bs bs_lmac_preserves_seq2_block2_as_tch_s_even_if_bits_decode_as_stch_without_stolen_marker --locked` passed.
+- `cargo test -p tetra-entities --test test_lmac_bs bs_lmac_recovers_seq2_block2_tch_s_after_hangtime_cp_marker_lag --locked` passed.
+- `cargo test -p tetra-entities --test test_lmac_bs bs_lmac_ignores_stale_blk2_stolen_marker_for_later_tch_s_block2 --locked` passed.
+- `cargo test -p tetra-entities --test test_lmac_bs --locked` passed: 12 tests.
+- `cargo test -p tetra-entities --test test_umac_bs group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` passed: 11 tests.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor_handoff_reopens_ul_traffic_for_lmac_tch_s_decode --locked` passed.
+- `cargo check -p tetra-entities --tests --locked` passed.
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Deploy direct to `/home/chris/nexus-bs/nexus-bs`.
+- Clear volatile service journal.
+- Test local group `226333`, especially `2260082` retaking PTT after another speaker.
+- Expected improvement: after positive `D-TX GRANTED` to `2260082`, valid NTS2 Block2 voice should reach UMAC instead of being consumed as STCH during marker lag.
+- If `accepted_ul_media_since_floor=0` still appears, the remaining evidence points lower: PHY duplicate candidate selection, RF decode/CRC, or the terminal not transmitting after grant.
+
+## 2026-06-08 19:47 EEST - Rejected group hangtime D-TX CONTINUE candidate
+
+Component in simple technical terms:
+
+- CMCE group call floor control is the BS logic that decides which terminal may talk on a GSSI and tells all other terminals to listen.
+- Hangtime/no-active-speaker is the normal short pause after a terminal releases PTT and sends `U-TX CEASED`.
+- Withdrawn transmission / WAIT is a different state where the SwMI explicitly pauses a transmission with `D-TX WAIT`.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 b) says the SwMI grants a group speaker with an individually addressed `D-TX GRANTED` and informs the rest of the group with group-addressed `D-TX GRANTED`.
+- EN 300 392-2 clause 14.5.2.2.1 d) case 3 says that when transmission was withdrawn and a terminal requested permission during that withdrawn period, the SwMI should first send group-addressed `D-TX CONTINUE` with Continue set to `not continue`, then send `D-TX GRANTED`.
+- This withdrawn-transmission clause does not describe normal hangtime after `U-TX CEASED`; normal group retake stays on `U-TX DEMAND` -> individual `D-TX GRANTED` to the new speaker plus group listener indication.
+- This is clause-scoped engineering evidence only, not formal ETSI/TETRA certification.
+
+Audit result:
+
+- Candidate patch rejected before commit/deploy: sending `D-TX CONTINUE/not-continue` in ordinary hangtime would mix the withdrawn-transmission procedure into a normal floor retake.
+- The candidate also only proved order in the CMCE queue. UMAC priority scheduling could still transmit the positive `D-TX GRANTED` before the `D-TX CONTINUE`, so it would not be a reliable RF-order fix without a lower-layer ordering change.
+- No protocol code from this candidate should be committed unless a future patch introduces a real `D-TX WAIT`/withdrawn state and enforces RF transmit order.
+
+Verification:
+
+- Candidate local tests had passed, but the ETSI/state audit overruled the patch before deploy.
+- The important lesson is that a passing CMCE queue test is not enough for group-call RF correctness when STCH/FACCH priority may reorder traffic.
+
+Next execution:
+
+- Keep normal hangtime floor retake ETSI-clean.
+- Investigate the real field failure below CMCE: FACCH/STCH grant delivery timing, UMAC priority/order, LMAC/PHY decode, RF level, and terminal-specific grant reception for `2260082`.
+- Key diagnostic remains `accepted_ul_media_since_floor=0` after a sent grant: BS decided floor correctly, but no valid uplink TCH/S reached UMAC for that floor epoch.
+
 ## 2026-06-08 01:15 EEST - Nexus-BS v0.1.58 Parrot/P2P field checkpoint
 
 Release note:

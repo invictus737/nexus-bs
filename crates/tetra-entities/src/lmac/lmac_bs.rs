@@ -155,11 +155,16 @@ impl LmacBs {
                         if blk.block_num == PhyBlockNum::Block1 {
                             LogicalChannel::Stch
                         } else if blk.block_num == PhyBlockNum::Block2 {
-                            if !burst_is_traffic || block2_stolen {
-                                // TODO FIXME remove !burst_is_traffic guard, temporary fix only
+                            if block2_stolen {
                                 tracing::debug!("NUB blk2 in STCH?");
                                 LogicalChannel::Stch
                             } else {
+                                // EN 300 392-2 clause 23.8.4.1.4: for NTS2
+                                // on an assigned traffic uplink, Block2 is
+                                // TCH unless the first-half MAC header says
+                                // the second half is stolen. A stale local CP
+                                // marker after a floor grant must not consume
+                                // valid speech as signalling.
                                 LogicalChannel::TchS
                             }
                         } else {

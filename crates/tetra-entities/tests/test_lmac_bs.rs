@@ -382,6 +382,59 @@ fn bs_lmac_recovers_seq2_block2_tch_s_after_hangtime_cp_marker_lag() {
 }
 
 #[test]
+fn bs_lmac_preserves_seq2_block2_as_tch_s_even_if_bits_decode_as_stch_without_stolen_marker() {
+    debug::setup_logging_verbose();
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { h: 0, m: 1, f: 1, t: 3 }));
+    test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+    mark_all_ul_timeslots_as_signalling(&mut test);
+
+    let stch_like_bits = errorcontrol::encode_cp(TmvUnitdataReq {
+        mac_block: BitBuffer::new(124),
+        logical_channel: LogicalChannel::Stch,
+        scrambling_code: test_scrambling_code(),
+    })
+    .expect("test STCH-like half-slot should encode");
+    let mut expected_raw = vec![0u8; stch_like_bits.get_len()];
+    let mut stch_like_bits_for_read = stch_like_bits.clone();
+    stch_like_bits_for_read.to_bitarr(&mut expected_raw);
+
+    test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq2,
+        PhyBlockNum::Block2,
+        stch_like_bits,
+    ));
+    test.deliver_all_messages();
+
+    let sinks = test.dump_sinks();
+    let traffic: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    let control: Vec<_> = sinks
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "EN 300 392-2 clause 23.8.4.1.4: without an explicit second-half-stolen marker, NTS2 Block2 shall be interpreted as TCH even if the bits could decode as STCH"
+    );
+    assert!(
+        control.is_empty(),
+        "NTS2 Block2 without a stolen marker must not be consumed as STCH control"
+    );
+    assert_eq!(traffic[0].raw_tch_s_block, Some(PhyBlockNum::Block2));
+    assert_eq!(traffic[0].data, expected_raw);
+}
+
+#[test]
 fn bs_lmac_ignores_stale_blk2_stolen_marker_for_later_tch_s_block2() {
     debug::setup_logging_verbose();
 
