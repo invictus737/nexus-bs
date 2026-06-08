@@ -137,6 +137,16 @@ struct PendingGroupTxCeasedTailDrain {
     started_at: TdmaTime,
 }
 
+struct PendingGroupFloorActivation {
+    call_id: u16,
+    source_issi: u32,
+    dest_gssi: u32,
+    ts: u8,
+    reporters: Vec<TxReporter>,
+    notify_brew: bool,
+    started_at: TdmaTime,
+}
+
 struct PendingIndividualConnectAck {
     reporter: TxReporter,
     stage: PendingIndividualConnectAckStage,
@@ -194,6 +204,8 @@ pub struct CcBsSubentity {
     pending_individual_tx_ceased_tail_drains: HashMap<u16, PendingIndividualTxCeasedTailDrain>,
     /// Group-call TX-CEASED/floor idle signalling waiting for traffic tail bits.
     pending_group_tx_ceased_tail_drains: HashMap<u16, PendingGroupTxCeasedTailDrain>,
+    /// Group-call positive D-TX GRANTED deliveries waiting before U-plane activation.
+    pending_group_floor_activations: HashMap<u16, PendingGroupFloorActivation>,
     /// Direct private-call setup delivery guards before caller authorization.
     pending_individual_connect_acks: HashMap<u16, PendingIndividualConnectAck>,
     /// Brew-bridged individual connect waiting for the local RF leg to acknowledge D-CONNECT/D-CONNECT ACK.

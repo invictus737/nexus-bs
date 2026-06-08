@@ -1411,6 +1411,72 @@ fn count_d_tx_granted(msgs: &[SapMsg]) -> usize {
         .count()
 }
 
+fn d_tx_granted_reporter(msgs: &[SapMsg], target_addr: TetraAddress, transmission_grant: TransmissionGrant) -> tetra_core::TxReporter {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address == target_addr => parse_d_tx_granted(prim).and_then(|pdu| {
+                (pdu.transmission_grant == transmission_grant.into_raw() as u8)
+                    .then(|| prim.tx_reporter.as_ref().expect("D-TX GRANTED should carry TxReporter").clone())
+            }),
+            _ => None,
+        })
+        .expect("expected D-TX GRANTED reporter")
+}
+
+fn transmit_positive_group_grants_and_drain(test: &mut ComponentTest, msgs: &[SapMsg]) -> Vec<SapMsg> {
+    let mut transmitted = 0;
+    for msg in msgs {
+        let SapMsgInner::LcmcMleUnitdataReq(prim) = &msg.msg else {
+            continue;
+        };
+        let Some(grant) = parse_d_tx_granted(prim) else {
+            continue;
+        };
+        if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 {
+            prim.tx_reporter
+                .as_ref()
+                .expect("positive group D-TX GRANTED should carry TxReporter")
+                .mark_transmitted();
+            transmitted += 1;
+        }
+    }
+    assert!(transmitted > 0, "expected at least one positive group D-TX GRANTED reporter");
+    test.run_stack(Some(1));
+    test.dump_sinks()
+}
+
+fn transmit_positive_group_grant_and_assert_floor(
+    test: &mut ComponentTest,
+    msgs: &[SapMsg],
+    requester_addr: TetraAddress,
+    call_id: u16,
+    source_issi: u32,
+    dest_gssi: u32,
+    ts: u8,
+) -> Vec<SapMsg> {
+    let requester_reporter = d_tx_granted_reporter(msgs, requester_addr, TransmissionGrant::Granted);
+    assert_eq!(requester_reporter.get_state(), TxState::Pending);
+    requester_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi: got_source_issi,
+                dest_gssi: got_dest_gssi,
+                ts: got_ts,
+            }) if *got_call_id == call_id
+                && *got_source_issi == source_issi
+                && *got_dest_gssi == dest_gssi
+                && *got_ts == ts
+        )
+    }));
+    activation_msgs
+}
+
 fn count_d_tx_interrupt(msgs: &[SapMsg]) -> usize {
     msgs.iter()
         .filter(|msg| matches!(&msg.msg, SapMsgInner::LcmcMleUnitdataReq(prim) if parse_d_tx_interrupt(prim).is_some()))
@@ -2502,7 +2568,16 @@ fn test_network_group_call_end_from_active_network_speaker_enters_hangtime_witho
     let demand_msgs = test.dump_sinks();
     assert_eq!(count_d_releases(&demand_msgs), 0);
     assert!(count_d_tx_granted(&demand_msgs) >= 1);
-    assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
+        &mut test,
+        &demand_msgs,
+        TetraAddress::issi(TEST_ISSI),
+        call_id,
+        TEST_ISSI,
+        TEST_GSSI,
+        ts,
+    );
 }
 
 #[test]
@@ -2671,7 +2746,7 @@ fn test_network_group_local_retake_after_network_end_does_not_transfer_call_owne
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
 
     let brew_uuid = uuid::Uuid::new_v4();
-    let (call_id, _, setup_msgs) = start_network_group_call(&mut test, brew_uuid, TEST_CALLED_ISSI, TEST_GSSI, 7);
+    let (call_id, ts, setup_msgs) = start_network_group_call(&mut test, brew_uuid, TEST_CALLED_ISSI, TEST_GSSI, 7);
     assert_eq!(count_network_call_end(&setup_msgs, brew_uuid), 0);
 
     test.submit_message(build_network_call_end_msg(brew_uuid));
@@ -2684,7 +2759,16 @@ fn test_network_group_local_retake_after_network_end_does_not_transfer_call_owne
     test.run_stack(Some(1));
     let demand_msgs = test.dump_sinks();
     assert!(count_d_tx_granted(&demand_msgs) >= 1);
-    assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
+        &mut test,
+        &demand_msgs,
+        TetraAddress::issi(TEST_ISSI),
+        call_id,
+        TEST_ISSI,
+        TEST_GSSI,
+        ts,
+    );
     assert_eq!(count_network_call_end(&demand_msgs, brew_uuid), 0);
 
     test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
@@ -4394,7 +4478,7 @@ fn test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout
         }),
         "later repeated U-SETUP contenders must not jump ahead of the first queued floor requester"
     );
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
 
@@ -4421,7 +4505,7 @@ fn test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout
         }),
         "second FIFO handoff must still produce only requester and GSSI listener grants"
     );
-    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 0);
     assert_eq!(count_d_releases(&second_handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&second_handoff_msgs), 0);
 }
@@ -4497,8 +4581,17 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
 
     assert_eq!(
         count_umac_floor_granted(&repeated_msgs),
-        1,
-        "current-speaker repeated setup must refresh the UMAC speaker mapping"
+        0,
+        "current-speaker repeated setup must wait for positive D-TX GRANTED transmission before refreshing UMAC"
+    );
+    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
+        &mut test,
+        &repeated_msgs,
+        TetraAddress::issi(TEST_ISSI),
+        active_call_id,
+        TEST_ISSI,
+        TEST_GSSI,
+        active_ts,
     );
     assert_eq!(count_umac_call_ended_or_close(&repeated_msgs), 0);
 }
@@ -4597,8 +4690,17 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
     );
     assert_eq!(
         count_umac_floor_granted(&repeated_msgs),
-        1,
-        "hangtime retake must hand the existing traffic floor to the requester"
+        0,
+        "hangtime retake must wait for positive D-TX GRANTED transmission before UMAC floor activation"
+    );
+    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
+        &mut test,
+        &repeated_msgs,
+        TetraAddress::issi(TEST_CALLED_ISSI),
+        active_call_id,
+        TEST_CALLED_ISSI,
+        TEST_GSSI,
+        active_ts,
     );
 
     run_group_late_entry_resend_tick(&mut test, dltime);
@@ -5237,8 +5339,10 @@ fn test_group_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_g
             assert_compact_d_tx_granted_facch(prim, grant);
         }
 
-        assert_eq!(count_umac_floor_granted(&demand_msgs), 1, "priority {tx_demand_priority}");
-        assert!(demand_msgs.iter().any(|msg| {
+        assert_eq!(count_umac_floor_granted(&demand_msgs), 0, "priority {tx_demand_priority}");
+        let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &demand_msgs);
+        assert_eq!(count_umac_floor_granted(&activation_msgs), 1, "priority {tx_demand_priority}");
+        assert!(activation_msgs.iter().any(|msg| {
             matches!(
                 &msg.msg,
                 SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -5309,8 +5413,10 @@ fn test_large_group_preemptive_grant_removes_requester_from_fifo_before_next_han
     test.run_stack(Some(1));
     let preempt_msgs = test.dump_sinks();
     assert_eq!(count_d_tx_interrupt(&preempt_msgs), 2);
-    assert_eq!(count_umac_floor_granted(&preempt_msgs), 1);
-    assert!(preempt_msgs.iter().any(|msg| {
+    assert_eq!(count_umac_floor_granted(&preempt_msgs), 0);
+    let preempt_activation = transmit_positive_group_grants_and_drain(&mut test, &preempt_msgs);
+    assert_eq!(count_umac_floor_granted(&preempt_activation), 1);
+    assert!(preempt_activation.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -5361,7 +5467,9 @@ fn test_large_group_preemptive_grant_removes_requester_from_fifo_before_next_han
     }));
     assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
     assert_eq!(count_umac_floor_released(&handoff_msgs), 0);
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+    let handoff_activation = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&handoff_activation), 1);
 }
 
 #[test]
@@ -5539,8 +5647,10 @@ fn test_group_tx_ceased_hands_floor_to_queued_requester() {
         "queued handoff should grant the next speaker instead of entering no-speaker hangtime"
     );
     assert_eq!(count_umac_floor_released(&ceased_msgs), 0);
-    assert_eq!(count_umac_floor_granted(&ceased_msgs), 1);
-    assert!(ceased_msgs.iter().any(|msg| {
+    assert_eq!(count_umac_floor_granted(&ceased_msgs), 0);
+    let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &ceased_msgs);
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -5669,7 +5779,9 @@ fn test_large_group_floor_handoff_uses_one_gssi_listener_grant() {
             UlDlAssignment::Dl,
             "large group listener grant",
         );
-        assert_eq!(count_umac_floor_granted(&handoff_msgs), 1, "cycle {cycle}");
+        assert_eq!(count_umac_floor_granted(&handoff_msgs), 0, "cycle {cycle}");
+        let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+        assert_eq!(count_umac_floor_granted(&activation_msgs), 1, "cycle {cycle}");
         assert_eq!(count_d_releases(&handoff_msgs), 0, "cycle {cycle}");
         assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0, "cycle {cycle}");
 
@@ -5781,7 +5893,9 @@ fn test_large_group_duplicate_queued_u_tx_demand_is_idempotent_before_handoff() 
         }),
         "duplicate requester handoff should notify listeners once via GSSI"
     );
-    assert_eq!(count_umac_floor_granted(&first_handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&first_handoff_msgs), 0);
+    let first_activation = transmit_positive_group_grants_and_drain(&mut test, &first_handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&first_activation), 1);
     assert_eq!(count_d_releases(&first_handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&first_handoff_msgs), 0);
 
@@ -5818,7 +5932,9 @@ fn test_large_group_duplicate_queued_u_tx_demand_is_idempotent_before_handoff() 
                 && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)),
         "duplicate requester must not remain in the FIFO for a second self-handoff"
     );
-    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 0);
+    let second_activation = transmit_positive_group_grants_and_drain(&mut test, &second_handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&second_activation), 1);
     assert_eq!(count_d_releases(&second_handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&second_handoff_msgs), 0);
 }
@@ -5931,7 +6047,9 @@ fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
         }),
         "later requesters must not jump ahead of the first queued floor requester"
     );
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+    let handoff_activation = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&handoff_activation), 1);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
 
@@ -5958,7 +6076,9 @@ fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
         }),
         "FIFO handoff must not skip to later large-group requesters"
     );
-    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 0);
+    let second_handoff_activation = transmit_positive_group_grants_and_drain(&mut test, &second_handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&second_handoff_activation), 1);
 
     let mut current_fifo_speaker = second_queued_requester;
     for expected_next_speaker in (first_issi + 3)..(first_issi + member_count) {
@@ -6010,7 +6130,9 @@ fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
         assert_eq!(count_d_tx_ceased(&drain_msgs), 0);
         assert_eq!(count_umac_call_ended_or_close(&drain_msgs), 0);
         assert_eq!(count_umac_floor_released(&drain_msgs), 0);
-        assert_eq!(count_umac_floor_granted(&drain_msgs), 1);
+        assert_eq!(count_umac_floor_granted(&drain_msgs), 0);
+        let drain_activation = transmit_positive_group_grants_and_drain(&mut test, &drain_msgs);
+        assert_eq!(count_umac_floor_granted(&drain_activation), 1);
         current_fifo_speaker = expected_next_speaker;
     }
 
@@ -6105,7 +6227,9 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
         .find(|(prim, _)| prim.main_address == TetraAddress::issi(first_waiter))
         .expect("overflow denial must not disturb the head of the FIFO");
     assert_eq!(first_handoff.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+    let first_activation = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&first_activation), 1);
 
     // Once the head waiter is granted, the bounded FIFO has capacity again.
     // A previously denied requester may retry and enter the tail, but it must
@@ -6167,7 +6291,9 @@ fn test_large_group_floor_fifo_overflow_returns_not_granted_after_4096_waiters()
         }),
         "overflow retry must wait behind the already queued FIFO users"
     );
-    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&second_handoff_msgs), 0);
+    let second_activation = transmit_positive_group_grants_and_drain(&mut test, &second_handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&second_activation), 1);
 }
 
 #[test]
@@ -6271,7 +6397,9 @@ fn test_ten_thousand_member_group_floor_overflow_is_explicit_and_private_call_st
         }),
         "only the FIFO head and GSSI listeners should receive the first handoff after 10k overflow"
     );
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+    let handoff_activation = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&handoff_activation), 1);
     assert_eq!(count_d_releases(&handoff_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&handoff_msgs), 0);
 
@@ -6569,7 +6697,18 @@ fn test_group_ul_inactivity_hands_floor_to_queued_requester() {
         "UL inactivity queued handoff",
     );
 
-    assert!(timeout_msgs.iter().any(|msg| {
+    assert_eq!(
+        count_umac_floor_granted(&timeout_msgs),
+        0,
+        "queued timeout handoff must wait until the positive D-TX GRANTED is transmitted"
+    );
+    let requester_reporter = d_tx_granted_reporter(&timeout_msgs, TetraAddress::issi(LAB_ISSI_B), TransmissionGrant::Granted);
+    assert_eq!(requester_reporter.get_state(), TxState::Pending);
+    requester_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -6639,7 +6778,18 @@ fn test_group_ul_inactivity_regrants_current_speaker_once_before_tx_ceased() {
         1,
         "regrant must not repeat listener notifications while the floor owner is unchanged"
     );
-    assert!(first_timeout_msgs.iter().any(|msg| {
+    assert_eq!(
+        count_umac_floor_granted(&first_timeout_msgs),
+        0,
+        "current-speaker regrant must wait until the positive D-TX GRANTED is transmitted"
+    );
+    let regrant_reporter = d_tx_granted_reporter(&first_timeout_msgs, TetraAddress::issi(LAB_ISSI_B), TransmissionGrant::Granted);
+    assert_eq!(regrant_reporter.get_state(), TxState::Pending);
+    regrant_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -6746,7 +6896,9 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     );
     assert_eq!(count_d_tx_ceased(&handoff_to_b_msgs), 0);
     assert_eq!(count_umac_floor_released(&handoff_to_b_msgs), 0);
-    assert!(handoff_to_b_msgs.iter().any(|msg| {
+    assert_eq!(count_umac_floor_granted(&handoff_to_b_msgs), 0);
+    let handoff_to_b_activation = transmit_positive_group_grants_and_drain(&mut test, &handoff_to_b_msgs);
+    assert!(handoff_to_b_activation.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -6826,7 +6978,9 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     );
     assert_eq!(count_d_tx_ceased(&handoff_to_a_msgs), 0);
     assert_eq!(count_umac_floor_released(&handoff_to_a_msgs), 0);
-    assert!(handoff_to_a_msgs.iter().any(|msg| {
+    assert_eq!(count_umac_floor_granted(&handoff_to_a_msgs), 0);
+    let handoff_to_a_activation = transmit_positive_group_grants_and_drain(&mut test, &handoff_to_a_msgs);
+    assert!(handoff_to_a_activation.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -6870,7 +7024,9 @@ fn test_group_226333_alternating_ptt_round_trip_queues_not_denies() {
     assert_eq!(count_d_tx_ceased(&current_speaker_retry_msgs), 0);
     assert_eq!(count_umac_floor_released(&current_speaker_retry_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&current_speaker_retry_msgs), 0);
-    assert_eq!(count_umac_floor_granted(&current_speaker_retry_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&current_speaker_retry_msgs), 0);
+    let retry_activation = transmit_positive_group_grants_and_drain(&mut test, &current_speaker_retry_msgs);
+    assert_eq!(count_umac_floor_granted(&retry_activation), 1);
 }
 
 #[test]
@@ -6963,7 +7119,9 @@ fn test_group_226333_three_local_members_listener_grants_exclude_new_speaker() {
         );
     }
 
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+    let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
     assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
 }
 
@@ -7085,7 +7243,9 @@ fn test_group_local_listener_floor_grant_fanout_threshold() {
             }),
             "new local speaker must not receive GrantedToOtherUser as an ISSI copy"
         );
-        assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+        assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+        let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+        assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
         assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
     }
 }
@@ -7419,7 +7579,9 @@ fn test_group_tx_ceased_skips_deaffiliated_front_waiter_and_grants_next_fifo_wai
         }),
         "deaffiliated front waiter must not receive the handoff"
     );
-    assert_eq!(count_umac_floor_granted(&ceased_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&ceased_msgs), 0);
+    let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &ceased_msgs);
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
     assert_eq!(count_d_tx_ceased(&ceased_msgs), 0);
 }
 
@@ -7497,7 +7659,9 @@ fn test_group_queued_requester_u_tx_ceased_withdraws_before_handoff() {
         }),
         "withdrawn queued requester must not receive a later floor grant"
     );
-    assert_eq!(count_umac_floor_granted(&handoff_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&handoff_msgs), 0);
+    let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &handoff_msgs);
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
     assert_eq!(count_d_tx_ceased(&handoff_msgs), 0);
 }
 
@@ -7685,8 +7849,19 @@ fn test_group_tx_ceased_tail_drain_then_grants_requester_queued_during_tail() {
     );
     assert_eq!(count_d_tx_ceased(&tail_msgs), 0);
     assert_eq!(count_umac_floor_released(&tail_msgs), 0);
-    assert_eq!(count_umac_floor_granted(&tail_msgs), 1);
-    assert!(tail_msgs.iter().any(|msg| {
+    assert_eq!(
+        count_umac_floor_granted(&tail_msgs),
+        0,
+        "tail-drained queued group handoff must wait until positive D-TX GRANTED is transmitted"
+    );
+
+    let requester_reporter = d_tx_granted_reporter(&tail_msgs, TetraAddress::issi(TEST_CALLED_ISSI), TransmissionGrant::Granted);
+    assert_eq!(requester_reporter.get_state(), TxState::Pending);
+    requester_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -7700,6 +7875,225 @@ fn test_group_tx_ceased_tail_drain_then_grants_requester_queued_during_tail() {
                 && *ts == active_ts
         )
     }));
+}
+
+#[test]
+fn test_group_226333_same_speaker_retake_during_tx_ceased_tail_defers_positive_grant() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_MXP600, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let retake_msgs = test.dump_sinks();
+
+    let queued_grant = retake_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("same-speaker fast retake during group tail drain should receive a queued response");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "same-speaker group retake queued during TX-CEASED tail",
+    );
+    assert_eq!(
+        count_umac_floor_granted(&retake_msgs),
+        0,
+        "same-speaker retake must not reopen U-plane before the previous U-TX CEASED tail settles"
+    );
+    assert_eq!(count_umac_floor_released(&retake_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&retake_msgs), 0);
+    assert_eq!(count_d_setups(&retake_msgs), 0);
+    assert_eq!(count_d_call_proceedings(&retake_msgs), 0);
+    assert_eq!(count_d_connects(&retake_msgs), 0);
+    assert_eq!(count_umac_open(&retake_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&retake_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let grant_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_setups(&grant_msgs),
+        0,
+        "same-speaker tail retake must not inject late-entry D-SETUP in the same burst as the deferred positive floor grant"
+    );
+    let grants: Vec<_> = grant_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    let requester_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("same-speaker retake should receive positive floor after tail drain");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        requester_grant.0,
+        &requester_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "same-speaker group retake positive grant after TX-CEASED tail",
+    );
+    for listener_issi in [LAB_ISSI_A, LAB_ISSI_MXP600] {
+        let listener_grant = grants
+            .iter()
+            .find(|(prim, _)| prim.main_address == TetraAddress::issi(listener_issi))
+            .unwrap_or_else(|| panic!("listener ISSI {listener_issi} should be informed after same-speaker retake"));
+        assert_eq!(
+            listener_grant.1.transmission_grant,
+            TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        );
+        assert_d_tx_granted_facch_allocation(
+            listener_grant.0,
+            &listener_grant.1,
+            active_ts,
+            active_usage,
+            UlDlAssignment::Dl,
+            "same-speaker group retake listener grant after TX-CEASED tail",
+        );
+    }
+    assert_eq!(count_d_tx_ceased(&grant_msgs), 0);
+    assert_eq!(count_umac_floor_released(&grant_msgs), 0);
+    assert_eq!(
+        count_umac_floor_granted(&grant_msgs),
+        0,
+        "positive group grant must not open U-plane until the D-TX GRANTED reporter is transmitted"
+    );
+
+    let requester_reporter = d_tx_granted_reporter(&grant_msgs, TetraAddress::issi(LAB_ISSI_B), TransmissionGrant::Granted);
+    assert_eq!(requester_reporter.get_state(), TxState::Pending);
+    requester_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == LAB_ISSI_B
+                && *dest_gssi == LAB_GROUP_GSSI
+                && *ts == active_ts
+        )
+    }));
+
+    test.run_stack(Some(2));
+    let stale_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&stale_msgs), 0);
+    assert_eq!(count_umac_floor_released(&stale_msgs), 0);
+}
+
+#[test]
+fn test_group_226333_same_speaker_repeated_setup_during_tx_ceased_tail_defers_positive_grant() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+    register_subscriber(&mut test, LAB_ISSI_A, LAB_GROUP_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit_for(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let _ceased_start_msgs = test.dump_sinks();
+
+    test.submit_message(build_u_setup_msg(LAB_ISSI_B, LAB_GROUP_GSSI));
+    test.run_stack(Some(1));
+    let repeated_setup_msgs = test.dump_sinks();
+
+    let queued_grant = repeated_setup_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("same-speaker repeated U-SETUP during group tail drain should receive a queued response");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "same-speaker repeated U-SETUP queued during group TX-CEASED tail",
+    );
+    assert_eq!(count_d_setups(&repeated_setup_msgs), 0);
+    assert_eq!(count_d_call_proceedings(&repeated_setup_msgs), 0);
+    assert_eq!(count_d_connects(&repeated_setup_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&repeated_setup_msgs), 0);
+    assert_eq!(count_umac_floor_released(&repeated_setup_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let grant_msgs = test.dump_sinks();
+    let requester_grant = grant_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(LAB_ISSI_B))
+        .expect("same-speaker repeated U-SETUP should receive positive floor after tail drain");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        requester_grant.0,
+        &requester_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "same-speaker repeated U-SETUP positive grant after group TX-CEASED tail",
+    );
+    assert_eq!(count_d_tx_ceased(&grant_msgs), 0);
+    assert_eq!(count_umac_floor_released(&grant_msgs), 0);
+    assert_eq!(
+        count_umac_floor_granted(&grant_msgs),
+        0,
+        "positive repeated-setup group grant must wait for RF transmission before U-plane activation"
+    );
+
+    let requester_reporter = d_tx_granted_reporter(&grant_msgs, TetraAddress::issi(LAB_ISSI_B), TransmissionGrant::Granted);
+    assert_eq!(requester_reporter.get_state(), TxState::Pending);
+    requester_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
 }
 
 #[test]
@@ -7755,7 +8149,18 @@ fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
             && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
     }));
     assert_one_group_d_info_reset_t310(&demand_msgs, call_id, TEST_GSSI, active_ts, active_usage, "hangtime floor retake");
-    assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
+    assert_eq!(
+        count_umac_floor_granted(&demand_msgs),
+        0,
+        "hangtime floor retake must wait until positive D-TX GRANTED is transmitted"
+    );
+
+    let requester_reporter = d_tx_granted_reporter(&demand_msgs, TetraAddress::issi(TEST_CALLED_ISSI), TransmissionGrant::Granted);
+    assert_eq!(requester_reporter.get_state(), TxState::Pending);
+    requester_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
 
     run_group_late_entry_resend_tick(&mut test, dltime);
     let backup_msgs = test.dump_sinks();
@@ -8554,7 +8959,9 @@ fn test_group_floor_holder_without_d_info_ownership_cannot_disconnect_call() {
     test.run_stack(Some(1));
     let demand_msgs = test.dump_sinks();
     assert!(count_d_tx_granted(&demand_msgs) >= 1);
-    assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+    let activation_msgs = transmit_positive_group_grants_and_drain(&mut test, &demand_msgs);
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
 
     test.submit_message(build_u_disconnect_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));

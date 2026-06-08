@@ -1244,6 +1244,80 @@ fn test_group_floor_handoff_reopens_ul_traffic_for_lmac_tch_s_decode() {
 }
 
 #[test]
+fn test_group_same_speaker_floor_retake_reopens_ul_traffic_for_lmac_tch_s_decode() {
+    debug::setup_logging_verbose();
+
+    let gssi = 226333;
+    let speaker = 2260082;
+    let call_id = 79;
+    let traffic_ts = 2;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut umac_test = ComponentTest::new(StackMode::Bs, Some(start));
+    umac_test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    umac_test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, speaker, traffic_ts));
+    umac_test.run_stack(Some(2));
+    let _ = umac_test.dump_sinks();
+
+    umac_test.submit_message(floor_released_msg(call_id, traffic_ts));
+    umac_test.run_stack(Some(2));
+    let _ = umac_test.dump_sinks();
+
+    umac_test.submit_message(floor_granted_msg(call_id, speaker, gssi, traffic_ts));
+    umac_test.run_stack(Some(10));
+    let umac_msgs = umac_test.dump_sinks();
+
+    let granted_traffic_slot = umac_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == traffic_ts => Some(slot),
+            _ => None,
+        })
+        .find(|slot| slot.ul_phy_chan == PhysicalChannel::Tp)
+        .cloned()
+        .expect("same-speaker FloorGranted after hangtime must schedule the group UL timeslot as traffic/TP");
+
+    let mut lmac_test = ComponentTest::new(StackMode::Bs, Some(granted_traffic_slot.ts.add_timeslots(2)));
+    lmac_test.populate_entities(vec![TetraEntity::Lmac], vec![TetraEntity::Umac]);
+    lmac_test.run_stack(Some(1));
+    let _ = lmac_test.dump_sinks();
+
+    lmac_test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Lmac,
+        msg: SapMsgInner::TmvUnitdataReq(granted_traffic_slot),
+    });
+    lmac_test.deliver_all_messages();
+    let _ = lmac_test.dump_sinks();
+
+    let codec_bits = acelp_test_bits();
+    lmac_test.submit_message(build_uplink_tch_s_ind(
+        TrainingSequence::NormalTrainSeq1,
+        PhyBlockNum::Both,
+        encoded_tch_s(&codec_bits, 1),
+    ));
+    lmac_test.deliver_all_messages();
+
+    let lmac_msgs = lmac_test.dump_sinks();
+    let traffic: Vec<_> = lmac_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmdCircuitDataInd(ind) => Some(ind),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        traffic.len(),
+        1,
+        "same-speaker group retake must leave LMAC in traffic mode so valid TCH/S reaches UMAC"
+    );
+    assert_eq!(traffic[0].ts, traffic_ts);
+    assert_eq!(traffic[0].data, codec_bits);
+    assert_eq!(traffic[0].raw_tch_s_block, None);
+}
+
+#[test]
 fn test_private_simplex_ul_voice_loopback_preserves_tch_s_bits() {
     debug::setup_logging_verbose();
 

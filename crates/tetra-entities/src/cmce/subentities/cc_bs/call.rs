@@ -202,6 +202,10 @@ impl ActiveCall {
             return TxDemandQueueResult::FromCurrentSpeaker;
         }
 
+        self.queue_tx_demand_after_cease_tail(requester)
+    }
+
+    pub(super) fn queue_tx_demand_after_cease_tail(&mut self, requester: TetraAddress) -> TxDemandQueueResult {
         if self.queued_floor_demand_ssis.contains(&requester.ssi) {
             return TxDemandQueueResult::AlreadyQueuedBySameUser;
         }

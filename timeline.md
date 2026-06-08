@@ -12175,6 +12175,71 @@ RF gate:
 2. If timeout shows `accepted_ul_media_since_floor=0`, the BS did not accept any valid TCH/S after grant; inspect LMAC/PHY grant delivery and uplink decode.
 3. If timeout shows `accepted_ul_media_since_floor>0`, the BS accepted media but did not refresh/reroute it correctly; inspect UMAC deferred raw TCH/S flushing and DL scheduling.
 
+## 2026-06-08 22:51 EEST - Group floor grant reporter gate for rapid 2260082 PTT
+
+Field context:
+
+- User reported that two rapid PTT presses from Motorola `2260082` on local GSSI `226333` could kill group voice / leave static.
+- Previous RF logs showed `D-TX GRANTED(Granted)` to `2260082` and immediate internal UMAC `FloorGranted`, followed by `accepted_ul_media_since_floor=0`.
+- The concrete race is CMCE/UMAC ordering: CMCE was opening the local U-plane as soon as it queued the positive grant, before the requester-positive `D-TX GRANTED` was actually transmitted by UMAC/STCH.
+
+Component explanation:
+
+- CMCE group floor control is the call-control state machine that decides which ISSI is allowed to talk in a group call.
+- `D-TX GRANTED(Granted)` is the air-interface permission sent to the requesting terminal.
+- UMAC `FloorGranted` is Nexus-BS internal state that lets the lower layers accept and route that terminal's uplink voice.
+- For rapid PTT retakes, UMAC must not accept speech before the positive grant has really left the BS on RF.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1 makes group transmission permission a SwMI-controlled floor-control decision carried by `D-TX GRANTED`.
+- EN 300 392-2 clauses 23.5 and 23.8.5 require assigned-channel signalling and speech bearer timing to remain ordered.
+- This patch is clause-scoped engineering hardening for local group floor control only. It is not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`
+  - Added `PendingGroupFloorActivation`.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added `queue_group_floor_activation()` and `drain_pending_group_floor_activations()`.
+  - Emits UMAC/Brew `FloorGranted` only after a positive requester `D-TX GRANTED` `TxReporter` reports transmitted.
+  - Suppresses the internal floor activation if the positive grant is discarded.
+  - Cancels pending activation on group release or new group TX-ceased tail drain.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - Local group positive grant paths now create a reporter and queue the floor activation:
+    current-speaker reassert, preemptive group grant, hangtime/no-active-speaker retake, and queued requester handoff.
+  - Same-speaker rapid retake during a pending group `U-TX CEASED` tail is answered as `RequestQueued`; positive grant is deferred until the tail drain completes.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Drains pending group floor activations at CMCE tick start.
+  - Suppresses late-entry `D-SETUP` resend and UL inactivity timeout while a group floor activation is pending.
+  - Group UL-inactivity handoff/regrant now uses the same reporter-gated activation.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated group tests to assert: positive `D-TX GRANTED` first, no immediate UMAC `FloorGranted`, then `FloorGranted` after reporter transmission.
+  - Added/kept RF-specific regressions for `226333`, rapid same-speaker retake, repeated `U-SETUP`, large FIFO groups, deaffiliation, withdrawal, network-hangtime local retake, and P2P non-regression.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added same-speaker group retake media-path guard proving UMAC/LMAC reopens the traffic/TP uplink path after `FloorGranted`.
+
+Read-only agent audit:
+
+- ETSI/UMAC audit confirmed no remaining early `FloorGranted` in active local group positive `D-TX GRANTED` paths.
+- Remaining direct `FloorGranted` paths are outside this local group-positive-grant scope: initial group setup, network-origin group speaker start, echo/parrot, and protected private-simplex/P2P paths.
+- P2P/private simplex was intentionally not changed because protected RF-good checkpoints `63c3b2f` / `87b8f11` remain the baseline for private simplex.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 179 tests.
+- `cargo test -p tetra-entities --test test_umac_bs --locked` passed: 88 tests.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_same_speaker_floor_retake_reopens_ul_traffic_for_lmac_tch_s_decode --locked` passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+- `rustfmt --edition 2024` was run on the touched Rust files.
+
+Next RF gate after deploy:
+
+1. Clean/restart deployed BS and test local GSSI `226333` with `2260082`, `2260616`, and `2260618`.
+2. Required field behaviour: rapid 2x PTT from `2260082` must not leave static/no-voice and must not kill the group floor state.
+3. Watch for `accepted_ul_media_since_floor` after each grant. If it remains `0`, continue below CMCE at real RF grant decode / LMAC / PHY timing; the local group positive-grant race is now guarded by reporter delivery.
+
 ## 2026-06-08 21:20 EEST - Group U-TX CEASED tail-drain before FloorReleased
 
 Field context:

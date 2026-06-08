@@ -61,6 +61,7 @@ impl CcBsSubentity {
             pending_individual_disconnect_release_acks: HashMap::new(),
             pending_individual_tx_ceased_tail_drains: HashMap::new(),
             pending_group_tx_ceased_tail_drains: HashMap::new(),
+            pending_group_floor_activations: HashMap::new(),
             pending_individual_connect_acks: HashMap::new(),
             pending_network_individual_connects: HashMap::new(),
             pending_individual_releases: HashMap::new(),
@@ -206,6 +207,7 @@ impl CcBsSubentity {
                 + self.pending_individual_disconnect_release_acks.len()
                 + self.pending_individual_tx_ceased_tail_drains.len()
                 + self.pending_group_tx_ceased_tail_drains.len()
+                + self.pending_group_floor_activations.len()
                 + self.pending_individual_connect_acks.len()
                 + self.pending_individual_releases.len()
                 + 4,
@@ -220,6 +222,7 @@ impl CcBsSubentity {
         ids.extend(self.pending_individual_disconnect_release_acks.keys().copied());
         ids.extend(self.pending_individual_tx_ceased_tail_drains.keys().copied());
         ids.extend(self.pending_group_tx_ceased_tail_drains.keys().copied());
+        ids.extend(self.pending_group_floor_activations.keys().copied());
         ids.extend(self.pending_individual_connect_acks.keys().copied());
         ids.extend(self.pending_individual_releases.keys().copied());
         ids.extend(self.circuits.active_call_ids());
@@ -443,7 +446,7 @@ impl CcBsSubentity {
         Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(sdu, address, ts, usage, ul_dl_assigned, reporter, None)
     }
 
-    fn build_sapmsg_stealing_ul_dl_reported_with_repetitions(
+    pub(super) fn build_sapmsg_stealing_ul_dl_reported_with_repetitions(
         sdu: BitBuffer,
         address: TetraAddress,
         ts: u8,
@@ -1191,6 +1194,7 @@ impl CcBsSubentity {
             tracing::debug!("CMCE: group TX-CEASED tail drain already pending for call_id={}", call_id);
             return;
         }
+        self.cancel_group_floor_activation(call_id, "group speaker sent U-TX CEASED");
 
         tracing::debug!(
             "CMCE: delaying group TX-CEASED/floor idle call_id={} sender ISSI {} GSSI {} for {} timeslots of TCH tail drain",
@@ -1235,6 +1239,164 @@ impl CcBsSubentity {
             return false;
         }
         self.cancel_group_tx_ceased_tail_drain(call_id, reason)
+    }
+
+    pub(super) fn has_pending_group_floor_activation(&self, call_id: u16) -> bool {
+        self.pending_group_floor_activations.contains_key(&call_id)
+    }
+
+    pub(super) fn cancel_group_floor_activation(&mut self, call_id: u16, reason: &str) -> bool {
+        if let Some(pending) = self.pending_group_floor_activations.remove(&call_id) {
+            tracing::debug!(
+                "CMCE: cancelling pending group floor activation call_id={} source ISSI {} because {}",
+                pending.call_id,
+                pending.source_issi,
+                reason
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn queue_group_floor_activation(
+        &mut self,
+        call_id: u16,
+        source_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        reporter: TxReporter,
+        notify_brew: bool,
+    ) {
+        // EN 300 392-2 clause 14.5.2.2.1 makes D-TX GRANTED the SwMI's
+        // air-interface floor authorization. Keep UMAC/Brew U-plane activation
+        // behind the positive requester grant reaching MAC, so a rapid PTT
+        // retake cannot start local speech acceptance before the MS has been
+        // told to transmit.
+        if let Some(pending) = self.pending_group_floor_activations.get_mut(&call_id) {
+            if pending.source_issi == source_issi && pending.dest_gssi == dest_gssi && pending.ts == ts {
+                pending.reporters.push(reporter);
+                pending.notify_brew |= notify_brew;
+                return;
+            }
+            tracing::debug!(
+                "CMCE: replacing pending group floor activation call_id={} old ISSI {} -> new ISSI {}",
+                call_id,
+                pending.source_issi,
+                source_issi
+            );
+        }
+
+        self.pending_group_floor_activations.insert(
+            call_id,
+            PendingGroupFloorActivation {
+                call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+                reporters: vec![reporter],
+                notify_brew,
+                started_at: self.dltime,
+            },
+        );
+    }
+
+    pub(super) fn drain_pending_group_floor_activations(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<(u16, bool)> = self
+            .pending_group_floor_activations
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.reporters.iter().any(TxReporter::is_transmitted) {
+                    Some((call_id, true))
+                } else if !pending.reporters.is_empty() && pending.reporters.iter().all(TxReporter::is_discarded) {
+                    Some((call_id, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (call_id, was_transmitted) in ready {
+            let Some(pending) = self.pending_group_floor_activations.remove(&call_id) else {
+                continue;
+            };
+
+            if was_transmitted {
+                self.complete_group_floor_activation(queue, pending);
+                continue;
+            }
+
+            tracing::warn!(
+                "CMCE: suppressing group FloorGranted call_id={} source ISSI {} because positive D-TX GRANTED was discarded before transmission",
+                pending.call_id,
+                pending.source_issi
+            );
+            if let Some(call) = self.active_calls.get_mut(&pending.call_id)
+                && call.is_current_speaker(pending.source_issi)
+                && call.dest_gssi == pending.dest_gssi
+                && call.ts == pending.ts
+            {
+                call.enter_hangtime(self.dltime);
+            }
+        }
+    }
+
+    fn complete_group_floor_activation(&mut self, queue: &mut MessageQueue, pending: PendingGroupFloorActivation) {
+        let Some(call) = self.active_calls.get(&pending.call_id) else {
+            tracing::debug!(
+                "CMCE: dropping pending group floor activation call_id={} source ISSI {}; call no longer active",
+                pending.call_id,
+                pending.source_issi
+            );
+            return;
+        };
+        if !call.is_current_speaker(pending.source_issi) || call.dest_gssi != pending.dest_gssi || call.ts != pending.ts {
+            tracing::debug!(
+                "CMCE: dropping stale group floor activation call_id={} source ISSI {} dest GSSI {} ts {}; active call is source ISSI {} dest GSSI {} ts {}",
+                pending.call_id,
+                pending.source_issi,
+                pending.dest_gssi,
+                pending.ts,
+                call.source_issi,
+                call.dest_gssi,
+                call.ts
+            );
+            return;
+        }
+
+        tracing::info!(
+            "CMCE: group floor activation call_id={} source ISSI {} dest GSSI {} ts={} after D-TX GRANTED transmission",
+            pending.call_id,
+            pending.source_issi,
+            pending.dest_gssi,
+            pending.ts
+        );
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: pending.call_id,
+                source_issi: pending.source_issi,
+                dest_gssi: pending.dest_gssi,
+                ts: pending.ts,
+            }),
+        });
+
+        if pending.notify_brew {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id: pending.call_id,
+                    source_issi: pending.source_issi,
+                    dest_gssi: pending.dest_gssi,
+                    ts: pending.ts,
+                }),
+            });
+        }
     }
 
     pub(super) fn drain_pending_group_tx_ceased_tail_drains(&mut self, queue: &mut MessageQueue) {
@@ -1299,7 +1461,7 @@ impl CcBsSubentity {
                 requester.ssi
             );
 
-            self.fsm_send_d_tx_granted_individual(
+            let reporter = self.fsm_send_d_tx_granted_individual_reported(
                 queue,
                 pending.call_id,
                 requester,
@@ -1325,31 +1487,14 @@ impl CcBsSubentity {
                 speaker_issi: requester.ssi,
             });
 
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id: pending.call_id,
-                    source_issi: requester.ssi,
-                    dest_gssi: pending.dest_gssi,
-                    ts: pending.ts,
-                }),
-            });
-
-            if pending.notify_brew {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id: pending.call_id,
-                        source_issi: requester.ssi,
-                        dest_gssi: pending.dest_gssi,
-                        ts: pending.ts,
-                    }),
-                });
-            }
+            self.queue_group_floor_activation(
+                pending.call_id,
+                requester.ssi,
+                pending.dest_gssi,
+                pending.ts,
+                reporter,
+                pending.notify_brew,
+            );
             return;
         }
 
@@ -2462,6 +2607,7 @@ impl CcBsSubentity {
         preclosed_circuit: Option<CmceCircuit>,
     ) {
         self.cancel_group_tx_ceased_tail_drain(call_id, "group release started");
+        self.cancel_group_floor_activation(call_id, "group release started");
 
         if self.pending_group_releases.contains_key(&call_id) {
             tracing::debug!("CMCE: group release already pending for call_id={}", call_id);

@@ -57,6 +57,54 @@ impl CcBsSubentity {
         transmission_grant: TransmissionGrant,
         _transmitting_party_issi: Option<u32>,
     ) {
+        self.fsm_send_d_tx_granted_individual_inner(
+            queue,
+            call_id,
+            target_addr,
+            ts,
+            usage,
+            transmission_grant,
+            _transmitting_party_issi,
+            None,
+        );
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_send_d_tx_granted_individual_reported(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        target_addr: TetraAddress,
+        ts: u8,
+        usage: u8,
+        transmission_grant: TransmissionGrant,
+        transmitting_party_issi: Option<u32>,
+    ) -> TxReporter {
+        debug_assert_eq!(transmission_grant, TransmissionGrant::Granted);
+        let reporter = TxReporter::new_unacked();
+        self.fsm_send_d_tx_granted_individual_inner(
+            queue,
+            call_id,
+            target_addr,
+            ts,
+            usage,
+            transmission_grant,
+            transmitting_party_issi,
+            Some(reporter.clone()),
+        );
+        reporter
+    }
+
+    fn fsm_send_d_tx_granted_individual_inner(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        target_addr: TetraAddress,
+        ts: u8,
+        usage: u8,
+        transmission_grant: TransmissionGrant,
+        _transmitting_party_issi: Option<u32>,
+        reporter: Option<TxReporter>,
+    ) {
         // EN 300 392-2 table 14.18 makes transmitting-party IEs optional.
         // Keep group floor responses compact so D-TX GRANTED fits on
         // assigned-channel FACCH/STCH rather than falling back to SCH/F while
@@ -97,7 +145,15 @@ impl CcBsSubentity {
         } else {
             UlDlAssignment::Dl
         };
-        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, target_addr, ts, Some(usage), ul_dl_assigned, Some(0));
+        let msg = Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(
+            sdu,
+            target_addr,
+            ts,
+            Some(usage),
+            ul_dl_assigned,
+            reporter,
+            Some(0),
+        );
         queue.push_back(msg);
     }
 
@@ -150,6 +206,10 @@ impl CcBsSubentity {
             return Ok(());
         }
 
+        if self.fsm_group_queue_same_speaker_retake_during_tx_ceased_tail(queue, call_id, speaker, ts, usage, current_speaker)? {
+            return Ok(());
+        }
+
         let Some(cached) = self.cached_setups.get(&call_id) else {
             return Err(GroupTransitionError::MissingCachedSetup(call_id));
         };
@@ -163,35 +223,26 @@ impl CcBsSubentity {
         // as an existing-call re-entry is not treated as unsolicited floor
         // signalling; this confirms that the already-current speaker still has
         // transmit permission and refreshes the local traffic scheduler.
-        self.fsm_send_d_tx_granted_individual(queue, call_id, speaker, ts, usage, TransmissionGrant::Granted, Some(speaker.ssi));
+        let reporter = self.fsm_send_d_tx_granted_individual_reported(
+            queue,
+            call_id,
+            speaker,
+            ts,
+            usage,
+            TransmissionGrant::Granted,
+            Some(speaker.ssi),
+        );
         self.send_group_listener_d_tx_granted_facch(queue, call_id, speaker.ssi, dest_addr.ssi, ts, usage);
         self.send_group_d_info_reset_t310_facch(queue, call_id, dest_addr.ssi, ts, usage);
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id,
-                source_issi: speaker.ssi,
-                dest_gssi: dest_addr.ssi,
-                ts,
-            }),
-        });
-
-        if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: speaker.ssi,
-                    dest_gssi: dest_addr.ssi,
-                    ts,
-                }),
-            });
-        }
+        self.queue_group_floor_activation(
+            call_id,
+            speaker.ssi,
+            dest_addr.ssi,
+            ts,
+            reporter,
+            net_brew::is_brew_gssi_routable(&self.config, dest_ssi),
+        );
 
         Ok(())
     }
@@ -240,6 +291,19 @@ impl CcBsSubentity {
             return Ok(());
         }
 
+        if current_speaker == requesting_party.ssi
+            && self.fsm_group_queue_same_speaker_retake_during_tx_ceased_tail(
+                queue,
+                call_id,
+                requesting_party,
+                ts,
+                usage,
+                current_speaker,
+            )?
+        {
+            return Ok(());
+        }
+
         let interruption_enabled = self.config.config().cell.transmission_interruption_enabled;
         let may_preempt = matches!(state, GroupCallState::Transmitting)
             && current_speaker != requesting_party.ssi
@@ -282,7 +346,7 @@ impl CcBsSubentity {
                 TransmissionGrant::GrantedToOtherUser,
             );
 
-            self.fsm_send_d_tx_granted_individual(
+            let reporter = self.fsm_send_d_tx_granted_individual_reported(
                 queue,
                 call_id,
                 requesting_party,
@@ -301,31 +365,14 @@ impl CcBsSubentity {
                 speaker_issi: requesting_party.ssi,
             });
 
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: requesting_party.ssi,
-                    dest_gssi: dest_addr.ssi,
-                    ts,
-                }),
-            });
-
-            if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: requesting_party.ssi,
-                        dest_gssi: dest_addr.ssi,
-                        ts,
-                    }),
-                });
-            }
+            self.queue_group_floor_activation(
+                call_id,
+                requesting_party.ssi,
+                dest_addr.ssi,
+                ts,
+                reporter,
+                net_brew::is_brew_gssi_routable(&self.config, dest_ssi),
+            );
 
             return Ok(());
         }
@@ -384,7 +431,7 @@ impl CcBsSubentity {
         }
 
         // NoActiveSpeaker -> Transmitting transition with granted floor.
-        self.fsm_send_d_tx_granted_individual(
+        let reporter = self.fsm_send_d_tx_granted_individual_reported(
             queue,
             call_id,
             requesting_party,
@@ -404,33 +451,63 @@ impl CcBsSubentity {
             speaker_issi: requesting_party.ssi,
         });
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id,
-                source_issi: requesting_party.ssi,
-                dest_gssi: dest_addr.ssi,
-                ts,
-            }),
-        });
-
-        if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: requesting_party.ssi,
-                    dest_gssi: dest_addr.ssi,
-                    ts,
-                }),
-            });
-        }
+        self.queue_group_floor_activation(
+            call_id,
+            requesting_party.ssi,
+            dest_addr.ssi,
+            ts,
+            reporter,
+            net_brew::is_brew_gssi_routable(&self.config, dest_ssi),
+        );
 
         Ok(())
+    }
+
+    fn fsm_group_queue_same_speaker_retake_during_tx_ceased_tail(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        requester: TetraAddress,
+        ts: u8,
+        usage: u8,
+        current_speaker: u32,
+    ) -> Result<bool, GroupTransitionError> {
+        let matching_tail = self
+            .pending_group_tx_ceased_tail_drains
+            .get(&call_id)
+            .is_some_and(|pending| pending.sender.ssi == requester.ssi && pending.ts == ts);
+        if !matching_tail {
+            return Ok(false);
+        }
+
+        let queue_result = {
+            let Some(call) = self.active_calls.get_mut(&call_id) else {
+                return Err(GroupTransitionError::UnknownCall(call_id));
+            };
+            call.queue_tx_demand_after_cease_tail(requester)
+        };
+
+        let transmission_grant = match queue_result {
+            TxDemandQueueResult::Queued | TxDemandQueueResult::AlreadyQueuedBySameUser => TransmissionGrant::RequestQueued,
+            TxDemandQueueResult::QueueBusy => TransmissionGrant::NotGranted,
+            TxDemandQueueResult::FromCurrentSpeaker => TransmissionGrant::RequestQueued,
+        };
+
+        tracing::info!(
+            "FSM: same-speaker group retake call_id={} ISSI {} during TX-CEASED tail drain -> {:?}; positive grant deferred until tail completes",
+            call_id,
+            requester.ssi,
+            transmission_grant
+        );
+
+        // EN 300 392-2 clause 14.5.2.2.1 e) lets the SwMI grant a queued
+        // requester after U-TX CEASED without an explicit D-TX CEASED. While
+        // the previous transmission is still tail-draining, answer the fast
+        // same-speaker retake as queued so the old lower-layer cease cannot
+        // switch the MS U-plane off after a new positive grant.
+        self.fsm_send_d_tx_granted_individual(queue, call_id, requester, ts, usage, transmission_grant, Some(current_speaker));
+
+        Ok(true)
     }
 
     pub(in crate::cmce::subentities::cc_bs) fn fsm_group_on_tx_ceased(
@@ -497,7 +574,7 @@ impl CcBsSubentity {
         let dest_addr = cached.dest_addr;
 
         if let Some(requester) = queued_request {
-            self.fsm_send_d_tx_granted_individual(
+            let reporter = self.fsm_send_d_tx_granted_individual_reported(
                 queue,
                 call_id,
                 requester,
@@ -517,31 +594,14 @@ impl CcBsSubentity {
                 speaker_issi: requester.ssi,
             });
 
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: requester.ssi,
-                    dest_gssi: dest_addr.ssi,
-                    ts,
-                }),
-            });
-
-            if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: requester.ssi,
-                        dest_gssi: dest_addr.ssi,
-                        ts,
-                    }),
-                });
-            }
+            self.queue_group_floor_activation(
+                call_id,
+                requester.ssi,
+                dest_addr.ssi,
+                ts,
+                reporter,
+                net_brew::is_brew_gssi_routable(&self.config, dest_ssi),
+            );
             return Ok(());
         }
 

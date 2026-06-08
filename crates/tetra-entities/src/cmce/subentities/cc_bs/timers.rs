@@ -36,6 +36,7 @@ impl CcBsSubentity {
         self.dltime = dltime;
         self.drain_pending_individual_tx_ceased_tail_drains(queue);
         self.drain_pending_group_tx_ceased_tail_drains(queue);
+        self.drain_pending_group_floor_activations(queue);
         self.drain_pending_individual_disconnect_tail_drains(queue);
         self.drain_pending_group_releases(queue);
         self.drain_pending_individual_releases(queue);
@@ -59,6 +60,20 @@ impl CcBsSubentity {
                     CircuitMgrCmd::SendDSetup(call_id, usage, ts) => {
                         if self.pending_group_releases.contains_key(&call_id) {
                             tracing::debug!("CMCE: suppressing D-SETUP resend for pending group release call_id={}", call_id);
+                            continue;
+                        }
+                        if self.pending_group_tx_ceased_tail_drains.contains_key(&call_id) {
+                            tracing::debug!(
+                                "CMCE: suppressing D-SETUP resend for pending group TX-CEASED tail drain call_id={}",
+                                call_id
+                            );
+                            continue;
+                        }
+                        if self.has_pending_group_floor_activation(call_id) {
+                            tracing::debug!(
+                                "CMCE: suppressing D-SETUP resend for pending group floor activation call_id={}",
+                                call_id
+                            );
                             continue;
                         }
                         if self.has_pending_individual_release(call_id) {
@@ -645,6 +660,14 @@ impl CcBsSubentity {
             );
             return;
         }
+        if self.has_pending_group_floor_activation(call_id) {
+            tracing::debug!(
+                "UL inactivity timeout on ts={} ignored for pending group floor activation call_id={}",
+                ts,
+                call_id
+            );
+            return;
+        }
 
         let (dest_gssi, usage, queued_request) = {
             let call = self.active_calls.get(&call_id).unwrap();
@@ -676,7 +699,7 @@ impl CcBsSubentity {
             // group request after the current transmission ceases. Treat the
             // local inactivity guard as the cease event; do not require a
             // second U-TX DEMAND from the waiting MS.
-            self.fsm_send_d_tx_granted_individual(
+            let reporter = self.fsm_send_d_tx_granted_individual_reported(
                 queue,
                 call_id,
                 requester,
@@ -695,31 +718,14 @@ impl CcBsSubentity {
                 speaker_issi: requester.ssi,
             });
 
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Umac,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                    call_id,
-                    source_issi: requester.ssi,
-                    dest_gssi,
-                    ts,
-                }),
-            });
-
-            if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: requester.ssi,
-                        dest_gssi,
-                        ts,
-                    }),
-                });
-            }
+            self.queue_group_floor_activation(
+                call_id,
+                requester.ssi,
+                dest_gssi,
+                ts,
+                reporter,
+                net_brew::is_brew_gssi_routable(&self.config, dest_gssi),
+            );
         } else {
             let (current_speaker, regrant_current_speaker) = {
                 let call = self.active_calls.get_mut(&call_id).unwrap();
@@ -741,7 +747,7 @@ impl CcBsSubentity {
                 // the uplink may have been corrupted. Keep this bounded to one
                 // regrant per floor epoch; do not re-notify group listeners,
                 // because the floor owner has not changed.
-                self.fsm_send_d_tx_granted_individual(
+                let reporter = self.fsm_send_d_tx_granted_individual_reported(
                     queue,
                     call_id,
                     TetraAddress::issi(current_speaker),
@@ -751,17 +757,14 @@ impl CcBsSubentity {
                     Some(current_speaker),
                 );
 
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Umac,
-                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                        call_id,
-                        source_issi: current_speaker,
-                        dest_gssi,
-                        ts,
-                    }),
-                });
+                self.queue_group_floor_activation(
+                    call_id,
+                    current_speaker,
+                    dest_gssi,
+                    ts,
+                    reporter,
+                    net_brew::is_brew_gssi_routable(&self.config, dest_gssi),
+                );
                 return;
             }
 
