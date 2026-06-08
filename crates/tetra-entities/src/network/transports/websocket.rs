@@ -19,6 +19,7 @@ use super::{NetworkAddress, NetworkError, NetworkMessage, NetworkTransport};
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const BREW_V1: u8 = 1;
 
 // ─── Configuration ────────────────────────────────────────────────
 
@@ -306,7 +307,7 @@ pub struct WebSocketTransport {
     last_ping_sent_at: Option<Instant>,
     last_ping_id: Option<u64>,
     ping_seq: u64,
-    /// Brew protocol version reported by server in last HTTP connect response (0 = v0/unknown)
+    /// Brew protocol version requested and used by this transport.
     server_brew_version: u8,
 }
 
@@ -321,7 +322,7 @@ impl WebSocketTransport {
             last_ping_sent_at: None,
             last_ping_id: None,
             ping_seq: 0,
-            server_brew_version: 0,
+            server_brew_version: BREW_V1,
         }
     }
 
@@ -482,6 +483,8 @@ impl NetworkTransport for WebSocketTransport {
             .uri(&ws_url)
             .header("Host", format!("{}:{}", self.config.host, self.config.port))
             .header("User-Agent", &self.config.user_agent)
+            .header("X-Brew-Version", BREW_V1.to_string())
+            .header("X-Brew-Mode", "Basestation")
             .header("Connection", "Upgrade")
             .header("Upgrade", "websocket")
             .header("Sec-WebSocket-Key", websocket_key)
@@ -521,9 +524,8 @@ impl NetworkTransport for WebSocketTransport {
         let (ws, _response) = tungstenite::client_tls_with_config(request, tcp, None, connector)
             .map_err(|e| NetworkError::ConnectionFailed(format!("WebSocket connect failed: {}", e)))?;
 
-        // Start at v0 — actual version is detected from message length (mnemonic presence).
-        self.server_brew_version = 0;
-        tracing::info!("WebSocketTransport: connected, Brew version TBD (detected from message length)");
+        self.server_brew_version = BREW_V1;
+        tracing::info!("WebSocketTransport: connected, using Brew v{}", self.server_brew_version);
 
         tracing::debug!("WebSocketTransport: WebSocket connected");
 
@@ -703,5 +705,33 @@ impl NetworkTransport for WebSocketTransport {
 
     fn server_brew_version(&self) -> u8 {
         self.server_brew_version
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_config() -> WebSocketTransportConfig {
+        WebSocketTransportConfig {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            use_tls: false,
+            custom_root_certs: None,
+            basic_auth_credentials: None,
+            digest_auth_credentials: None,
+            endpoint_path: "/brew/".to_string(),
+            subprotocol: Some("brew".to_string()),
+            user_agent: tetra_core::PRODUCT_USER_AGENT.to_string(),
+            heartbeat_interval: Duration::from_secs(10),
+            heartbeat_timeout: Duration::from_secs(30),
+        }
+    }
+
+    #[test]
+    fn websocket_transport_reports_requested_brew_v1_by_default() {
+        let transport = WebSocketTransport::new(test_config());
+
+        assert_eq!(transport.server_brew_version(), 1);
     }
 }

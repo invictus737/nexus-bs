@@ -385,7 +385,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                         priority,
                         service,
                     } => {
-                        let msg = build_group_tx(&uuid, source_issi, dest_gssi, priority, service, None);
+                        let msg = build_group_tx(&uuid, source_issi, dest_gssi, priority, service, Some(&EMPTY_BREW_MNEMONIC));
                         if let Err(e) = self.transport.send_reliable(&msg) {
                             tracing::error!("BrewWorker: failed to send GROUP_TX: {}", e);
                         } else {

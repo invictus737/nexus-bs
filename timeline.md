@@ -11732,3 +11732,53 @@ Next:
 
 - Continue RF Parrot test with Hytera `2260616 -> 99999`.
 - If low-level PHY burst evidence is needed again, temporarily run with debug logging or add a bounded/rate-limited diagnostic, not high-rate `INFO`.
+
+## 2026-06-08 11:50 EEST - Brew v1 wire-format hardening for external group audio
+
+Field context:
+
+- User reported dashboard showing `Brew v0`, but current TetraPack Brew documentation requires client-side `X-Brew-Version: 1`.
+- RF group call from `2260082` to Brew-routable GSSI `22699` signalled correctly, but no audio reached Brew externally.
+- Live logs showed `GROUP_TX`/floor signalling succeeded and one transmit epoch reached `frames=43`, while TetraPack returned repeated `server error type=0`.
+- Brew error type `0` is `BREW_TYPE_MALFORMED`, so the failure points to Brew wire-format compatibility, not a CMCE group-floor denial.
+
+Clause/protocol scope:
+
+- No ETSI air-interface CMCE/UMAC/P2P/Parrot behavior was changed.
+- ETSI-side behavior remains the existing EN 300 392-2 group-call floor model: local RF group calls notify Brew on `FloorGranted`; user-plane media is forwarded only after valid decoded ACELP TCH/S.
+- Changed only the external Brew/TetraPack interconnect serialization and dashboard-reported negotiated Brew version.
+
+Patch:
+
+- `crates/tetra-entities/src/network/transports/websocket.rs`
+  - WebSocket transport now reports requested Brew v1 by default instead of v0/unknown.
+  - WebSocket upgrade request now includes `X-Brew-Version: 1` and `X-Brew-Mode: Basestation`, matching the discovery GET headers.
+- `crates/tetra-entities/src/net_brew/protocol.rs`
+  - Added `EMPTY_BREW_MNEMONIC`.
+  - `GROUP_TX` v1 with a zero-length mnemonic is still parsed as v1 when the 34-byte field is present.
+  - `SETUP_REQUEST` now always serializes the v1 34-byte mnemonic field; `CONNECT_REQUEST` remains without mnemonic.
+- `crates/tetra-entities/src/net_brew/worker.rs`
+  - Outbound `GROUP_TX` now sends the v1 layout with the empty 34-byte mnemonic field.
+- `crates/tetra-entities/src/net_brew/entity.rs`
+  - Outbound voice frames are now 36-byte STE frames with header bit 7 set (`0x80`) and final unused tail bits set (`0x3f`).
+  - Brew voice `length_bits` now describes the full 36-byte STE payload (`288` bits), not only the 274 ACELP speech bits.
+- Release identity bumped from `v0.1.58` to `v0.1.59` across workspace metadata, dashboard/control/telemetry protocol strings, README and example config.
+
+Verification:
+
+- `cargo fmt --all` passed.
+- `git diff --check` passed.
+- `cargo test -p tetra-entities --lib network::transports::websocket --locked` passed.
+- `cargo test -p tetra-entities --lib net_brew --locked` passed: 31 tests.
+- `cargo test -p tetra-core --locked product_identity_tracks_workspace_version` passed.
+- `cargo test -p tetra-entities --lib net_control --locked` passed: 22 tests.
+- `cargo test -p tetra-entities --lib net_telemetry --locked` passed: 8 passed, 5 ignored.
+- `cargo test -p tetra-entities --lib net_dashboard --locked` passed: 53 tests.
+- `cargo check -p tetra-core -p tetra-entities --tests --locked` passed.
+
+Next deploy/test:
+
+1. Deploy with `scripts/nexus-bs-test-deploy.sh` only; build locally, deploy directly to `/home/chris/nexus-bs/nexus-bs`, no remote binary backup.
+2. Confirm dashboard shows `Brew v1` after reconnect.
+3. RF test: `2260082` group call to GSSI `22699`; expected Brew logs should no longer show repeated `server error type=0` for 56-byte voice frames.
+4. If `frames=0` still appears, inspect whether LMAC produced only raw Block2 half-slot media for that transmit epoch; do not change P2P/Parrot while debugging this.

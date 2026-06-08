@@ -30,7 +30,11 @@ use super::worker::{BrewCommand, BrewEvent, BrewWorker};
 
 /// Hangtime before releasing group call circuit to allow reuse without re-signaling.
 const GROUP_CALL_HANGTIME_DEFAULT_SECS: u64 = 5;
-const TETRA_ACELP_TCH_S_BITS: u16 = 274;
+const TETRA_ACELP_TCH_S_BITS: usize = 274;
+const BREW_STE_FRAME_BYTES: usize = 36;
+const BREW_STE_FRAME_BITS: u16 = (BREW_STE_FRAME_BYTES * 8) as u16;
+const BREW_STE_HEADER_NORMAL_SPEECH: u8 = 0x80;
+const BREW_STE_UNUSED_TAIL_MASK: u8 = 0x3f;
 
 // ─── Active call tracking ─────────────────────────────────────────
 
@@ -1516,47 +1520,50 @@ impl BrewEntity {
 
         fwd.frame_count += 1;
 
-        // Convert ACELP bits to STE format.
-        // Supported inputs:
-        //   - 274 bytes (1-bit-per-byte) → pack to 35 bytes + header
-        //   - 35 bytes (already packed) → prepend header
-        //   - 36 bytes (already STE with header) → send as-is
-        let ste_data = if acelp_bits.len() == 36 {
-            acelp_bits
-        } else if acelp_bits.len() == 35 {
-            let mut ste = Vec::with_capacity(36);
-            ste.push(0x00); // STE header byte: normal speech frame
-            ste.extend_from_slice(&acelp_bits);
-            ste
-        } else {
-            if acelp_bits.len() < 274 {
-                tracing::warn!("BrewEntity: UL voice too short: {} bits", acelp_bits.len());
-                return;
-            }
-
-            // Pack 274 bits into bytes, MSB first, prepend STE header
-            let mut ste = Vec::with_capacity(36);
-            ste.push(0x00); // STE header byte: normal speech frame
-
-            // Pack 274 bits (1-per-byte) into 35 bytes (280 bits, last 6 bits padded)
-            for chunk_idx in 0..35 {
-                let mut byte = 0u8;
-                for bit in 0..8 {
-                    let bit_idx = chunk_idx * 8 + bit;
-                    if bit_idx < 274 {
-                        byte |= (acelp_bits[bit_idx] & 1) << (7 - bit);
-                    }
-                }
-                ste.push(byte);
-            }
-            ste
+        let Some(ste_data) = Self::build_brew_ste_voice_frame(&acelp_bits) else {
+            tracing::warn!("BrewEntity: UL voice too short: {} bits", acelp_bits.len());
+            return;
         };
 
         let _ = self.command_sender.send(BrewCommand::SendVoiceFrame {
             uuid: fwd.uuid,
-            length_bits: TETRA_ACELP_TCH_S_BITS,
+            length_bits: BREW_STE_FRAME_BITS,
             data: ste_data,
         });
+    }
+
+    fn build_brew_ste_voice_frame(acelp_bits: &[u8]) -> Option<Vec<u8>> {
+        if acelp_bits.len() == BREW_STE_FRAME_BYTES {
+            let mut ste = acelp_bits.to_vec();
+            ste[0] = (ste[0] | BREW_STE_HEADER_NORMAL_SPEECH) & 0xfc;
+            ste[BREW_STE_FRAME_BYTES - 1] |= BREW_STE_UNUSED_TAIL_MASK;
+            return Some(ste);
+        }
+
+        let packed_payload = if acelp_bits.len() == BREW_STE_FRAME_BYTES - 1 {
+            acelp_bits.to_vec()
+        } else if acelp_bits.len() >= TETRA_ACELP_TCH_S_BITS {
+            let mut packed = Vec::with_capacity(BREW_STE_FRAME_BYTES - 1);
+            for chunk_idx in 0..(BREW_STE_FRAME_BYTES - 1) {
+                let mut byte = 0u8;
+                for bit in 0..8 {
+                    let bit_idx = chunk_idx * 8 + bit;
+                    if bit_idx < TETRA_ACELP_TCH_S_BITS {
+                        byte |= (acelp_bits[bit_idx] & 1) << (7 - bit);
+                    }
+                }
+                packed.push(byte);
+            }
+            packed
+        } else {
+            return None;
+        };
+
+        let mut ste = Vec::with_capacity(BREW_STE_FRAME_BYTES);
+        ste.push(BREW_STE_HEADER_NORMAL_SPEECH);
+        ste.extend_from_slice(&packed_payload);
+        ste[BREW_STE_FRAME_BYTES - 1] |= BREW_STE_UNUSED_TAIL_MASK;
+        Some(ste)
     }
 }
 
@@ -1788,7 +1795,7 @@ mod tests {
     use tetra_core::{TdmaTime, TxReporter};
     use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 
-    use super::BrewEntity;
+    use super::{BREW_STE_FRAME_BITS, BREW_STE_FRAME_BYTES, BREW_STE_HEADER_NORMAL_SPEECH, BREW_STE_UNUSED_TAIL_MASK, BrewEntity};
     use crate::net_brew::worker::{BrewCommand, BrewEvent};
 
     fn brew_test_config() -> SharedConfig {
@@ -2035,6 +2042,46 @@ mod tests {
                 assert_eq!(service, 0);
             }
             other => panic!("expected SendGroupTx, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn local_group_ul_voice_is_sent_as_brew_v1_ste_frame() {
+        let (mut entity, rx) = brew_entity_without_worker();
+
+        entity.handle_local_call_start(7, 2260082, 22699, 2);
+        let group_uuid = match rx.try_recv().expect("GSSI 22699 GROUP_TX must be forwarded") {
+            BrewCommand::SendGroupTx {
+                uuid,
+                source_issi,
+                dest_gssi,
+                priority,
+                service,
+            } => {
+                assert_eq!(source_issi, 2260082);
+                assert_eq!(dest_gssi, 22699);
+                assert_eq!(priority, 0);
+                assert_eq!(service, 0);
+                uuid
+            }
+            other => panic!("expected SendGroupTx, got {other:?}"),
+        };
+
+        let acelp_bits: Vec<u8> = (0..274).map(|idx| (idx % 2) as u8).collect();
+        entity.handle_ul_voice(2, acelp_bits);
+
+        match rx.try_recv().expect("UL ACELP must be forwarded as Brew voice") {
+            BrewCommand::SendVoiceFrame { uuid, length_bits, data } => {
+                assert_eq!(uuid, group_uuid);
+                assert_eq!(length_bits, BREW_STE_FRAME_BITS);
+                assert_eq!(data.len(), BREW_STE_FRAME_BYTES);
+                assert_eq!(data[0], BREW_STE_HEADER_NORMAL_SPEECH);
+                assert_eq!(
+                    data[BREW_STE_FRAME_BYTES - 1] & BREW_STE_UNUSED_TAIL_MASK,
+                    BREW_STE_UNUSED_TAIL_MASK
+                );
+            }
+            other => panic!("expected SendVoiceFrame, got {other:?}"),
         }
     }
 

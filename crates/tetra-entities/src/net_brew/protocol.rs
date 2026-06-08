@@ -51,6 +51,10 @@ const CIRCULAR_CALL_LEN: usize = 4 + 4 + CIRCULAR_NUMBER_LEN + 11;
 pub const BREW_TYPE_MALFORMED: u8 = 0;
 pub const BREW_TYPE_RESTRICTED: u8 = 1;
 
+/// Brew v1 carries SS-TPI mnemonic slots on GROUP_TX and SETUP_REQUEST.
+/// A zero-length mnemonic is still encoded as the full 34-byte field.
+pub const EMPTY_BREW_MNEMONIC: [u8; 34] = [0; 34];
+
 // ─── Parsed message types ─────────────────────────────────────────
 
 /// Top-level parsed Brew message
@@ -306,8 +310,7 @@ fn parse_call_control(call_state: u8, data: &[u8]) -> Result<BrewMessage, BrewPa
             if payload_data.len() < 12 {
                 return Err(BrewParseError::TooShort(data.len()));
             }
-            let mnemonic = if payload_data.len() >= 46 && payload_data[13] > 0 {
-                // byte 12 = coding scheme, byte 13 = length in bits; 0 bits = no mnemonic
+            let mnemonic = if payload_data.len() >= 46 {
                 let mut m = [0u8; 34];
                 m.copy_from_slice(&payload_data[12..46]);
                 Some(m)
@@ -338,11 +341,7 @@ fn parse_call_control(call_state: u8, data: &[u8]) -> Result<BrewMessage, BrewPa
             if payload_data.len() < CIRCULAR_CALL_LEN {
                 return Err(BrewParseError::TooShort(data.len()));
             }
-            let mnemonic = if call_state == CALL_STATE_SETUP_REQUEST
-                && payload_data.len() >= CIRCULAR_CALL_LEN + 34
-                && payload_data[CIRCULAR_CALL_LEN + 1] > 0
-            {
-                // byte 0 = coding scheme, byte 1 = length in bits; 0 bits = no mnemonic
+            let mnemonic = if call_state == CALL_STATE_SETUP_REQUEST && payload_data.len() >= CIRCULAR_CALL_LEN + 34 {
                 let mut m = [0u8; 34];
                 m.copy_from_slice(&payload_data[CIRCULAR_CALL_LEN..CIRCULAR_CALL_LEN + 34]);
                 Some(m)
@@ -454,8 +453,9 @@ fn parse_service(service_type: u8, data: &[u8]) -> Result<BrewMessage, BrewParse
 // ─── Circuit / individual call serializers ────────────────────────────────
 
 fn build_circular_call(call_state: u8, session_uuid: &Uuid, call: &BrewCircularCall) -> Vec<u8> {
-    // v1 mnemonic is only sent in SETUP_REQUEST, not CONNECT_REQUEST
-    let include_mnemonic = call_state == CALL_STATE_SETUP_REQUEST && call.mnemonic.is_some();
+    // Brew v1 mnemonic is present in SETUP_REQUEST, not CONNECT_REQUEST.
+    // Zero-length names are encoded as the full 34-byte empty field.
+    let include_mnemonic = call_state == CALL_STATE_SETUP_REQUEST;
     let cap = 2 + 16 + CIRCULAR_CALL_LEN + if include_mnemonic { 34 } else { 0 };
     let mut buf = Vec::with_capacity(cap);
     buf.push(BREW_CLASS_CALL_CONTROL);
@@ -476,9 +476,7 @@ fn build_circular_call(call_state: u8, session_uuid: &Uuid, call: &BrewCircularC
     buf.push(call.ownership);
     buf.push(call.queued);
     if include_mnemonic {
-        if let Some(m) = &call.mnemonic {
-            buf.extend_from_slice(m);
-        }
+        buf.extend_from_slice(call.mnemonic.as_ref().unwrap_or(&EMPTY_BREW_MNEMONIC));
     }
     buf
 }
@@ -816,6 +814,31 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_group_tx_v1_empty_mnemonic_still_detects_v1() {
+        let uuid = Uuid::new_v4();
+        let mut data = vec![BREW_CLASS_CALL_CONTROL, CALL_STATE_GROUP_TX];
+        data.extend_from_slice(uuid.as_bytes());
+        write_u32_le(&mut data, 1001);
+        write_u32_le(&mut data, 26);
+        data.push(3);
+        data.push(0);
+        write_u16_le(&mut data, 0);
+        data.extend_from_slice(&EMPTY_BREW_MNEMONIC);
+
+        let msg = parse_brew_message(&data).unwrap();
+        if let BrewMessage::CallControl(cc) = msg {
+            if let BrewCallPayload::GroupTransmission(gt) = cc.payload {
+                assert_eq!(gt.source, 1001);
+                assert_eq!(gt.mnemonic, Some(EMPTY_BREW_MNEMONIC));
+            } else {
+                panic!("Expected GroupTransmission");
+            }
+        } else {
+            panic!("Expected CallControl");
+        }
+    }
+
+    #[test]
     fn test_parse_setup_request_v1_with_mnemonic() {
         let uuid = Uuid::new_v4();
         let mut data = vec![BREW_CLASS_CALL_CONTROL, CALL_STATE_SETUP_REQUEST];
@@ -870,6 +893,43 @@ mod tests {
             }
         } else {
             panic!();
+        }
+    }
+
+    #[test]
+    fn test_build_setup_request_v1_includes_empty_mnemonic() {
+        let uuid = Uuid::new_v4();
+        let call = BrewCircularCall {
+            source: 2001,
+            destination: 3001,
+            number: "600".to_string(),
+            priority: 0,
+            service: 0,
+            mode: 0,
+            duplex: 0,
+            method: 0,
+            communication: 0,
+            grant: 0,
+            permission: 0,
+            timeout: 0,
+            ownership: 0,
+            queued: 0,
+            mnemonic: None,
+        };
+
+        let built = build_setup_request(&uuid, &call);
+        assert_eq!(built.len(), 103, "v1 SETUP_REQUEST must include the 34-byte mnemonic field");
+
+        let msg = parse_brew_message(&built).unwrap();
+        if let BrewMessage::CallControl(cc) = msg {
+            if let BrewCallPayload::CircularCall(parsed) = cc.payload {
+                assert_eq!(parsed.source, 2001);
+                assert_eq!(parsed.mnemonic, Some(EMPTY_BREW_MNEMONIC));
+            } else {
+                panic!("Expected CircularCall");
+            }
+        } else {
+            panic!("Expected CallControl");
         }
     }
 
