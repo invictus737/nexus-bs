@@ -4568,6 +4568,93 @@ fn test_group_floor_grant_stch_repeats_preserved_random_access_ack_for_requester
 }
 
 #[test]
+fn test_group_requester_d_tx_granted_stch_consumes_ready_random_access_ack() {
+    debug::setup_logging_verbose();
+
+    let first_speaker_issi = 2_260_616;
+    let requester_issi = 2_260_082;
+    let gssi = 226_333;
+    let traffic_ts = 2;
+    let call_id = 6;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(group_call_open_msg_with_secondary_speaker(gssi, first_speaker_issi, traffic_ts));
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(2));
+    let _ = test.dump_sinks();
+
+    {
+        let umac = test
+            .router
+            .get_entity(TetraEntity::Umac)
+            .expect("UMAC entity should be registered")
+            .as_any_mut()
+            .downcast_mut::<UmacBs>()
+            .expect("registered UMAC should be UmacBs");
+        umac.channel_scheduler
+            .dl_enqueue_random_access_ack(traffic_ts, TetraAddress::issi(requester_issi));
+    }
+
+    let mut timeslots = [false; 4];
+    timeslots[(traffic_ts - 1) as usize] = true;
+    let grant_reporter = TxReporter::new_unacked();
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 72,
+            pdu: d_tx_granted_sdu(call_id, TransmissionGrant::Granted),
+            main_address: TetraAddress::issi(requester_issi),
+            endpoint_id: 0,
+            pdu_prio: 0,
+            stealing_permission: true,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: Some(6),
+                timeslots,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: Some(grant_reporter.clone()),
+        }),
+    });
+
+    test.run_stack(Some(16));
+    let sink_msgs = test.dump_sinks();
+    let resources = mac_resources_for_addr(&sink_msgs, TetraAddress::issi(requester_issi));
+    let grant = resources
+        .iter()
+        .find(|(logical_channel, resource)| *logical_channel == LogicalChannel::Stch && resource.chan_alloc_element.is_some())
+        .unwrap_or_else(|| {
+            panic!(
+                "expected requester positive D-TX GRANTED STCH with channel allocation; reporter={:?}; resources={resources:?}",
+                grant_reporter.get_state()
+            )
+        });
+    assert!(
+        grant.1.random_access_flag,
+        "EN 300 392-2 clauses 21.4.3.1 and 14.5.2.2.1 b): real-ordering group requester D-TX GRANTED must acknowledge the U-TX DEMAND random access even before UMAC FloorGranted clears hangtime"
+    );
+    assert_eq!(
+        grant
+            .1
+            .chan_alloc_element
+            .as_ref()
+            .expect("grant should keep channel allocation")
+            .ul_dl_assigned,
+        UlDlAssignment::Both
+    );
+    assert_eq!(grant_reporter.get_state(), TxState::Transmitted);
+}
+
+#[test]
 fn test_large_group_ptt_storm_prioritizes_requester_grant_with_preserved_ra_ack() {
     debug::setup_logging_verbose();
 

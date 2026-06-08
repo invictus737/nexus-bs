@@ -2567,11 +2567,27 @@ impl UmacBs {
                     }
 
                     if total_len <= STCH_CAP {
-                        mac_pdu.random_access_flag = self.channel_scheduler.take_pending_ra_ack_for_stch(
-                            ts,
-                            prim.main_address,
-                            mac_pdu.chan_alloc_element.is_some() || consume_ra_ack_without_chan_alloc,
-                        );
+                        let carries_channel_allocation = mac_pdu.chan_alloc_element.is_some() || consume_ra_ack_without_chan_alloc;
+                        let is_group_requester_positive_floor_grant = d_tx_granted
+                            .as_ref()
+                            .is_some_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+                            && prim.main_address.ssi_type == SsiType::Issi
+                            && mac_pdu
+                                .chan_alloc_element
+                                .as_ref()
+                                .is_some_and(|chan_alloc| matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both))
+                            && !self.channel_scheduler.ul_circuit_is_private_participant_scoped(ts)
+                            && self
+                                .channel_scheduler
+                                .ul_circuit_primary_addr(ts)
+                                .is_some_and(|addr| addr.ssi_type == SsiType::Gssi);
+                        mac_pdu.random_access_flag = if is_group_requester_positive_floor_grant {
+                            self.channel_scheduler
+                                .take_pending_or_ready_ra_ack_for_stch(ts, prim.main_address, carries_channel_allocation)
+                        } else {
+                            self.channel_scheduler
+                                .take_pending_ra_ack_for_stch(ts, prim.main_address, carries_channel_allocation)
+                        };
                         mac_pdu.length_ind = (total_len / 8) as u8;
                         mac_pdu.fill_bits = fill_bits > 0;
 

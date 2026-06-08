@@ -536,6 +536,47 @@ impl BsChannelScheduler {
             .unwrap_or(false)
     }
 
+    fn has_pending_group_positive_floor_grant_stealing(&self, ts: u8) -> bool {
+        let Some(slot) = Self::dl_slot_index(ts, "has_pending_group_positive_floor_grant_stealing") else {
+            return false;
+        };
+        if self.ul_circuit_is_private_participant_scoped(ts) {
+            return false;
+        }
+        if !self.ul_circuit_primary_addr(ts).is_some_and(|addr| addr.ssi_type == SsiType::Gssi) {
+            return false;
+        }
+
+        self.dltx_queues[slot].iter().any(Self::stealing_is_group_positive_floor_grant)
+    }
+
+    fn stealing_is_group_positive_floor_grant(elem: &DlSchedElem) -> bool {
+        let DlSchedElem::Stealing(block, addr, _, _) = elem else {
+            return false;
+        };
+        if addr.ssi_type != SsiType::Issi {
+            return false;
+        }
+
+        let mut mac_probe = BitBuffer::from_bitbuffer(block);
+        let Ok(resource) = MacResource::from_bitbuf(&mut mac_probe) else {
+            return false;
+        };
+        let Some(chan_alloc) = resource.chan_alloc_element.as_ref() else {
+            return false;
+        };
+        if !matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both) {
+            return false;
+        }
+
+        let mac_payload = BitBuffer::from_bitbuffer_pos(&mac_probe);
+        let Some(mut cmce_payload) = Self::cmce_dl_payload_from_tma_sdu(&mac_payload) else {
+            return false;
+        };
+        DTxGranted::from_bitbuf(&mut cmce_payload)
+            .is_ok_and(|grant| grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8)
+    }
+
     fn generate_hangtime_idle_schf(&self) -> BitBuffer {
         // Full-slot SCH/F carrying a Null PDU (idle).
         let mut buf = BitBuffer::new(SCH_F_CAP);
@@ -1285,6 +1326,38 @@ impl BsChannelScheduler {
             );
             true
         }
+    }
+
+    /// Same STCH random-access acknowledgement decision as
+    /// `take_pending_ra_ack_for_stch`, but also consumes a ready ACK that is
+    /// still queued on the real downlink scheduler path. This is intentionally
+    /// used for group requester positive D-TX GRANTED only: CMCE gates UMAC
+    /// FloorGranted until that STCH is transmitted, so hangtime cleanup may not
+    /// have moved the ACK into `pending_ra_acks` yet.
+    pub fn take_pending_or_ready_ra_ack_for_stch(&mut self, ts: u8, addr: TetraAddress, carries_channel_allocation: bool) -> bool {
+        if self.take_pending_ra_ack_for_stch(ts, addr, carries_channel_allocation) {
+            return true;
+        }
+
+        let Some(slot) = Self::dl_slot_index(ts, "take_pending_or_ready_ra_ack_for_stch") else {
+            return false;
+        };
+        let Some(pos) = self.dltx_queues[slot].iter().position(
+            |elem| matches!(elem, DlSchedElem::RandomAccessAck(ack_addr) if ack_addr.ssi == addr.ssi && ack_addr.ssi_type == addr.ssi_type),
+        ) else {
+            return false;
+        };
+
+        if carries_channel_allocation {
+            self.dltx_queues[slot].remove(pos);
+        } else {
+            tracing::debug!(
+                "take_pending_or_ready_ra_ack_for_stch: mirroring ready RA ACK for {} on ts {} and preserving it until channel-allocation STCH",
+                addr,
+                ts
+            );
+        }
+        true
     }
 
     /// Enqueue a pre-built STCH block for FACCH/stealing on a traffic timeslot.
@@ -2883,6 +2956,7 @@ impl BsChannelScheduler {
 
         let dl_is_traffic = dl_circuit_active && !hang_effective;
         let ul_is_traffic = ul_circuit_active && !hang_effective;
+        let group_positive_floor_grant_pending = (2..=4).contains(&ts.t) && self.has_pending_group_positive_floor_grant_stealing(ts.t);
 
         // Build the block for this timeslot with anything scheduled (traffic or signalling)
         // For traffic timeslots, also check for FACCH/stealing (STCH half-slot)
@@ -3060,7 +3134,7 @@ impl BsChannelScheduler {
 
         // Construct the BBK block to reflect UL/DL usage
         assert!(elem.bbk.is_none(), "BBK block already set");
-        elem.bbk = Some(self.generate_bbk_block(ts));
+        elem.bbk = Some(self.generate_bbk_block_with_group_floor_grant(ts, group_positive_floor_grant_pending));
 
         // tracing::trace!("finalize_ts_for_tick: have {}{}{}",
         //     if elem.bbk.is_some() { "bbk " } else { "" },
@@ -3141,6 +3215,11 @@ impl BsChannelScheduler {
     }
 
     fn generate_bbk_block(&self, ts: TdmaTime) -> TmvUnitdataReq {
+        let group_positive_floor_grant_pending = (2..=4).contains(&ts.t) && self.has_pending_group_positive_floor_grant_stealing(ts.t);
+        self.generate_bbk_block_with_group_floor_grant(ts, group_positive_floor_grant_pending)
+    }
+
+    fn generate_bbk_block_with_group_floor_grant(&self, ts: TdmaTime, group_positive_floor_grant_pending: bool) -> TmvUnitdataReq {
         let (ul_traffic_usage, dl_traffic_usage) = if ts.f == 18 {
             (None, None)
         } else {
@@ -3208,9 +3287,10 @@ impl BsChannelScheduler {
                     // Normal operation: Traffic(usage) when a circuit is active, else Unallocated.
                     // Hangtime: immediately switch AACH to AssignedControl so radios
                     // detect the end of traffic in the same frame as D-TX CEASED.
-                    // The timeslot may still be in traffic mode (for STCH delivery) but
-                    // the AACH reflects the new channel state.
-                    let in_hangtime = (2..=4).contains(&ts.t) && self.hangtime[ts.t as usize - 1];
+                    // The individually addressed group D-TX GRANTED is the
+                    // opposite edge: it switches the granted MS U-plane on, so
+                    // AACH must advertise traffic while that STCH is delivered.
+                    let in_hangtime = (2..=4).contains(&ts.t) && self.hangtime[ts.t as usize - 1] && !group_positive_floor_grant_pending;
 
                     if in_hangtime && (dl_traffic_usage.is_some() || ul_traffic_usage.is_some()) {
                         aach.dl_usage = AccessAssignDlUsage::AssignedControl;
@@ -4165,6 +4245,26 @@ mod tests {
         );
     }
 
+    fn open_test_group_circuit(sched: &mut BsChannelScheduler, ts: u8, gssi: u32, speaker_issi: u32, usage: u8) {
+        for direction in [Direction::Dl, Direction::Ul] {
+            sched.create_circuit(
+                direction,
+                Circuit {
+                    direction,
+                    ts,
+                    peer_ts: None,
+                    usage,
+                    circuit_mode: tetra_saps::control::enums::circuit_mode_type::CircuitModeType::TchS,
+                    speech_service: Some(0),
+                    etee_encrypted: false,
+                    dl_media_source: CircuitDlMediaSource::LocalLoopback,
+                    active_addr: Some(TetraAddress::new(gssi, SsiType::Gssi)),
+                    active_secondary_addrs: vec![TetraAddress::issi(speaker_issi)],
+                },
+            );
+        }
+    }
+
     #[test]
     fn test_ts1_traffic_circuit_request_is_rejected_without_panic() {
         let mut sched = get_testing_slotter();
@@ -4766,6 +4866,96 @@ mod tests {
                 .any(|elem| matches!(elem, DlSchedElem::Stealing(_, addr, _, _) if addr.ssi != requester.ssi)),
             "lower-priority busy responses should remain queued after the requester floor grant is sent"
         );
+    }
+
+    #[test]
+    fn test_hangtime_group_positive_floor_grant_aach_advertises_traffic_for_older_ms() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+
+        let traffic_ts = 2;
+        let usage = 4;
+        let gssi = 226_333;
+        let first_speaker = 2_260_616;
+        let mtp3550_requester = TetraAddress::issi(2_260_082);
+        open_test_group_circuit(&mut sched, traffic_ts, gssi, first_speaker, usage);
+        sched.set_hangtime(traffic_ts, true);
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_granted_stch_block(mtp3550_requester, TransmissionGrant::Granted, UlDlAssignment::Both),
+            mtp3550_requester,
+            None,
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let slot = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(
+            slot.ts,
+            TdmaTime {
+                t: traffic_ts,
+                f: 2,
+                m: 1,
+                h: 0
+            }
+        );
+        assert_eq!(
+            slot.blk1.as_ref().map(|block| block.logical_channel),
+            Some(LogicalChannel::Stch),
+            "positive group D-TX GRANTED should be delivered as assigned-channel FACCH/STCH"
+        );
+        assert_eq!(
+            slot.ul_phy_chan,
+            PhysicalChannel::Tp,
+            "group requester grant should reopen the uplink traffic path for TCH/S"
+        );
+
+        let mut bbk = slot.bbk.expect("traffic slot should carry AACH").mac_block;
+        bbk.seek(0);
+        let aach = AccessAssign::from_bitbuf(&mut bbk).expect("AACH should parse");
+        assert_eq!(
+            aach.dl_usage,
+            AccessAssignDlUsage::Traffic(usage),
+            "EN 300 392-2 clauses 14.5.2.2.1 b) and 23.5: D-TX GRANTED/Granted switches U-plane on, so its FACCH slot must not advertise AssignedControl to older Motorola MSs"
+        );
+        assert_eq!(
+            aach.ul_usage,
+            AccessAssignUlUsage::Traffic(usage),
+            "EN 300 392-2 clauses 14.5.2.2.1 b) and 23.5: the granted requester must see traffic uplink on the same slot as the positive grant"
+        );
+    }
+
+    #[test]
+    fn test_hangtime_group_d_tx_ceased_aach_stays_assigned_control() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+
+        let traffic_ts = 2;
+        let gssi = 226_333;
+        let first_speaker = 2_260_082;
+        let group_addr = TetraAddress::new(gssi, SsiType::Gssi);
+        open_test_group_circuit(&mut sched, traffic_ts, gssi, first_speaker, 4);
+        sched.set_hangtime(traffic_ts, true);
+        sched.dl_enqueue_stealing(
+            traffic_ts,
+            test_d_tx_ceased_stch_block(group_addr, 7, UlDlAssignment::Dl),
+            group_addr,
+            None,
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let slot = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        let mut bbk = slot.bbk.expect("traffic slot should carry AACH").mac_block;
+        bbk.seek(0);
+        let aach = AccessAssign::from_bitbuf(&mut bbk).expect("AACH should parse");
+        assert_eq!(
+            aach.dl_usage,
+            AccessAssignDlUsage::AssignedControl,
+            "EN 300 392-2 clause 14.5.2.2.1 e): D-TX CEASED remains the floor-withdraw edge and should keep hangtime AACH in assigned-control mode"
+        );
+        assert_eq!(aach.ul_usage, AccessAssignUlUsage::AssignedOnly);
     }
 
     #[test]

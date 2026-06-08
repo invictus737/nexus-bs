@@ -1,5 +1,55 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-08 23:32 EEST - Group requester grant AACH/RA ACK hardening for Motorola MTP3550 MR19.9
+
+Component in simple technical terms:
+
+- CMCE decides which MS may talk in a GSSI group call; UMAC/MAC must then put the exact grant and access hints on the RF slot.
+- AACH is the small per-slot MAC announcement that tells terminals whether a slot is traffic or assigned-control.
+- Random access ACK is the MAC flag that confirms the terminal's `U-TX DEMAND` access was heard.
+- Field evidence narrowed the remaining group-call issue to `2260082`, Motorola MTP3550 MR19.9: CMCE/UMAC granted the floor, but `accepted_ul_media_since_floor=0` showed no valid voice reached UMAC after the grant, while `2260616` and `2260618` passed repeated PTT cycles.
+
+ETSI clause scope:
+
+- EN 300 392-2 clause 14.5.2.2.1 b) requires the SwMI to send an individually addressed `D-TX GRANTED` with `transmission granted` before the requester may transmit, and to inform other group members separately.
+- The same clause says `D-TX GRANTED/Granted` switches U-plane on for the granted MS; the RF slot carrying that grant must not simultaneously look like assigned-control hangtime to a strict older terminal.
+- EN 300 392-2 clause 21.4.3.1 defines the random-access acknowledgement flag in MAC-RESOURCE.
+- EN 300 392-2 clause 23.5 requires assigned-channel signalling and traffic timing to stay coherent on FACCH/STCH.
+- This is clause-scoped engineering hardening and focused regression evidence, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/umac/subcomp/bs_sched.rs`
+  - Added detection for pending group requester positive `D-TX GRANTED` STCH: individual ISSI address, GSSI-primary bearer, uplink-capable channel allocation, and `TransmissionGrant::Granted`.
+  - When that exact STCH is pending, AACH now advertises traffic usage instead of hangtime `AssignedControl/AssignedOnly`.
+  - `D-TX CEASED` stays on the hangtime assigned-control path so floor-withdraw semantics are unchanged.
+  - Added `take_pending_or_ready_ra_ack_for_stch` so a group requester grant can consume a matching ready `RandomAccessAck` still in the normal scheduler queue.
+- `crates/tetra-entities/src/umac/umac_bs.rs`
+  - Uses the new ready-ACK helper only for group requester positive `D-TX GRANTED`; private/P2P, SDS, parrot, listener GSSI grants, and D-TX CEASED remain on existing paths.
+- `crates/tetra-entities/tests/test_umac_bs.rs`
+  - Added a real-ordering regression: queued ready RA ACK plus positive group requester `D-TX GRANTED` before UMAC `FloorGranted` must produce STCH `random_access_flag=true`.
+
+Verification:
+
+- `cargo test -p tetra-entities --lib test_hangtime_group_positive_floor_grant_aach_advertises_traffic_for_older_ms --locked` passed.
+- `cargo test -p tetra-entities --lib test_hangtime_group_d_tx_ceased_aach_stays_assigned_control --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_requester_d_tx_granted_stch_consumes_ready_random_access_ack --locked` passed.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_umac_bs test_group_same_speaker_floor_retake_reopens_ul_traffic_for_lmac_tch_s_decode --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs group_226333 --locked` passed: 4 tests.
+- `cargo test -p tetra-entities --test test_umac_bs test_private_floor_grant_stch_carries_preserved_random_access_ack --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+Next RF gate:
+
+- Deploy direct only after this checkpoint is committed or explicitly selected for RF test.
+- Clear volatile service journal, restart `nexus-bs@chris.service`, and test GSSI `226333` with `2260082` MTP3550 MR19.9 retaking PTT after `2260616` and `2260618`.
+- Expected field behaviour: the positive grant slot for `2260082` should advertise traffic in AACH, carry the requester RA ACK if present, then produce valid accepted uplink media instead of `accepted_ul_media_since_floor=0`.
+- If the counter still remains zero, the next layer is PHY/LMAC RF decode or terminal not transmitting after a standards-coherent grant, not CMCE floor ownership.
+
 ## 2026-06-08 20:08 EEST - LMAC preserves NTS2 Block2 TCH/S without stolen marker
 
 Component in simple technical terms:
