@@ -35,6 +35,7 @@ impl CcBsSubentity {
     pub fn tick_start(&mut self, queue: &mut MessageQueue, dltime: TdmaTime) {
         self.dltime = dltime;
         self.drain_pending_individual_tx_ceased_tail_drains(queue);
+        self.drain_pending_group_tx_ceased_tail_drains(queue);
         self.drain_pending_individual_disconnect_tail_drains(queue);
         self.drain_pending_group_releases(queue);
         self.drain_pending_individual_releases(queue);
@@ -631,6 +632,14 @@ impl CcBsSubentity {
         if self.pending_group_releases.contains_key(&call_id) {
             tracing::debug!(
                 "UL inactivity timeout on ts={} ignored for pending group release call_id={}",
+                ts,
+                call_id
+            );
+            return;
+        }
+        if self.pending_group_tx_ceased_tail_drains.contains_key(&call_id) {
+            tracing::debug!(
+                "UL inactivity timeout on ts={} ignored for pending group TX-CEASED tail drain call_id={}",
                 ts,
                 call_id
             );

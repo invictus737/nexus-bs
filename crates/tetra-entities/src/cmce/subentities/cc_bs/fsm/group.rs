@@ -155,6 +155,7 @@ impl CcBsSubentity {
         };
         let dest_addr = cached.dest_addr;
 
+        self.cancel_matching_group_tx_ceased_tail_drain(call_id, speaker.ssi, "same group speaker reasserted floor");
         self.refresh_group_cached_d_setup_speaker(call_id, speaker.ssi);
 
         // EN 300 392-2 clause 14.5.2.2.1 b) defines D-TX GRANTED as the
@@ -257,6 +258,7 @@ impl CcBsSubentity {
                 };
                 call.grant_floor(requesting_party.ssi, Some(requesting_party));
             }
+            self.cancel_group_tx_ceased_tail_drain(call_id, "pre-emptive group floor grant");
 
             // EN 300 392-2 clause 14.5.2.2.1 f) and table 14.85: pre-emptive
             // U-TX DEMAND may withdraw the current speaker when SwMI supports
@@ -487,9 +489,6 @@ impl CcBsSubentity {
         if let Some(requester) = queued_request {
             // Transmitting -> Transmitting, hand over floor directly to queued requester.
             call.grant_floor(requester.ssi, Some(requester));
-        } else {
-            // Transmitting -> NoActiveSpeaker.
-            call.enter_hangtime(self.dltime);
         }
 
         let Some(cached) = self.cached_setups.get(&call_id) else {
@@ -546,23 +545,18 @@ impl CcBsSubentity {
             return Ok(());
         }
 
-        self.send_d_tx_ceased_facch(queue, call_id, dest_addr.ssi, ts, usage);
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-        });
-
-        if net_brew::is_brew_gssi_routable(&self.config, dest_ssi) {
-            queue.push_back(SapMsg {
-                sap: Sap::Control,
-                src: TetraEntity::Cmce,
-                dest: TetraEntity::Brew,
-                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts }),
-            });
-        }
+        // EN 300 392-2 clauses 14.5.2.2.1 e) and 23.8.2.2 require the
+        // SwMI to end the transmission, but clause 23.8.5 keeps bearer tail
+        // ordering intact. Delay D-TX CEASED/FloorReleased very briefly so
+        // UMAC can flush a deferred TCH/S half-slot before hangtime purges it.
+        self.begin_group_tx_ceased_tail_drain(
+            call_id,
+            sender,
+            dest_addr.ssi,
+            ts,
+            usage,
+            net_brew::is_brew_gssi_routable(&self.config, dest_ssi),
+        );
 
         Ok(())
     }
@@ -648,6 +642,8 @@ impl CcBsSubentity {
             .active_calls
             .get(&call_id)
             .is_some_and(|call| call.tx_active && self.subscriber_affiliated_to_group(call.source_issi, call.dest_gssi));
+
+        self.cancel_group_tx_ceased_tail_drain(call_id, "network group speaker took floor");
 
         let (preempted_local_speaker, ts, usage, dest_gssi) = {
             let Some(call) = self.active_calls.get_mut(&call_id) else {

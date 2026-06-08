@@ -127,6 +127,16 @@ struct PendingIndividualTxCeasedTailDrain {
     started_at: TdmaTime,
 }
 
+struct PendingGroupTxCeasedTailDrain {
+    call_id: u16,
+    sender: TetraAddress,
+    dest_gssi: u32,
+    ts: u8,
+    usage: u8,
+    notify_brew: bool,
+    started_at: TdmaTime,
+}
+
 struct PendingIndividualConnectAck {
     reporter: TxReporter,
     stage: PendingIndividualConnectAckStage,
@@ -182,6 +192,8 @@ pub struct CcBsSubentity {
     pending_individual_disconnect_release_acks: HashMap<u16, PendingIndividualDisconnectReleaseAck>,
     /// Simplex private-call TX-CEASED/floor handoff signalling waiting for traffic tail bits.
     pending_individual_tx_ceased_tail_drains: HashMap<u16, PendingIndividualTxCeasedTailDrain>,
+    /// Group-call TX-CEASED/floor idle signalling waiting for traffic tail bits.
+    pending_group_tx_ceased_tail_drains: HashMap<u16, PendingGroupTxCeasedTailDrain>,
     /// Direct private-call setup delivery guards before caller authorization.
     pending_individual_connect_acks: HashMap<u16, PendingIndividualConnectAck>,
     /// Brew-bridged individual connect waiting for the local RF leg to acknowledge D-CONNECT/D-CONNECT ACK.

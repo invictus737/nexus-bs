@@ -18,6 +18,10 @@ const INDIVIDUAL_DISCONNECT_DELIVERY_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOT
 // depth here, so simplex speech uses the same short N=4-equivalent guard as a
 // conservative bearer-tail compatibility drain before peer-facing clear state.
 const INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
+// Group speech uses the same TCH/S interleaver tail ordering. Delay the
+// no-speaker D-TX CEASED/FloorReleased transition long enough for UMAC to
+// flush a deferred NTS2 Block2 speech half-slot before entering hangtime.
+const GROUP_TX_CEASED_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 // EN 300 392-2 table 20.54 defines priority 7 as the highest TMA priority.
 // Keep this restricted to time-critical floor-control signalling.
 const CMCE_FLOOR_CONTROL_PDU_PRIO: i32 = 7;
@@ -56,6 +60,7 @@ impl CcBsSubentity {
             pending_individual_disconnect_deliveries: HashMap::new(),
             pending_individual_disconnect_release_acks: HashMap::new(),
             pending_individual_tx_ceased_tail_drains: HashMap::new(),
+            pending_group_tx_ceased_tail_drains: HashMap::new(),
             pending_individual_connect_acks: HashMap::new(),
             pending_network_individual_connects: HashMap::new(),
             pending_individual_releases: HashMap::new(),
@@ -200,6 +205,7 @@ impl CcBsSubentity {
                 + self.pending_individual_disconnect_deliveries.len()
                 + self.pending_individual_disconnect_release_acks.len()
                 + self.pending_individual_tx_ceased_tail_drains.len()
+                + self.pending_group_tx_ceased_tail_drains.len()
                 + self.pending_individual_connect_acks.len()
                 + self.pending_individual_releases.len()
                 + 4,
@@ -213,6 +219,7 @@ impl CcBsSubentity {
         ids.extend(self.pending_individual_disconnect_deliveries.keys().copied());
         ids.extend(self.pending_individual_disconnect_release_acks.keys().copied());
         ids.extend(self.pending_individual_tx_ceased_tail_drains.keys().copied());
+        ids.extend(self.pending_group_tx_ceased_tail_drains.keys().copied());
         ids.extend(self.pending_individual_connect_acks.keys().copied());
         ids.extend(self.pending_individual_releases.keys().copied());
         ids.extend(self.circuits.active_call_ids());
@@ -1169,6 +1176,212 @@ impl CcBsSubentity {
         };
         queue.push_back(msg);
         delivery_reporter
+    }
+
+    pub(super) fn begin_group_tx_ceased_tail_drain(
+        &mut self,
+        call_id: u16,
+        sender: TetraAddress,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+        notify_brew: bool,
+    ) {
+        if self.pending_group_tx_ceased_tail_drains.contains_key(&call_id) {
+            tracing::debug!("CMCE: group TX-CEASED tail drain already pending for call_id={}", call_id);
+            return;
+        }
+
+        tracing::debug!(
+            "CMCE: delaying group TX-CEASED/floor idle call_id={} sender ISSI {} GSSI {} for {} timeslots of TCH tail drain",
+            call_id,
+            sender.ssi,
+            dest_gssi,
+            GROUP_TX_CEASED_TAIL_DRAIN_TIMESLOTS
+        );
+        self.pending_group_tx_ceased_tail_drains.insert(
+            call_id,
+            PendingGroupTxCeasedTailDrain {
+                call_id,
+                sender,
+                dest_gssi,
+                ts,
+                usage,
+                notify_brew,
+                started_at: self.dltime,
+            },
+        );
+    }
+
+    pub(super) fn cancel_group_tx_ceased_tail_drain(&mut self, call_id: u16, reason: &str) -> bool {
+        let Some(pending) = self.pending_group_tx_ceased_tail_drains.remove(&call_id) else {
+            return false;
+        };
+        tracing::debug!(
+            "CMCE: cancelling pending group TX-CEASED tail drain call_id={} sender ISSI {} because {}",
+            pending.call_id,
+            pending.sender.ssi,
+            reason
+        );
+        true
+    }
+
+    pub(super) fn cancel_matching_group_tx_ceased_tail_drain(&mut self, call_id: u16, sender_issi: u32, reason: &str) -> bool {
+        let should_cancel = self
+            .pending_group_tx_ceased_tail_drains
+            .get(&call_id)
+            .is_some_and(|pending| pending.sender.ssi == sender_issi);
+        if !should_cancel {
+            return false;
+        }
+        self.cancel_group_tx_ceased_tail_drain(call_id, reason)
+    }
+
+    pub(super) fn drain_pending_group_tx_ceased_tail_drains(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<u16> = self
+            .pending_group_tx_ceased_tail_drains
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.started_at.age(self.dltime) >= GROUP_TX_CEASED_TAIL_DRAIN_TIMESLOTS {
+                    Some(call_id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for call_id in ready {
+            let Some(pending) = self.pending_group_tx_ceased_tail_drains.remove(&call_id) else {
+                continue;
+            };
+            self.complete_group_tx_ceased_tail_drain(queue, pending);
+        }
+    }
+
+    fn complete_group_tx_ceased_tail_drain(&mut self, queue: &mut MessageQueue, pending: PendingGroupTxCeasedTailDrain) {
+        let queued_requester = {
+            let Some(call) = self.active_calls.get(&pending.call_id) else {
+                return;
+            };
+            if !call.is_current_speaker(pending.sender.ssi) || call.ts != pending.ts {
+                tracing::debug!(
+                    "CMCE: group TX-CEASED tail drain call_id={} skipped; floor changed from ISSI {}",
+                    pending.call_id,
+                    pending.sender.ssi
+                );
+                return;
+            }
+            self.first_affiliated_group_floor_requester(pending.call_id, call, "group TX-CEASED tail drain")
+        };
+
+        let queued_requester = {
+            let Some(call) = self.active_calls.get_mut(&pending.call_id) else {
+                return;
+            };
+            if !call.is_current_speaker(pending.sender.ssi) || call.ts != pending.ts {
+                return;
+            }
+
+            let queued_requester = call.take_queued_tx_demand_through(queued_requester.map(|requester| requester.ssi));
+            if let Some(requester) = queued_requester {
+                call.grant_floor(requester.ssi, Some(requester));
+            } else {
+                call.enter_hangtime(self.dltime);
+            }
+            queued_requester
+        };
+
+        if let Some(requester) = queued_requester {
+            tracing::info!(
+                "U-TX CEASED (group) call_id={} tail-drained from ISSI {} -> granting queued floor to ISSI {}",
+                pending.call_id,
+                pending.sender.ssi,
+                requester.ssi
+            );
+
+            self.fsm_send_d_tx_granted_individual(
+                queue,
+                pending.call_id,
+                requester,
+                pending.ts,
+                pending.usage,
+                TransmissionGrant::Granted,
+                Some(requester.ssi),
+            );
+            self.send_group_listener_d_tx_granted_facch(
+                queue,
+                pending.call_id,
+                requester.ssi,
+                pending.dest_gssi,
+                pending.ts,
+                pending.usage,
+            );
+            self.send_group_d_info_reset_t310_facch(queue, pending.call_id, pending.dest_gssi, pending.ts, pending.usage);
+            self.refresh_group_cached_d_setup_speaker(pending.call_id, requester.ssi);
+
+            self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
+                call_id: pending.call_id,
+                gssi: pending.dest_gssi,
+                speaker_issi: requester.ssi,
+            });
+
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id: pending.call_id,
+                    source_issi: requester.ssi,
+                    dest_gssi: pending.dest_gssi,
+                    ts: pending.ts,
+                }),
+            });
+
+            if pending.notify_brew {
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Brew,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id: pending.call_id,
+                        source_issi: requester.ssi,
+                        dest_gssi: pending.dest_gssi,
+                        ts: pending.ts,
+                    }),
+                });
+            }
+            return;
+        }
+
+        tracing::info!(
+            "-> D-TX CEASED (group, tail-drained FACCH) call_id={} GSSI {} sender ISSI {}",
+            pending.call_id,
+            pending.dest_gssi,
+            pending.sender.ssi
+        );
+        self.send_d_tx_ceased_facch(queue, pending.call_id, pending.dest_gssi, pending.ts, pending.usage);
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased {
+                call_id: pending.call_id,
+                ts: pending.ts,
+            }),
+        });
+
+        if pending.notify_brew {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased {
+                    call_id: pending.call_id,
+                    ts: pending.ts,
+                }),
+            });
+        }
     }
 
     pub(super) fn begin_individual_tx_ceased_tail_drain(
@@ -2248,6 +2461,8 @@ impl CcBsSubentity {
         disconnect_cause: DisconnectCause,
         preclosed_circuit: Option<CmceCircuit>,
     ) {
+        self.cancel_group_tx_ceased_tail_drain(call_id, "group release started");
+
         if self.pending_group_releases.contains_key(&call_id) {
             tracing::debug!("CMCE: group release already pending for call_id={}", call_id);
             return;

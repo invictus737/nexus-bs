@@ -74,6 +74,7 @@ const LAB_ISSI_MXP600: u32 = 2260618;
 const LARGE_GSSI_MEMBER_COUNT: u32 = 4096;
 const TETRA_TIMESLOTS_PER_SECOND: i32 = 18 * 4;
 const PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
+const GROUP_TX_CEASED_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS: i32 = 16;
@@ -194,6 +195,25 @@ fn drain_private_simplex_tail(test: &mut ComponentTest, dltime: TdmaTime) {
     test.router
         .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
     test.run_stack(Some(1));
+}
+
+fn drain_group_tx_ceased_tail(test: &mut ComponentTest, dltime: TdmaTime) {
+    test.router
+        .set_dl_time(dltime.add_timeslots(GROUP_TX_CEASED_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+}
+
+fn drain_group_tx_ceased_tail_after_large_stress(test: &mut ComponentTest, dltime: TdmaTime) {
+    test.router.set_dl_time(dltime.add_timeslots(1_000_000));
+    test.run_stack(Some(1));
+}
+
+fn run_group_late_entry_resend_tick(test: &mut ComponentTest, dltime: TdmaTime) {
+    let base = dltime.add_timeslots(5 * TETRA_TIMESLOTS_PER_SECOND);
+    for frame_offset in 0..=18 {
+        test.router.set_dl_time(base.add_timeslots(frame_offset * 4));
+        test.run_stack(Some(1));
+    }
 }
 
 /// Helper: submit a real MM U-LOCATION UPDATE DEMAND carrying group affiliation.
@@ -4502,6 +4522,8 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, active_call_id));
     test.run_stack(Some(1));
     let _hangtime_msgs = test.dump_sinks();
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let _tail_msgs = test.dump_sinks();
 
     // Nexus-BS hangtime is local call-retention between transmissions. While
     // the call is still maintained, EN 300 392-2 clause 14.5.2.2.1 floor
@@ -4579,7 +4601,7 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
         "hangtime retake must hand the existing traffic floor to the requester"
     );
 
-    test.run_stack(Some(8));
+    run_group_late_entry_resend_tick(&mut test, dltime);
     let backup_msgs = test.dump_sinks();
     let setup_refresh = backup_msgs
         .iter()
@@ -5994,6 +6016,13 @@ fn test_large_group_floor_queue_is_bounded_fifo_for_thousands_of_waiters() {
 
     test.submit_message(build_u_tx_ceased_msg(current_fifo_speaker, call_id));
     test.run_stack(Some(1));
+    let final_ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_granted(&final_ceased_start_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&final_ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&final_ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&final_ceased_start_msgs), 0);
+
+    drain_group_tx_ceased_tail_after_large_stress(&mut test, dltime);
     let final_ceased_msgs = test.dump_sinks();
     assert_eq!(count_d_tx_granted(&final_ceased_msgs), 0);
     assert_eq!(count_d_tx_ceased(&final_ceased_msgs), 1);
@@ -7295,6 +7324,24 @@ fn test_group_tx_ceased_does_not_grant_deaffiliated_queued_requester() {
     // queued U-TX DEMAND must not receive a later D-TX-GRANTED handoff.
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+
+    assert_eq!(count_d_tx_granted(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&ceased_start_msgs), 0);
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+    assert!(ceased_start_msgs.iter().all(|msg| {
+        !matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                source_issi,
+                dest_gssi,
+                ..
+            }) if *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_GSSI
+        )
+    }));
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
     let ceased_msgs = test.dump_sinks();
 
     assert_eq!(count_d_tx_granted(&ceased_msgs), 0);
@@ -7509,6 +7556,20 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_tx_ceased(&ceased_start_msgs),
+        0,
+        "group no-queue U-TX CEASED must wait for bearer-tail drain before D-TX CEASED"
+    );
+    assert_eq!(
+        count_umac_floor_released(&ceased_start_msgs),
+        0,
+        "group no-queue U-TX CEASED must not put UMAC into hangtime before TCH/S tail drain"
+    );
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
     let ceased_msgs = test.dump_sinks();
 
     let ceased: Vec<_> = ceased_msgs
@@ -7550,6 +7611,98 @@ fn test_group_tx_ceased_without_queue_releases_floor_to_hangtime() {
 }
 
 #[test]
+fn test_group_tx_ceased_tail_drain_then_grants_requester_queued_during_tail() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    let components = vec![TetraEntity::Cmce];
+    let sinks = vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew];
+    test.populate_entities(components, sinks);
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    let (call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
+
+    test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
+    test.run_stack(Some(1));
+    let demand_msgs = test.dump_sinks();
+
+    let queued_grant = demand_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI))
+        .expect("requester PTT during group tail drain should be queued");
+    assert_eq!(queued_grant.1.transmission_grant, TransmissionGrant::RequestQueued.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        queued_grant.0,
+        &queued_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Dl,
+        "group tail-drain requester queue response",
+    );
+    assert_eq!(count_umac_floor_released(&demand_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let tail_msgs = test.dump_sinks();
+
+    let grants: Vec<_> = tail_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        grants.len(),
+        2,
+        "tail-drained group handoff should grant requester and inform listeners"
+    );
+    let requester_grant = grants
+        .iter()
+        .find(|(prim, _)| prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI))
+        .expect("queued requester should receive the floor after tail drain");
+    assert_eq!(requester_grant.1.transmission_grant, TransmissionGrant::Granted.into_raw() as u8);
+    assert_d_tx_granted_facch_allocation(
+        requester_grant.0,
+        &requester_grant.1,
+        active_ts,
+        active_usage,
+        UlDlAssignment::Both,
+        "group tail-drain queued requester handoff",
+    );
+    assert_eq!(count_d_tx_ceased(&tail_msgs), 0);
+    assert_eq!(count_umac_floor_released(&tail_msgs), 0);
+    assert_eq!(count_umac_floor_granted(&tail_msgs), 1);
+    assert!(tail_msgs.iter().any(|msg| {
+        matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: got_call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if *got_call_id == call_id
+                && *source_issi == TEST_CALLED_ISSI
+                && *dest_gssi == TEST_GSSI
+                && *ts == active_ts
+        )
+    }));
+}
+
+#[test]
 fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
     debug::setup_logging_verbose();
 
@@ -7567,6 +7720,8 @@ fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
     let _hangtime_msgs = test.dump_sinks();
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let _tail_msgs = test.dump_sinks();
 
     // EN 300 392-2 clauses 14.5.2.1.1/14.5.2.1.2 and Annex D allow back-up
     // D-SETUP for group-call setup/late entry; clause 14.5.2.2.1 moves the
@@ -7602,7 +7757,7 @@ fn test_group_hangtime_tx_demand_defers_late_entry_d_setup_refresh() {
     assert_one_group_d_info_reset_t310(&demand_msgs, call_id, TEST_GSSI, active_ts, active_usage, "hangtime floor retake");
     assert_eq!(count_umac_floor_granted(&demand_msgs), 1);
 
-    test.run_stack(Some(8));
+    run_group_late_entry_resend_tick(&mut test, dltime);
     let backup_msgs = test.dump_sinks();
     let setup_refreshes: Vec<_> = backup_msgs
         .iter()
@@ -8386,6 +8541,11 @@ fn test_group_floor_holder_without_d_info_ownership_cannot_disconnect_call() {
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
     let ceased_msgs = test.dump_sinks();
     assert_eq!(count_d_tx_ceased(&ceased_msgs), 1);
     assert_eq!(count_umac_floor_released(&ceased_msgs), 1);

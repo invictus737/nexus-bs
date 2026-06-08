@@ -12174,3 +12174,54 @@ RF gate:
 1. Deploy this diagnostic build and repeat GSSI `226333` with `2260082`.
 2. If timeout shows `accepted_ul_media_since_floor=0`, the BS did not accept any valid TCH/S after grant; inspect LMAC/PHY grant delivery and uplink decode.
 3. If timeout shows `accepted_ul_media_since_floor>0`, the BS accepted media but did not refresh/reroute it correctly; inspect UMAC deferred raw TCH/S flushing and DL scheduling.
+
+## 2026-06-08 21:20 EEST - Group U-TX CEASED tail-drain before FloorReleased
+
+Field context:
+
+- After commit `09c71fc`, RF logs showed group call `226333` floor grants and valid deferred raw TCH/S candidates, followed by repeated `UMAC: dropped deferred private raw TCH/S ... because floor released; U-plane enters hangtime`.
+- The wording is from a shared UMAC queue, but the affected path was GSSI group call media.
+- This made short or boundary PTTs vulnerable to static/silence: CMCE sent `FloorReleased` in the same control drain as `U-TX CEASED`, so UMAC correctly purged pending media before the final TCH/S half-slot could be scheduled to DL.
+
+Clause-scoped reasoning:
+
+- EN 300 392-2 clause 14.5.2.2.1 e) defines the group end-of-transmission path: the MS sends `U-TX CEASED`, and the SwMI ends the current transmission / floor state.
+- EN 300 392-2 clauses 23.8.2.2 and 23.8.5 require bearer tail ordering to be preserved around circuit-mode speech/data transitions.
+- EN 300 392-2 clause 23.8.4.1.4 keeps NTS2 Block2 as TCH/S unless explicitly stolen by the first-half MAC header. Therefore CMCE must not force UMAC into hangtime before a deferred non-stolen TCH/S Block2 has a bounded chance to flush.
+- This is clause-scoped engineering hardening, not formal ETSI/TETRA certification.
+
+Patch:
+
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/mod.rs`
+  - Added `PendingGroupTxCeasedTailDrain`, separate from private simplex state.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/shared.rs`
+  - Added a group TX-ceased tail-drain queue with a short N=4-equivalent guard.
+  - Completion either grants the first still-affiliated queued requester, or enters hangtime and sends `D-TX CEASED` + UMAC/Brew `FloorReleased`.
+  - Cancels stale group tail-drains on release, same-speaker reassert, pre-emptive/network floor movement.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/fsm/group.rs`
+  - No-queue `U-TX CEASED` now starts tail-drain instead of immediate hangtime/FloorReleased.
+  - Existing queued-requester handoff path stays immediate and unchanged.
+- `crates/tetra-entities/src/cmce/subentities/cc_bs/timers.rs`
+  - Drains pending group TX-ceased tails at CMCE tick start.
+  - Ignores UL inactivity on a call while a group TX-ceased tail-drain is pending.
+- `crates/tetra-entities/tests/test_cmce_bs.rs`
+  - Updated no-queue group TX-ceased tests to expect delayed `D-TX CEASED`/`FloorReleased`.
+  - Added `test_group_tx_ceased_tail_drain_then_grants_requester_queued_during_tail`.
+  - Updated hangtime and large-FIFO tests to distinguish tail-pending from true hangtime.
+
+Verification:
+
+- `cargo test -p tetra-entities --test test_cmce_bs group_ --locked` passed: 73 tests.
+- `cargo test -p tetra-entities --test test_umac_bs group_ul_raw_block2 --locked` passed: 2 tests.
+- `cargo test -p tetra-entities --test test_umac_bs group_floor --locked` passed: 6 tests.
+- `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked` passed: 11 tests.
+- `cargo check -p tetra-entities --tests --locked` passed.
+- `cargo fmt --package tetra-entities -- --check` passed.
+- `git diff --check` passed.
+
+RF gate:
+
+1. Deploy and retest local GSSI `226333` with fast ping-pong PTT from `2260616`, `2260618`, and `2260082`.
+2. Expected improvement: no more dropped deferred raw TCH/S immediately caused by `FloorReleased` after `U-TX CEASED`.
+3. If `accepted_ul_media_since_floor=0` still appears for `2260082`, continue below CMCE at grant decode / LMAC / RF timing, because CMCE no longer purges the tail immediately.
