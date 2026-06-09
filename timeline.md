@@ -13007,13 +13007,15 @@ Verification:
 
 Deploy verification:
 
-- Tagged local release commit `470b20d` as `v0.1.61`.
+- Tagged local release commit `750b21c` as `v0.1.61`.
 - Built locally only and deployed with
   `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
-- Remote binary SHA-256:
-  `739c4aa28eb3ba2b6c9d92c9db9046ce87afad2dcb78d86d6dc9e8fadbac96f3`.
+- Remote core binary SHA-256:
+  `bed6c97174be62a2e2e0fb6a37be547c66ee84e1e0d9bf395d6f241c7fd4ed59`.
+- Remote control-service SHA-256:
+  `9108adf547aeec4aa9383b0e418c9d978c6c83796d42c6f658dc001c42cac329`.
 - Remote service `nexus-bs@chris.service` restarted successfully and showed
-  `Build: v0.1.61-470b20dc`.
+  `Build: v0.1.61-750b21ce`.
 - Installed updated `nexus-bs@.service` and `nexus-bs-control@.service` on the
   Pi, ran `systemctl daemon-reload`, and restarted both services.
 - `systemctl show nexus-bs@chris.service` confirmed:
@@ -13026,7 +13028,7 @@ Deploy verification:
   - `Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/chris/nexus-bs/dashboard`
 - `/api/system` on the deployed dashboard returned:
   - `product_user_agent=Nexus-BS/v0.1.61`
-  - `stack_version=v0.1.61-470b20dc`
+  - `stack_version=v0.1.61-750b21ce`
   - `config_path=/home/chris/nexus-bs/config.toml`
   - `runtime_config_path=/run/nexus-bs-chris/config.toml`
   - `cpu_model=Broadcom Cortex-A53 1GHz 64-bit`
@@ -13034,15 +13036,16 @@ Deploy verification:
 - Dashboard `/` served the external static `dashboard/index.html`, not the
   embedded compatibility dashboard.
 - `GET /api/system2` returned HTTP `404` JSON instead of SPA HTML fallback.
+- Startup logs after the final systemd restart showed `Control transport
+  connected`; the earlier mismatch where the old control service expected
+  `nexus-bs-control-v0.1.55` is fixed by deploying
+  `nexus-bs-control-service` with the core binary.
 - Startup logs after the final systemd restart showed restart recovery armed for
   local ISSIs `2260082`, `2260616`, `2260618`; the three registered/affiliated
   back to GSSI `226333` during recovery.
 
 Residual deploy observations:
 
-- `nexus-bs-control@chris.service`/control transport still logs WebSocket
-  handshake failures every 15s. RF core and dashboard are active; this remains a
-  control-service/backhaul follow-up, not a new RF protocol change.
 - The current watchdog proves RF router tick progress. It still does not prove
   independent helper-thread liveness for dashboard/control/telemetry/Brew; this
   remains tracked in `MISSION_READINESS.md`.
