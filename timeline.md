@@ -13004,3 +13004,45 @@ Verification:
   passed.
 - `cargo test -p tetra-entities telemetry_protocol_tracks_nexus_bs_product_version --locked`
   passed.
+
+Deploy verification:
+
+- Tagged local release commit `470b20d` as `v0.1.61`.
+- Built locally only and deployed with
+  `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote binary SHA-256:
+  `739c4aa28eb3ba2b6c9d92c9db9046ce87afad2dcb78d86d6dc9e8fadbac96f3`.
+- Remote service `nexus-bs@chris.service` restarted successfully and showed
+  `Build: v0.1.61-470b20dc`.
+- Installed updated `nexus-bs@.service` and `nexus-bs-control@.service` on the
+  Pi, ran `systemctl daemon-reload`, and restarted both services.
+- `systemctl show nexus-bs@chris.service` confirmed:
+  - `Type=notify`
+  - `NotifyAccess=main`
+  - `WatchdogUSec=30s`
+  - `ActiveState=active`
+  - `SubState=running`
+  - `Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/chris/nexus-bs/config.toml`
+  - `Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/chris/nexus-bs/dashboard`
+- `/api/system` on the deployed dashboard returned:
+  - `product_user_agent=Nexus-BS/v0.1.61`
+  - `stack_version=v0.1.61-470b20dc`
+  - `config_path=/home/chris/nexus-bs/config.toml`
+  - `runtime_config_path=/run/nexus-bs-chris/config.toml`
+  - `cpu_model=Broadcom Cortex-A53 1GHz 64-bit`
+  - `sdr_name=SXceiver`
+- Dashboard `/` served the external static `dashboard/index.html`, not the
+  embedded compatibility dashboard.
+- `GET /api/system2` returned HTTP `404` JSON instead of SPA HTML fallback.
+- Startup logs after the final systemd restart showed restart recovery armed for
+  local ISSIs `2260082`, `2260616`, `2260618`; the three registered/affiliated
+  back to GSSI `226333` during recovery.
+
+Residual deploy observations:
+
+- `nexus-bs-control@chris.service`/control transport still logs WebSocket
+  handshake failures every 15s. RF core and dashboard are active; this remains a
+  control-service/backhaul follow-up, not a new RF protocol change.
+- The current watchdog proves RF router tick progress. It still does not prove
+  independent helper-thread liveness for dashboard/control/telemetry/Brew; this
+  remains tracked in `MISSION_READINESS.md`.
