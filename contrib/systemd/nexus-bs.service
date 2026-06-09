@@ -1,4 +1,4 @@
-# Legacy single-user sample systemd service file for Nexus-BS v0.1.60.
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.61.
 #
 # New deployments should prefer:
 #   contrib/systemd/nexus-bs@.service
@@ -12,7 +12,7 @@
 # - adapt your user/group and paths, sample assumes:
 #   - user/group are both "user",
 #   - installation in /home/user/nexus-bs
-#   - configuration in /home/user/nexus-bs-config.toml
+#   - configuration in /home/user/nexus-bs/config.toml
 # - copy file to "/etc/systemd/system"
 # - execute "systemctl daemon-reload"
 #
@@ -25,7 +25,7 @@
 # - see log with "journalctl -u nexus-bs --output=cat -f"
 
 [Unit]
-Description=Nexus-BS v0.1.60 TETRA base station service
+Description=Nexus-BS v0.1.61 TETRA base station service
 # network-online.target ensures the interface is UP and routable,
 # not just "declared active" like network.target.
 After=network-online.target
@@ -34,10 +34,12 @@ Wants=network-online.target
 [Service]
 User=user
 Group=user
-Type=simple
+Type=notify
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=73
 WorkingDirectory=/home/user/nexus-bs/
+Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/user/nexus-bs/config.toml
+Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/user/nexus-bs/dashboard
 
 # Reset the SXceiver/SoapySDR USB device before each start to prevent
 # stale hardware timestamp state causing "Too late to produce TX block" skips
@@ -48,14 +50,23 @@ WorkingDirectory=/home/user/nexus-bs/
 # or simply: ls /sys/bus/usb/devices/
 ExecStartPre=/bin/sh -c 'for dev in /sys/bus/usb/devices/*/idVendor; do dir=$(dirname $dev); [ -f "$dir/authorized" ] && echo 0 > "$dir/authorized" && sleep 0.5 && echo 1 > "$dir/authorized"; done; sleep 1'
 
-ExecStart=/home/user/nexus-bs/target/release/nexus-bs /home/user/nexus-bs-config.toml
+ExecStart=/home/user/nexus-bs/nexus-bs /home/user/nexus-bs/config.toml
 KillSignal=SIGINT
+NotifyAccess=main
+WatchdogSec=30s
+TimeoutStopSec=20
 
 # Restart automatically on crash or unexpected exit.
 # on-failure covers: non-zero exit, killed by signal, timeout.
 # Does NOT restart on clean exit (systemctl stop) or SIGINT (graceful shutdown).
 Restart=on-failure
 RestartSec=10
+RestartForceExitStatus=75
+OOMPolicy=stop
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=4096
+NoNewPrivileges=yes
 
 # Remove start rate limiting entirely — let RestartSec govern the pace.
 # Without this, systemd stops trying after 5 restarts in 10s (the default).

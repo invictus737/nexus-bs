@@ -32,6 +32,8 @@ use tetra_entities::{
     umac::umac_bs::UmacBs,
 };
 
+const DASHBOARD_LOG_CHANNEL_CAPACITY: usize = 2048;
+
 /// Result of loading config — either primary or fallback.
 enum ConfigLoadResult {
     Primary(StackConfig),
@@ -77,6 +79,23 @@ fn load_config_with_fallback(cfg_path: &str) -> ConfigLoadResult {
             }
         }
     }
+}
+
+fn dashboard_editable_config_path(runtime_config_path: &str) -> String {
+    std::env::var("NEXUS_BS_PERSISTENT_CONFIG")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| runtime_config_path.to_string())
+}
+
+fn dashboard_static_dir(config_static_dir: Option<String>) -> Option<String> {
+    config_static_dir.or_else(|| {
+        std::env::var("NEXUS_BS_DASHBOARD_STATIC_DIR")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 fn start_telemetry_worker(cfg: SharedConfig, telemetry_source: TelemetrySource) -> thread::JoinHandle<()> {
@@ -271,7 +290,7 @@ fn main() {
 
     // If dashboard is enabled, set up log capture channel BEFORE logging initialises
     let dashboard_log_rx = if cfg.config().dashboard.is_some() {
-        let (tx, rx) = crossbeam_channel::unbounded::<(String, String)>();
+        let (tx, rx) = crossbeam_channel::bounded::<(String, String)>(DASHBOARD_LOG_CHANNEL_CAPACITY);
         debug::set_dashboard_log_sender(tx);
         Some(rx)
     } else {
@@ -308,10 +327,20 @@ fn main() {
 
         if has_dashboard {
             let dash_cfg = cfg.config().dashboard.clone().unwrap();
-            let mut dashboard = DashboardServer::new(args.config.clone());
+            let editable_config_path = dashboard_editable_config_path(&args.config);
+            if editable_config_path != args.config {
+                tracing::info!(
+                    "Dashboard: editing persistent config '{}' while core runs runtime config '{}'",
+                    editable_config_path,
+                    args.config
+                );
+            }
+            let mut dashboard = DashboardServer::new(editable_config_path);
+            dashboard.set_runtime_config_path(args.config.clone());
 
             // Propagate optional source_dir override for OTA updates.
             dashboard.set_source_dir(dash_cfg.source_dir.clone());
+            dashboard.set_static_dir(dashboard_static_dir(dash_cfg.static_dir.clone()));
 
             // Propagate optional HTTP Basic Auth credentials.
             if let (Some(user), Some(pass)) = (dash_cfg.username.clone(), dash_cfg.password.clone()) {
@@ -416,6 +445,7 @@ fn main() {
     // systemd to restart us instead of treating it as a normal exit).
     let is_running = Arc::new(AtomicBool::new(true));
     tetra_entities::service_control::install_lifecycle_control(is_running.clone());
+    let _watchdog_handle = tetra_entities::service_control::spawn_systemd_watchdog(is_running.clone());
     let is_running_clone = is_running.clone();
     ctrlc::set_handler(move || {
         is_running_clone.store(false, Ordering::SeqCst);
@@ -423,7 +453,9 @@ fn main() {
     .expect("failed to set Ctrl+C handler");
 
     // Start the stack
+    tetra_entities::service_control::notify_ready("Nexus-BS stack initialized");
     router.run_stack(None, Some(is_running));
+    tetra_entities::service_control::notify_stopping("Nexus-BS stack stopped");
 
     // router drops here → entities are dropped, networked entities disconnect.
     // If RestartService/ShutdownService was triggered, exit with the requested code

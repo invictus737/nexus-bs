@@ -628,6 +628,7 @@ allowed_gssi_ranges = [
         assert!(toml.contains("call_preemptive = false"));
         assert!(toml.contains("legacy_gssi_group_call = true"));
         assert!(toml.contains("energy_saving_mode = \"auto\""));
+        assert!(toml.contains("# static_dir = "));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));

@@ -35,7 +35,13 @@ ssh $SSH_OPTS "$REMOTE" "timeout 12s sh -lc '
 sudo -n systemctl stop \"$REMOTE_SERVICE\"
 '"
 
+ssh $SSH_OPTS "$REMOTE" "timeout 10s sh -lc '
+mkdir -p \"$REMOTE_BASE/dashboard/assets\"
+'"
 scp $SSH_OPTS "$BIN" "$REMOTE:$REMOTE_BASE/nexus-bs"
+scp $SSH_OPTS dashboard/index.html "$REMOTE:$REMOTE_BASE/dashboard/index.html"
+scp $SSH_OPTS dashboard/assets/app.js "$REMOTE:$REMOTE_BASE/dashboard/assets/app.js"
+scp $SSH_OPTS dashboard/assets/styles.css "$REMOTE:$REMOTE_BASE/dashboard/assets/styles.css"
 
 remote_sha="$(ssh $SSH_OPTS "$REMOTE" "timeout 10s sha256sum '$REMOTE_BASE/nexus-bs' | awk '{print \$1}'")"
 if [ "$remote_sha" != "$local_sha" ]; then

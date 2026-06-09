@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.60
+# Nexus-BS v0.1.61
 
 > **TETRA base station software for amateur radio operators and researchers.**
 > Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
@@ -41,7 +41,7 @@ Nexus-BS implements a functional TETRA base station (BS) in software. You plug i
 | Neighbor cell broadcast | ✅ |
 | Web dashboard | ✅ |
 | OTA update button | Disabled for now |
-| HTTP Basic Auth on dashboard | ✅ |
+| Dashboard login session | ✅ |
 | Fallback config on bad edit | ✅ |
 | Live SDS broadcast queue | ✅ |
 | Edit inactive config profiles in dashboard | ✅ |
@@ -75,13 +75,18 @@ cargo build --release
 
 ### As a systemd service
 
-The current service layout is flat under the runtime user's home directory:
+The current service layout keeps the runtime files under the target user's
+`nexus-bs` directory. The RF core and config stay flat; the optional dashboard
+module is a static asset directory served by the core API gateway:
 
 ```text
 /home/<user>/nexus-bs/nexus-bs
 /home/<user>/nexus-bs/nexus-bs-control-service
 /home/<user>/nexus-bs/nexus-bs-control
 /home/<user>/nexus-bs/config.toml
+/home/<user>/nexus-bs/dashboard/index.html
+/home/<user>/nexus-bs/dashboard/assets/app.js
+/home/<user>/nexus-bs/dashboard/assets/styles.css
 ```
 
 Install the templated units from `contrib/systemd/` and start them for the target user:
@@ -140,13 +145,17 @@ colour_code = 1
 [dashboard]
 port = 8080
 
-# Optional: HTTP Basic Auth
+# Optional: form login + cookie session
 username = "admin"
 password = "changeme"
 
 # Optional: reserved git source path for future OTA updates.
-# OTA update is disabled in Nexus-BS v0.1.60.
+# OTA update is disabled in Nexus-BS v0.1.61.
 # source_dir = "/opt/nexus-bs"
+
+# Optional: external dashboard assets. Core keeps API/login/WebSocket handling.
+# Leave unset to use the embedded compatibility dashboard.
+# static_dir = "/home/chris/nexus-bs/dashboard"
 ```
 
 ### Fallback config
@@ -208,6 +217,18 @@ password = "hotspot_password"
 
 Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
 
+For appliance installs, `nexus-bs@USER.service` runs the RF core from a volatile
+`/run/nexus-bs-USER/config.toml` copy, but dashboard config APIs edit the
+persistent `/home/USER/nexus-bs/config.toml` through
+`NEXUS_BS_PERSISTENT_CONFIG`. This keeps subscriber recovery/cache files
+volatile without losing operator config edits after restart.
+
+For the decoupled Nexus-BS dashboard, set `static_dir` or use the service
+default `NEXUS_BS_DASHBOARD_STATIC_DIR=/home/USER/nexus-bs/dashboard`. The
+Rust process still owns login, `/api/*` and `/ws`; only HTML/CSS/JS are served
+from the external directory. `scripts/nexus-bs-test-deploy.sh` copies these
+assets beside the binary for test deployments.
+
 **Radios tab** — live table of registered terminals with ISSI, groups, RSSI signal bar, energy saving mode, last seen time. Kick button forces immediate re-registration. SDS button sends a text message. Timeslot visualizer shows TS2–TS4 state in real time — idle (grey), call allocated (amber), voice active (red flash with animated waveform).
 
 **Calls tab** — active calls with caller, destination, duration, simplex/duplex.
@@ -231,7 +252,7 @@ Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
 
 ### WAP MVP over SDS
 
-Nexus-BS v0.1.60 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
+Nexus-BS v0.1.61 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
 
 From the flat install directory, send the default WML page to a terminal ISSI:
 

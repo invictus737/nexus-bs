@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use clap::Parser;
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use tetra_entities::net_control::codec::ControlCodecJson;
 use tetra_entities::net_control::commands::{
     ControlCommand, WAP_MVP_COLOR_PAGE_TEXT, WAP_MVP_PAGE_TEXT, WAP_SDS_TYPE4_MAX_BYTE_ALIGNED_PAYLOAD_BYTES,
@@ -26,6 +26,8 @@ use tetra_entities::net_control::{CONTROL_PROTOCOL_VERSION, select_control_subpr
 use tracing::{error, info, warn};
 use tungstenite::Message;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
+
+const CONTROL_CLI_CLIENT_QUEUE_CAPACITY: usize = 1024;
 
 #[derive(Parser)]
 #[command(name = "nexus-bs-control", version, about = "Nexus-BS TETRA control service")]
@@ -611,10 +613,10 @@ fn spawn_stdin_reader(clients: ClientRegistry) {
                 }
                 let mut delivered = 0u32;
                 for (id, tx) in registry.iter() {
-                    if tx.send(cmd.clone()).is_ok() {
+                    if tx.try_send(cmd.clone()).is_ok() {
                         delivered += 1;
                     } else {
-                        warn!("client {} channel closed", id);
+                        warn!("client {} command queue full or closed", id);
                     }
                 }
                 info!("command dispatched to {} client(s)", delivered);
@@ -676,7 +678,7 @@ fn main() {
                 let auth = auth_db.clone();
                 let clients_ref = Arc::clone(&clients);
                 let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
-                let (cmd_tx, cmd_rx) = unbounded::<ControlCommand>();
+                let (cmd_tx, cmd_rx) = bounded::<ControlCommand>(CONTROL_CLI_CLIENT_QUEUE_CAPACITY);
 
                 // Register this client's command sender
                 clients_ref.lock().unwrap().insert(client_id, cmd_tx);

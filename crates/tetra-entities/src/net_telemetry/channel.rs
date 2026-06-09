@@ -1,7 +1,9 @@
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, unbounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
 use std::time::Duration;
 
 use crate::net_telemetry::events::TelemetryEvent;
+
+pub const TELEMETRY_CHANNEL_CAPACITY: usize = 8192;
 
 // ---------------------------------------------------------------------------
 // TelemetrySink  (cloneable, push‑only handle given to entities)
@@ -19,10 +21,11 @@ pub struct TelemetrySink {
 }
 
 impl TelemetrySink {
-    /// Push a telemetry event. Lock‑free. Fire‑and‑forget: silently drops if the receiver is gone.
+    /// Push a telemetry event. Fire-and-forget: silently drops if the receiver is gone
+    /// or the bounded queue is full, so telemetry cannot block RF/core paths.
     #[inline]
     pub fn send(&self, event: TelemetryEvent) {
-        let _ = self.tx.send(event);
+        let _ = self.tx.try_send(event);
     }
 }
 
@@ -71,7 +74,7 @@ impl TelemetrySource {
 
 /// Create a linked (sink, source) pair.
 pub fn telemetry_channel() -> (TelemetrySink, TelemetrySource) {
-    let (tx, rx) = unbounded();
+    let (tx, rx) = bounded(TELEMETRY_CHANNEL_CAPACITY);
     (TelemetrySink { tx }, TelemetrySource { rx })
 }
 
@@ -110,5 +113,20 @@ mod tests {
 
         // No more items
         assert!(source.try_recv().is_none());
+    }
+
+    #[test]
+    fn telemetry_channel_is_bounded_and_non_blocking_on_overflow() {
+        let (sink, source) = telemetry_channel();
+
+        for idx in 0..(TELEMETRY_CHANNEL_CAPACITY + 16) {
+            sink.send(TelemetryEvent::MsRegistration { issi: idx as u32 });
+        }
+
+        let mut received = 0usize;
+        while source.try_recv().is_some() {
+            received += 1;
+        }
+        assert_eq!(received, TELEMETRY_CHANNEL_CAPACITY);
     }
 }

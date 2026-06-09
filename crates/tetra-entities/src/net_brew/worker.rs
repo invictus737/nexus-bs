@@ -95,6 +95,35 @@ pub enum BrewEvent {
     ServerError { error_type: u8, data: Vec<u8> },
 }
 
+impl BrewEvent {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            BrewEvent::Connected { .. } => "connected",
+            BrewEvent::VersionDetected { .. } => "version_detected",
+            BrewEvent::Disconnected(_) => "disconnected",
+            BrewEvent::GroupCallStart { .. } => "group_call_start",
+            BrewEvent::GroupCallEnd { .. } => "group_call_end",
+            BrewEvent::VoiceFrame { .. } => "voice_frame",
+            BrewEvent::SubscriberEvent { .. } => "subscriber_event",
+            BrewEvent::SdsTransfer { .. } => "sds_transfer",
+            BrewEvent::SdsReport { .. } => "sds_report",
+            BrewEvent::CircuitSetupRequest { .. } => "circuit_setup_request",
+            BrewEvent::CircuitSetupAccept { .. } => "circuit_setup_accept",
+            BrewEvent::CircuitSetupReject { .. } => "circuit_setup_reject",
+            BrewEvent::CircuitCallAlert { .. } => "circuit_call_alert",
+            BrewEvent::CircuitConnectRequest { .. } => "circuit_connect_request",
+            BrewEvent::CircuitConnectConfirm { .. } => "circuit_connect_confirm",
+            BrewEvent::CircuitCallRelease { .. } => "circuit_call_release",
+            BrewEvent::CircuitDtmf { .. } => "circuit_dtmf",
+            BrewEvent::ServerError { .. } => "server_error",
+        }
+    }
+
+    pub(crate) fn is_critical(&self) -> bool {
+        !matches!(self, BrewEvent::VoiceFrame { .. } | BrewEvent::ServerError { .. })
+    }
+}
+
 /// Commands the BrewEntity sends to the worker
 #[derive(Debug)]
 pub enum BrewCommand {
@@ -175,6 +204,39 @@ pub enum BrewCommand {
     Disconnect,
 }
 
+impl BrewCommand {
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            BrewCommand::RegisterSubscriber { .. } => "register_subscriber",
+            BrewCommand::DeregisterSubscriber { .. } => "deregister_subscriber",
+            BrewCommand::AffiliateGroups { .. } => "affiliate_groups",
+            BrewCommand::DeaffiliateGroups { .. } => "deaffiliate_groups",
+            BrewCommand::SendGroupTx { .. } => "send_group_tx",
+            BrewCommand::SendVoiceFrame { .. } => "send_voice_frame",
+            BrewCommand::SendGroupIdle { .. } => "send_group_idle",
+            BrewCommand::SendSds { .. } => "send_sds",
+            BrewCommand::SendSdsReport { .. } => "send_sds_report",
+            BrewCommand::SendSetupRequest { .. } => "send_setup_request",
+            BrewCommand::SendSetupAccept { .. } => "send_setup_accept",
+            BrewCommand::SendSetupReject { .. } => "send_setup_reject",
+            BrewCommand::SendCallAlert { .. } => "send_call_alert",
+            BrewCommand::SendConnectRequest { .. } => "send_connect_request",
+            BrewCommand::SendConnectConfirm { .. } => "send_connect_confirm",
+            BrewCommand::SendCallRelease { .. } => "send_call_release",
+            BrewCommand::SendDtmf { .. } => "send_dtmf",
+            BrewCommand::SendRssiUpdate { .. } => "send_rssi_update",
+            BrewCommand::Disconnect => "disconnect",
+        }
+    }
+
+    pub(crate) fn is_critical(&self) -> bool {
+        !matches!(
+            self,
+            BrewCommand::SendVoiceFrame { .. } | BrewCommand::SendRssiUpdate { .. } | BrewCommand::SendDtmf { .. }
+        )
+    }
+}
+
 // ─── Worker ───────────────────────────────────────────────────────
 
 /// Pending SDS header data (from CALL_STATE_SHORT_TRANSFER), awaiting matching FRAME_TYPE_SDS_TRANSFER
@@ -202,6 +264,11 @@ pub struct BrewWorker<T: NetworkTransport> {
     subscriber_groups: HashMap<u32, HashSet<u32>>,
     /// Pending SDS transfers keyed by UUID, awaiting matching SDS_TRANSFER frame
     pending_sds: HashMap<Uuid, PendingSds>,
+    /// Per-event overload counters for bounded worker->entity channel drops.
+    event_drop_counts: HashMap<&'static str, u64>,
+    /// Last log timestamp per dropped event type, to keep overload visible
+    /// without flooding the dashboard log tab during voice spikes.
+    event_drop_last_log: HashMap<&'static str, Instant>,
 }
 
 impl<T: NetworkTransport> BrewWorker<T> {
@@ -215,6 +282,58 @@ impl<T: NetworkTransport> BrewWorker<T> {
             command_receiver,
             subscriber_groups: HashMap::new(),
             pending_sds: HashMap::new(),
+            event_drop_counts: HashMap::new(),
+            event_drop_last_log: HashMap::new(),
+        }
+    }
+
+    fn enqueue_event(&mut self, event: BrewEvent) -> bool {
+        const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_millis(2);
+
+        let label = event.label();
+        let critical = event.is_critical();
+        let sent = if critical {
+            match self.event_sender.send_timeout(event, CRITICAL_EVENT_TIMEOUT) {
+                Ok(()) => true,
+                Err(crossbeam_channel::SendTimeoutError::Timeout(_)) | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => false,
+            }
+        } else {
+            self.event_sender.try_send(event).is_ok()
+        };
+
+        if !sent {
+            self.record_event_drop(label, critical);
+        }
+        sent
+    }
+
+    fn record_event_drop(&mut self, label: &'static str, critical: bool) {
+        const DROP_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+        let count = self.event_drop_counts.entry(label).or_insert(0);
+        *count += 1;
+
+        let now = Instant::now();
+        let should_log = critical
+            || self
+                .event_drop_last_log
+                .get(label)
+                .is_none_or(|last| now.duration_since(*last) >= DROP_LOG_INTERVAL);
+        if should_log {
+            self.event_drop_last_log.insert(label, now);
+            if critical {
+                tracing::warn!(
+                    "BrewWorker: critical event queue overloaded; dropped {} event (total drops={})",
+                    label,
+                    *count
+                );
+            } else {
+                tracing::debug!(
+                    "BrewWorker: non-critical event queue overloaded; dropped {} event (total drops={})",
+                    label,
+                    *count
+                );
+            }
         }
     }
 
@@ -227,7 +346,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
             match self.transport.connect() {
                 Ok(()) => {
                     tracing::info!("BrewWorker: transport connected");
-                    let _ = self.event_sender.send(BrewEvent::Connected {
+                    self.enqueue_event(BrewEvent::Connected {
                         server_version: self.transport.server_brew_version(),
                     });
                 }
@@ -237,7 +356,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                         e,
                         self.brew_config.reconnect_delay
                     );
-                    let _ = self.event_sender.send(BrewEvent::Disconnected(e.to_string()));
+                    self.enqueue_event(BrewEvent::Disconnected(e.to_string()));
                     std::thread::sleep(self.brew_config.reconnect_delay);
                     continue;
                 }
@@ -255,7 +374,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                         e,
                         self.brew_config.reconnect_delay
                     );
-                    let _ = self.event_sender.send(BrewEvent::Disconnected(e));
+                    self.enqueue_event(BrewEvent::Disconnected(e));
                     std::thread::sleep(self.brew_config.reconnect_delay);
                 }
             }
@@ -536,7 +655,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                 BrewMessage::Subscriber(sub) => {
                     tracing::debug!("BrewWorker: subscriber event type={}", sub.msg_type);
                     // TODO FIXME we could check whether this call is indeed a brew ssi here
-                    let _ = self.event_sender.send(BrewEvent::SubscriberEvent {
+                    self.enqueue_event(BrewEvent::SubscriberEvent {
                         msg_type: sub.msg_type,
                         issi: sub.number,
                         groups: sub.groups,
@@ -545,7 +664,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                 BrewMessage::Error(err) => {
                     tracing::warn!("BrewWorker: server error type={}: {} bytes", err.error_type, err.data.len());
                     // TODO FIXME we could check whether this call is indeed a brew ssi here
-                    let _ = self.event_sender.send(BrewEvent::ServerError {
+                    self.enqueue_event(BrewEvent::ServerError {
                         error_type: err.error_type,
                         data: err.data,
                     });
@@ -576,13 +695,13 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     );
                     // Detect server version from mnemonic presence (v1 includes 34-byte mnemonic)
                     if gt.mnemonic.is_some() {
-                        let _ = self.event_sender.send(BrewEvent::VersionDetected { version: 1 });
+                        self.enqueue_event(BrewEvent::VersionDetected { version: 1 });
                     }
                     if !net_brew::is_brew_gssi_routable(&self.config, gt.destination) {
                         tracing::warn!("BrewWorker: dropping GROUP_TX to non-routable GSSI {}", gt.destination);
                         return;
                     };
-                    let _ = self.event_sender.send(BrewEvent::GroupCallStart {
+                    self.enqueue_event(BrewEvent::GroupCallStart {
                         uuid: cc.identifier,
                         source_issi: gt.source,
                         dest_gssi: gt.destination,
@@ -595,7 +714,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: GROUP_IDLE uuid={} cause={}", cc.identifier, cause);
                 // TODO FIXME we could check whether this call is indeed a brew call here
-                let _ = self.event_sender.send(BrewEvent::GroupCallEnd {
+                self.enqueue_event(BrewEvent::GroupCallEnd {
                     uuid: cc.identifier,
                     cause,
                 });
@@ -611,24 +730,24 @@ impl<T: NetworkTransport> BrewWorker<T> {
                         call.number,
                         call.duplex
                     );
-                    let _ = self.event_sender.send(BrewEvent::CircuitSetupRequest { uuid: cc.identifier, call });
+                    self.enqueue_event(BrewEvent::CircuitSetupRequest { uuid: cc.identifier, call });
                 }
             }
             CALL_STATE_SETUP_ACCEPT => {
                 tracing::info!("BrewWorker: SETUP_ACCEPT uuid={}", cc.identifier);
-                let _ = self.event_sender.send(BrewEvent::CircuitSetupAccept { uuid: cc.identifier });
+                self.enqueue_event(BrewEvent::CircuitSetupAccept { uuid: cc.identifier });
             }
             CALL_STATE_SETUP_REJECT => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: SETUP_REJECT uuid={} cause={}", cc.identifier, cause);
-                let _ = self.event_sender.send(BrewEvent::CircuitSetupReject {
+                self.enqueue_event(BrewEvent::CircuitSetupReject {
                     uuid: cc.identifier,
                     cause,
                 });
             }
             CALL_STATE_CALL_ALERT => {
                 tracing::info!("BrewWorker: CALL_ALERT uuid={}", cc.identifier);
-                let _ = self.event_sender.send(BrewEvent::CircuitCallAlert { uuid: cc.identifier });
+                self.enqueue_event(BrewEvent::CircuitCallAlert { uuid: cc.identifier });
             }
             CALL_STATE_CONNECT_REQUEST => {
                 if let BrewCallPayload::CircularCall(call) = cc.payload {
@@ -639,9 +758,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                         call.destination,
                         call.duplex
                     );
-                    let _ = self
-                        .event_sender
-                        .send(BrewEvent::CircuitConnectRequest { uuid: cc.identifier, call });
+                    self.enqueue_event(BrewEvent::CircuitConnectRequest { uuid: cc.identifier, call });
                 }
             }
             CALL_STATE_CONNECT_CONFIRM => {
@@ -656,7 +773,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     grant,
                     permission
                 );
-                let _ = self.event_sender.send(BrewEvent::CircuitConnectConfirm {
+                self.enqueue_event(BrewEvent::CircuitConnectConfirm {
                     uuid: cc.identifier,
                     grant,
                     permission,
@@ -666,11 +783,11 @@ impl<T: NetworkTransport> BrewWorker<T> {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: CALL_RELEASE uuid={} cause={}", cc.identifier, cause);
                 // Send both events — entity will handle whichever is relevant
-                let _ = self.event_sender.send(BrewEvent::GroupCallEnd {
+                self.enqueue_event(BrewEvent::GroupCallEnd {
                     uuid: cc.identifier,
                     cause,
                 });
-                let _ = self.event_sender.send(BrewEvent::CircuitCallRelease {
+                self.enqueue_event(BrewEvent::CircuitCallRelease {
                     uuid: cc.identifier,
                     cause,
                 });
@@ -706,7 +823,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
             FRAME_TYPE_TRAFFIC_CHANNEL => {
                 // Forward ACELP voice frame to entity
                 // TODO FIXME we could check whether this call is indeed a brew call here
-                let _ = self.event_sender.send(BrewEvent::VoiceFrame {
+                self.enqueue_event(BrewEvent::VoiceFrame {
                     uuid: frame.identifier,
                     length_bits: frame.length_bits,
                     data: frame.data,
@@ -737,7 +854,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                         pending.destination,
                         frame.data.len()
                     );
-                    let _ = self.event_sender.send(BrewEvent::SdsTransfer {
+                    self.enqueue_event(BrewEvent::SdsTransfer {
                         uuid: frame.identifier,
                         source: pending.source,
                         destination: pending.destination,
@@ -755,7 +872,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
             FRAME_TYPE_SDS_REPORT => {
                 let status = if frame.data.is_empty() { 0 } else { frame.data[0] };
                 tracing::debug!("BrewWorker: SDS_REPORT uuid={} status={}", frame.identifier, status);
-                let _ = self.event_sender.send(BrewEvent::SdsReport {
+                self.enqueue_event(BrewEvent::SdsReport {
                     uuid: frame.identifier,
                     status,
                 });

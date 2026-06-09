@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use std::{marker::PhantomData, thread};
 
 use tetra_config::bluestation::SharedConfig;
@@ -6,6 +6,8 @@ use tetra_core::{TdmaTime, tetra_common::Sap, tetra_entities::TetraEntity};
 use tetra_saps::SapMsg;
 
 use crate::{MessageQueue, TetraEntityTrait, network::transports::NetworkError};
+
+const NET_ENTITY_CHANNEL_CAPACITY: usize = 4096;
 
 /// Trait that all network entity workers must implement.
 /// Workers run in a separate thread and handle blocking network operations.
@@ -67,8 +69,8 @@ impl<W: NetEntityWorker> NetEntity<W> {
         worker_config: W::Transport,
     ) -> Result<Self, NetworkError> {
         // Create channels for worker communication
-        let (e2w_sender, e2w_receiver) = unbounded::<SapMsg>();
-        let (w2e_sender, w2e_receiver) = unbounded::<SapMsg>();
+        let (e2w_sender, e2w_receiver) = bounded::<SapMsg>(NET_ENTITY_CHANNEL_CAPACITY);
+        let (w2e_sender, w2e_receiver) = bounded::<SapMsg>(NET_ENTITY_CHANNEL_CAPACITY);
 
         // Spawn worker thread
         thread::Builder::new()
@@ -122,9 +124,15 @@ impl<W: NetEntityWorker> TetraEntityTrait for NetEntity<W> {
         // Determine destination based on message content and routing logic
         // This should be implemented by specialized network entities
         tracing::debug!("NetEntity{:?} received SAP message: {:?}", self.sap, message);
-        self.e2w_sender
-            .send(message)
-            .expect(format!("NetEntity{:?} failed to send message to worker", self.sap).as_str());
+        match self.e2w_sender.try_send(message) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => tracing::warn!(
+                "NetEntity{:?} worker input queue full (capacity {}), dropping SAP message",
+                self.sap,
+                NET_ENTITY_CHANNEL_CAPACITY
+            ),
+            Err(TrySendError::Disconnected(_)) => tracing::warn!("NetEntity{:?} worker disconnected, dropping SAP message", self.sap),
+        }
     }
 
     fn tick_start(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) {

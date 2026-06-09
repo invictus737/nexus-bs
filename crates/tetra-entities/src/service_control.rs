@@ -1,13 +1,15 @@
 use std::process::{Command, Output};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
 
 const SERVICE_UNIT_ENV: &str = "NEXUS_BS_SERVICE_UNIT";
 const DEFAULT_SERVICE_UNIT: &str = "nexus-bs.service";
 const NO_EXIT_REQUESTED: i32 = i32::MIN;
 const RESTART_EXIT_CODE: i32 = 75;
+const NOTIFY_SOCKET_ENV: &str = "NOTIFY_SOCKET";
+const WATCHDOG_USEC_ENV: &str = "WATCHDOG_USEC";
 
 struct LifecycleControl {
     running: Arc<AtomicBool>,
@@ -15,6 +17,7 @@ struct LifecycleControl {
 }
 
 static LIFECYCLE_CONTROL: OnceLock<LifecycleControl> = OnceLock::new();
+static STACK_TICK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Service unit configured from the TOML config file (e.g. service_name = "nexus-bs").
 /// Takes precedence over cgroup auto-detection but is overridden by NEXUS_BS_SERVICE_UNIT.
@@ -63,6 +66,109 @@ pub fn requested_exit_code() -> Option<i32> {
     let lifecycle = LIFECYCLE_CONTROL.get()?;
     let code = lifecycle.exit_code.load(Ordering::SeqCst);
     (code != NO_EXIT_REQUESTED).then_some(code)
+}
+
+pub fn mark_stack_tick() {
+    STACK_TICK_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+fn stack_tick_count() -> u64 {
+    STACK_TICK_COUNTER.load(Ordering::Relaxed)
+}
+
+pub fn notify_ready(status: &str) {
+    let payload = format!("READY=1\nSTATUS={}", sanitize_notify_status(status));
+    notify_systemd(&payload);
+}
+
+pub fn notify_stopping(status: &str) {
+    let payload = format!("STOPPING=1\nSTATUS={}", sanitize_notify_status(status));
+    notify_systemd(&payload);
+}
+
+pub fn spawn_systemd_watchdog(running: Arc<AtomicBool>) -> Option<std::thread::JoinHandle<()>> {
+    let interval = watchdog_interval_from_env()?;
+    tracing::info!("Service watchdog: enabled with heartbeat interval {:?}", interval);
+    std::thread::Builder::new()
+        .name("systemd-watchdog".into())
+        .spawn(move || {
+            let mut last_tick = stack_tick_count();
+            loop {
+                std::thread::sleep(interval);
+                if !running.load(Ordering::Relaxed) {
+                    notify_stopping("Nexus-BS stopping");
+                    break;
+                }
+
+                let current_tick = stack_tick_count();
+                if current_tick == last_tick {
+                    tracing::error!(
+                        "Service watchdog: stack tick counter stalled at {}, withholding WATCHDOG=1",
+                        current_tick
+                    );
+                    continue;
+                }
+                last_tick = current_tick;
+                notify_systemd("WATCHDOG=1\nSTATUS=Nexus-BS RF loop alive");
+            }
+        })
+        .ok()
+}
+
+fn watchdog_interval_from_env() -> Option<Duration> {
+    std::env::var(WATCHDOG_USEC_ENV)
+        .ok()
+        .and_then(|value| watchdog_interval_from_usec(&value))
+}
+
+fn watchdog_interval_from_usec(value: &str) -> Option<Duration> {
+    let usec = value.trim().parse::<u64>().ok()?;
+    if usec == 0 {
+        return None;
+    }
+    let half = (usec / 2).max(1_000_000);
+    Some(Duration::from_micros(half))
+}
+
+fn sanitize_notify_status(status: &str) -> String {
+    status.replace(['\n', '\r'], " ")
+}
+
+fn notify_systemd(payload: &str) {
+    let Ok(socket) = std::env::var(NOTIFY_SOCKET_ENV) else {
+        return;
+    };
+    if socket.trim().is_empty() {
+        return;
+    }
+    if let Err(e) = send_notify_datagram(&socket, payload.as_bytes()) {
+        tracing::debug!("Service watchdog: systemd notify failed: {}", e);
+    }
+}
+
+#[cfg(unix)]
+fn send_notify_datagram(socket: &str, payload: &[u8]) -> Result<(), String> {
+    use std::os::unix::net::UnixDatagram;
+
+    let sock = UnixDatagram::unbound().map_err(|e| e.to_string())?;
+
+    #[cfg(target_os = "linux")]
+    if let Some(name) = socket.strip_prefix('@') {
+        use std::os::linux::net::SocketAddrExt;
+        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name.as_bytes()).map_err(|e| e.to_string())?;
+        return sock.send_to_addr(payload, &addr).map(|_| ()).map_err(|e| e.to_string());
+    }
+
+    if socket.starts_with('@') {
+        return Err("abstract NOTIFY_SOCKET is only supported on Linux".to_string());
+    }
+
+    sock.send_to(payload, socket).map(|_| ()).map_err(|e| e.to_string())
+}
+
+#[cfg(not(unix))]
+fn send_notify_datagram(_socket: &str, _payload: &[u8]) -> Result<(), String> {
+    Err("systemd notify is only supported on Unix".to_string())
 }
 
 pub fn schedule_service_action(action: ServiceAction, delay: Duration) {
@@ -196,7 +302,9 @@ fn normalize_service_unit(raw: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{normalize_service_unit, service_unit_from_cgroup_text};
+    use std::time::Duration;
+
+    use super::{normalize_service_unit, sanitize_notify_status, service_unit_from_cgroup_text, watchdog_interval_from_usec};
 
     #[test]
     fn finds_service_unit_in_cgroup_v2() {
@@ -212,5 +320,21 @@ mod tests {
     #[test]
     fn rejects_path_like_unit_names() {
         assert!(normalize_service_unit("../tetra").is_none());
+    }
+
+    #[test]
+    fn watchdog_interval_uses_half_of_systemd_timeout() {
+        assert_eq!(watchdog_interval_from_usec("30000000"), Some(Duration::from_secs(15)));
+    }
+
+    #[test]
+    fn watchdog_interval_has_one_second_floor() {
+        assert_eq!(watchdog_interval_from_usec("1000"), Some(Duration::from_secs(1)));
+        assert_eq!(watchdog_interval_from_usec("0"), None);
+    }
+
+    #[test]
+    fn notify_status_is_single_line() {
+        assert_eq!(sanitize_notify_status("ready\nwith\rcarriage"), "ready with carriage");
     }
 }

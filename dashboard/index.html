@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Nexus-BS Operations</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <div class="brand-mark">NB</div>
+        <div>
+          <div class="brand-name">Nexus-BS</div>
+          <div class="brand-sub" id="buildLabel">--</div>
+        </div>
+      </div>
+      <nav class="nav" aria-label="Dashboard sections">
+        <button class="nav-item active" data-page="overview">Overview</button>
+        <button class="nav-item" data-page="radios">Radios</button>
+        <button class="nav-item" data-page="calls">Calls</button>
+        <button class="nav-item" data-page="lastheard">Last Heard</button>
+        <button class="nav-item" data-page="logs">Logs</button>
+        <button class="nav-item" data-page="system">System</button>
+      </nav>
+      <div class="rail-status">
+        <div class="status-line"><span>Core</span><strong id="coreState">CONNECTING</strong></div>
+        <div class="status-line"><span>Brew</span><strong id="brewState">OFFLINE</strong></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 id="pageTitle">Overview</h1>
+          <p id="subtitle">Nexus-BS local TETRA base station</p>
+        </div>
+        <div class="top-actions">
+          <button class="icon-btn" id="refreshBtn" title="Refresh system state" type="button">R</button>
+          <button class="icon-btn disabled" title="OTA update disabled" type="button" disabled>U</button>
+        </div>
+      </header>
+
+      <section class="page active" id="page-overview">
+        <div class="metrics">
+          <div class="metric"><span>Registered</span><strong id="metricRadios">0</strong></div>
+          <div class="metric"><span>Active Calls</span><strong id="metricCalls">0</strong></div>
+          <div class="metric"><span>Last Heard</span><strong id="metricHeard">0</strong></div>
+          <div class="metric"><span>CPU</span><strong id="metricCpu">--</strong></div>
+        </div>
+        <div class="grid two">
+          <section class="panel">
+            <div class="panel-head"><h2>Live Radios</h2><span id="radioCountLabel">0 online</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>ISSI</th><th>Groups</th><th>RSSI</th><th>EE</th><th>Last Seen</th></tr></thead>
+                <tbody id="overviewRadios"></tbody>
+              </table>
+            </div>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>Active Calls</h2><span id="callCountLabel">0 active</span></div>
+            <div class="table-wrap">
+              <table>
+                <thead><tr><th>ID</th><th>Type</th><th>Target</th><th>Speaker</th><th>TS</th></tr></thead>
+                <tbody id="overviewCalls"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="page-radios">
+        <section class="panel">
+          <div class="panel-head"><h2>Subscriber Registry</h2><span id="radiosUpdated">live</span></div>
+          <div class="table-wrap tall">
+            <table>
+              <thead><tr><th>ISSI</th><th>Affiliated Groups</th><th>RSSI dBFS</th><th>Energy Economy</th><th>Last Seen</th></tr></thead>
+              <tbody id="radiosTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-calls">
+        <section class="panel">
+          <div class="panel-head"><h2>Call Control</h2><span>CMCE view</span></div>
+          <div class="table-wrap tall">
+            <table>
+              <thead><tr><th>Call ID</th><th>Mode</th><th>GSSI</th><th>Caller</th><th>Called</th><th>Speaker</th><th>Age</th><th>TS</th></tr></thead>
+              <tbody id="callsTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-lastheard">
+        <section class="panel">
+          <div class="panel-head"><h2>Last Heard</h2><span>recent activity</span></div>
+          <div class="table-wrap tall">
+            <table>
+              <thead><tr><th>Time</th><th>ISSI</th><th>Activity</th><th>Destination</th></tr></thead>
+              <tbody id="heardTable"></tbody>
+            </table>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-logs">
+        <section class="panel">
+          <div class="panel-head"><h2>Runtime Log</h2><span id="logCount">0 lines</span></div>
+          <div class="log-list" id="logList"></div>
+        </section>
+      </section>
+
+      <section class="page" id="page-system">
+        <div class="grid two">
+          <section class="panel">
+            <div class="panel-head"><h2>Host</h2><span id="hostName">--</span></div>
+            <dl class="facts">
+              <dt>Product</dt><dd id="productName">--</dd>
+              <dt>CPU</dt><dd id="cpuName">--</dd>
+              <dt>Memory</dt><dd id="memoryUse">--</dd>
+              <dt>Temperature</dt><dd id="cpuTemp">--</dd>
+              <dt>Config</dt><dd id="configPath">--</dd>
+              <dt>Runtime Config</dt><dd id="runtimeConfigPath">--</dd>
+            </dl>
+          </section>
+          <section class="panel">
+            <div class="panel-head"><h2>RF Device</h2><span id="sdrName">--</span></div>
+            <pre class="soapy" id="soapyInfo">--</pre>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

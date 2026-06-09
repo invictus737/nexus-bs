@@ -13,20 +13,22 @@
 # logs stay volatile on read-only/appliance installs.
 
 [Unit]
-Description=Nexus-BS v0.1.60 TETRA base station service for %i
+Description=Nexus-BS v0.1.61 TETRA base station service for %i
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs-control@%i.service
 Wants=network-online.target nexus-bs-control@%i.service
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+Type=notify
 User=%i
 WorkingDirectory=/home/%i/nexus-bs
 RuntimeDirectory=nexus-bs-%i
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs@%i.service
+Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/%i/nexus-bs/config.toml
+Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/%i/nexus-bs/dashboard
 Environment=RUST_LOG=info,tetra_entities::messagerouter=warn,tetra_entities::phy::phy_bs=warn,tetra_entities::mm::components::client_state=warn
 
 # Copy config into tmpfs before start. nexus-bs derives the subscriber recovery
@@ -38,8 +40,16 @@ ExecStart=/home/%i/nexus-bs/nexus-bs /run/nexus-bs-%i/config.toml
 
 KillSignal=SIGINT
 TimeoutStopSec=20
+NotifyAccess=main
+WatchdogSec=30s
 Restart=on-failure
 RestartSec=10
+RestartForceExitStatus=75
+OOMPolicy=stop
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=4096
+NoNewPrivileges=yes
 
 StandardOutput=journal
 StandardError=journal

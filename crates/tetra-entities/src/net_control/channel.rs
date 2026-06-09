@@ -1,9 +1,12 @@
 use std::collections::HashMap;
 
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, bounded};
 use tetra_core::tetra_entities::TetraEntity;
 
 use crate::net_control::commands::{ControlCommand, ControlResponse};
+
+pub const CONTROL_COMMAND_CHANNEL_CAPACITY: usize = 1024;
+pub const CONTROL_RESPONSE_CHANNEL_CAPACITY: usize = 1024;
 
 // ---------------------------------------------------------------------------
 // CommandDispatcher  (worker side of a per‑entity link)
@@ -19,10 +22,10 @@ pub struct CommandDispatcher {
 
 impl CommandDispatcher {
     /// Send a command to the linked entity. Fire‑and‑forget: silently drops
-    /// if the entity's endpoint has been dropped.
+    /// if the entity's endpoint has been dropped or the bounded queue is full.
     #[inline]
     pub fn send(&self, command: ControlCommand) {
-        let _ = self.cmd_tx.send(command);
+        let _ = self.cmd_tx.try_send(command);
     }
 
     /// Clone just the Sender half so a secondary source (e.g. dashboard) can
@@ -71,10 +74,10 @@ impl ControlEndpoint {
     }
 
     /// Send a response back to the worker. Fire‑and‑forget: silently drops
-    /// if the dispatcher has been dropped.
+    /// if the dispatcher has been dropped or the bounded queue is full.
     #[inline]
     pub fn respond(&self, response: ControlResponse) {
-        let _ = self.resp_tx.send(response);
+        let _ = self.resp_tx.try_send(response);
     }
 }
 
@@ -87,8 +90,8 @@ impl ControlEndpoint {
 /// - The **dispatcher** (worker side) sends [`ControlCommand`]s and receives [`ControlResponse`]s.
 /// - The **endpoint** (entity side) receives [`ControlCommand`]s and sends [`ControlResponse`]s.
 pub fn make_control_link() -> (CommandDispatcher, ControlEndpoint) {
-    let (cmd_tx, cmd_rx) = unbounded();
-    let (resp_tx, resp_rx) = unbounded();
+    let (cmd_tx, cmd_rx) = bounded(CONTROL_COMMAND_CHANNEL_CAPACITY);
+    let (resp_tx, resp_rx) = bounded(CONTROL_RESPONSE_CHANNEL_CAPACITY);
     (CommandDispatcher { cmd_tx, resp_rx }, ControlEndpoint { cmd_rx, resp_tx })
 }
 
@@ -206,5 +209,23 @@ mod tests {
             responses[1],
             ControlResponse::SendRawSdsResponse { handle: 2, success: true }
         ));
+    }
+
+    #[test]
+    fn control_link_is_bounded_and_non_blocking_on_overflow() {
+        let (dispatcher, endpoint) = make_control_link();
+
+        for idx in 0..(CONTROL_COMMAND_CHANNEL_CAPACITY + 8) {
+            dispatcher.send(ControlCommand::CommandA {
+                handle: idx as u32,
+                parameter: idx as u32,
+            });
+        }
+
+        let mut received = 0usize;
+        while endpoint.try_recv().is_some() {
+            received += 1;
+        }
+        assert_eq!(received, CONTROL_COMMAND_CHANNEL_CAPACITY);
     }
 }

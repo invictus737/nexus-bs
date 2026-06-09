@@ -17,7 +17,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.60"
+version = "0.1.61"
 edition = "2024"
 authors = ["Chris YO3TCO / Nexus-BS Project"]
 license = "MIT"

@@ -9,6 +9,8 @@ Current protected checkpoints:
 
 - `v0.1.57`: private simplex RF-good checkpoint.
 - `v0.1.60`: legacy local GSSI group-call compatibility checkpoint.
+- `v0.1.61`: runtime/dashboard hardening checkpoint; no RF protocol semantic
+  change beyond infrastructure/backhaul overload handling.
 
 ## Active Goals
 
@@ -73,29 +75,46 @@ Secondary goal:
 ## P0 Runtime Backlog
 
 1. Fix dashboard config persistence with `/run` runtime copy
-   - Current risk: systemd copies `/home/%i/nexus-bs/config.toml` to
-     `/run/nexus-bs-%i/config.toml`, but dashboard edits write the runtime copy.
-     Edits can be lost on restart.
-   - Acceptance: edit config through dashboard, restart service, prove persistent
-     home config and runtime copy both retain the change. Corrupt primary config,
-     boot fallback, repair through dashboard, restart and prove repair survives.
+   - Status: implemented locally on 2026-06-09. `nexus-bs@USER.service` sets
+     `NEXUS_BS_PERSISTENT_CONFIG=/home/USER/nexus-bs/config.toml`, while the
+     RF core can still run the volatile `/run/nexus-bs-USER/config.toml` copy.
+   - Remaining acceptance: edit config through dashboard, restart service, prove
+     persistent home config and runtime copy both retain the change. Corrupt
+     primary config, boot fallback, repair through dashboard, restart and prove
+     repair survives.
 
 2. Bound cross-thread and network queues
-   - Current risk: some telemetry/control/Brew/log channels are unbounded.
-   - Acceptance: overflow drops or coalesces non-critical telemetry/log/control
-     messages without blocking RF; synthetic flood keeps RSS under a fixed limit.
+   - Status: implemented locally on 2026-06-09 for telemetry, control links,
+     dashboard logs, Brew worker/entity queues, generic network entity worker
+     queues, PHY file writer queues and the control CLI receiver. Brew
+     lifecycle/control/SDS commands now use a short bounded timeout before
+     drop; voice/RSSI/DTMF remain best-effort because they are overload media or
+     telemetry.
+   - Remaining acceptance: overflow drops or coalesces non-critical
+     telemetry/log/control/backhaul messages without blocking RF; synthetic
+     flood on deployed Pi keeps RSS under a fixed limit.
 
 3. Cap dashboard HTTP bodies and connection concurrency
-   - Current risk: large `Content-Length` or many idle sockets can consume memory
-     and threads.
-   - Acceptance: oversized POST returns `413` or closes early without RSS growth;
-     slow clients hit a connection cap.
+   - Status: implemented locally on 2026-06-09. Dashboard handlers now use
+     bounded body and header reads, oversized bodies return `413`, oversized
+     headers return `431`, active HTTP connection handlers are capped, API route
+     matching is exact, `/api/*` misses return API `404`, and external static
+     files are streamed with a 2 MiB cap.
+   - Remaining acceptance: synthetic oversized header/body/static/flood test on
+     deployed Pi proves no RSS/thread growth and RF continues to run.
 
 4. Add readiness/watchdog and supervise worker death
-   - Current risk: `Type=simple` only proves process liveness, not RF/control
-     worker health.
-   - Acceptance: systemd watchdog/readiness is configured; injected worker exit
-     causes degraded health alarm or controlled restart.
+   - Status: implemented locally on 2026-06-09. The service templates use
+     `Type=notify` and `WatchdogSec=30s`; Nexus-BS sends `READY=1`, sends
+     `WATCHDOG=1` only when the router tick counter advances, and sends
+     `STOPPING=1` on shutdown. A missed tick withholds the heartbeat but no
+     longer kills the watchdog helper permanently, so a recovered RF loop can
+     resume heartbeats before systemd's watchdog deadline.
+   - Remaining acceptance: deploy template, confirm `systemctl show` readiness
+     and watchdog fields, then inject a stack stall/failure in a lab run and
+     prove systemd restarts or degrades as expected. Add explicit helper-thread
+     health for dashboard/control/telemetry/Brew; the current watchdog proves
+     the RF router loop, not every auxiliary thread.
 
 ## P1 Backlog
 
@@ -109,11 +128,21 @@ Secondary goal:
 - Panic-free volatile logging under read-only roots.
 - Atomic, health-gated deploy with rollback and companion binary/script update.
 - Brew/control reconnect outage testing without queue growth.
+- Auxiliary thread health supervision: dashboard, telemetry, control and Brew
+  helpers must expose liveness so systemd health is not based only on RF router
+  ticks.
 
 ## Dashboard Migration
 
 Add a new dashboard asset path instead of reusing `[dashboard].source_dir`, which
 is reserved for OTA source override.
+
+Status: first core-side step implemented locally on 2026-06-09 as
+`[dashboard].static_dir` plus `NEXUS_BS_DASHBOARD_STATIC_DIR`. The Rust process
+still provides API/login/WebSocket and embedded fallback; an external Nexus-BS UI
+can now be served without recompiling the RF core. A first static Nexus-BS
+operator dashboard lives under `dashboard/`, and the test deploy script copies it
+beside the binary at `/home/USER/nexus-bs/dashboard`.
 
 Target config:
 

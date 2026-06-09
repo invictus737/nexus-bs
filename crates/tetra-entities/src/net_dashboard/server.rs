@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
@@ -29,6 +31,12 @@ const MAX_AIR_INTERFACE_SSI: u64 = 0x00FF_FFFF;
 const DASHBOARD_WAP_SOURCE_SSI: u32 = 0x00FF_FFFF;
 const DASHBOARD_OTA_UPDATE_ENABLED: bool = false;
 const DASHBOARD_WS_BROADCAST_QUEUE_MAX: usize = 4096;
+const DASHBOARD_HTTP_CONNECTION_MAX: usize = 64;
+const DASHBOARD_HTTP_HEADER_MAX: usize = 8 * 1024;
+const DASHBOARD_HTTP_HEADER_LINE_MAX: usize = 2 * 1024;
+const DASHBOARD_HTTP_BODY_MAX: usize = 512 * 1024;
+const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
+const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
 
 #[derive(Debug, PartialEq, Eq)]
 struct LiveSdsPost {
@@ -549,6 +557,7 @@ pub struct DashboardServer {
     pub state: DashboardState,
     clients: WsClients,
     config_path: String,
+    runtime_config_path: Option<String>,
     /// Shared stack config — used to read live_sds_queue from StackState.
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     cmd_tx: Option<CmdSender>,
@@ -556,6 +565,10 @@ pub struct DashboardServer {
     /// Optional override for the OTA update source directory.
     /// If None, the update routine auto-detects.
     source_dir_override: Option<String>,
+    /// Optional external dashboard asset directory.
+    /// `/api/*`, `/ws`, `/login` stay inside this Rust process; only browser
+    /// assets are read from this directory when configured.
+    static_dir: Option<String>,
     /// Authentication credentials. None = no auth (open access). When set, requests
     /// must carry a valid `fs_session` cookie obtained from `POST /api/login`.
     auth: Option<(String, String)>,
@@ -563,6 +576,7 @@ pub struct DashboardServer {
     sessions: SharedSessionStore,
     /// Last time a ts_voice WS message was broadcast per TS (indexed 0..3 for TS1..TS4)
     ts_last_broadcast: std::sync::Mutex<[std::time::Instant; 4]>,
+    active_http_connections: Arc<AtomicUsize>,
 }
 
 impl DashboardServer {
@@ -572,13 +586,16 @@ impl DashboardServer {
             state: Arc::new(RwLock::new(DashboardStateInner::new(config_path.clone()))),
             clients: Arc::new(Mutex::new(Vec::new())),
             config_path,
+            runtime_config_path: None,
             shared_config: None,
             cmd_tx: None,
             update_state: Arc::new(Mutex::new(UpdateState::new())),
             source_dir_override: None,
+            static_dir: None,
             auth: None,
             sessions: Arc::new(Mutex::new(SessionStore::new())),
             ts_last_broadcast: std::sync::Mutex::new([now; 4]),
+            active_http_connections: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -596,7 +613,18 @@ impl DashboardServer {
         self.source_dir_override = source_dir;
     }
 
-    /// Configure HTTP Basic Auth credentials.
+    /// Configure an explicit external asset directory for the dashboard SPA.
+    pub fn set_static_dir(&mut self, static_dir: Option<String>) {
+        self.static_dir = static_dir;
+    }
+
+    /// Record the runtime config path used by the core stack when it differs
+    /// from the editable/persistent config path exposed by dashboard APIs.
+    pub fn set_runtime_config_path(&mut self, runtime_config_path: String) {
+        self.runtime_config_path = Some(runtime_config_path);
+    }
+
+    /// Configure dashboard form-login credentials.
     pub fn set_auth(&mut self, auth: Option<(String, String)>) {
         self.auth = auth;
     }
@@ -614,12 +642,15 @@ impl DashboardServer {
         let state = Arc::clone(&self.state);
         let clients = Arc::clone(&self.clients);
         let config_path = self.config_path.clone();
+        let runtime_config_path = self.runtime_config_path.clone();
         let cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.cmd_tx.take()));
         let update_state = Arc::clone(&self.update_state);
         let source_dir_override = self.source_dir_override.clone();
+        let static_dir = self.static_dir.clone();
         let auth = self.auth.clone();
         let shared_config = self.shared_config.clone();
         let sessions = Arc::clone(&self.sessions);
+        let active_http_connections = Arc::clone(&self.active_http_connections);
 
         std::thread::Builder::new()
             .name("dashboard-server".into())
@@ -636,32 +667,50 @@ impl DashboardServer {
                 };
                 for stream in listener.incoming() {
                     let Ok(stream) = stream else { continue };
+                    let current = active_http_connections.fetch_add(1, Ordering::AcqRel);
+                    if current >= DASHBOARD_HTTP_CONNECTION_MAX {
+                        active_http_connections.fetch_sub(1, Ordering::AcqRel);
+                        tracing::warn!(
+                            "Dashboard: rejecting connection over active limit {}",
+                            DASHBOARD_HTTP_CONNECTION_MAX
+                        );
+                        http_response(stream, 503, "dashboard connection limit reached");
+                        continue;
+                    }
+
                     let state = Arc::clone(&state);
                     let clients = Arc::clone(&clients);
                     let config_path = config_path.clone();
+                    let runtime_config_path = runtime_config_path.clone();
                     let cmd_tx = Arc::clone(&cmd_tx);
                     let update_state = Arc::clone(&update_state);
                     let source_dir_override = source_dir_override.clone();
+                    let static_dir = static_dir.clone();
                     let auth = auth.clone();
                     let shared_config = shared_config.clone();
                     let sessions = Arc::clone(&sessions);
-                    std::thread::Builder::new()
-                        .name("dashboard-conn".into())
-                        .spawn(move || {
-                            handle_connection(
-                                stream,
-                                state,
-                                clients,
-                                config_path,
-                                cmd_tx,
-                                update_state,
-                                source_dir_override,
-                                auth,
-                                shared_config,
-                                sessions,
-                            )
-                        })
-                        .ok();
+                    let active_for_guard = Arc::clone(&active_http_connections);
+                    let active_for_spawn_error = Arc::clone(&active_http_connections);
+                    if let Err(e) = std::thread::Builder::new().name("dashboard-conn".into()).spawn(move || {
+                        let _guard = DashboardConnectionGuard::new(active_for_guard);
+                        handle_connection(
+                            stream,
+                            state,
+                            clients,
+                            config_path,
+                            runtime_config_path,
+                            cmd_tx,
+                            update_state,
+                            source_dir_override,
+                            static_dir,
+                            auth,
+                            shared_config,
+                            sessions,
+                        )
+                    }) {
+                        active_for_spawn_error.fetch_sub(1, Ordering::AcqRel);
+                        tracing::warn!("Dashboard: failed to spawn connection handler: {}", e);
+                    }
                 }
             })
             .expect("failed to spawn dashboard thread");
@@ -905,6 +954,22 @@ impl DashboardServer {
     }
 }
 
+struct DashboardConnectionGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl DashboardConnectionGuard {
+    fn new(active: Arc<AtomicUsize>) -> Self {
+        Self { active }
+    }
+}
+
+impl Drop for DashboardConnectionGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 fn empty_ms_entry(issi: u32) -> MsEntry {
     MsEntry {
         issi,
@@ -1085,7 +1150,7 @@ fn http_response_401(mut stream: TcpStream) {
 fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand) -> bool {
     if let Ok(guard) = cmd_tx.lock() {
         if let Some(ref tx) = *guard {
-            return tx.send(cmd).is_ok();
+            return tx.try_send(cmd).is_ok();
         }
     }
     false
@@ -1132,9 +1197,11 @@ fn handle_connection(
     state: DashboardState,
     clients: WsClients,
     config_path: String,
+    runtime_config_path: Option<String>,
     cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     update_state: SharedUpdateState,
     source_dir_override: Option<String>,
+    static_dir: Option<String>,
     auth: Option<(String, String)>,
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     sessions: SharedSessionStore,
@@ -1147,11 +1214,22 @@ fn handle_connection(
     let mut header_buf = Vec::with_capacity(2048);
     {
         // peek for the request line (already works for routing)
-        let mut peek_buf = [0u8; 4096];
+        let mut peek_buf = [0u8; DASHBOARD_HTTP_HEADER_MAX];
         let n = match stream.peek(&mut peek_buf) {
             Ok(n) => n,
             Err(_) => return,
         };
+        if n == 0 {
+            return;
+        }
+        if !peek_buf[..n].windows(4).any(|window| window == b"\r\n\r\n") {
+            http_response(
+                stream,
+                431,
+                &format!("request headers too large or incomplete (max {DASHBOARD_HTTP_HEADER_MAX} bytes)"),
+            );
+            return;
+        }
         header_buf.extend_from_slice(&peek_buf[..n]);
     }
     let header_str = String::from_utf8_lossy(&header_buf);
@@ -1163,12 +1241,13 @@ fn handle_connection(
     // mobile usability issues (iOS Safari prompts 2-3 times, forgets credentials
     // between WebSocket reconnects, etc.). With cookies we control the UX fully.
     //
-    // Public routes (no auth required): GET /login, POST /api/login, static assets.
+    // Public routes (no auth required): GET /login and POST /api/login.
+    // Dashboard assets are served after the same cookie-session gate as `/`.
     // Every other route is checked here against the session store.
     if let Some((ref expected_user, ref expected_pass)) = auth {
         // Login page and login API must remain reachable without a session.
-        let is_login_page = req_line.starts_with("GET /login ") || req_line.starts_with("GET /login?");
-        let is_login_api = req_line.starts_with("POST /api/login ");
+        let is_login_page = request_matches(&req_line, "GET", "/login");
+        let is_login_api = request_matches(&req_line, "POST", "/api/login");
 
         // Validate session cookie when present. Note: validate() refreshes last-seen,
         // so active users effectively never time out.
@@ -1200,26 +1279,13 @@ fn handle_connection(
         if is_login_api {
             // Body has form-encoded or JSON-encoded credentials.
             let mut buf = BufReader::new(stream);
-            let mut content_length = 0usize;
-            loop {
-                let mut line = String::new();
-                let _ = buf.read_line(&mut line);
-                if line == "\r\n" || line.is_empty() || line == "\n" {
-                    break;
+            let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+                Ok(body) => body,
+                Err(e) => {
+                    respond_http_body_error(buf.into_inner(), e);
+                    return;
                 }
-                let lower = line.to_lowercase();
-                if lower.starts_with("content-length:") {
-                    content_length = lower
-                        .trim_start_matches("content-length:")
-                        .trim()
-                        .trim_end_matches("\r\n")
-                        .trim_end_matches('\n')
-                        .parse()
-                        .unwrap_or(0);
-                }
-            }
-            let mut body = vec![0u8; content_length.min(4096)];
-            let _ = buf.read_exact(&mut body);
+            };
             let body_str = String::from_utf8_lossy(&body);
 
             let (user, pass) = parse_login_body(&body_str);
@@ -1243,7 +1309,7 @@ fn handle_connection(
         }
 
         // Logout: invalidate the cookie, then redirect to /login.
-        if req_line.starts_with("POST /api/logout") || req_line.starts_with("GET /logout") {
+        if request_matches(&req_line, "POST", "/api/logout") || request_matches(&req_line, "GET", "/logout") {
             if let Some(token) = parse_session_cookie(&header_str) {
                 if let Ok(mut store) = sessions.lock() {
                     store.invalidate(&token);
@@ -1273,7 +1339,7 @@ fn handle_connection(
             }
             // For GET / (the dashboard SPA): redirect to /login so the browser navigates.
             // For API requests: 401 so JS code can detect and refresh.
-            if req_line.starts_with("GET / ") || req_line.starts_with("GET /?") || req_line == "GET / HTTP/1.1" {
+            if request_matches(&req_line, "GET", "/") {
                 http_redirect(buf.into_inner(), "/login");
             } else {
                 http_response(buf.into_inner(), 401, "Unauthorized — please log in");
@@ -1282,9 +1348,9 @@ fn handle_connection(
         }
     }
 
-    if req_line.contains("/ws") {
+    if request_matches(&req_line, "GET", "/ws") {
         handle_ws(stream, state, clients, cmd_tx, update_state, auth);
-    } else if req_line.contains("GET /api/system") {
+    } else if request_matches(&req_line, "GET", "/api/system") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1293,29 +1359,16 @@ fn handle_connection(
                 break;
             }
         }
-        serve_system_info(buf.into_inner(), &config_path);
-    } else if req_line.contains("POST /api/configs/activate") {
+        serve_system_info(buf.into_inner(), &config_path, runtime_config_path.as_deref());
+    } else if request_matches(&req_line, "POST", "/api/configs/activate") {
         let mut buf = BufReader::new(stream);
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let _ = buf.read_line(&mut line);
-            if line == "\r\n" || line.is_empty() || line == "\n" {
-                break;
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end_matches("\r\n")
-                    .trim_end_matches('\n')
-                    .parse()
-                    .unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length];
-        let _ = buf.read_exact(&mut body);
+        };
         let profile = String::from_utf8_lossy(&body).trim().to_string();
         match activate_config_profile(&config_path, &profile) {
             Ok(_) => {
@@ -1324,7 +1377,7 @@ fn handle_connection(
             }
             Err(e) => http_response(buf.into_inner(), 500, &e),
         }
-    } else if req_line.contains("GET /api/configs") {
+    } else if request_matches(&req_line, "GET", "/api/configs") || request_path_has_prefix(&req_line, "GET", "/api/configs/") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1345,7 +1398,7 @@ fn handle_connection(
         } else {
             serve_config_list(buf.into_inner(), &config_path);
         }
-    } else if req_line.contains("POST /api/configs/") {
+    } else if request_path_has_prefix(&req_line, "POST", "/api/configs/") {
         // POST /api/configs/<name> — save content to a specific profile (not activate)
         let profile_name: Option<String> = req_line
             .split_whitespace()
@@ -1353,26 +1406,13 @@ fn handle_connection(
             .and_then(|path| path.strip_prefix("/api/configs/"))
             .map(|n| n.to_string());
         let mut buf = BufReader::new(stream);
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let _ = buf.read_line(&mut line);
-            if line == "\r\n" || line.is_empty() || line == "\n" {
-                break;
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_HTTP_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end_matches("\r\n")
-                    .trim_end_matches('\n')
-                    .parse()
-                    .unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length.min(512 * 1024)];
-        let _ = buf.read_exact(&mut body);
+        };
         match profile_name {
             None => http_response(buf.into_inner(), 400, "missing profile name"),
             Some(name) => match save_config_profile(&config_path, &name, &String::from_utf8_lossy(&body)) {
@@ -1383,7 +1423,7 @@ fn handle_connection(
                 Err(e) => http_response(buf.into_inner(), 500, &e),
             },
         }
-    } else if req_line.contains("GET /api/update/check") {
+    } else if request_matches(&req_line, "GET", "/api/update/check") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1393,7 +1433,7 @@ fn handle_connection(
             }
         }
         serve_update_check(buf.into_inner());
-    } else if req_line.contains("GET /api/update/status") {
+    } else if request_matches(&req_line, "GET", "/api/update/status") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1403,7 +1443,7 @@ fn handle_connection(
             }
         }
         serve_update_status(buf.into_inner(), &update_state);
-    } else if req_line.contains("POST /api/update") {
+    } else if request_matches(&req_line, "POST", "/api/update") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1433,7 +1473,7 @@ fn handle_connection(
             .spawn(move || run_update(update_clone, cfg_clone, src_override))
             .ok();
         http_response(buf.into_inner(), 200, "OK");
-    } else if req_line.contains("GET /api/config/backup") {
+    } else if request_matches(&req_line, "GET", "/api/config/backup") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1444,7 +1484,7 @@ fn handle_connection(
         }
         let backup_path = format!("{}.bak", config_path);
         serve_config_get(buf.into_inner(), &backup_path);
-    } else if req_line.contains("POST /api/config/restore") {
+    } else if request_matches(&req_line, "POST", "/api/config/restore") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1461,28 +1501,15 @@ fn handle_connection(
             }
             Err(e) => http_response(buf.into_inner(), 500, &e.to_string()),
         }
-    } else if req_line.contains("POST /api/config") {
+    } else if request_matches(&req_line, "POST", "/api/config") {
         let mut buf = BufReader::new(stream);
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let _ = buf.read_line(&mut line);
-            if line == "\r\n" || line.is_empty() || line == "\n" {
-                break;
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_HTTP_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end_matches("\r\n")
-                    .trim_end_matches('\n')
-                    .parse()
-                    .unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length];
-        let _ = buf.read_exact(&mut body);
+        };
         let body_str = String::from_utf8_lossy(&body);
         // Write backup of current config before overwriting
         let backup_path = format!("{}.bak", config_path);
@@ -1493,7 +1520,7 @@ fn handle_connection(
             Ok(_) => http_response(buf.into_inner(), 200, "OK"),
             Err(e) => http_response(buf.into_inner(), 500, &e.to_string()),
         }
-    } else if req_line.contains("GET /api/whitelist") {
+    } else if request_matches(&req_line, "GET", "/api/whitelist") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1503,31 +1530,18 @@ fn handle_connection(
             }
         }
         serve_whitelist_get(buf.into_inner(), &shared_config);
-    } else if req_line.contains("POST /api/whitelist") {
+    } else if request_matches(&req_line, "POST", "/api/whitelist") {
         let mut buf = BufReader::new(stream);
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let _ = buf.read_line(&mut line);
-            if line == "\r\n" || line.is_empty() || line == "\n" {
-                break;
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_HTTP_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end_matches("\r\n")
-                    .trim_end_matches('\n')
-                    .parse()
-                    .unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length];
-        let _ = buf.read_exact(&mut body);
+        };
         let body_str = String::from_utf8_lossy(&body);
         serve_whitelist_post(buf.into_inner(), &shared_config, &config_path, body_str.as_ref(), &cmd_tx);
-    } else if req_line.contains("GET /api/wx") {
+    } else if request_matches(&req_line, "GET", "/api/wx") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1537,31 +1551,18 @@ fn handle_connection(
             }
         }
         serve_wx_get(buf.into_inner(), &shared_config);
-    } else if req_line.contains("POST /api/wx") {
+    } else if request_matches(&req_line, "POST", "/api/wx") {
         let mut buf = BufReader::new(stream);
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let _ = buf.read_line(&mut line);
-            if line == "\r\n" || line.is_empty() || line == "\n" {
-                break;
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_HTTP_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end_matches("\r\n")
-                    .trim_end_matches('\n')
-                    .parse()
-                    .unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length];
-        let _ = buf.read_exact(&mut body);
+        };
         let body_str = String::from_utf8_lossy(&body);
         serve_wx_post(buf.into_inner(), &shared_config, &config_path, body_str.as_ref());
-    } else if req_line.contains("GET /api/config") {
+    } else if request_matches(&req_line, "GET", "/api/config") {
         let mut buf = BufReader::new(stream);
         loop {
             let mut line = String::new();
@@ -1571,7 +1572,7 @@ fn handle_connection(
             }
         }
         serve_config_get(buf.into_inner(), &config_path);
-    } else if req_line.contains("GET /api/live-sds") {
+    } else if request_matches(&req_line, "GET", "/api/live-sds") {
         // Return current live SDS queue as JSON.
         let mut buf = BufReader::new(stream);
         loop {
@@ -1582,7 +1583,7 @@ fn handle_connection(
             }
         }
         serve_live_sds_list(buf.into_inner(), &shared_config);
-    } else if req_line.contains("DELETE /api/live-sds/") {
+    } else if request_path_has_prefix(&req_line, "DELETE", "/api/live-sds/") {
         // DELETE /api/live-sds/<id>
         let id: u32 = req_line
             .split('/')
@@ -1604,7 +1605,7 @@ fn handle_connection(
             send_control_cmd(&cmd_tx, ControlCommand::DeleteLiveSds { id });
             http_response(buf.into_inner(), 200, "OK");
         }
-    } else if req_line.contains("DELETE /api/live-sds") {
+    } else if request_matches(&req_line, "DELETE", "/api/live-sds") {
         // DELETE /api/live-sds  — clear all
         let mut buf = BufReader::new(stream);
         loop {
@@ -1616,29 +1617,16 @@ fn handle_connection(
         }
         send_control_cmd(&cmd_tx, ControlCommand::ClearLiveSds);
         http_response(buf.into_inner(), 200, "OK");
-    } else if req_line.contains("POST /api/live-sds") {
+    } else if request_matches(&req_line, "POST", "/api/live-sds") {
         // POST /api/live-sds  body: JSON { "text": "...", "protocol_id": 130, "source_issi": 16777215, "repeat_count": 0 }
         let mut buf = BufReader::new(stream);
-        let mut content_length = 0usize;
-        loop {
-            let mut line = String::new();
-            let _ = buf.read_line(&mut line);
-            if line == "\r\n" || line.is_empty() || line == "\n" {
-                break;
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
             }
-            let lower = line.to_lowercase();
-            if lower.starts_with("content-length:") {
-                content_length = lower
-                    .trim_start_matches("content-length:")
-                    .trim()
-                    .trim_end_matches("\r\n")
-                    .trim_end_matches('\n')
-                    .parse()
-                    .unwrap_or(0);
-            }
-        }
-        let mut body = vec![0u8; content_length.min(4096)];
-        let _ = buf.read_exact(&mut body);
+        };
         match serde_json::from_slice::<serde_json::Value>(&body) {
             Ok(v) => match parse_live_sds_post(&v) {
                 Ok(post) => {
@@ -1674,31 +1662,37 @@ fn handle_connection(
     // All paths under /api/wifi/* are GET (read) or POST (mutate). We keep
     // the handlers small and delegate to the `wifi` module — see that for
     // docs on what each operation does. Responses are JSON.
-    } else if req_line.contains("GET /api/wifi/status") {
+    } else if request_matches(&req_line, "GET", "/api/wifi/status") {
         drain_http_headers(&mut stream);
         let body = match crate::wifi::status() {
             Ok(s) => serde_json::to_string(&serde_json::json!({"ok": true, "status": s})).unwrap_or_default(),
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("GET /api/wifi/scan") {
+    } else if request_matches(&req_line, "GET", "/api/wifi/scan") {
         drain_http_headers(&mut stream);
         let body = match crate::wifi::scan() {
             Ok(networks) => serde_json::to_string(&serde_json::json!({"ok": true, "networks": networks})).unwrap_or_default(),
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("GET /api/wifi/saved") {
+    } else if request_matches(&req_line, "GET", "/api/wifi/saved") {
         drain_http_headers(&mut stream);
         let body = match crate::wifi::list_saved() {
             Ok(profiles) => serde_json::to_string(&serde_json::json!({"ok": true, "profiles": profiles})).unwrap_or_default(),
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("POST /api/wifi/connect") {
+    } else if request_matches(&req_line, "POST", "/api/wifi/connect") {
         // Body shape: {"ssid": "...", "psk": "...", "hidden": false} for a new
         // network, or {"uuid": "..."} to bring up a saved profile.
-        let body = read_http_body(&mut stream);
+        let body = match read_http_body(&mut stream, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(stream, e);
+                return;
+            }
+        };
         let req: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(e) => {
@@ -1723,7 +1717,7 @@ fn handle_connection(
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("POST /api/wifi/disconnect") {
+    } else if request_matches(&req_line, "POST", "/api/wifi/disconnect") {
         drain_http_headers(&mut stream);
         // Find the wireless device name and disconnect it. The body is empty.
         let iface = match crate::wifi::status() {
@@ -1739,9 +1733,15 @@ fn handle_connection(
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("POST /api/wifi/forget") {
+    } else if request_matches(&req_line, "POST", "/api/wifi/forget") {
         // Body: {"uuid": "..."}
-        let body = read_http_body(&mut stream);
+        let body = match read_http_body(&mut stream, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(stream, e);
+                return;
+            }
+        };
         let req: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(e) => {
@@ -1762,9 +1762,15 @@ fn handle_connection(
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("POST /api/wifi/radio") {
+    } else if request_matches(&req_line, "POST", "/api/wifi/radio") {
         // Body: {"enabled": true|false}
-        let body = read_http_body(&mut stream);
+        let body = match read_http_body(&mut stream, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(stream, e);
+                return;
+            }
+        };
         let req: serde_json::Value = match serde_json::from_slice(&body) {
             Ok(v) => v,
             Err(e) => {
@@ -1779,7 +1785,7 @@ fn handle_connection(
             Err(e) => serde_json::to_string(&serde_json::json!({"ok": false, "error": e})).unwrap_or_default(),
         };
         http_json_response(stream, 200, &body);
-    } else if req_line.contains("GET /api/wifi/available") {
+    } else if request_matches(&req_line, "GET", "/api/wifi/available") {
         // Cheap probe used by the dashboard to decide whether to even show
         // the WiFi tab. Returns {"available": true|false}.
         drain_http_headers(&mut stream);
@@ -1788,6 +1794,16 @@ fn handle_connection(
         }))
         .unwrap_or_default();
         http_json_response(stream, 200, &body);
+    } else if request_is_api(&req_line) {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        http_json_response(buf.into_inner(), 404, r#"{"ok":false,"error":"API endpoint not found"}"#);
     } else {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1797,7 +1813,7 @@ fn handle_connection(
                 break;
             }
         }
-        serve_html(buf.into_inner());
+        serve_dashboard_asset(buf.into_inner(), static_dir.as_deref(), &req_line);
     }
 }
 
@@ -1895,7 +1911,7 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
     let send_cmd = |cmd: ControlCommand| -> bool {
         if let Ok(guard) = cmd_tx.lock() {
             if let Some(ref tx) = *guard {
-                return tx.send(cmd).is_ok();
+                return tx.try_send(cmd).is_ok();
             }
         }
         false
@@ -1916,11 +1932,19 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
         }
         Some("restart") => {
             tracing::info!("Dashboard: restart service requested");
-            send_cmd(ControlCommand::RestartService);
+            if !send_cmd(ControlCommand::RestartService) {
+                tracing::warn!("Dashboard: control dispatcher unavailable for restart request");
+                let mut s = state.write().unwrap();
+                s.push_log("WARN", "Restart request was not queued; control channel unavailable".to_string());
+            }
         }
         Some("shutdown") => {
             tracing::info!("Dashboard: shutdown service requested");
-            send_cmd(ControlCommand::ShutdownService);
+            if !send_cmd(ControlCommand::ShutdownService) {
+                tracing::warn!("Dashboard: control dispatcher unavailable for shutdown request");
+                let mut s = state.write().unwrap();
+                s.push_log("WARN", "Shutdown request was not queued; control channel unavailable".to_string());
+            }
         }
         Some("update") => {
             if !DASHBOARD_OTA_UPDATE_ENABLED {
@@ -1954,16 +1978,21 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
             let payload = msg_text.as_bytes().to_vec();
             let len_bits = (payload.len() * 8) as u16;
 
-            send_cmd(ControlCommand::SendSds {
+            if send_cmd(ControlCommand::SendSds {
                 handle: 0,
                 source_ssi: 9999,
                 dest_ssi: dest,
                 dest_is_group: false,
                 len_bits,
                 payload,
-            });
-            let mut s = state.write().unwrap();
-            s.push_log("INFO", format!("SDS sent to {}: {}", dest, msg_text));
+            }) {
+                let mut s = state.write().unwrap();
+                s.push_log("INFO", format!("SDS queued to {}: {}", dest, msg_text));
+            } else {
+                tracing::warn!("Dashboard: control dispatcher unavailable for SDS to {}", dest);
+                let mut s = state.write().unwrap();
+                s.push_log("WARN", format!("SDS to {} was not queued; control channel unavailable", dest));
+            }
         }
         Some("wap") => {
             let Ok(wap) = parse_ws_wap_command(&v) else {
@@ -2483,7 +2512,7 @@ fn detect_cpu_descriptor() -> CpuDescriptor {
     )
 }
 
-fn serve_system_info(mut stream: TcpStream, config_path: &str) {
+fn serve_system_info(mut stream: TcpStream, config_path: &str, runtime_config_path: Option<&str>) {
     let product = dashboard_product_identity();
     let hostname = std::process::Command::new("hostname")
         .output()
@@ -2657,6 +2686,7 @@ fn serve_system_info(mut stream: TcpStream, config_path: &str) {
         "uptime_secs": uptime_secs,
         "os": os_info,
         "config_path": config_path,
+        "runtime_config_path": runtime_config_path.unwrap_or(config_path),
         "config_dir": config_dir,
         "product_name": product.name,
         "product_version": product.version,
@@ -2815,6 +2845,205 @@ fn serve_html(mut stream: TcpStream) {
     let _ = stream.write_all(body);
 }
 
+enum DashboardAsset {
+    File { path: PathBuf, mime: &'static str },
+    EmbeddedFallback,
+    NotFound,
+    BadRequest(&'static str),
+}
+
+fn serve_dashboard_asset(stream: TcpStream, static_dir: Option<&str>, req_line: &str) {
+    match resolve_dashboard_asset(static_dir, req_line) {
+        DashboardAsset::File { path, mime } => serve_static_file(stream, &path, mime),
+        DashboardAsset::EmbeddedFallback => serve_html(stream),
+        DashboardAsset::NotFound => http_response(stream, 404, "Not found"),
+        DashboardAsset::BadRequest(reason) => http_response(stream, 400, reason),
+    }
+}
+
+fn resolve_dashboard_asset(static_dir: Option<&str>, req_line: &str) -> DashboardAsset {
+    let Some(static_dir) = static_dir else {
+        return DashboardAsset::EmbeddedFallback;
+    };
+    let base = Path::new(static_dir);
+    if !base.is_dir() {
+        tracing::warn!("Dashboard: static_dir '{}' is not usable, serving embedded fallback", static_dir);
+        return DashboardAsset::EmbeddedFallback;
+    }
+
+    let Some(path) = request_path(req_line) else {
+        return DashboardAsset::EmbeddedFallback;
+    };
+    let Some(decoded) = percent_decode_path(&path) else {
+        return DashboardAsset::BadRequest("invalid URL path encoding");
+    };
+    if decoded.contains('\\') {
+        return DashboardAsset::BadRequest("invalid path");
+    }
+
+    let safe_relative = match safe_relative_path(&decoded) {
+        Some(path) => path,
+        None => return DashboardAsset::BadRequest("invalid path"),
+    };
+
+    let candidate = if safe_relative.as_os_str().is_empty() {
+        base.join("index.html")
+    } else {
+        base.join(&safe_relative)
+    };
+    let candidate = if candidate.is_dir() {
+        candidate.join("index.html")
+    } else {
+        candidate
+    };
+
+    if candidate.is_file() && is_within_static_dir(base, &candidate) {
+        let mime = mime_for_path(&candidate);
+        return DashboardAsset::File { path: candidate, mime };
+    }
+
+    if decoded_has_extension(&decoded) {
+        DashboardAsset::NotFound
+    } else {
+        let index = base.join("index.html");
+        if index.is_file() && is_within_static_dir(base, &index) {
+            DashboardAsset::File {
+                path: index,
+                mime: "text/html; charset=utf-8",
+            }
+        } else {
+            DashboardAsset::EmbeddedFallback
+        }
+    }
+}
+
+fn request_path(req_line: &str) -> Option<String> {
+    let target = req_line.split_whitespace().nth(1)?;
+    let path = target.split('?').next().unwrap_or(target);
+    Some(path.to_string())
+}
+
+fn request_method(req_line: &str) -> Option<&str> {
+    req_line.split_whitespace().next()
+}
+
+fn request_matches(req_line: &str, method: &str, path: &str) -> bool {
+    request_method(req_line) == Some(method) && request_path(req_line).as_deref() == Some(path)
+}
+
+fn request_path_has_prefix(req_line: &str, method: &str, prefix: &str) -> bool {
+    request_method(req_line) == Some(method) && request_path(req_line).is_some_and(|path| path.starts_with(prefix))
+}
+
+fn request_is_api(req_line: &str) -> bool {
+    request_path(req_line).is_some_and(|path| path == "/api" || path.starts_with("/api/"))
+}
+
+fn percent_decode_path(path: &str) -> Option<String> {
+    let bytes = path.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut idx = 0usize;
+    while idx < bytes.len() {
+        if bytes[idx] == b'%' {
+            if idx + 2 >= bytes.len() {
+                return None;
+            }
+            let hi = hex_value(bytes[idx + 1])?;
+            let lo = hex_value(bytes[idx + 2])?;
+            out.push((hi << 4) | lo);
+            idx += 3;
+        } else {
+            out.push(bytes[idx]);
+            idx += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn safe_relative_path(path: &str) -> Option<PathBuf> {
+    let mut relative = PathBuf::new();
+    let trimmed = path.trim_start_matches('/');
+    if trimmed.is_empty() {
+        return Some(relative);
+    }
+    for component in Path::new(trimmed).components() {
+        match component {
+            Component::Normal(part) => relative.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    Some(relative)
+}
+
+fn is_within_static_dir(base: &Path, path: &Path) -> bool {
+    match (base.canonicalize(), path.canonicalize()) {
+        (Ok(base), Ok(path)) => path.starts_with(base),
+        _ => false,
+    }
+}
+
+fn decoded_has_extension(path: &str) -> bool {
+    Path::new(path.trim_start_matches('/')).extension().is_some()
+}
+
+fn mime_for_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "json" => "application/json",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        "wasm" => "application/wasm",
+        _ => "application/octet-stream",
+    }
+}
+
+fn serve_static_file(mut stream: TcpStream, path: &Path, mime: &str) {
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.len() > DASHBOARD_STATIC_FILE_MAX => {
+            http_response(
+                stream,
+                413,
+                &format!("static asset too large (max {DASHBOARD_STATIC_FILE_MAX} bytes)"),
+            );
+        }
+        Ok(meta) => match std::fs::File::open(path) {
+            Ok(mut file) => {
+                let header = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    mime,
+                    meta.len()
+                );
+                let _ = stream.write_all(header.as_bytes());
+                let _ = std::io::copy(&mut file, &mut stream);
+            }
+            Err(e) => http_response(stream, 500, &e.to_string()),
+        },
+        Err(e) => http_response(stream, 500, &e.to_string()),
+    }
+}
+
 fn serve_config_get(mut stream: TcpStream, config_path: &str) {
     match std::fs::read_to_string(config_path) {
         Ok(content) => {
@@ -2866,8 +3095,13 @@ fn drain_http_headers(stream: &mut TcpStream) {
     // which matters for POST handlers that need to keep reading the body.
     let mut prev3 = [0u8; 3];
     let mut byte = [0u8; 1];
+    let mut read = 0usize;
     loop {
         if stream.read(&mut byte).unwrap_or(0) == 0 {
+            break;
+        }
+        read = read.saturating_add(1);
+        if read > DASHBOARD_HTTP_HEADER_MAX {
             break;
         }
         // Detect "\r\n\r\n" by sliding a 4-byte window.
@@ -2878,42 +3112,98 @@ fn drain_http_headers(stream: &mut TcpStream) {
     }
 }
 
-/// Read an HTTP request body from the stream. Returns the body bytes.
-/// We read headers first to extract Content-Length, then read exactly that
-/// many bytes. Returns an empty vec if Content-Length is missing or 0.
-fn read_http_body(stream: &mut TcpStream) -> Vec<u8> {
-    // Read headers line-by-line. We can't use BufReader here because we'd
-    // lose buffered bytes when we drop it; instead read one byte at a time
-    // until we hit the header/body separator, accumulating into a String we
-    // can scan for Content-Length.
-    let mut header_buf = Vec::with_capacity(512);
-    let mut byte = [0u8; 1];
-    let mut prev3 = [0u8; 3];
-    loop {
-        if stream.read(&mut byte).unwrap_or(0) == 0 {
-            return Vec::new();
-        }
-        header_buf.push(byte[0]);
-        if prev3 == [b'\r', b'\n', b'\r'] && byte[0] == b'\n' {
-            break;
-        }
-        prev3 = [prev3[1], prev3[2], byte[0]];
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpBodyReadError {
+    TooLarge { max: usize },
+    HeadersTooLarge { max: usize },
+    ReadFailed,
+}
+
+fn respond_http_body_error(stream: TcpStream, err: HttpBodyReadError) {
+    match err {
+        HttpBodyReadError::TooLarge { max } => http_response(stream, 413, &format!("request body too large (max {max} bytes)")),
+        HttpBodyReadError::HeadersTooLarge { max } => http_response(stream, 431, &format!("request headers too large (max {max} bytes)")),
+        HttpBodyReadError::ReadFailed => http_response(stream, 400, "failed to read request body"),
     }
-    let header_str = String::from_utf8_lossy(&header_buf);
+}
+
+/// Read an HTTP request body from a stream, bounded by `max_len`.
+fn read_http_body(stream: &mut TcpStream, max_len: usize) -> Result<Vec<u8>, HttpBodyReadError> {
+    let mut buf = BufReader::new(stream);
+    read_http_body_from_buf(&mut buf, max_len)
+}
+
+/// Read headers and body from a buffered HTTP request, bounded by `max_len`.
+fn read_http_body_from_buf<R: BufRead>(buf: &mut R, max_len: usize) -> Result<Vec<u8>, HttpBodyReadError> {
     let mut content_length = 0usize;
-    for line in header_str.lines() {
-        let lower = line.to_lowercase();
-        if let Some(rest) = lower.strip_prefix("content-length:") {
-            content_length = rest.trim().parse().unwrap_or(0);
+    let mut header_bytes = 0usize;
+    loop {
+        let Some(line) = read_http_header_line_bounded(buf)? else {
+            break;
+        };
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > DASHBOARD_HTTP_HEADER_MAX {
+            return Err(HttpBodyReadError::HeadersTooLarge {
+                max: DASHBOARD_HTTP_HEADER_MAX,
+            });
+        }
+        if line == "\r\n" || line == "\n" {
             break;
         }
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:") {
+            content_length = lower
+                .trim_start_matches("content-length:")
+                .trim()
+                .trim_end_matches("\r\n")
+                .trim_end_matches('\n')
+                .parse()
+                .unwrap_or(0);
+        }
+    }
+
+    if content_length > max_len {
+        return Err(HttpBodyReadError::TooLarge { max: max_len });
     }
     if content_length == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
+
     let mut body = vec![0u8; content_length];
-    let _ = stream.read_exact(&mut body);
-    body
+    buf.read_exact(&mut body).map_err(|_| HttpBodyReadError::ReadFailed)?;
+    Ok(body)
+}
+
+fn read_http_header_line_bounded<R: BufRead>(buf: &mut R) -> Result<Option<String>, HttpBodyReadError> {
+    let mut bytes = Vec::new();
+    loop {
+        let available = buf.fill_buf().map_err(|_| HttpBodyReadError::ReadFailed)?;
+        if available.is_empty() {
+            if bytes.is_empty() {
+                return Ok(None);
+            }
+            break;
+        }
+
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|idx| idx + 1)
+            .unwrap_or(available.len());
+        if bytes.len().saturating_add(take) > DASHBOARD_HTTP_HEADER_LINE_MAX {
+            return Err(HttpBodyReadError::HeadersTooLarge {
+                max: DASHBOARD_HTTP_HEADER_LINE_MAX,
+            });
+        }
+
+        bytes.extend_from_slice(&available[..take]);
+        buf.consume(take);
+        if bytes.ends_with(b"\n") {
+            break;
+        }
+    }
+
+    Ok(Some(String::from_utf8_lossy(&bytes).into_owned()))
 }
 
 // ── Login UI / session helpers ──────────────────────────────────────────────
@@ -3052,10 +3342,29 @@ fn render_product_template(template: &str) -> String {
 #[cfg(test)]
 mod tests {
     use serde_json::json;
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
 
     use crate::net_control::commands::WAP_WDP_PROTOCOL_ID;
 
     use super::*;
+
+    fn temp_dashboard_static_dir() -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "nexus-bs-dashboard-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(dir.join("assets")).expect("create test dashboard dir");
+        fs::write(dir.join("index.html"), "<html>Nexus-BS dashboard</html>").expect("write index");
+        fs::write(dir.join("assets/app.js"), "console.log('nexus-bs');").expect("write js");
+        dir
+    }
 
     #[test]
     fn product_template_renders_current_nexus_bs_identity() {
@@ -3064,11 +3373,131 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.60"));
+        assert!(rendered.contains("Nexus-BS v0.1.61"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.60"));
+        assert!(rendered.contains("Nexus-BS/v0.1.61"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
+    }
+
+    #[test]
+    fn dashboard_static_dir_serves_index_and_assets() {
+        let dir = temp_dashboard_static_dir();
+        let dir_str = dir.to_string_lossy().to_string();
+
+        match resolve_dashboard_asset(Some(&dir_str), "GET / HTTP/1.1") {
+            DashboardAsset::File { path, mime } => {
+                assert_eq!(path, dir.join("index.html"));
+                assert_eq!(mime, "text/html; charset=utf-8");
+            }
+            _ => panic!("expected dashboard index from static_dir"),
+        }
+
+        match resolve_dashboard_asset(Some(&dir_str), "GET /assets/app.js HTTP/1.1") {
+            DashboardAsset::File { path, mime } => {
+                assert_eq!(path, dir.join("assets/app.js"));
+                assert_eq!(mime, "text/javascript; charset=utf-8");
+            }
+            _ => panic!("expected JS asset from static_dir"),
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dashboard_static_dir_falls_back_to_index_for_spa_routes() {
+        let dir = temp_dashboard_static_dir();
+        let dir_str = dir.to_string_lossy().to_string();
+
+        match resolve_dashboard_asset(Some(&dir_str), "GET /radios/2260618 HTTP/1.1") {
+            DashboardAsset::File { path, mime } => {
+                assert_eq!(path, dir.join("index.html"));
+                assert_eq!(mime, "text/html; charset=utf-8");
+            }
+            _ => panic!("expected SPA route fallback to index.html"),
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dashboard_static_dir_rejects_path_traversal() {
+        let dir = temp_dashboard_static_dir();
+        let dir_str = dir.to_string_lossy().to_string();
+
+        for req in [
+            "GET /assets/../config.toml HTTP/1.1",
+            "GET /assets/%2e%2e/config.toml HTTP/1.1",
+            "GET /assets/%2E%2E/config.toml HTTP/1.1",
+        ] {
+            match resolve_dashboard_asset(Some(&dir_str), req) {
+                DashboardAsset::BadRequest(_) => {}
+                _ => panic!("expected traversal to be rejected for {req}"),
+            }
+        }
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dashboard_http_body_reader_rejects_oversized_content_length() {
+        let request = b"POST /api/config HTTP/1.1\r\nContent-Length: 10\r\n\r\nabcdefghij";
+        let mut reader = BufReader::new(Cursor::new(request.as_slice()));
+
+        let err = read_http_body_from_buf(&mut reader, 4).expect_err("oversized body must fail");
+
+        assert_eq!(err, HttpBodyReadError::TooLarge { max: 4 });
+    }
+
+    #[test]
+    fn dashboard_http_body_reader_rejects_oversized_header_line() {
+        let long_header = "X-Test: ".to_string() + &"a".repeat(DASHBOARD_HTTP_HEADER_LINE_MAX + 1);
+        let request = format!("POST /api/config HTTP/1.1\r\n{long_header}\r\nContent-Length: 0\r\n\r\n");
+        let mut reader = BufReader::new(Cursor::new(request.as_bytes()));
+
+        let err = read_http_body_from_buf(&mut reader, DASHBOARD_SMALL_BODY_MAX).expect_err("oversized header must fail");
+
+        assert_eq!(
+            err,
+            HttpBodyReadError::HeadersTooLarge {
+                max: DASHBOARD_HTTP_HEADER_LINE_MAX
+            }
+        );
+    }
+
+    #[test]
+    fn dashboard_unknown_api_paths_are_reserved_from_spa_fallback() {
+        assert!(request_is_api("GET /api/unknown HTTP/1.1"));
+        assert!(request_is_api("POST /api/configure HTTP/1.1"));
+        assert!(!request_matches("GET /api/system2 HTTP/1.1", "GET", "/api/system"));
+        assert!(request_matches("GET /api/system?fresh=1 HTTP/1.1", "GET", "/api/system"));
+        assert!(request_path_has_prefix(
+            "GET /api/configs/profile.toml HTTP/1.1",
+            "GET",
+            "/api/configs/"
+        ));
+        assert!(!request_is_api("GET /assets/app.js HTTP/1.1"));
+        assert!(!request_is_api("GET /radios/2260618 HTTP/1.1"));
+    }
+
+    #[test]
+    fn dashboard_http_body_reader_reads_bounded_body() {
+        let request = b"POST /api/config HTTP/1.1\r\nContent-Length: 5\r\n\r\nabcde";
+        let mut reader = BufReader::new(Cursor::new(request.as_slice()));
+
+        let body = read_http_body_from_buf(&mut reader, 5).expect("body should fit limit");
+
+        assert_eq!(body, b"abcde");
+    }
+
+    #[test]
+    fn dashboard_connection_guard_decrements_active_count() {
+        let active = Arc::new(AtomicUsize::new(1));
+        {
+            let _guard = DashboardConnectionGuard::new(Arc::clone(&active));
+            assert_eq!(active.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(active.load(Ordering::Acquire), 0);
     }
 
     #[test]
@@ -3123,9 +3552,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.60");
-        assert_eq!(product.version_tag, "v0.1.60");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.60");
+        assert_eq!(product.version, "0.1.61");
+        assert_eq!(product.version_tag, "v0.1.61");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.61");
     }
 
     #[test]
@@ -3460,7 +3889,7 @@ model name	: Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz
     #[test]
     fn dashboard_wap_ws_dispatches_raw_type4_wap_sds() {
         let state = Arc::new(RwLock::new(DashboardStateInner::new("test.toml".to_string())));
-        let (tx, rx) = crossbeam_channel::unbounded();
+        let (tx, rx) = crossbeam_channel::bounded(crate::net_control::channel::CONTROL_COMMAND_CHANNEL_CAPACITY);
         let cmd_tx = Arc::new(Mutex::new(Some(tx)));
         let update_state = Arc::new(Mutex::new(UpdateState::new()));
 

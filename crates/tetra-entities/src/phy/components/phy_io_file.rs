@@ -1,8 +1,10 @@
-use crossbeam_channel::{Sender, unbounded};
+use crossbeam_channel::{Sender, bounded};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::thread;
+
+const PHY_FILE_WRITE_CHANNEL_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub enum FileWriteMsg {
@@ -156,7 +158,7 @@ impl PhyIoFile {
     /// Returns a Sender that can be used to queue write operations
     pub fn create_async_writer<P: AsRef<Path>>(filename: P, thread_name: String) -> io::Result<Sender<FileWriteMsg>> {
         let file_path = filename.as_ref().to_path_buf();
-        let (sender, receiver) = unbounded::<FileWriteMsg>();
+        let (sender, receiver) = bounded::<FileWriteMsg>(PHY_FILE_WRITE_CHANNEL_CAPACITY);
         // let thread_name = format!("phy-io-writer-{}", file_path.display());
 
         thread::Builder::new()

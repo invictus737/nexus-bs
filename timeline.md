@@ -1,5 +1,135 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-09 08:05 EEST - P0 runtime config persistence and first dashboard decoupling step
+
+Scope:
+
+- Infrastructure/dashboard patch only. No TETRA PDU, CMCE, UMAC, MM, LLC,
+  SDS or WAP protocol behavior changed.
+- ETSI law memory was reloaded before work. Since this patch does not alter
+  air-interface behavior, no new clause-scoped protocol claim is made.
+
+Patch:
+
+- `bins/nexus-bs/src/main.rs`
+  - Dashboard config APIs now use `NEXUS_BS_PERSISTENT_CONFIG` when present.
+  - The core may still run the volatile `/run/nexus-bs-USER/config.toml` copy,
+    preserving volatile subscriber recovery/cache behavior.
+  - Dashboard system API records the runtime config path separately for
+    diagnostics.
+- `contrib/systemd/nexus-bs@.service`
+  - Sets `NEXUS_BS_PERSISTENT_CONFIG=/home/%i/nexus-bs/config.toml`.
+  - Sets `NEXUS_BS_DASHBOARD_STATIC_DIR=/home/%i/nexus-bs/dashboard` for the
+    optional external dashboard asset module.
+- `crates/tetra-config/src/bluestation/sec_dashboard.rs`
+  - Added `[dashboard].static_dir` as an explicit external asset path, separate
+    from OTA `source_dir`.
+  - Parser validates explicit `static_dir` as an existing directory.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added `DashboardServer::set_static_dir`.
+  - Keeps `/api/*`, `/ws`, `/login` and session handling in the Rust gateway.
+  - Serves `/`, `/assets/*` and SPA routes from `static_dir` when configured.
+  - Falls back to the embedded dashboard when no external assets are configured
+    or the asset directory is not usable.
+  - Rejects path traversal, including percent-encoded `..`.
+- `README.md` and `example_config/config.toml`
+  - Documented `static_dir` and persistent-dashboard-config behavior.
+
+Verification:
+
+- `cargo fmt -p tetra-config -p tetra-entities -p nexus-bs` passed.
+- `cargo test -p tetra-config dashboard_static_dir --locked` passed.
+- `cargo test -p tetra-config test_example_config_keeps_transmission_interruption_disabled --locked` passed.
+- `cargo test -p tetra-entities dashboard_static_dir --locked` passed.
+- `cargo check -p nexus-bs --locked` passed.
+- `git diff --check` passed.
+
+Next non-repeating execution gates:
+
+1. Deploy only after the next runtime build gate, then verify dashboard config
+   edit survives service restart because it writes `/home/USER/nexus-bs/config.toml`.
+2. Continue P0 runtime hardening with dashboard HTTP body/concurrency caps and
+   bounded telemetry/log queues.
+3. Keep protected private simplex/P2P and v0.1.60 legacy GSSI protocol behavior
+   untouched unless fresh RF logs specifically implicate those paths.
+4. RF validation still required for GSSI `226333`, P2P close behavior, restart
+   attach/group recovery, mixed EE auto and WAP/SDS.
+
+### Runtime P0 continuation - dashboard memory/thread bounds
+
+Additional patch in the same workstream:
+
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added `DASHBOARD_HTTP_CONNECTION_MAX = 64` active dashboard connection
+    limit.
+  - Added RAII connection guard so the active count is decremented when handler
+    threads exit.
+  - Added bounded HTTP body reader.
+  - Oversized dashboard POST bodies now return `413` instead of allocating from
+    untrusted `Content-Length` or silently truncating.
+  - Applied body caps to login, config/profile edit, whitelist, WX, live-SDS and
+    WiFi mutation endpoints.
+
+Additional verification:
+
+- `cargo test -p tetra-entities dashboard_http_body_reader --locked` passed.
+- `cargo test -p tetra-entities dashboard_connection_guard --locked` passed.
+- `cargo check -p nexus-bs --locked` passed after the runtime bounds patch.
+
+### Runtime P0 continuation - bounded queues
+
+Additional patch in the same workstream:
+
+- Removed remaining unbounded crossbeam channels from `crates/` and `bins/`.
+- Bounded telemetry events at 8192 entries and changed telemetry sink sends to
+  non-blocking `try_send`.
+- Bounded control command/response links at 1024 entries and changed control
+  dispatch/response sends to non-blocking `try_send`.
+- Bounded dashboard log forwarding at 2048 entries; the tracing dashboard layer
+  already used `try_send`.
+- Bounded Brew worker/event queues and changed Brew command/event sends to
+  non-blocking `try_send`.
+- Bounded generic network entity worker queues and removed the panic-on-send
+  path from `NetEntity::rx_prim`.
+- Bounded PHY async file writer queues.
+- Bounded the `nexus-bs-control` per-client command queue.
+
+Additional verification:
+
+- `cargo test -p tetra-entities telemetry_channel_is_bounded --locked` passed.
+- `cargo test -p tetra-entities control_link_is_bounded --locked` passed.
+- `cargo test -p tetra-entities brew_command_channel_is_bounded --locked` passed.
+- `cargo test -p tetra-entities phy_io_file --locked` passed.
+- `cargo test -p tetra-entities wx --locked` passed after WX reply enqueue
+  switched to non-blocking `try_send`.
+- `cargo check -p nexus-bs --locked` passed.
+- `cargo check -p nexus-bs-control --locked` passed.
+
+### Runtime P0 continuation - systemd readiness/watchdog
+
+Additional patch in the same workstream:
+
+- `crates/tetra-entities/src/service_control.rs`
+  - Added direct `sd_notify` support using `NOTIFY_SOCKET`, without adding a
+    new dependency.
+  - Added `READY=1`, `STOPPING=1` and watchdog notification helpers.
+  - Added `WATCHDOG_USEC` interval parsing with a one-second minimum.
+  - Watchdog notifications are tied to the stack tick counter.
+- `crates/tetra-entities/src/messagerouter.rs`
+  - Marks stack progress after each completed router tick.
+- `bins/nexus-bs/src/main.rs`
+  - Starts the systemd watchdog helper and emits readiness/stopping status.
+- `contrib/systemd/nexus-bs@.service` and legacy sample
+  - Switched to `Type=notify`.
+  - Added `NotifyAccess=main`, `WatchdogSec=30s`,
+    `RestartForceExitStatus=75`, `OOMPolicy=stop`, `MemoryMax=512M`,
+    `TasksMax=128`, `LimitNOFILE=4096` and `NoNewPrivileges=yes`.
+
+Additional verification:
+
+- `cargo test -p tetra-entities service_control --locked` passed.
+- `cargo check -p nexus-bs --locked` passed after the readiness/watchdog patch.
+
 ## 2026-06-09 02:52 EEST - Architecture swarm started for robustness and dashboard goals
 
 Swarm status:
@@ -12747,3 +12877,130 @@ RF gate:
 1. Deploy and retest local GSSI `226333` with fast ping-pong PTT from `2260616`, `2260618`, and `2260082`.
 2. Expected improvement: no more dropped deferred raw TCH/S immediately caused by `FloorReleased` after `U-TX CEASED`.
 3. If `accepted_ul_media_since_floor=0` still appears for `2260082`, continue below CMCE at grant decode / LMAC / RF timing, because CMCE no longer purges the tail immediately.
+
+## 2026-06-09 - Runtime/dashboard P0 hardening and external dashboard module
+
+Scope:
+
+- Reloaded ETSI compliance law and EG/SwMI resume before continuing. This patch
+  is runtime/dashboard/backhaul infrastructure, not a new air-interface protocol
+  claim and not formal TETRA certification.
+- Spawned three read-only specialist reviews: runtime QA, dashboard/API
+  decoupling review and TETRA protocol safety guard.
+
+Patch:
+
+- `bins/nexus-bs/src/main.rs`
+  - Dashboard config APIs edit persistent `NEXUS_BS_PERSISTENT_CONFIG` while the
+    RF core may run a volatile `/run/.../config.toml` copy.
+  - External dashboard static assets can come from `[dashboard].static_dir` or
+    `NEXUS_BS_DASHBOARD_STATIC_DIR`.
+  - systemd watchdog helper is started and `READY=1` / `STOPPING=1` are sent.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added bounded HTTP connection cap, bounded body reads, bounded header reads,
+    `431` for excessive headers, `413` for excessive bodies/static assets,
+    exact API route matching and reserved `/api/*` 404 responses.
+  - Serves external dashboard files from `static_dir` with path traversal
+    rejection and embedded fallback.
+  - Streams static files with a 2 MiB cap instead of reading whole files into
+    memory.
+  - Dashboard WS restart/shutdown/SDS commands now report enqueue failure instead
+    of logging success on a full control channel.
+- `dashboard/`
+  - Added first no-build external Nexus-BS operator dashboard using `/api/system`
+    and `/ws`.
+  - Fallback product version displays `--` until `/api/system` provides current
+    identity.
+- `scripts/nexus-bs-test-deploy.sh`
+  - Copies `dashboard/index.html`, `dashboard/assets/app.js` and
+    `dashboard/assets/styles.css` beside the deployed binary.
+- `crates/tetra-config/src/bluestation/sec_dashboard.rs`
+  - Added `static_dir` parsing. Missing asset directories no longer make config
+    parsing fail; existing non-directory paths are still rejected.
+  - Updated auth comments to describe the current form-login + `fs_session`
+    cookie model.
+- `crates/tetra-entities/src/net_brew/entity.rs`
+  - Bounded Brew command queue remains in place. Critical lifecycle/control/SDS
+    commands use a short bounded timeout before drop; voice/RSSI/DTMF remain
+    best-effort overload traffic.
+- `crates/tetra-entities/src/net_brew/worker.rs`
+  - Bounded Brew worker event queue remains in place. Critical lifecycle/control
+    events use a short bounded timeout; voice and server-error event drops are
+    rate-limited and observable.
+- `crates/tetra-entities/src/service_control.rs`
+  - A missed RF router tick withholds `WATCHDOG=1` but no longer exits the
+    watchdog helper permanently.
+- `contrib/systemd/`
+  - Service templates use `Type=notify`, `NotifyAccess=main`, `WatchdogSec=30s`
+    and bounded resource settings. The `@` unit points config and dashboard
+    assets at `/home/%i/nexus-bs`.
+
+Specialist review outcomes:
+
+- Protocol guard found no accidental RF-good P2P/GSSI semantic changes in MM,
+  LLC, UMAC/MAC or CMCE call control. Direct CMCE touch is WX SDS queue
+  injection only.
+- Runtime QA flagged remaining helper-thread supervision as a real gap:
+  current watchdog proves RF router ticks, not dashboard/control/telemetry/Brew
+  helper liveness. This is now tracked as P1/P0-next acceptance work.
+- Dashboard review flagged stale auth wording, optional `static_dir` startup
+  risk, `/api/*` SPA fallback and hardcoded static version; all were patched.
+
+Verification:
+
+- `cargo fmt -p tetra-config -p tetra-entities -p nexus-bs -p nexus-bs-control`
+  passed.
+- `cargo test -p tetra-config dashboard_static_dir --locked` passed.
+- `cargo test -p tetra-entities dashboard_http_body_reader --locked` passed.
+- `cargo test -p tetra-entities dashboard_unknown_api_paths --locked` passed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `cargo test -p tetra-entities dashboard_static_dir --locked` passed.
+- `cargo test -p tetra-entities dashboard_connection_guard --locked` passed.
+- `cargo test -p tetra-entities brew_command_channel_is_bounded --locked`
+  passed.
+- `cargo test -p tetra-entities service_control --locked` passed.
+- `cargo check -p nexus-bs --locked` passed.
+- `cargo check -p nexus-bs-control --locked` passed.
+- `rg -n "crossbeam_channel::unbounded|\bunbounded\(" crates bins` found no
+  runtime unbounded channel use.
+- `git diff --check` passed.
+
+Next:
+
+1. Deploy this stage only after final local review/commit, then verify systemd
+   `Type=notify` and `WatchdogSec` fields on `nexus-bs@chris.service`.
+2. On Pi, test dashboard external assets load from
+   `/home/chris/nexus-bs/dashboard` and persistent config edits survive restart.
+3. Run synthetic dashboard HTTP/header/body/static flood and Brew/control
+   reconnect tests while watching RSS and RF continuity.
+4. Add explicit helper-thread liveness tracking for dashboard/control/telemetry
+   and Brew before claiming the runtime watchdog covers all service health.
+
+## 2026-06-09 - Nexus-BS v0.1.61 runtime/dashboard checkpoint
+
+Scope:
+
+- Bumped current workspace identity from `v0.1.60` to `v0.1.61` after the
+  runtime/dashboard P0 hardening stage.
+- This is a runtime/dashboard/backhaul overload checkpoint. It does not supersede
+  the protected RF-good semantics of `v0.1.60` for legacy local GSSI or earlier
+  private-simplex checkpoints, and it is not formal TETRA certification.
+
+Updated identity surfaces:
+
+- Workspace/package version and `Cargo.lock` path-package versions.
+- `tetra_core::PRODUCT_VERSION_TAG`, User-Agent, control protocol and telemetry
+  protocol tests.
+- README, example config, systemd unit descriptions and dashboard product
+  identity tests.
+
+Verification:
+
+- `cargo check -p tetra-core` passed and updated `Cargo.lock`.
+- `cargo test -p tetra-core product_identity_tracks_workspace_version --locked`
+  passed.
+- `cargo test -p tetra-entities control_protocol_tracks_nexus_bs_product_version --locked`
+  passed.
+- `cargo test -p tetra-entities telemetry_protocol_tracks_nexus_bs_product_version --locked`
+  passed.

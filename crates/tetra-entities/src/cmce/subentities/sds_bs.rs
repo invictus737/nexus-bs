@@ -1417,7 +1417,7 @@ impl SdsBsSubentity {
             len_bits,
             payload,
         };
-        if tx.send(cmd).is_err() {
+        if tx.try_send(cmd).is_err() {
             tracing::warn!("WX: failed to enqueue reply to ISSI {}", dest_issi);
         }
     }
@@ -1465,7 +1465,7 @@ impl SdsBsSubentity {
                     len_bits,
                     payload,
                 };
-                let _ = tx.send(cmd);
+                let _ = tx.try_send(cmd);
             })
             .ok();
     }

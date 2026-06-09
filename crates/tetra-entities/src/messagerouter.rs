@@ -207,6 +207,7 @@ impl MessageRouter {
 
             // Send tick_end event and process final messages
             self.tick_end();
+            crate::service_control::mark_stack_tick();
 
             // Check if we should stop
             ticks += 1;
