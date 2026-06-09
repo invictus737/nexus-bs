@@ -3,7 +3,7 @@
 > **TETRA base station software for amateur radio operators and researchers.**
 > Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
 
-Nexus-BS is a TETRA base-station stack derived from the BlueStation and FlowStation project lineages, with ongoing dashboard, SDR and ETSI EN 300 392-2 clause-scoped hardening work.
+Nexus-BS is an independently maintained TETRA base-station stack by the Nexus-BS Project, with ongoing dashboard, SDR and ETSI EN 300 392-2 clause-scoped hardening work. Historical credits are listed below; they do not describe current Nexus-BS project governance.
 
 Tested hardware: **LimeSDR Mini 2.0** · **Motorola MXP600** · **Motorola MTM800E** · **Motorola MTM5400**
 
@@ -284,11 +284,11 @@ For terminal browsers that support basic HTML/color handling, use:
 
 - **Harald Welte** and the **osmocom** team for the foundational osmocom-tetra work
 - **Tatu Peltola** for rust-soapysdr timestamping and the native Rust Viterbi encoder/decoder used in LMAC
-- **BlueStation Project** for the upstream TETRA BS foundation and protocol structure
-- **FlowStation Project** for operational field features, dashboard evolution and deployment hardening
-- **SXCEIVER** for SDR hardware ecosystem and station-oriented RF integration context
+- **BlueStation Project** for historical TETRA BS foundation and protocol-structure contributions
+- **FlowStation Project** for historical field-feature, dashboard and deployment-hardening contributions
+- **SXCEIVER** for SDR hardware ecosystem context and station-oriented RF integration work
 - **Stichting NLnet** for partially funding this work through the [RETETRA3 grant](https://nlnet.nl/project/RETETRA3/)
-- All upstream, fork, testing, documentation, hardware, dashboard and integration contributors, including the operator community — ON6RF, EA7KEN, BU2GQ, DK5RTA, DO5MF, ES4TIX, DK5RTA and others — for testing, bug reports, and feature requests that shaped this release
+- All historical, fork, testing, documentation, hardware, dashboard and integration contributors, including the operator community — ON6RF, EA7KEN, BU2GQ, DK5RTA, DO5MF, ES4TIX, DK5RTA and others — for testing, bug reports, and feature requests that shaped this release
 
 ---
 

@@ -1897,8 +1897,8 @@ td code{
           <div class="about-title">Nexus-BS Project - version {{PRODUCT_VERSION_TAG}} by Chris YO3TCO</div>
           <div class="about-copy">
             Nexus-BS is a TETRA base-station stack for lab, amateur-radio and research work.
-            The dashboard identifies this build as Nexus-BS and keeps the upstream technical
-            lineage visible for operators and contributors.
+            The dashboard identifies this build as Nexus-BS. Historical credits are listed
+            for transparency; they do not describe current Nexus-BS project governance.
           </div>
           <div class="about-chip-row">
             <span class="about-chip">User-Agent {{PRODUCT_USER_AGENT}}</span>
@@ -1925,19 +1925,19 @@ td code{
           <div class="about-grid">
             <div class="about-credit">
               <div class="about-credit-name">BlueStation Project</div>
-              <div class="about-credit-desc">Upstream TETRA base-station foundation, protocol structure and early SDR stack lineage.</div>
+              <div class="about-credit-desc">Historical TETRA base-station foundation, protocol-structure and early SDR-stack contributions.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name">FlowStation Project</div>
-              <div class="about-credit-desc">Operational field features, dashboard evolution, Brew integration work and practical deployment hardening.</div>
+              <div class="about-credit-desc">Historical field-feature, dashboard, Brew integration and deployment-hardening contributions.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name">SXCEIVER</div>
-              <div class="about-credit-desc">SDR hardware ecosystem, RF integration context and station-oriented deployment support.</div>
+              <div class="about-credit-desc">SDR hardware ecosystem context, RF integration work and station-oriented deployment support.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name">All Contributors</div>
-              <div class="about-credit-desc">All upstream, fork, testing, documentation, hardware, dashboard and integration contributors whose work is preserved in the project history and credits.</div>
+              <div class="about-credit-desc">All historical, fork, testing, documentation, hardware, dashboard and integration contributors whose work is preserved in project history and credits.</div>
             </div>
           </div>
         </div>

@@ -3106,6 +3106,7 @@ mod tests {
         for credit in ["BlueStation Project", "FlowStation Project", "SXCEIVER", "All Contributors"] {
             assert!(dashboard.contains(credit), "missing About credit {credit}");
         }
+        assert!(dashboard.contains("current Nexus-BS project governance"));
     }
 
     #[test]

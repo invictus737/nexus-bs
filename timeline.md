@@ -1,5 +1,29 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-09 02:52 EEST - Architecture swarm started for robustness and dashboard goals
+
+Swarm status:
+
+- Closed previous telecom analysis agents before starting the new workstream.
+- Started orchestration/PM agent `019eaaab-bf55-7c12-9b1e-b918f56ed61b` to produce milestone sequencing, owners, acceptance gates, RF gates and timeline update format for the two active goals.
+- Started protocol architect agent `019eaaab-f110-7341-b742-95c6bb659d4e` for clause-scoped TETRA backlog across GSSI group call, private simplex/duplex, SDS/WAP, MM attach/affiliation/restart recovery, EE auto/EG and scan/group stability.
+- Started runtime reliability architect agent `019eaaac-1d82-70d0-a99a-99f1ca82cf68` for 24x7 systemd/runtime/logging/resource/recovery hardening.
+- Started dashboard architect agent `019eaaac-489f-7523-88b1-19ef2cae67ee` for extracting the operator dashboard from the Rust binary and replacing it with a Nexus-BS-owned operational dashboard.
+- Started QA/soak architect agent `019eaaac-81ea-7d50-a4e5-a84607e06652` for automated/RF/soak/restart/affiliation/private/SDS/WAP/dashboard acceptance matrix.
+
+Execution rules for the swarm:
+
+- All protocol work remains governed by `/Users/ctermure/.codex/memories/tetra-etsi-compliance-law.md`: clause-scoped ETSI EN 300 392-2 analysis, focused tests, no formal certification claim without official conformance evidence.
+- FlowStation remains historical/upstream context only. Nexus-BS product identity, dashboard, runtime packaging and operational roadmap are Nexus-BS-owned and must not imply collaboration or shared product governance.
+- Dashboard redesign must be modern, dense and operational, inspired by the discipline of professional TETRA management consoles, not a marketing page or decorative demo UI.
+
+Integration update:
+
+- All five swarm agents completed and were closed after read-only analysis.
+- Added `MISSION_READINESS.md` as the central operational backlog and QA gate document for mission-readiness evidence.
+- Updated README and dashboard About wording so BlueStation/FlowStation/SXCEIVER remain historical credits only; Nexus-BS is described as independently maintained and not a FlowStation collaboration or shared product.
+- Added a dashboard test assertion for the independent Nexus-BS wording to prevent accidental regression.
+
 ## 2026-06-09 02:18 EEST - Nexus-BS v0.1.60 release bump and mission-critical robustness goal
 
 Release scope:
