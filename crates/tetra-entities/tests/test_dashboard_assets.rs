@@ -32,8 +32,12 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(logo_path.is_file(), "dashboard vector logo asset must exist on disk");
     assert!(
-        index.contains(r#"src="/assets/nexus-bs-logo.svg""#) && !index.contains(r#"id="buildLabel""#) && !app.contains("buildLabel"),
-        "brand area must use the vector logo and show only the Nexus-BS wordmark without a version label"
+        index.contains(r#"<img class="brand-logo" src="/assets/nexus-bs-logo.svg" alt="Nexus-BS">"#)
+            && !index.contains(r#"class="brand-mark""#)
+            && !index.contains(r#"class="brand-name""#)
+            && !index.contains(r#"id="buildLabel""#)
+            && !app.contains("buildLabel"),
+        "brand area must use the vector Nexus-BS lockup without a version label"
     );
     assert!(
         deploy_script.contains("dashboard/assets/nexus-bs-logo.svg"),
