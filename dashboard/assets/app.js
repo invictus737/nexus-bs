@@ -41,6 +41,8 @@ const state = {
   activePage: "system",
   pageScroll: new Map(),
   scrollRestoreFrame: 0,
+  scrollRestoreSecondFrame: 0,
+  lastScrollInputMs: 0,
 };
 
 const radioId = {
@@ -72,6 +74,7 @@ const SITE_REFRESH_MS = 10000;
 const CORE_ONLINE_GRACE_MS = 5000;
 const CORE_RECONNECT_GRACE_MS = 12000;
 const SLOT_ACTIVITY_MS = 2000;
+const SCROLL_INPUT_GRACE_MS = 180;
 
 const pages = {
   system: "System",
@@ -92,7 +95,8 @@ function setText(id, value) {
 
 function setHtml(id, value) {
   const node = $(id);
-  if (node) node.innerHTML = value ?? "";
+  const html = value ?? "";
+  if (node && node.innerHTML !== html) node.innerHTML = html;
 }
 
 function setClass(id, className, enabled) {
@@ -127,29 +131,76 @@ function clampScrollY(value) {
   return Math.min(Math.max(0, Number(value) || 0), maxScrollY());
 }
 
+function scrollClock() {
+  return window.performance?.now?.() || Date.now();
+}
+
+function markScrollInput() {
+  state.lastScrollInputMs = scrollClock();
+}
+
+function recentScrollInput() {
+  return scrollClock() - state.lastScrollInputMs < SCROLL_INPUT_GRACE_MS;
+}
+
+function cancelScrollRestore() {
+  if (state.scrollRestoreFrame) cancelAnimationFrame(state.scrollRestoreFrame);
+  if (state.scrollRestoreSecondFrame) cancelAnimationFrame(state.scrollRestoreSecondFrame);
+  state.scrollRestoreFrame = 0;
+  state.scrollRestoreSecondFrame = 0;
+}
+
+function applyScrollY(top) {
+  window.scrollTo({ top: clampScrollY(top), left: 0, behavior: "auto" });
+}
+
+function scheduleScrollRestore(page, target, inputToken) {
+  cancelScrollRestore();
+  const restore = () => {
+    if (state.activePage !== page || state.lastScrollInputMs !== inputToken) {
+      cancelScrollRestore();
+      return false;
+    }
+    applyScrollY(target);
+    state.pageScroll.set(page, clampScrollY(target));
+    return true;
+  };
+  state.scrollRestoreFrame = requestAnimationFrame(() => {
+    state.scrollRestoreFrame = 0;
+    if (!restore()) return;
+    state.scrollRestoreSecondFrame = requestAnimationFrame(() => {
+      state.scrollRestoreSecondFrame = 0;
+      restore();
+    });
+  });
+}
+
 function rememberPageScroll(page = state.activePage) {
   if (!pages[page]) return;
-  if (state.scrollRestoreFrame) {
-    cancelAnimationFrame(state.scrollRestoreFrame);
-    state.scrollRestoreFrame = 0;
-  }
   state.pageScroll.set(page, currentScrollY());
 }
 
 function restorePageScroll(page = state.activePage, fallback = 0) {
   if (!pages[page]) return;
   const target = state.pageScroll.has(page) ? state.pageScroll.get(page) : fallback;
-  if (state.scrollRestoreFrame) cancelAnimationFrame(state.scrollRestoreFrame);
-  state.scrollRestoreFrame = requestAnimationFrame(() => {
-    state.scrollRestoreFrame = 0;
-    window.scrollTo({ top: clampScrollY(target), left: 0, behavior: "auto" });
-  });
+  scheduleScrollRestore(page, target, state.lastScrollInputMs);
 }
 
 function preserveActivePageScroll(renderFn) {
-  // Live telemetry updates must not fight manual operator scrolling. Stored
-  // per-page scroll positions are restored only when switching dashboard tabs.
+  // Live telemetry updates must not fight manual operator scrolling. They do,
+  // however, replace dynamic DOM blocks; preserve the viewport unless fresh
+  // wheel/touch/key input arrives while the render is in progress.
+  const page = state.activePage;
+  const beforeY = currentScrollY();
+  const inputToken = state.lastScrollInputMs;
   renderFn();
+  if (state.activePage !== page || state.lastScrollInputMs !== inputToken || recentScrollInput()) {
+    rememberPageScroll(page);
+    return;
+  }
+  const target = clampScrollY(beforeY);
+  if (Math.abs(currentScrollY() - target) > 1) applyScrollY(target);
+  scheduleScrollRestore(page, target, inputToken);
 }
 
 function esc(value) {
@@ -1878,6 +1929,19 @@ function switchPage(page) {
 }
 
 function initNav() {
+  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
+  window.addEventListener("wheel", markScrollInput, { passive: true });
+  window.addEventListener("touchstart", markScrollInput, { passive: true });
+  window.addEventListener("touchmove", markScrollInput, { passive: true });
+  window.addEventListener(
+    "keydown",
+    (event) => {
+      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
+        markScrollInput();
+      }
+    },
+    { passive: true }
+  );
   window.addEventListener("scroll", () => rememberPageScroll(), { passive: true });
   for (const node of document.querySelectorAll(".nav-item")) {
     node.addEventListener("click", () => switchPage(node.dataset.page));

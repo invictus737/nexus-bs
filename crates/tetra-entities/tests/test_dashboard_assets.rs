@@ -140,11 +140,18 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("activePage: \"system\"")
             && app.contains("pageScroll: new Map()")
             && app.contains("function preserveActivePageScroll")
+            && app.contains("SCROLL_INPUT_GRACE_MS")
+            && app.contains("history.scrollRestoration = \"manual\"")
+            && app.contains("function scheduleScrollRestore")
+            && app.contains("function markScrollInput")
+            && app.contains("function recentScrollInput")
             && app.contains("Live telemetry updates must not fight manual operator scrolling")
+            && app.contains("replace dynamic DOM blocks; preserve the viewport")
             && app.contains("restorePageScroll(page, 0)")
             && app.contains("cancelAnimationFrame(state.scrollRestoreFrame)")
+            && app.contains("cancelAnimationFrame(state.scrollRestoreSecondFrame)")
             && app.contains(r#"state.activePage === "logs" && state.logAutoScroll"#),
-        "dashboard tab changes must preserve per-page scroll while live renders avoid forced scroll restoration"
+        "dashboard tab changes and live renders must preserve per-page scroll without fighting fresh operator scroll input"
     );
     assert!(
         app.contains(r#"/ws`"#),
