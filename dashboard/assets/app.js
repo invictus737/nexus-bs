@@ -61,6 +61,9 @@ const RADIOID_MIN_INTERVAL_MS = 2500;
 const RADIOID_MAX_CACHE = 500;
 const RADIOID_MAX_QUEUE = 64;
 const RADIOID_FETCH_TIMEOUT_MS = 6000;
+const BUILTIN_RADIO_IDENTITIES = new Map([
+  ["99999", { issi: 99999, callsign: "Parrot", name: "", country: "", missing: false, builtin: true, fetchedAt: Number.MAX_SAFE_INTEGER }],
+]);
 const GROUP_CALL_HANGTIME_UI_MS = 12000;
 const CALLS_REFRESH_MS = 1000;
 const CALLS_FETCH_TIMEOUT_MS = 2500;
@@ -126,6 +129,10 @@ function clampScrollY(value) {
 
 function rememberPageScroll(page = state.activePage) {
   if (!pages[page]) return;
+  if (state.scrollRestoreFrame) {
+    cancelAnimationFrame(state.scrollRestoreFrame);
+    state.scrollRestoreFrame = 0;
+  }
   state.pageScroll.set(page, currentScrollY());
 }
 
@@ -140,14 +147,9 @@ function restorePageScroll(page = state.activePage, fallback = 0) {
 }
 
 function preserveActivePageScroll(renderFn) {
-  if (state.activePage === "logs" && !state.logAutoScroll) {
-    renderFn();
-    return;
-  }
-  const page = state.activePage;
-  const y = currentScrollY();
+  // Live telemetry updates must not fight manual operator scrolling. Stored
+  // per-page scroll positions are restored only when switching dashboard tabs.
   renderFn();
-  if (state.activePage === page) restorePageScroll(page, y);
 }
 
 function esc(value) {
@@ -212,8 +214,14 @@ function normalizeIssi(issi) {
 
 function validRadioIdCacheEntry(entry) {
   if (!entry) return false;
+  if (entry.builtin) return true;
   const ttl = entry.missing ? RADIOID_NEGATIVE_TTL_MS : RADIOID_CACHE_TTL_MS;
   return Date.now() - Number(entry.fetchedAt || 0) <= ttl;
+}
+
+function builtinRadioIdentity(issi) {
+  if (!validLookupIssi(issi)) return null;
+  return BUILTIN_RADIO_IDENTITIES.get(normalizeIssi(issi)) || null;
 }
 
 function loadRadioIdCache() {
@@ -276,6 +284,11 @@ function radioIdDisplay(entry) {
 
 function radioIdentityHtml(issi) {
   if (!validLookupIssi(issi)) return `<span class="identity-issi">${esc(issi || "--")}</span>`;
+  const builtin = builtinRadioIdentity(issi);
+  if (builtin) {
+    const key = normalizeIssi(issi);
+    return `<span class="identity resolved builtin"><span class="identity-primary">${esc(radioIdDisplay(builtin) || builtin.callsign)}</span><span class="identity-issi">ISSI ${esc(key)}</span></span>`;
+  }
   const endpoint = radioIdEndpoint();
   if (!endpoint) return `<span class="identity-issi">${esc(issi)}</span>`;
   const key = normalizeIssi(issi);
@@ -306,6 +319,7 @@ function destinationHtml(entry) {
 
 function queueRadioIdLookup(issi, options = {}) {
   if (!validLookupIssi(issi)) return;
+  if (builtinRadioIdentity(issi)) return;
   const endpoint = radioIdEndpoint();
   if (!endpoint) return;
   const key = normalizeIssi(issi);
@@ -328,6 +342,7 @@ function queueRadioIdLookup(issi, options = {}) {
 
 function identityIsResolved(issi) {
   if (!validLookupIssi(issi)) return true;
+  if (builtinRadioIdentity(issi)) return true;
   const entry = radioId.cache.get(normalizeIssi(issi));
   return !!entry && validRadioIdCacheEntry(entry) && !entry.missing && !!entry.callsign;
 }
@@ -1268,28 +1283,27 @@ function renderRadios() {
 
 function renderCalls() {
   const currentCalls = activeCalls();
-  const trackedCalls = sortedCalls();
   const overview = currentCalls.map((call) => callCardHtml(call));
   setHtml("overviewCalls", overview.length ? overview.join("") : '<div class="empty-call-board">No active calls</div>');
-
-  const rows = trackedCalls.map((call) => {
-    const mode = callMode(call);
-    return `
-      <tr>
-        <td>${callCountryHtml(call)}</td>
-        <td>${esc(call.call_id)}</td>
-        <td><span class="pill ${mode.className}">${esc(mode.label)}</span></td>
-        <td>${callTargetHtml(call)}</td>
-        <td>${call.caller_issi ? radioIdentityHtml(call.caller_issi) : "--"}</td>
-        <td>${call.call_type === "group" ? "--" : call.called_issi ? radioIdentityHtml(call.called_issi) : "--"}</td>
-        <td>${callSpeakerHtml(call)}</td>
-        <td data-call-seconds="${esc(call.call_id)}">${callAgeSeconds(call)}s</td>
-        <td>${esc(call.ts || "--")}</td>
-      </tr>
-    `;
-  });
-  setHtml("callsTable", rowsOrEmpty(rows, 9, "No active calls"));
   renderSlots();
+}
+
+function activityMeta(activity) {
+  switch (activity) {
+    case "call_group":
+      return { label: "Group voice", className: "blue" };
+    case "call_individual":
+      return { label: "Private voice", className: "green" };
+    case "sds":
+      return { label: "SDS", className: "amber" };
+    default:
+      return { label: activity || "--", className: "" };
+  }
+}
+
+function activityHtml(activity) {
+  const meta = activityMeta(activity);
+  return `<span class="pill ${esc(meta.className)}">${esc(meta.label)}</span>`;
 }
 
 function heardRows(limit) {
@@ -1297,17 +1311,16 @@ function heardRows(limit) {
     <tr>
       <td>${esc(entry.ts || "--")}</td>
       <td>${radioIdentityHtml(entry.issi)}</td>
-      <td>${esc(entry.activity || "--")}</td>
+      <td>${activityHtml(entry.activity)}</td>
       <td>${destinationHtml(entry)}</td>
     </tr>
   `);
 }
 
 function renderHeard() {
-  setText("overviewHeardLabel", `${Math.min(state.heard.length, 8)} shown, ${radioId.cache.size} cached`);
-  setHtml("overviewHeard", rowsOrEmpty(heardRows(8), 4, "No recent activity"));
-  const rows = heardRows(80);
-  setHtml("heardTable", rowsOrEmpty(rows, 4, "No recent activity"));
+  const shown = Math.min(state.heard.length, 30);
+  setText("overviewHeardLabel", `${shown} shown, ${radioId.cache.size} RadioID cached`);
+  setHtml("overviewHeard", rowsOrEmpty(heardRows(30), 4, "No recent voice or SDS activity"));
 }
 
 function renderLogs() {

@@ -34,9 +34,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
     assert!(
         index.contains(r#"class="traffic-detail-stack""#)
             && index.contains(r#"id="radiosTable""#)
-            && index.contains(r#"id="callsTable""#)
-            && index.contains(r#"id="heardTable""#),
-        "Traffic page must contain detailed radio, call, and Last Heard views without separate workflow tabs"
+            && !index.contains(r#"id="callsTable""#)
+            && !index.contains(r#"id="heardTable""#)
+            && !index.contains("Call Control")
+            && !index.contains("Activity Log"),
+        "Traffic page must keep the subscriber registry while removing redundant Call Control and Activity Log panels"
     );
     assert!(
         index.contains(r#"class="panel active-calls-panel""#)
@@ -63,6 +65,13 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && index.contains(r#"id="diagramFrequency""#)
             && index.contains(r#"id="slotGrid""#),
         "System/RF Ops and Traffic pages must expose RF, slot, and active-call render targets"
+    );
+    let timeslots_pos = index.find("<h2>Timeslots</h2>").expect("Timeslots panel should exist");
+    let host_pos = index.find("<h2>Host</h2>").expect("Host panel should exist");
+    let carrier_pos = index.find("<h2>Carrier Plan</h2>").expect("Carrier Plan panel should exist");
+    assert!(
+        timeslots_pos < host_pos && timeslots_pos < carrier_pos,
+        "System page must show Timeslots before Host and Carrier Plan details"
     );
     assert!(
         index.contains(r#"id="settingsSection""#) && index.contains(r#"id="aboutSection""#),
@@ -131,9 +140,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("activePage: \"system\"")
             && app.contains("pageScroll: new Map()")
             && app.contains("function preserveActivePageScroll")
+            && app.contains("Live telemetry updates must not fight manual operator scrolling")
             && app.contains("restorePageScroll(page, 0)")
+            && app.contains("cancelAnimationFrame(state.scrollRestoreFrame)")
             && app.contains(r#"state.activePage === "logs" && state.logAutoScroll"#),
-        "dashboard tab changes and live renders must preserve per-page scroll without stale Current Floor code or hidden log autoscroll"
+        "dashboard tab changes must preserve per-page scroll while live renders avoid forced scroll restoration"
     );
     assert!(
         app.contains(r#"/ws`"#),
@@ -142,6 +153,13 @@ fn external_dashboard_asset_manifest_is_coherent() {
     assert!(
         app.contains("RADIOID_MIN_INTERVAL_MS") && app.contains("RADIOID_MAX_QUEUE"),
         "RadioID lookup must be rate-limited and bounded"
+    );
+    assert!(
+        app.contains("BUILTIN_RADIO_IDENTITIES")
+            && app.contains(r#""99999""#)
+            && app.contains(r#"callsign: "Parrot""#)
+            && app.contains("function builtinRadioIdentity"),
+        "dashboard must resolve local Parrot ISSI 99999 without external RadioID lookup"
     );
     assert!(
         app.contains("localStorage") && app.contains("RADIOID_CACHE_TTL_MS") && app.contains("nexus-bs.radioid.cache.v2"),
@@ -191,7 +209,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "dashboard logs must support clear, export, and pause/play autoscroll"
     );
     assert!(
-        app.contains("function callAgeSeconds") && index.contains("<th>Seconds</th>"),
+        app.contains("function callAgeSeconds") && app.contains("data-call-seconds") && app.contains("Call time"),
         "call duration display must be a live seconds counter"
     );
     assert!(

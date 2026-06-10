@@ -14654,3 +14654,40 @@ Dashboard Logs Pause Scroll Fix - 2026-06-10 09:48 EEST:
 - Verification:
   - `node --check dashboard/assets/app.js` passed.
   - `cargo test -p tetra-entities --test test_dashboard_assets --locked` passed.
+
+Dashboard Traffic Consolidation and Parrot Identity Fix - 2026-06-10 10:14 EEST:
+
+- Scope is external dashboard HTML/CSS/JavaScript plus the dashboard asset
+  manifest test only. No TETRA RF, UMAC/MAC, MM, CMCE, SDS protocol handling,
+  Brew protocol, WAP, parrot audio path, or service-control behaviour was
+  intentionally changed.
+- User reported the Traffic tab still fought manual scrolling, had redundant
+  `Call Control` and `Activity Log` panels, and displayed local Parrot service
+  ISSI `99999` as RadioID `not found`.
+- Fix:
+  - live renders no longer perform generic `window.scrollTo()` restoration on
+    any active page, so one-second telemetry/call/snapshot updates do not fight
+    manual operator scrolling in Traffic or System;
+  - pending page-scroll restoration is cancelled when the operator scrolls;
+  - per-page scroll restoration is kept only for explicit dashboard tab
+    switches;
+  - moved the System `Timeslots` panel above `Host` and `Carrier Plan`, keeping
+    TDMA slot state visible before administrative host/carrier details;
+  - removed the redundant Traffic `Call Control` and `Activity Log` panels;
+  - kept Active Calls as the live voice board and made Last Heard the unified
+    voice/SDS event stream;
+  - Last Heard now labels events as `Group voice`, `Private voice`, or `SDS`
+    instead of exposing raw activity keys;
+  - added built-in dashboard identity for local Parrot service:
+    callsign `Parrot`, ISSI `99999`, no external RadioID lookup.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets --locked` passed.
+  - `git diff --check` passed.
+- Deploy note:
+  - pre-commit field deploy succeeded with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`;
+  - services were active/running since `2026-06-10 10:14:16 EEST`;
+  - this committed hotfix is intended for the follow-up redeploy so the live
+    build id points at the traceable dashboard hotfix commit instead of the
+    previous `099df5fd`.

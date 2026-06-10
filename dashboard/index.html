@@ -143,6 +143,11 @@
           </div>
         </section>
 
+        <section class="panel slot-panel">
+          <div class="panel-head"><h2>Timeslots</h2><span id="slotSummary">TS1 control, TS2-TS4 traffic</span></div>
+          <div class="slot-grid" id="slotGrid"></div>
+        </section>
+
         <div class="grid two system-grid">
           <section class="panel">
             <div class="panel-head"><h2>Host</h2><span id="hostName">--</span></div>
@@ -202,18 +207,13 @@
             </dl>
           </section>
         </div>
-
-        <section class="panel slot-panel">
-          <div class="panel-head"><h2>Timeslots</h2><span id="slotSummary">TS1 control, TS2-TS4 traffic</span></div>
-          <div class="slot-grid" id="slotGrid"></div>
-        </section>
       </section>
 
       <section class="page" id="page-traffic" aria-labelledby="trafficHeading">
         <div class="page-head">
           <div>
             <h2 id="trafficHeading">Traffic</h2>
-            <p>Air-interface activity and floor control.</p>
+            <p>Air-interface voice, SDS, and subscriber state.</p>
           </div>
         </div>
 
@@ -231,10 +231,10 @@
           </section>
 
           <section class="panel overview-heard-panel">
-            <div class="panel-head"><h2>Last Heard</h2><span id="overviewHeardLabel">RadioID cache</span></div>
-            <div class="table-wrap compact">
+            <div class="panel-head"><h2>Last Heard</h2><span id="overviewHeardLabel">Voice and SDS</span></div>
+            <div class="table-wrap heard-timeline">
               <table>
-                <thead><tr><th>Time</th><th>Radio</th><th>Activity</th><th>Destination</th></tr></thead>
+                <thead><tr><th>Time</th><th>Source</th><th>Event</th><th>Target</th></tr></thead>
                 <tbody id="overviewHeard"></tbody>
               </table>
             </div>
@@ -247,26 +247,6 @@
                 <table>
                   <thead><tr><th>ISSI</th><th>Affiliated Groups</th><th>RSSI dBFS</th><th>Energy Economy</th><th>Last Seen</th></tr></thead>
                   <tbody id="radiosTable"></tbody>
-                </table>
-              </div>
-            </section>
-
-            <section class="panel">
-              <div class="panel-head"><h2 id="callsHeading">Call Control</h2><span>CMCE view</span></div>
-              <div class="table-wrap tall">
-                <table class="wide-table">
-                  <thead><tr><th>Flag</th><th>Call ID</th><th>Mode</th><th>Target</th><th>Caller</th><th>Called</th><th>Speaker</th><th>Seconds</th><th>TS</th></tr></thead>
-                  <tbody id="callsTable"></tbody>
-                </table>
-              </div>
-            </section>
-
-            <section class="panel">
-              <div class="panel-head"><h2 id="heardHeading">Activity Log</h2><span>recent activity</span></div>
-              <div class="table-wrap tall">
-                <table>
-                  <thead><tr><th>Time</th><th>ISSI</th><th>Activity</th><th>Destination</th></tr></thead>
-                  <tbody id="heardTable"></tbody>
                 </table>
               </div>
             </section>
