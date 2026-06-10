@@ -14633,3 +14633,24 @@ Brew External Subscriber Accounting Hardening and Nexus-BS v0.1.62 - 2026-06-10 
     `not.*syncing.*affiliate`.
   - Journal showed Brew echo affiliate handled on the external path:
     `CMCE: external subscriber affiliate source=Brew issi=2260616 groups=[226333]`.
+
+Dashboard Logs Pause Scroll Fix - 2026-06-10 09:48 EEST:
+
+- Scope is external dashboard JavaScript only. No TETRA air-interface, RF
+  scheduling, CMCE, SDS, Brew protocol, WAP, parrot, or service-control
+  behaviour was intentionally changed.
+- User reported that the Logs page still fought manual scrolling while log
+  auto-scroll was paused: the operator could not read logs because the view
+  kept returning upward.
+- Root cause: live log/snapshot rerenders rebuild the log list DOM; replacing
+  the list content reset the log viewer scroll offset. The generic page scroll
+  preservation also still ran on the Logs page while auto-scroll was paused.
+- Fix:
+  - when `logAutoScroll=false`, `renderLogs()` preserves the current
+    `#logList.scrollTop` across every rerender;
+  - generic active-page scroll restoration is skipped for Logs while paused, so
+    manual operator scrolling wins until Play is pressed again;
+  - when auto-scroll is enabled, Logs still follows the bottom as before.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets --locked` passed.

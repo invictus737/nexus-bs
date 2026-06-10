@@ -140,6 +140,10 @@ function restorePageScroll(page = state.activePage, fallback = 0) {
 }
 
 function preserveActivePageScroll(renderFn) {
+  if (state.activePage === "logs" && !state.logAutoScroll) {
+    renderFn();
+    return;
+  }
   const page = state.activePage;
   const y = currentScrollY();
   renderFn();
@@ -1309,6 +1313,7 @@ function renderHeard() {
 function renderLogs() {
   setText("logCount", `${state.logs.length} lines`);
   const list = $("logList");
+  const previousScrollTop = list ? list.scrollTop : 0;
   const rows = state.logs.slice(-500).map((entry) => {
     const level = String(entry.level || "INFO").toLowerCase();
     const cls = level.includes("error") ? "error" : level.includes("warn") ? "warn" : "";
@@ -1327,6 +1332,8 @@ function renderLogs() {
   }
   if (state.activePage === "logs" && state.logAutoScroll && list) {
     list.scrollTop = list.scrollHeight;
+  } else if (state.activePage === "logs" && list) {
+    list.scrollTop = Math.min(previousScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
   }
 }
 
