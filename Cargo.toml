@@ -11,13 +11,14 @@ members = [
     
     # Binaries
     "bins/nexus-bs",
+    "bins/nexus-bs-dashboard",
     "bins/nexus-bs-telemetry",
     "bins/nexus-bs-control",
     "bins/pdu-tool",
 ]
 
 [workspace.package]
-version = "0.1.61"
+version = "0.1.62"
 edition = "2024"
 authors = ["Chris YO3TCO / Nexus-BS Project"]
 license = "MIT"

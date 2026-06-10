@@ -434,6 +434,22 @@ impl BsChannelScheduler {
         }
     }
 
+    pub fn health_stats(&self) -> crate::health::UmacHealthStats {
+        let dl_queue_total = self.dltx_queues.iter().map(Vec::len).sum();
+        let dl_queue_max_per_ts = self.dltx_queues.iter().map(Vec::len).max().unwrap_or_default();
+        let pending_ra_ack_total = self.pending_ra_acks.iter().map(Vec::len).sum();
+        let pending_ra_ack_max_per_ts = self.pending_ra_acks.iter().map(Vec::len).max().unwrap_or_default();
+
+        crate::health::UmacHealthStats {
+            dl_queue_total,
+            dl_queue_max_per_ts,
+            next_slot_queue_len: self.dltx_next_slot_queue.len(),
+            pending_ra_ack_total,
+            pending_ra_ack_max_per_ts,
+            ..crate::health::UmacHealthStats::default()
+        }
+    }
+
     fn dl_slot_index(ts: u8, context: &str) -> Option<usize> {
         if (1..=NUM_TIMESLOTS as u8).contains(&ts) {
             Some(ts as usize - 1)
@@ -2170,6 +2186,10 @@ impl BsChannelScheduler {
             .unwrap_or(CircuitDlMediaSource::LocalLoopback)
     }
 
+    pub fn set_circuit_dl_media_source(&mut self, ts: u8, dl_media_source: CircuitDlMediaSource) -> bool {
+        self.circuits.set_dl_media_source(ts, dl_media_source)
+    }
+
     pub fn close_circuit(&mut self, dir: Direction, ts: u8) -> Option<Circuit> {
         // Clearing hangtime here is safe: if the circuit is gone, this timeslot is no longer in use.
         if (1..=4).contains(&ts) {
@@ -2792,9 +2812,9 @@ impl BsChannelScheduler {
             self.log_selected_stch_d_tx_granted_diag(ts, block, addr, tch_buf.is_some());
         }
 
-        // Warn about other queued signaling that can't be sent via stealing yet
+        // Trace queued signaling that is not yet eligible for stealing.
         if stch_opt.is_none() && !self.dltx_queues[ts.t as usize - 1].is_empty() {
-            tracing::warn!("dl_build_traffic_block: queued signaling on ts {} but no stealing item", ts.t);
+            tracing::debug!("dl_build_traffic_block: queued signaling on ts {} but no stealing item", ts.t);
         }
 
         let mut should_report_transmitted = stch_opt.is_some();

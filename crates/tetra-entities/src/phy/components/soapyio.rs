@@ -40,6 +40,7 @@ pub struct SoapyIo {
     rx: Option<soapysdr::RxStream<StreamType>>,
     /// Transmit stream. None if transmitting is disabled.
     tx: Option<soapysdr::TxStream<StreamType>>,
+    temperature_sensor_reads_supported: bool,
 }
 
 /// Soapy/Lime timestamps can occasionally jitter by a single sample.
@@ -75,6 +76,7 @@ impl SoapyIo {
 
         let rx_ch = sdr_settings.rx_ch;
         let tx_ch = sdr_settings.tx_ch;
+        let temperature_sensor_reads_supported = temperature_sensor_reads_supported(&sdr_settings.name);
 
         // Get PPM corrected freqs
         let (dl_corrected, _) = soapy_cfg.dl_freq_corrected();
@@ -192,6 +194,7 @@ impl SoapyIo {
             dev,
             rx,
             tx,
+            temperature_sensor_reads_supported,
         })
     }
 
@@ -341,6 +344,9 @@ impl SoapyIo {
     /// We probe sensor names rather than hard-coding per-driver, so any future radio
     /// that follows the Soapy convention works without code changes.
     pub fn read_temperature_c(&self) -> Option<f32> {
+        if !self.temperature_sensor_reads_supported {
+            return None;
+        }
         let sensors = self.dev.list_sensors().ok()?;
         for name in sensors {
             let s = name.to_string();
@@ -393,6 +399,23 @@ impl SoapyIo {
                     .map(|g| (s, g as f32))
             })
             .collect()
+    }
+}
+
+fn temperature_sensor_reads_supported(settings_name: &str) -> bool {
+    !matches!(settings_name, "SXceiver" | "µCell")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sxceiver_like_devices_skip_runtime_temperature_reads() {
+        assert!(!temperature_sensor_reads_supported("SXceiver"));
+        assert!(!temperature_sensor_reads_supported("µCell"));
+        assert!(temperature_sensor_reads_supported("LimeSDR Mini v2"));
+        assert!(temperature_sensor_reads_supported("USRP B210"));
     }
 }
 

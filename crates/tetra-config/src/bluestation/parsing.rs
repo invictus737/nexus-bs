@@ -14,6 +14,7 @@ use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_p
 use super::config::{StackConfig, StackMode};
 use super::sec_brew::{CfgBrewDto, apply_brew_patch};
 use super::sec_dashboard::{CfgDashboardDto, apply_dashboard_patch};
+use super::sec_health::{CfgHealthDto, apply_health_patch};
 use super::sec_security::{CfgSecurityDto, apply_security_patch};
 use super::sec_telemetry::{CfgTelemetryDto, apply_telemetry_patch};
 use super::sec_wx::{CfgWxServiceDto, apply_wx_service_patch};
@@ -123,6 +124,13 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     }
 
+    // Optional health section
+    if let Some(ref health) = root.health {
+        if !health.extra.is_empty() {
+            return Err(format!("Unrecognized fields in health config: {:?}", sorted_keys(&health.extra)).into());
+        }
+    }
+
     // Build cell config, then inject the separately-parsed neighbor cells and sds_command_control
     let mut cell_cfg = cell_dto_to_cfg(root.cell_info)?;
     cell_cfg.neighbor_cells_ca = neighbor_cells_ca;
@@ -145,6 +153,7 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         dashboard: None,
         telemetry: None,
         control: None,
+        health: apply_health_patch(root.health.unwrap_or_default())?,
         security: apply_security_patch(root.security.unwrap_or_default()),
         wx_service: apply_wx_service_patch(root.wx_service.unwrap_or_default()),
     };
@@ -208,6 +217,7 @@ struct TomlConfigRoot {
     dashboard: Option<CfgDashboardDto>,
     telemetry: Option<CfgTelemetryDto>,
     command: Option<CfgControlDto>,
+    health: Option<CfgHealthDto>,
     security: Option<CfgSecurityDto>,
     #[serde(rename = "wx_service")]
     wx_service: Option<CfgWxServiceDto>,
@@ -638,6 +648,61 @@ allowed_gssi_ranges = [
         assert!(!cfg.cell.sndcp_service);
         assert!(cfg.dashboard.is_some());
         assert_eq!(cfg.service_name.as_deref(), Some("nexus-bs"));
+        assert!(cfg.health.enabled);
+        assert_eq!(cfg.health.snapshot_interval_secs, 1);
+        assert!(!cfg.health.restart_on_core_stall);
+    }
+
+    #[test]
+    fn test_health_defaults_to_observe_only_when_section_is_absent() {
+        let toml = minimal_toml("");
+        let cfg = from_toml_str(&toml).expect("parse failed");
+
+        assert!(cfg.health.enabled);
+        assert_eq!(cfg.health.snapshot_interval_secs, 1);
+        assert_eq!(cfg.health.core_stall_critical_ms, 10_000);
+        assert!(!cfg.health.restart_on_core_stall);
+    }
+
+    #[test]
+    fn test_health_section_parses_explicit_values() {
+        let toml = format!(
+            "{}\n{}",
+            minimal_toml(""),
+            r#"
+[health]
+enabled = false
+snapshot_interval_secs = 2
+core_stall_critical_ms = 15000
+restart_on_core_stall = false
+restart_after_critical_secs = 45
+restart_cooldown_secs = 900
+"#
+        );
+        let cfg = from_toml_str(&toml).expect("parse failed");
+
+        assert!(!cfg.health.enabled);
+        assert_eq!(cfg.health.snapshot_interval_secs, 2);
+        assert_eq!(cfg.health.core_stall_critical_ms, 15_000);
+        assert_eq!(cfg.health.restart_after_critical_secs, 45);
+        assert_eq!(cfg.health.restart_cooldown_secs, 900);
+    }
+
+    #[test]
+    fn test_health_section_rejects_unknown_fields() {
+        let toml = format!(
+            "{}\n{}",
+            minimal_toml(""),
+            r#"
+[health]
+enabled = true
+surprise = 1
+"#
+        );
+        let err = from_toml_str(&toml).expect_err("unknown health field should fail");
+
+        assert!(err.to_string().contains("health"));
+        assert!(err.to_string().contains("surprise"));
     }
 
     #[test]

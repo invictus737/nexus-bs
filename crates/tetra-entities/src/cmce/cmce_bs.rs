@@ -63,6 +63,11 @@ impl CmceBs {
         self.cc.debug_active_call_ids()
     }
 
+    #[doc(hidden)]
+    pub fn debug_subscriber_groups_for(&self, issi: u32) -> Vec<u32> {
+        self.cc.subscriber_groups_for(issi)
+    }
+
     fn do_control_command(
         sds: &mut SdsBsSubentity,
         cc: &mut CcBsSubentity,
@@ -124,6 +129,13 @@ impl CmceBs {
                     crate::service_control::ServiceAction::Stop,
                     std::time::Duration::from_millis(500),
                 );
+            }
+            ControlCommand::StopGoService { start_delay_secs } => {
+                tracing::info!(
+                    "CMCE: StopGoService requested; core exits now, systemd restart delay should be {}s",
+                    start_delay_secs
+                );
+                crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::ZERO);
             }
             ControlCommand::AddLiveSds {
                 text,
@@ -285,6 +297,8 @@ impl TetraEntityTrait for CmceBs {
                 }
             }
         }
+        crate::health::registry().set_cmce_stats(self.cc.health_stats());
+        crate::health::registry().set_sds_stats(self.sds.health_stats());
     }
 
     fn rx_prim(&mut self, queue: &mut MessageQueue, message: SapMsg) {
@@ -310,7 +324,7 @@ impl TetraEntityTrait for CmceBs {
                     self.cc.rx_call_control(queue, message);
                 }
                 SapMsgInner::MmSubscriberUpdate(update) => {
-                    self.cc.handle_subscriber_update(queue, update);
+                    self.cc.handle_subscriber_update(queue, update, message.src);
                 }
                 SapMsgInner::CmceSdsData(_) => {
                     self.sds.rx_sds_from_brew(queue, message);

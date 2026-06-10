@@ -158,6 +158,20 @@ fn test_frame_18_extension_is_not_advertised_without_full_frame18_receive_suppor
 }
 
 #[test]
+fn test_mac_sync_defaults_to_etsi_v3_system_code() {
+    debug::setup_logging_verbose();
+
+    let config = ComponentTest::get_default_test_config(StackMode::Bs);
+    let shared_config = SharedConfig::from_parts(config, None);
+    let precomps = UmacBs::generate_precomps(&shared_config);
+
+    // EN 300 392-2 clause 21.4.4.2 table 21.76:
+    // system code 0011b identifies EN 300 392-2 V3.1.1 through the present
+    // document family. It is not a security class or terminal capability.
+    assert_eq!(precomps.mac_sync.system_code, 3);
+}
+
+#[test]
 fn test_mle_sysinfo_does_not_advertise_sndcp_service_until_bearer_is_implemented() {
     debug::setup_logging_verbose();
 
@@ -174,6 +188,35 @@ fn test_mle_sysinfo_does_not_advertise_sndcp_service_until_bearer_is_implemented
         !precomps.mle_sysinfo.bs_service_details.sndcp_service,
         "local D-MLE-SYSINFO must not advertise SNDCP/WAP until the bearer is implemented"
     );
+}
+
+#[test]
+fn test_sysinfo_does_not_advertise_aie_or_security_classes_until_security_is_implemented() {
+    debug::setup_logging_verbose();
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.aie_service = true;
+    let shared_config = SharedConfig::from_parts(config, None);
+    let precomps = UmacBs::generate_precomps(&shared_config);
+
+    // EN 300 392-2 clauses 18.5.2.1 and 21.4.4.1 advertise AIE through
+    // D-MLE-SYSINFO plus MAC-SYSINFO extended services. Security classes are
+    // EN 300 392-7 security IEs; until those procedures exist locally, the BS
+    // must not claim class 1/2/3 support on-air.
+    assert!(
+        !precomps.mle_sysinfo.bs_service_details.aie_service,
+        "local D-MLE-SYSINFO must not advertise AIE until security is implemented"
+    );
+    let ext_services = precomps
+        .mac_sysinfo2
+        .ext_services
+        .as_ref()
+        .expect("second SYSINFO precomp must carry extended services");
+    assert!(!ext_services.auth_required);
+    assert!(!ext_services.class1_supported);
+    assert!(!ext_services.class2_supported);
+    assert!(!ext_services.class3_supported);
+    assert!(ext_services.sck_n.is_none());
 }
 
 #[test]

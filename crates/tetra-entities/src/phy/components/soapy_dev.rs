@@ -161,6 +161,7 @@ impl RxTxDev for RxTxDevSoapySdr {
         tx_slot: &[TxSlotBits],
         // TODO multiple demodulators
     ) -> Result<Vec<Option<RxSlotBits<'a>>>, RxTxDevError> {
+        let health_started = std::time::Instant::now();
         // First generate as much TX signal as possible at the moment.
         while self.process_tx_block(tx_slot)? {}
 
@@ -179,8 +180,11 @@ impl RxTxDev for RxTxDevSoapySdr {
         }
 
         if let Some(rx_dsp) = &mut self.rx_dsp {
-            Ok(rx_dsp.take_slot_bits())
+            let slot_bits = rx_dsp.take_slot_bits();
+            crate::health::registry().mark_phy_rxtx_duration(health_started.elapsed());
+            Ok(slot_bits)
         } else {
+            crate::health::registry().mark_phy_rxtx_duration(health_started.elapsed());
             Ok(Default::default())
         }
     }
@@ -499,6 +503,7 @@ impl SdrTimingEventLog {
     }
 
     fn tx_late(&mut self, block_count: fcfb::BlockCount, skipped_blocks: fcfb::BlockCount) {
+        crate::health::registry().incr_phy_tx_late(nonnegative_count(skipped_blocks));
         if self.should_emit() {
             tracing::warn!(
                 "Too late to produce TX block {}, skipping {} TX blocks{}",
@@ -514,6 +519,7 @@ impl SdrTimingEventLog {
     }
 
     fn rx_lost_samples(&mut self, samples_lost: SampleCount, samples_to_skip: SampleCount, processing_blocks: fcfb::BlockCount) {
+        crate::health::registry().incr_phy_rx_lost(nonnegative_count(samples_lost), nonnegative_count(processing_blocks));
         if self.should_emit() {
             tracing::warn!(
                 "Lost {} samples, skipping {} more samples and {} processing blocks{}",
@@ -556,6 +562,10 @@ impl SdrTimingEventLog {
             )
         }
     }
+}
+
+fn nonnegative_count(value: i64) -> u64 {
+    value.max(0) as u64
 }
 
 struct DemodulatorChannel {
@@ -1126,6 +1136,7 @@ struct SdrHealthMonitor {
     /// the gains exactly once (lazily, on the first tick) and reuse the cached values.
     cached_tx_gains: Option<Vec<(String, f32)>>,
     cached_rx_gains: Option<Vec<(String, f32)>>,
+    temperature_read_disabled: bool,
 }
 
 impl SdrHealthMonitor {
@@ -1138,6 +1149,7 @@ impl SdrHealthMonitor {
             interval: std::time::Duration::from_secs(10),
             cached_tx_gains: None,
             cached_rx_gains: None,
+            temperature_read_disabled: false,
         }
     }
 
@@ -1148,9 +1160,19 @@ impl SdrHealthMonitor {
         }
         self.next_emit = now + self.interval;
 
-        // Only the temperature is read live — it's a single sensor read and the value
-        // genuinely changes. Gains are cached after the first read (see field docs).
-        let temperature_c = sdr.read_temperature_c();
+        // Only the temperature is read live. Some devices, notably SXceiver/SX1255,
+        // expose a temp-like sensor but reject reads while RX/TX streams are active;
+        // after the first failed/unsupported read, stop polling so health telemetry
+        // does not spam stderr or disturb the PHY thread.
+        let temperature_c = if self.temperature_read_disabled {
+            None
+        } else {
+            let value = sdr.read_temperature_c();
+            if value.is_none() {
+                self.temperature_read_disabled = true;
+            }
+            value
+        };
 
         if self.cached_tx_gains.is_none() {
             self.cached_tx_gains = Some(sdr.read_tx_gains());
@@ -1166,5 +1188,17 @@ impl SdrHealthMonitor {
             tx_gains,
             rx_gains,
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn health_counter_conversion_clamps_negative_timing_counts() {
+        assert_eq!(nonnegative_count(-1200), 0);
+        assert_eq!(nonnegative_count(0), 0);
+        assert_eq!(nonnegative_count(13), 13);
     }
 }

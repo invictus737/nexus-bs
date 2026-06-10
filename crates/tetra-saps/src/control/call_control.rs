@@ -115,6 +115,8 @@ pub struct NetworkCircuitCall {
 pub enum CallControl {
     /// Signals to set up a circuit
     Open(Circuit),
+    /// Updates the downlink media source policy for an already-open circuit.
+    SetDlMediaSource { ts: u8, dl_media_source: CircuitDlMediaSource },
     /// Signals to release a circuit
     Close(Direction, u8),
     /// Floor granted: a speaker has been given transmission permission.

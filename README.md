@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.61
+# Nexus-BS v0.1.62
 
 > **TETRA base station software for amateur radio operators and researchers.**
 > Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
@@ -143,18 +143,19 @@ colour_code = 1
 
 ```toml
 [dashboard]
-port = 8080
+port = 18080
+bind = "127.0.0.1"
 
 # Optional: form login + cookie session
-username = "admin"
-password = "changeme"
+# username = "admin"
+# password = "change-this-before-exposing-the-dashboard"
 
 # Optional: reserved git source path for future OTA updates.
-# OTA update is disabled in Nexus-BS v0.1.61.
+# OTA update is disabled in Nexus-BS v0.1.62.
 # source_dir = "/opt/nexus-bs"
 
-# Optional: external dashboard assets. Core keeps API/login/WebSocket handling.
-# Leave unset to use the embedded compatibility dashboard.
+# Optional: external dashboard assets for legacy all-in-one mode.
+# In the recommended split systemd deployment, nexus-bs-dashboard serves this.
 # static_dir = "/home/chris/nexus-bs/dashboard"
 ```
 
@@ -215,7 +216,8 @@ password = "hotspot_password"
 
 ## Web dashboard
 
-Available at `http://<bts-ip>:8080` when `[dashboard]` is configured.
+Available at `http://<bts-ip>:8080` when the recommended
+`nexus-bs-dashboard@USER.service` front-end is running.
 
 For appliance installs, `nexus-bs@USER.service` runs the RF core from a volatile
 `/run/nexus-bs-USER/config.toml` copy, but dashboard config APIs edit the
@@ -223,11 +225,20 @@ persistent `/home/USER/nexus-bs/config.toml` through
 `NEXUS_BS_PERSISTENT_CONFIG`. This keeps subscriber recovery/cache files
 volatile without losing operator config edits after restart.
 
-For the decoupled Nexus-BS dashboard, set `static_dir` or use the service
-default `NEXUS_BS_DASHBOARD_STATIC_DIR=/home/USER/nexus-bs/dashboard`. The
-Rust process still owns login, `/api/*` and `/ws`; only HTML/CSS/JS are served
-from the external directory. `scripts/nexus-bs-test-deploy.sh` copies these
-assets beside the binary for test deployments.
+For the split Nexus-BS dashboard, `nexus-bs@USER.service` exposes the core
+dashboard API only on `127.0.0.1:18080`, while
+`nexus-bs-dashboard@USER.service` runs as a separate process on public port
+`8080`, serves `/home/USER/nexus-bs/dashboard`, and proxies `/api/*`, `/ws`,
+`/login` and `/logout` to the loopback-only core API. The dashboard service is
+assigned its own systemd CPU/cgroup limits so browser refreshes and static file
+serving stay outside the RF-critical core process. If `[dashboard] username` and
+`password` are configured, the split front-end also checks the core
+`fs_session` status before serving `/` or static assets, so the browser UI and
+API share the same login boundary.
+
+Dashboard hardening is verified by focused automated tests and deployment
+checks. This is not a formal security or ETSI/TETRA certification claim; use an
+HTTPS reverse proxy before exposing the dashboard outside a trusted LAN.
 
 **Radios tab** — live table of registered terminals with ISSI, groups, RSSI signal bar, energy saving mode, last seen time. Kick button forces immediate re-registration. SDS button sends a text message. Timeslot visualizer shows TS2–TS4 state in real time — idle (grey), call allocated (amber), voice active (red flash with animated waveform).
 
@@ -237,7 +248,7 @@ assets beside the binary for test deployments.
 
 **Log tab** — live log with level filter and autoscroll.
 
-**Config tab** — edit the active `config.toml` directly. Save writes to disk; restart applies changes. Backup and restore buttons.
+**Settings / Config Manager** — edit the current `config.toml`, load and edit inactive flat-file profiles in the same Nexus-BS folder, duplicate a config as `config+N.toml`, and activate a selected profile. Activation copies the selected profile over the persistent `config.toml` and records the selected profile marker, so the same config is used again after service restart or reboot.
 
 **System tab:**
 - BTS / Brew connection status
@@ -246,13 +257,13 @@ assets beside the binary for test deployments.
 - CPU temperature (where available)
 - RF hardware info (SoapySDR probe output)
 - Auto-refresh checkbox (5s interval)
-- Config profiles — activate, edit inactive profiles directly in a modal editor
+- Config profiles — select, activate, duplicate, and edit flat TOML profiles in the Nexus-BS runtime folder
 - Live SDS broadcast queue — broadcast a text message to all radios on the cell, repeating at the HMD interval until deleted or repeat count exhausted
 - OTA update is intentionally disabled for now; update controls are visible but grayed out
 
 ### WAP MVP over SDS
 
-Nexus-BS v0.1.61 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
+Nexus-BS v0.1.62 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
 
 From the flat install directory, send the default WML page to a terminal ISSI:
 

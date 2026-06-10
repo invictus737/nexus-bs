@@ -767,9 +767,9 @@ impl CcBsSubentity {
             return;
         }
 
-        if !self.has_listener(dest_gssi) {
+        if !self.has_local_listener(dest_gssi) {
             tracing::info!(
-                "CMCE: ignoring network call start uuid={} gssi={} (no listeners)",
+                "CMCE: ignoring network call start uuid={} gssi={} (no local RF listeners)",
                 brew_uuid,
                 dest_gssi
             );
@@ -939,7 +939,7 @@ impl CcBsSubentity {
             queue,
             &circuit,
             None,
-            CircuitDlMediaSource::LocalLoopback,
+            CircuitDlMediaSource::SwMI,
             Some(TetraAddress::new(dest_gssi, SsiType::Gssi)),
             vec![TetraAddress::issi(source_issi)],
         );
@@ -988,13 +988,14 @@ impl CcBsSubentity {
         );
         let d_setup_ref = &self.cached_setups.get(&call_id).unwrap().pdu;
 
+        let setup_reporter = TxReporter::new_unacked();
         let (setup_sdu, setup_chan_alloc) = Self::build_d_setup_prim(d_setup_ref, usage, ts, UlDlAssignment::Both);
         let setup_msg = Self::build_sapmsg(
             setup_sdu,
             Some(setup_chan_alloc),
             dest_addr.clone(),
             Layer2Service::Unacknowledged,
-            None,
+            Some(setup_reporter.clone()),
         );
         queue.push_back(setup_msg);
 
@@ -1020,16 +1021,6 @@ impl CcBsSubentity {
             ts,
         });
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid,
-                call_id,
-                ts,
-                usage,
-            }),
-        });
+        self.queue_network_group_ready(call_id, brew_uuid, source_issi, dest_gssi, ts, usage, vec![setup_reporter], false);
     }
 }

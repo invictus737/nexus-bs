@@ -22,6 +22,11 @@ const INDIVIDUAL_SIMPLEX_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
 // no-speaker D-TX CEASED/FloorReleased transition long enough for UMAC to
 // flush a deferred NTS2 Block2 speech half-slot before entering hangtime.
 const GROUP_TX_CEASED_TAIL_DRAIN_TIMESLOTS: i32 = (4 - 1) * 4;
+// Brew-origin group calls must not feed speech into UMAC until the RF control
+// edge (D-SETUP or D-TX GRANTED) is known to have left the downlink scheduler.
+// This bounded guard is a BS/interconnect robustness policy; the air-interface
+// baseline remains EN 300 392-2 clauses 14.5.2.1 and 14.5.2.2.1.
+const NETWORK_GROUP_READY_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SECOND;
 // EN 300 392-2 table 20.54 defines priority 7 as the highest TMA priority.
 // Keep this restricted to time-critical floor-control signalling.
 const CMCE_FLOOR_CONTROL_PDU_PRIO: i32 = 7;
@@ -62,11 +67,14 @@ impl CcBsSubentity {
             pending_individual_tx_ceased_tail_drains: HashMap::new(),
             pending_group_tx_ceased_tail_drains: HashMap::new(),
             pending_group_floor_activations: HashMap::new(),
+            pending_network_group_readies: HashMap::new(),
             pending_individual_connect_acks: HashMap::new(),
             pending_network_individual_connects: HashMap::new(),
             pending_individual_releases: HashMap::new(),
             subscriber_groups: HashMap::new(),
             group_listeners: HashMap::new(),
+            external_subscriber_groups: HashMap::new(),
+            external_group_listeners: HashMap::new(),
             telemetry: None,
             echo_session: None,
             parrot_session: None,
@@ -75,6 +83,35 @@ impl CcBsSubentity {
 
     pub fn set_telemetry(&mut self, sink: crate::net_telemetry::channel::TelemetrySink) {
         self.telemetry = Some(sink);
+    }
+
+    pub fn health_stats(&self) -> crate::health::CmceHealthStats {
+        let active_individual_calls = self.individual_calls.values().filter(|call| call.is_active()).count();
+        let pending_individual_calls = self.individual_calls.len().saturating_sub(active_individual_calls);
+        let pending_individual_disconnects = self.pending_individual_disconnect_tail_drains.len()
+            + self.pending_individual_disconnect_deliveries.len()
+            + self.pending_individual_disconnect_release_acks.len()
+            + self.pending_individual_tx_ceased_tail_drains.len();
+        let group_floor_waiters = self.active_calls.values().map(|call| call.queued_tx_demands().count()).sum();
+        let individual_floor_waiters = self
+            .individual_calls
+            .values()
+            .filter(|call| call.queued_tx_demand.is_some())
+            .count();
+
+        crate::health::CmceHealthStats {
+            active_group_calls: self.active_calls.len(),
+            pending_group_releases: self.pending_group_releases.len(),
+            pending_group_floor_activations: self.pending_group_floor_activations.len(),
+            pending_network_group_readies: self.pending_network_group_readies.len(),
+            group_floor_waiters,
+            active_individual_calls,
+            pending_individual_calls,
+            pending_individual_releases: self.pending_individual_releases.len(),
+            pending_network_individual_connects: self.pending_network_individual_connects.len(),
+            pending_individual_disconnects,
+            individual_floor_waiters,
+        }
     }
 
     /// Called when an UL voice frame arrives on TmdSap.
@@ -208,6 +245,7 @@ impl CcBsSubentity {
                 + self.pending_individual_tx_ceased_tail_drains.len()
                 + self.pending_group_tx_ceased_tail_drains.len()
                 + self.pending_group_floor_activations.len()
+                + self.pending_network_group_readies.len()
                 + self.pending_individual_connect_acks.len()
                 + self.pending_individual_releases.len()
                 + 4,
@@ -223,6 +261,7 @@ impl CcBsSubentity {
         ids.extend(self.pending_individual_tx_ceased_tail_drains.keys().copied());
         ids.extend(self.pending_group_tx_ceased_tail_drains.keys().copied());
         ids.extend(self.pending_group_floor_activations.keys().copied());
+        ids.extend(self.pending_network_group_readies.keys().copied());
         ids.extend(self.pending_individual_connect_acks.keys().copied());
         ids.extend(self.pending_individual_releases.keys().copied());
         ids.extend(self.circuits.active_call_ids());
@@ -585,6 +624,13 @@ impl CcBsSubentity {
         if self.config.state_read().subscribers.has_group_members(gssi) {
             return true;
         }
+        self.group_listeners.get(&gssi).copied().unwrap_or(0) > 0 || self.external_group_listeners.get(&gssi).copied().unwrap_or(0) > 0
+    }
+
+    pub(super) fn has_local_listener(&self, gssi: u32) -> bool {
+        if self.config.state_read().subscribers.has_group_members(gssi) {
+            return true;
+        }
         self.group_listeners.get(&gssi).copied().unwrap_or(0) > 0
     }
 
@@ -614,7 +660,18 @@ impl CcBsSubentity {
         })
     }
 
-    fn sync_shared_subscribers_from_mm_update(&self, issi: u32, groups: &[u32], action: BrewSubscriberAction) {
+    fn sync_shared_subscribers_from_mm_update(&self, issi: u32, groups: &[u32], action: BrewSubscriberAction, source: TetraEntity) {
+        if source != TetraEntity::Mm {
+            tracing::debug!(
+                "CMCE: keeping {:?} subscriber update issi={} action={:?} groups={:?} out of shared RF subscriber registry",
+                source,
+                issi,
+                action,
+                groups
+            );
+            return;
+        }
+
         let mut state = self.config.state_write();
         match action {
             BrewSubscriberAction::Register => {
@@ -701,6 +758,21 @@ impl CcBsSubentity {
         }
     }
 
+    pub(super) fn inc_external_group_listener(&mut self, gssi: u32) {
+        let entry = self.external_group_listeners.entry(gssi).or_insert(0);
+        *entry += 1;
+    }
+
+    pub(super) fn dec_external_group_listener(&mut self, gssi: u32) {
+        if let Some(entry) = self.external_group_listeners.get_mut(&gssi) {
+            if *entry <= 1 {
+                self.external_group_listeners.remove(&gssi);
+            } else {
+                *entry -= 1;
+            }
+        }
+    }
+
     pub(super) fn find_individual_call_by_issi(&self, issi: u32) -> Option<(u16, IndividualCallState)> {
         self.individual_calls
             .iter()
@@ -743,10 +815,114 @@ impl CcBsSubentity {
         }
     }
 
-    pub fn handle_subscriber_update(&mut self, queue: &mut MessageQueue, update: MmSubscriberUpdate) {
+    fn handle_external_subscriber_update(&mut self, queue: &mut MessageQueue, update: MmSubscriberUpdate, source: TetraEntity) {
         let issi = update.issi;
         let groups = update.groups;
-        self.sync_shared_subscribers_from_mm_update(issi, &groups, update.action);
+
+        match update.action {
+            BrewSubscriberAction::Register => {
+                let known = self.external_subscriber_groups.contains_key(&issi);
+                self.external_subscriber_groups.entry(issi).or_insert_with(HashSet::new);
+                tracing::info!(
+                    "CMCE: external subscriber register source={:?} issi={} known={}",
+                    source,
+                    issi,
+                    known
+                );
+            }
+            BrewSubscriberAction::Deregister => {
+                if let Some(existing) = self.external_subscriber_groups.remove(&issi) {
+                    let existing_groups: Vec<u32> = existing.into_iter().collect();
+                    for gssi in &existing_groups {
+                        self.dec_external_group_listener(*gssi);
+                    }
+                    for gssi in &existing_groups {
+                        self.clear_group_floor_state_for_departure(queue, issi, *gssi);
+                    }
+                    for gssi in &existing_groups {
+                        self.drop_group_calls_if_unlistened(queue, *gssi);
+                    }
+                }
+                tracing::info!("CMCE: external subscriber deregister source={:?} issi={}", source, issi);
+            }
+            BrewSubscriberAction::Affiliate => {
+                let mut new_groups = Vec::new();
+                {
+                    let entry = self.external_subscriber_groups.entry(issi).or_insert_with(HashSet::new);
+                    for gssi in groups {
+                        if entry.insert(gssi) {
+                            new_groups.push(gssi);
+                        }
+                    }
+                }
+                for gssi in &new_groups {
+                    self.inc_external_group_listener(*gssi);
+                }
+
+                if new_groups.is_empty() {
+                    tracing::debug!("CMCE: external affiliate ignored source={:?} issi={} (no new groups)", source, issi);
+                } else {
+                    tracing::info!(
+                        "CMCE: external subscriber affiliate source={:?} issi={} groups={:?}",
+                        source,
+                        issi,
+                        new_groups
+                    );
+                }
+            }
+            BrewSubscriberAction::Deaffiliate => {
+                let mut removed_groups = Vec::new();
+                if let Some(entry) = self.external_subscriber_groups.get_mut(&issi) {
+                    for gssi in groups {
+                        if entry.remove(&gssi) {
+                            removed_groups.push(gssi);
+                        }
+                    }
+                    if entry.is_empty() {
+                        self.external_subscriber_groups.remove(&issi);
+                    }
+                }
+
+                for gssi in &removed_groups {
+                    self.dec_external_group_listener(*gssi);
+                }
+
+                if removed_groups.is_empty() {
+                    tracing::debug!(
+                        "CMCE: external deaffiliate ignored source={:?} issi={} (no matching groups)",
+                        source,
+                        issi
+                    );
+                } else {
+                    tracing::info!(
+                        "CMCE: external subscriber deaffiliate source={:?} issi={} groups={:?}",
+                        source,
+                        issi,
+                        removed_groups
+                    );
+                    for gssi in &removed_groups {
+                        self.clear_group_floor_state_for_departure(queue, issi, *gssi);
+                    }
+                    for gssi in &removed_groups {
+                        self.drop_group_calls_if_unlistened(queue, *gssi);
+                    }
+                }
+            }
+            BrewSubscriberAction::ReleaseIndividualCalls => {
+                tracing::debug!("CMCE: ignoring external ReleaseIndividualCalls source={:?} issi={}", source, issi);
+            }
+        }
+    }
+
+    pub fn handle_subscriber_update(&mut self, queue: &mut MessageQueue, update: MmSubscriberUpdate, source: TetraEntity) {
+        let issi = update.issi;
+        self.sync_shared_subscribers_from_mm_update(issi, &update.groups, update.action, source);
+        if source != TetraEntity::Mm {
+            self.handle_external_subscriber_update(queue, update, source);
+            return;
+        }
+
+        let groups = update.groups;
 
         match update.action {
             BrewSubscriberAction::Register => {
@@ -1341,6 +1517,188 @@ impl CcBsSubentity {
         }
     }
 
+    pub(super) fn queue_network_group_ready(
+        &mut self,
+        call_id: u16,
+        brew_uuid: uuid::Uuid,
+        source_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+        reporters: Vec<TxReporter>,
+        notify_speaker_changed: bool,
+    ) {
+        if reporters.is_empty() {
+            tracing::warn!(
+                "CMCE: network group ready call_id={} uuid={} has no RF reporter; completing without gating",
+                call_id,
+                brew_uuid
+            );
+            self.pending_network_group_readies.insert(
+                call_id,
+                PendingNetworkGroupReady {
+                    brew_uuid,
+                    call_id,
+                    source_issi,
+                    dest_gssi,
+                    ts,
+                    usage,
+                    reporters,
+                    notify_speaker_changed,
+                    started_at: self.dltime,
+                },
+            );
+            return;
+        }
+
+        if let Some(pending) = self.pending_network_group_readies.insert(
+            call_id,
+            PendingNetworkGroupReady {
+                brew_uuid,
+                call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+                usage,
+                reporters,
+                notify_speaker_changed,
+                started_at: self.dltime,
+            },
+        ) {
+            tracing::debug!(
+                "CMCE: replaced pending network group ready call_id={} old_uuid={} new_uuid={}",
+                call_id,
+                pending.brew_uuid,
+                brew_uuid
+            );
+        }
+    }
+
+    pub(super) fn cancel_network_group_ready(&mut self, call_id: u16, reason: &str) -> bool {
+        if let Some(pending) = self.pending_network_group_readies.remove(&call_id) {
+            tracing::debug!(
+                "CMCE: cancelling pending network group ready call_id={} uuid={} because {}",
+                call_id,
+                pending.brew_uuid,
+                reason
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(super) fn drain_pending_network_group_readies(&mut self, queue: &mut MessageQueue) {
+        let ready: Vec<(u16, bool)> = self
+            .pending_network_group_readies
+            .iter()
+            .filter_map(|(&call_id, pending)| {
+                if pending.reporters.is_empty() || pending.reporters.iter().any(TxReporter::is_transmitted) {
+                    Some((call_id, true))
+                } else if pending.reporters.iter().all(TxReporter::is_discarded)
+                    || pending.started_at.age(self.dltime) >= NETWORK_GROUP_READY_PENDING_TIMEOUT_TIMESLOTS
+                {
+                    Some((call_id, false))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (call_id, was_transmitted) in ready {
+            let Some(pending) = self.pending_network_group_readies.remove(&call_id) else {
+                continue;
+            };
+
+            if was_transmitted {
+                self.complete_network_group_ready(queue, pending);
+                continue;
+            }
+
+            tracing::warn!(
+                "CMCE: releasing network group call_id={} uuid={} because RF setup/floor signalling was not transmitted before ready guard",
+                pending.call_id,
+                pending.brew_uuid
+            );
+            self.release_group_call(queue, pending.call_id, DisconnectCause::AcknowledgedServiceNotComplete);
+        }
+    }
+
+    fn complete_network_group_ready(&mut self, queue: &mut MessageQueue, pending: PendingNetworkGroupReady) {
+        let Some(call) = self.active_calls.get(&pending.call_id) else {
+            tracing::debug!(
+                "CMCE: dropping pending network group ready call_id={} uuid={}; call no longer active",
+                pending.call_id,
+                pending.brew_uuid
+            );
+            return;
+        };
+
+        if !call.is_current_speaker(pending.source_issi)
+            || call.dest_gssi != pending.dest_gssi
+            || call.ts != pending.ts
+            || call.usage != pending.usage
+            || call.brew_uuid != Some(pending.brew_uuid)
+        {
+            tracing::debug!(
+                "CMCE: dropping stale network group ready call_id={} uuid={} source={} gssi={} ts={}; active source={} gssi={} ts={} uuid={:?}",
+                pending.call_id,
+                pending.brew_uuid,
+                pending.source_issi,
+                pending.dest_gssi,
+                pending.ts,
+                call.source_issi,
+                call.dest_gssi,
+                call.ts,
+                call.brew_uuid
+            );
+            return;
+        }
+
+        tracing::info!(
+            "CMCE: network group ready call_id={} uuid={} source ISSI {} GSSI {} ts={} after RF control signalling",
+            pending.call_id,
+            pending.brew_uuid,
+            pending.source_issi,
+            pending.dest_gssi,
+            pending.ts
+        );
+
+        Self::signal_umac_dl_media_source(queue, pending.ts, CircuitDlMediaSource::SwMI);
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id: pending.call_id,
+                source_issi: pending.source_issi,
+                dest_gssi: pending.dest_gssi,
+                ts: pending.ts,
+            }),
+        });
+
+        if pending.notify_speaker_changed {
+            self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
+                call_id: pending.call_id,
+                gssi: pending.dest_gssi,
+                speaker_issi: pending.source_issi,
+            });
+        }
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Brew,
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+                brew_uuid: pending.brew_uuid,
+                call_id: pending.call_id,
+                ts: pending.ts,
+                usage: pending.usage,
+            }),
+        });
+    }
+
     fn complete_group_floor_activation(&mut self, queue: &mut MessageQueue, pending: PendingGroupFloorActivation) {
         let Some(call) = self.active_calls.get(&pending.call_id) else {
             tracing::debug!(
@@ -1371,6 +1729,8 @@ impl CcBsSubentity {
             pending.dest_gssi,
             pending.ts
         );
+
+        Self::signal_umac_dl_media_source(queue, pending.ts, CircuitDlMediaSource::LocalLoopback);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -2199,6 +2559,16 @@ impl CcBsSubentity {
         queue.push_back(cmd);
     }
 
+    pub(super) fn signal_umac_dl_media_source(queue: &mut MessageQueue, ts: u8, dl_media_source: CircuitDlMediaSource) {
+        let cmd = SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::SetDlMediaSource { ts, dl_media_source }),
+        };
+        queue.push_back(cmd);
+    }
+
     pub(super) fn signal_umac_circuit_close(queue: &mut MessageQueue, circuit: CmceCircuit) {
         let cmd = SapMsg {
             sap: Sap::Control,
@@ -2439,6 +2809,33 @@ impl CcBsSubentity {
         ts: u8,
         usage: u8,
     ) {
+        self.send_d_tx_granted_facch_inner(queue, call_id, source_issi, dest_gssi, ts, usage, None);
+    }
+
+    pub(super) fn send_d_tx_granted_facch_reported(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        source_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+    ) -> TxReporter {
+        let reporter = TxReporter::new_unacked();
+        self.send_d_tx_granted_facch_inner(queue, call_id, source_issi, dest_gssi, ts, usage, Some(reporter.clone()));
+        reporter
+    }
+
+    fn send_d_tx_granted_facch_inner(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        source_issi: u32,
+        dest_gssi: u32,
+        ts: u8,
+        usage: u8,
+        reporter: Option<TxReporter>,
+    ) {
         // EN 300 392-2 clause 14.5.2.2.1 b) requires group listeners to be
         // informed when another user receives transmit permission. The same
         // clause notes that the group-addressed D-TX GRANTED should identify
@@ -2470,7 +2867,15 @@ impl CcBsSubentity {
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
         // DL-only on group FACCH: only the current speaker holds UL.
-        let msg = Self::build_sapmsg_stealing_ul_dl_with_repetitions(sdu, dest_addr, ts, Some(usage), UlDlAssignment::Dl, Some(0));
+        let msg = Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(
+            sdu,
+            dest_addr,
+            ts,
+            Some(usage),
+            UlDlAssignment::Dl,
+            reporter,
+            Some(0),
+        );
         queue.push_back(msg);
     }
 
@@ -2642,6 +3047,7 @@ impl CcBsSubentity {
     ) {
         self.cancel_group_tx_ceased_tail_drain(call_id, "group release started");
         self.cancel_group_floor_activation(call_id, "group release started");
+        self.cancel_network_group_ready(call_id, "group release started");
 
         if self.pending_group_releases.contains_key(&call_id) {
             tracing::debug!("CMCE: group release already pending for call_id={}", call_id);

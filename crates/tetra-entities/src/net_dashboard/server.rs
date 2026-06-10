@@ -37,6 +37,12 @@ const DASHBOARD_HTTP_HEADER_LINE_MAX: usize = 2 * 1024;
 const DASHBOARD_HTTP_BODY_MAX: usize = 512 * 1024;
 const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
 const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
+const DASHBOARD_SECURITY_HEADERS: &str = concat!(
+    "X-Content-Type-Options: nosniff\r\n",
+    "X-Frame-Options: DENY\r\n",
+    "Referrer-Policy: no-referrer\r\n",
+    "Content-Security-Policy: frame-ancestors 'none'; object-src 'none'; base-uri 'none'\r\n",
+);
 
 #[derive(Debug, PartialEq, Eq)]
 struct LiveSdsPost {
@@ -577,6 +583,7 @@ pub struct DashboardServer {
     /// Last time a ts_voice WS message was broadcast per TS (indexed 0..3 for TS1..TS4)
     ts_last_broadcast: std::sync::Mutex<[std::time::Instant; 4]>,
     active_http_connections: Arc<AtomicUsize>,
+    bs_started_at: Instant,
 }
 
 impl DashboardServer {
@@ -596,6 +603,7 @@ impl DashboardServer {
             sessions: Arc::new(Mutex::new(SessionStore::new())),
             ts_last_broadcast: std::sync::Mutex::new([now; 4]),
             active_http_connections: Arc::new(AtomicUsize::new(0)),
+            bs_started_at: now,
         }
     }
 
@@ -651,6 +659,7 @@ impl DashboardServer {
         let shared_config = self.shared_config.clone();
         let sessions = Arc::clone(&self.sessions);
         let active_http_connections = Arc::clone(&self.active_http_connections);
+        let bs_started_at = self.bs_started_at;
 
         std::thread::Builder::new()
             .name("dashboard-server".into())
@@ -689,6 +698,7 @@ impl DashboardServer {
                     let auth = auth.clone();
                     let shared_config = shared_config.clone();
                     let sessions = Arc::clone(&sessions);
+                    let bs_started_at = bs_started_at;
                     let active_for_guard = Arc::clone(&active_http_connections);
                     let active_for_spawn_error = Arc::clone(&active_http_connections);
                     if let Err(e) = std::thread::Builder::new().name("dashboard-conn".into()).spawn(move || {
@@ -706,6 +716,7 @@ impl DashboardServer {
                             auth,
                             shared_config,
                             sessions,
+                            bs_started_at,
                         )
                     }) {
                         active_for_spawn_error.fetch_sub(1, Ordering::AcqRel);
@@ -800,6 +811,8 @@ impl DashboardServer {
                 } => {
                     if let Some(c) = s.calls.get_mut(call_id) {
                         c.speaker_issi = Some(*speaker_issi);
+                        c.caller_issi = *speaker_issi;
+                        c.started_at = Instant::now();
                     }
                     s.push_last_heard(*speaker_issi, "call_group", *gssi);
                 }
@@ -902,6 +915,9 @@ impl DashboardServer {
                         sensors: sensors.clone(),
                     });
                 }
+                TelemetryEvent::HealthSnapshot(snapshot) => {
+                    s.last_health = Some(snapshot.clone());
+                }
             }
         }
         if let Some(json) = msg {
@@ -1003,15 +1019,17 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             caller_issi,
             ts,
         } => {
-            serde_json::json!({"type":"call_started","call_id":call_id,"call_type":"group","gssi":gssi,"caller_issi":caller_issi,"ts":ts,"last_heard":{"issi":caller_issi,"activity":"call_group","dest":gssi}})
+            serde_json::json!({"type":"call_started","call_id":call_id,"call_type":"group","gssi":gssi,"caller_issi":caller_issi,"active_speaker":caller_issi,"ts":ts,"last_heard":{"issi":caller_issi,"activity":"call_group","dest":gssi}})
         }
-        TelemetryEvent::GroupCallEnded { call_id, gssi: _ } => serde_json::json!({"type":"call_ended","call_id":call_id}),
+        TelemetryEvent::GroupCallEnded { call_id, gssi } => {
+            serde_json::json!({"type":"call_ended","call_id":call_id,"call_type":"group","gssi":gssi})
+        }
         TelemetryEvent::GroupCallSpeakerChanged {
             call_id,
             gssi,
             speaker_issi,
         } => {
-            serde_json::json!({"type":"speaker_changed","call_id":call_id,"speaker_issi":speaker_issi,"last_heard":{"issi":speaker_issi,"activity":"call_group","dest":gssi}})
+            serde_json::json!({"type":"speaker_changed","call_id":call_id,"gssi":gssi,"speaker_issi":speaker_issi,"last_heard":{"issi":speaker_issi,"activity":"call_group","dest":gssi}})
         }
         TelemetryEvent::IndividualCallStarted {
             call_id,
@@ -1080,6 +1098,10 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             "type": "sys_health",
             "total_power_w": total_power_w,
             "sensors": sensors,
+        }),
+        TelemetryEvent::HealthSnapshot(snapshot) => serde_json::json!({
+            "type": "health",
+            "snapshot": snapshot,
         }),
     };
     serde_json::to_string(&v).ok()
@@ -1156,13 +1178,42 @@ fn send_control_cmd(cmd_tx: &Arc<Mutex<Option<CmdSender>>>, cmd: ControlCommand)
     false
 }
 
+fn serve_service_command(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, label: &str, cmd: ControlCommand) {
+    let accepted = send_control_cmd(cmd_tx, cmd);
+    if accepted {
+        tracing::warn!("Dashboard: service {} requested", label);
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": true,
+            "action": label,
+            "message": format!("{} queued", label),
+        }))
+        .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+        http_json_response(stream, 200, &body);
+    } else {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "action": label,
+            "error": "control channel unavailable",
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"control channel unavailable"}"#.to_string());
+        http_json_response(stream, 503, &body);
+    }
+}
+
+fn serve_clear_dashboard_logs(stream: TcpStream, state: &DashboardState) {
+    if let Ok(mut s) = state.write() {
+        s.clear_logs();
+    }
+    http_json_response(stream, 200, r#"{"ok":true}"#);
+}
+
 fn live_sds_queue_full(cfg: &Option<tetra_config::bluestation::SharedConfig>) -> bool {
     cfg.as_ref()
         .is_some_and(|c| c.state_read().live_sds_queue.len() >= LIVE_SDS_QUEUE_MAX_LEN)
 }
 
 /// Serialize the current live SDS queue to JSON and serve it.
-fn serve_live_sds_list(mut stream: TcpStream, cfg: &Option<tetra_config::bluestation::SharedConfig>) {
+fn serve_live_sds_list(stream: TcpStream, cfg: &Option<tetra_config::bluestation::SharedConfig>) {
     let items: Vec<serde_json::Value> = cfg
         .as_ref()
         .map(|c| {
@@ -1184,12 +1235,7 @@ fn serve_live_sds_list(mut stream: TcpStream, cfg: &Option<tetra_config::bluesta
         })
         .unwrap_or_default();
     let body = serde_json::to_string(&items).unwrap_or_else(|_| "[]".to_string());
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
 }
 
 fn handle_connection(
@@ -1205,6 +1251,7 @@ fn handle_connection(
     auth: Option<(String, String)>,
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     sessions: SharedSessionStore,
+    bs_started_at: Instant,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
 
@@ -1234,6 +1281,19 @@ fn handle_connection(
     }
     let header_str = String::from_utf8_lossy(&header_buf);
     let req_line = header_str.lines().next().unwrap_or("").to_string();
+
+    if request_matches(&req_line, "GET", "/api/auth/status") {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        serve_dashboard_auth_status(buf.into_inner(), &auth, &sessions, &header_str);
+        return;
+    }
 
     // ── Cookie-session auth ──────────────────────────────────────────────────
     // We replaced the browser-native Basic Auth dialog with a form-based login at
@@ -1359,7 +1419,60 @@ fn handle_connection(
                 break;
             }
         }
-        serve_system_info(buf.into_inner(), &config_path, runtime_config_path.as_deref());
+        serve_system_info(buf.into_inner(), &config_path, runtime_config_path.as_deref(), bs_started_at);
+    } else if request_matches(&req_line, "GET", "/api/snapshot") {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        serve_dashboard_snapshot(buf.into_inner(), &state);
+    } else if request_matches(&req_line, "GET", "/api/calls") {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        serve_dashboard_calls(buf.into_inner(), &state);
+    } else if request_matches(&req_line, "GET", "/api/site") {
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        serve_dashboard_site(buf.into_inner(), &state, &shared_config);
+    } else if request_matches(&req_line, "GET", "/api/radioid") {
+        let issi = request_query_param(&req_line, "id").and_then(|id| id.parse::<u32>().ok());
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        crate::net_dashboard::radioid::serve(buf.into_inner(), issi);
+    } else if request_matches(&req_line, "POST", "/api/service/restart") {
+        drain_http_headers(&mut stream);
+        serve_service_command(stream, &cmd_tx, "restart", ControlCommand::RestartService);
+    } else if request_matches(&req_line, "POST", "/api/service/shutdown") {
+        drain_http_headers(&mut stream);
+        serve_service_command(stream, &cmd_tx, "shutdown", ControlCommand::ShutdownService);
+    } else if request_matches(&req_line, "POST", "/api/service/stop-go") {
+        drain_http_headers(&mut stream);
+        serve_service_command(stream, &cmd_tx, "stop-go", ControlCommand::StopGoService { start_delay_secs: 5 });
+    } else if request_matches(&req_line, "POST", "/api/logs/clear") {
+        drain_http_headers(&mut stream);
+        serve_clear_dashboard_logs(stream, &state);
     } else if request_matches(&req_line, "POST", "/api/configs/activate") {
         let mut buf = BufReader::new(stream);
         let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
@@ -1388,11 +1501,7 @@ fn handle_connection(
         }
         // GET /api/configs/<name> — read a specific profile's content
         // GET /api/configs       — list all profiles
-        let profile_name: Option<String> = req_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|path| path.strip_prefix("/api/configs/"))
-            .map(|n| n.to_string());
+        let profile_name = request_profile_name(&req_line, "/api/configs/");
         if let Some(name) = profile_name {
             serve_config_profile_get(buf.into_inner(), &config_path, &name);
         } else {
@@ -1400,11 +1509,7 @@ fn handle_connection(
         }
     } else if request_path_has_prefix(&req_line, "POST", "/api/configs/") {
         // POST /api/configs/<name> — save content to a specific profile (not activate)
-        let profile_name: Option<String> = req_line
-            .split_whitespace()
-            .nth(1)
-            .and_then(|path| path.strip_prefix("/api/configs/"))
-            .map(|n| n.to_string());
+        let profile_name = request_profile_name(&req_line, "/api/configs/");
         let mut buf = BufReader::new(stream);
         let body = match read_http_body_from_buf(&mut buf, DASHBOARD_HTTP_BODY_MAX) {
             Ok(body) => body,
@@ -1418,6 +1523,26 @@ fn handle_connection(
             Some(name) => match save_config_profile(&config_path, &name, &String::from_utf8_lossy(&body)) {
                 Ok(_) => {
                     tracing::info!("Dashboard: saved profile '{}'", name);
+                    http_response(buf.into_inner(), 200, "OK")
+                }
+                Err(e) => http_response(buf.into_inner(), 500, &e),
+            },
+        }
+    } else if request_path_has_prefix(&req_line, "DELETE", "/api/configs/") {
+        let profile_name = request_profile_name(&req_line, "/api/configs/");
+        let mut buf = BufReader::new(stream);
+        loop {
+            let mut line = String::new();
+            let _ = buf.read_line(&mut line);
+            if line == "\r\n" || line.is_empty() || line == "\n" {
+                break;
+            }
+        }
+        match profile_name {
+            None => http_response(buf.into_inner(), 400, "missing profile name"),
+            Some(name) => match delete_config_profile(&config_path, &name) {
+                Ok(_) => {
+                    tracing::info!("Dashboard: deleted profile '{}'", name);
                     http_response(buf.into_inner(), 200, "OK")
                 }
                 Err(e) => http_response(buf.into_inner(), 500, &e),
@@ -1847,34 +1972,8 @@ fn handle_ws(
         c.push(broadcast_tx);
     }
 
-    // Send initial snapshot
-    {
-        let s = state.read().unwrap();
-        let ms = s.snapshot_ms();
-        let calls = s.snapshot_calls();
-        let logs: Vec<_> = s.log_ring.iter().cloned().collect();
-        let last_heard: Vec<_> = s.last_heard.iter().cloned().collect();
-        let brew_online = s.brew_online;
-        let brew_version = s.brew_version;
-        let fallback_active = s.fallback_config_active;
-        let fallback_reason = s.fallback_config_reason.clone();
-        let last_tx_visual = s.last_tx_visual.clone();
-        let last_tx_quality = s.last_tx_quality.clone();
-        let last_sdr_health = s.last_sdr_health.clone();
-        let last_sys_health = s.last_sys_health.clone();
-        drop(s);
-        if let Ok(json) = serde_json::to_string(&serde_json::json!({
-            "type": "snapshot", "ms": ms, "calls": calls, "log": logs,
-            "brew_online": brew_online, "brew_version": brew_version, "last_heard": last_heard,
-            "fallback_config_active": fallback_active, "fallback_config_reason": fallback_reason,
-            "last_tx_visual": last_tx_visual,
-            "last_tx_quality": last_tx_quality,
-            "last_sdr_health": last_sdr_health,
-            "last_sys_health": last_sys_health,
-        })) {
-            let _ = ws.send(Message::Text(json));
-        }
-    }
+    // Send initial snapshot.
+    let _ = ws.send(Message::Text(dashboard_snapshot_json(&state)));
 
     let _ = ws.get_ref().set_read_timeout(Some(std::time::Duration::from_millis(20)));
 
@@ -1901,6 +2000,312 @@ fn handle_ws(
             Err(_) => break,
         }
     }
+}
+
+fn dashboard_snapshot_json(state: &DashboardState) -> String {
+    let s = state.read().unwrap();
+    let ms = s.snapshot_ms();
+    let calls = s.snapshot_calls();
+    let logs: Vec<_> = s.log_ring.iter().cloned().collect();
+    let last_heard: Vec<_> = s.last_heard.iter().cloned().collect();
+    let brew_online = s.brew_online;
+    let brew_version = s.brew_version;
+    let fallback_active = s.fallback_config_active;
+    let fallback_reason = s.fallback_config_reason.clone();
+    let last_tx_visual = s.last_tx_visual.clone();
+    let last_tx_quality = s.last_tx_quality.clone();
+    let last_sdr_health = s.last_sdr_health.clone();
+    let last_sys_health = s.last_sys_health.clone();
+    let last_health = s.last_health.clone();
+    drop(s);
+
+    serde_json::to_string(&serde_json::json!({
+        "type": "snapshot",
+        "ms": ms,
+        "calls": calls,
+        "log": logs,
+        "brew_online": brew_online,
+        "brew_version": brew_version,
+        "last_heard": last_heard,
+        "fallback_config_active": fallback_active,
+        "fallback_config_reason": fallback_reason,
+        "last_tx_visual": last_tx_visual,
+        "last_tx_quality": last_tx_quality,
+        "last_sdr_health": last_sdr_health,
+        "last_sys_health": last_sys_health,
+        "last_health": last_health,
+    }))
+    .unwrap_or_else(|_| r#"{"type":"snapshot","ms":[],"calls":[],"log":[],"last_heard":[]}"#.to_string())
+}
+
+fn serve_dashboard_snapshot(stream: TcpStream, state: &DashboardState) {
+    let body = dashboard_snapshot_json(state);
+    http_json_response(stream, 200, &body);
+}
+
+fn dashboard_calls_json(state: &DashboardState) -> String {
+    let s = state.read().unwrap();
+    let calls = s.snapshot_calls();
+    let last_heard: Vec<_> = s.last_heard.iter().cloned().collect();
+    let brew_online = s.brew_online;
+    let brew_version = s.brew_version;
+    drop(s);
+
+    serde_json::to_string(&serde_json::json!({
+        "type": "calls",
+        "calls": calls,
+        "last_heard": last_heard,
+        "brew_online": brew_online,
+        "brew_version": brew_version,
+    }))
+    .unwrap_or_else(|_| r#"{"type":"calls","calls":[],"last_heard":[]}"#.to_string())
+}
+
+fn serve_dashboard_calls(stream: TcpStream, state: &DashboardState) {
+    let body = dashboard_calls_json(state);
+    http_json_response(stream, 200, &body);
+}
+
+fn energy_saving_config_label(mode: u8) -> String {
+    if mode == tetra_config::bluestation::ENERGY_SAVING_MODE_AUTO {
+        "auto".to_string()
+    } else if mode == 0 {
+        "StayAlive".to_string()
+    } else if (1..=7).contains(&mode) {
+        format!("EG{}", mode)
+    } else {
+        format!("unknown({})", mode)
+    }
+}
+
+fn gain_map_json(gains: &std::collections::HashMap<String, f64>) -> serde_json::Value {
+    let mut rows: Vec<_> = gains.iter().collect();
+    rows.sort_by(|a, b| a.0.cmp(b.0));
+    serde_json::Value::Object(
+        rows.into_iter()
+            .map(|(name, value)| (name.clone(), serde_json::json!(value)))
+            .collect(),
+    )
+}
+
+fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_config::bluestation::SharedConfig>) -> String {
+    let (calls, last_tx_visual, last_tx_quality, last_sdr_health, last_sys_health, last_health, radio_count, brew_online, brew_version) = {
+        let s = state.read().unwrap();
+        (
+            s.snapshot_calls(),
+            s.last_tx_visual.clone(),
+            s.last_tx_quality.clone(),
+            s.last_sdr_health.clone(),
+            s.last_sys_health.clone(),
+            s.last_health.clone(),
+            s.ms_map.len(),
+            s.brew_online,
+            s.brew_version,
+        )
+    };
+
+    let config = if let Some(shared) = shared_config {
+        let cfg = shared.config();
+        let freq_info = tetra_core::freqs::FreqInfo::from_components(
+            cfg.cell.freq_band,
+            cfg.cell.main_carrier,
+            cfg.cell.freq_offset_hz,
+            cfg.cell.reverse_operation,
+            cfg.cell.duplex_spacing_id,
+            cfg.cell.custom_duplex_spacing,
+        )
+        .ok();
+        let (derived_dl_hz, derived_ul_hz, duplex_spacing_hz) = freq_info
+            .as_ref()
+            .map(|freq| {
+                let (dl, ul) = freq.get_freqs();
+                (Some(dl), Some(ul), Some(freq.duplex_spacing_val))
+            })
+            .unwrap_or((None, None, None));
+
+        let soapy = cfg.phy_io.soapysdr.as_ref();
+        let soapy_tx_hz = soapy.map(|s| s.dl_freq);
+        let soapy_rx_hz = soapy.map(|s| s.ul_freq);
+        let (soapy_tx_corrected_hz, soapy_tx_ppm_error_hz) = soapy
+            .map(|s| {
+                let (corrected, error) = s.dl_freq_corrected();
+                (Some(corrected), Some(error))
+            })
+            .unwrap_or((None, None));
+        let (soapy_rx_corrected_hz, soapy_rx_ppm_error_hz) = soapy
+            .map(|s| {
+                let (corrected, error) = s.ul_freq_corrected();
+                (Some(corrected), Some(error))
+            })
+            .unwrap_or((None, None));
+        let frequency_match = match (derived_dl_hz, derived_ul_hz, soapy_tx_hz, soapy_rx_hz) {
+            (Some(dl), Some(ul), Some(tx), Some(rx)) => (tx.round() as u32 == dl) && (rx.round() as u32 == ul),
+            _ => false,
+        };
+
+        let stack_state = shared.state_read();
+        let timeslot_owners: Vec<_> = (2..=4)
+            .map(|ts| {
+                serde_json::json!({
+                    "ts": ts,
+                    "owner": stack_state.timeslot_alloc.owner(ts).map(|owner| format!("{:?}", owner)),
+                    "free": stack_state.timeslot_alloc.is_free(ts),
+                })
+            })
+            .collect();
+        let live_sds_queue_len = stack_state.live_sds_queue.len();
+        let whitelist_override = stack_state.issi_whitelist_override.clone();
+        drop(stack_state);
+
+        let whitelist_count = whitelist_override
+            .as_ref()
+            .map(|list| list.len())
+            .unwrap_or_else(|| cfg.security.issi_whitelist.len());
+        let whitelist_source = if whitelist_override.is_some() { "runtime" } else { "config" };
+
+        serde_json::json!({
+            "available": true,
+            "stack_mode": format!("{:?}", cfg.stack_mode),
+            "phy_backend": format!("{:?}", cfg.phy_io.backend),
+            "network": {
+                "mcc": cfg.net.mcc,
+                "mnc": cfg.net.mnc,
+            },
+            "cell": {
+                "main_carrier": cfg.cell.main_carrier,
+                "freq_band": cfg.cell.freq_band,
+                "freq_offset_hz": cfg.cell.freq_offset_hz,
+                "duplex_spacing_id": cfg.cell.duplex_spacing_id,
+                "custom_duplex_spacing_hz": cfg.cell.custom_duplex_spacing,
+                "duplex_spacing_hz": duplex_spacing_hz,
+                "reverse_operation": cfg.cell.reverse_operation,
+                "location_area": cfg.cell.location_area,
+                "system_code": cfg.cell.system_code,
+                "colour_code": cfg.cell.colour_code,
+                "frame_18_ext": cfg.cell.frame_18_ext,
+                "ts_reserved_frames": cfg.cell.ts_reserved_frames,
+                "u_plane_dtx": cfg.cell.u_plane_dtx,
+                "hangtime_secs": cfg.cell.hangtime_secs,
+                "call_timeout_secs": cfg.cell.call_timeout_secs,
+                "ul_inactivity_secs": cfg.cell.ul_inactivity_secs,
+                "legacy_gssi_group_call": cfg.cell.legacy_gssi_group_call,
+                "energy_saving_mode": cfg.cell.energy_saving_mode,
+                "energy_saving_label": energy_saving_config_label(cfg.cell.energy_saving_mode),
+                "timezone": cfg.cell.timezone,
+                "derived_dl_hz": derived_dl_hz,
+                "derived_ul_hz": derived_ul_hz,
+            },
+            "soapy": soapy.map(|s| serde_json::json!({
+                "tx_hz": s.dl_freq,
+                "rx_hz": s.ul_freq,
+                "tx_corrected_hz": soapy_tx_corrected_hz,
+                "rx_corrected_hz": soapy_rx_corrected_hz,
+                "tx_ppm_error_hz": soapy_tx_ppm_error_hz,
+                "rx_ppm_error_hz": soapy_rx_ppm_error_hz,
+                "ppm_err": s.ppm_err,
+                "device": s.device,
+                "rx_ant": s.rx_ant,
+                "tx_ant": s.tx_ant,
+                "rx_ch": s.rx_ch,
+                "tx_ch": s.tx_ch,
+                "sample_rate": s.fs,
+                "rx_gains": gain_map_json(&s.rx_gains),
+                "tx_gains": gain_map_json(&s.tx_gains),
+                "frequency_match": frequency_match,
+            })),
+            "timeslot_owners": timeslot_owners,
+            "services": {
+                "voice": cfg.cell.voice_service,
+                "sds_live_queue_len": live_sds_queue_len,
+                "whitelist_enabled": whitelist_count > 0,
+                "whitelist_count": whitelist_count,
+                "whitelist_source": whitelist_source,
+                "home_mode_display": cfg.cell.home_mode_display.is_some(),
+                "sds_broadcast": cfg.cell.sds_broadcast.is_some(),
+                "wx_service": cfg.wx_service.enabled,
+            },
+            "health": {
+                "enabled": cfg.health.enabled,
+                "snapshot_interval_secs": cfg.health.snapshot_interval_secs,
+                "restart_on_core_stall": cfg.health.restart_on_core_stall,
+                "restart_after_critical_secs": cfg.health.restart_after_critical_secs,
+                "restart_cooldown_secs": cfg.health.restart_cooldown_secs,
+            },
+        })
+    } else {
+        serde_json::json!({
+            "available": false,
+            "reason": "shared config unavailable",
+        })
+    };
+
+    let mut timeslots = Vec::new();
+    for ts in 1..=4u8 {
+        let call = calls.iter().find(|call| call.ts == ts);
+        timeslots.push(serde_json::json!({
+            "ts": ts,
+            "role": if ts == 1 { "control" } else { "traffic" },
+            "state": if ts == 1 { "control" } else if call.is_some() { "active" } else { "idle" },
+            "call": call,
+        }));
+    }
+
+    serde_json::to_string(&serde_json::json!({
+        "type": "site",
+        "config": config,
+        "counts": {
+            "radios": radio_count,
+            "calls": calls.len(),
+        },
+        "backhaul": {
+            "brew_online": brew_online,
+            "brew_version": brew_version,
+        },
+        "timeslots": timeslots,
+        "rf_cached": {
+            "tx_visual": last_tx_visual,
+            "tx_quality": last_tx_quality,
+            "sdr_health": last_sdr_health,
+            "sys_health": last_sys_health,
+            "health": last_health,
+        },
+    }))
+    .unwrap_or_else(|_| r#"{"type":"site","config":{"available":false}}"#.to_string())
+}
+
+fn serve_dashboard_site(stream: TcpStream, state: &DashboardState, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
+    let body = dashboard_site_json(state, shared_config);
+    http_json_response(stream, 200, &body);
+}
+
+fn dashboard_session_valid(headers: &str, sessions: &SharedSessionStore) -> bool {
+    parse_session_cookie(headers)
+        .and_then(|token| {
+            let mut store = sessions.lock().ok()?;
+            Some(store.validate(&token))
+        })
+        .unwrap_or(false)
+}
+
+fn dashboard_auth_status_json(auth: &Option<(String, String)>, sessions: &SharedSessionStore, headers: &str) -> String {
+    let auth_required = auth.is_some();
+    let session_valid = if auth_required {
+        dashboard_session_valid(headers, sessions)
+    } else {
+        true
+    };
+
+    serde_json::to_string(&serde_json::json!({
+        "auth_required": auth_required,
+        "session_valid": session_valid,
+        "session_cookie": "fs_session",
+    }))
+    .unwrap_or_else(|_| r#"{"auth_required":true,"session_valid":false}"#.to_string())
+}
+
+fn serve_dashboard_auth_status(stream: TcpStream, auth: &Option<(String, String)>, sessions: &SharedSessionStore, headers: &str) {
+    let body = dashboard_auth_status_json(auth, sessions, headers);
+    http_json_response(stream, 200, &body);
 }
 
 fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, update_state: &SharedUpdateState) {
@@ -2029,7 +2434,7 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
     }
 }
 
-fn serve_update_status(mut stream: TcpStream, update_state: &SharedUpdateState) {
+fn serve_update_status(stream: TcpStream, update_state: &SharedUpdateState) {
     let (phase_str, success, log) = {
         let u = update_state.lock().unwrap();
         let phase_str = match &u.phase {
@@ -2047,45 +2452,30 @@ fn serve_update_status(mut stream: TcpStream, update_state: &SharedUpdateState) 
         success,
         serde_json::to_string(&log).unwrap_or_else(|_| "\"\"".into())
     );
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
 }
 
 /// GET /api/update/check — query GitHub for the latest release and report whether a newer
 /// version than the running build exists. Best-effort; on any failure returns
 /// check_failed=true so the dashboard simply hides the badge.
-fn serve_update_check(mut stream: TcpStream) {
+fn serve_update_check(stream: TcpStream) {
     if !DASHBOARD_OTA_UPDATE_ENABLED {
         let body = format!(
             "{{\"current\":\"{}\",\"latest\":null,\"update_available\":false,\"release_url\":null,\"check_failed\":true,\"disabled\":true}}",
             tetra_core::STACK_VERSION
         );
-        let header = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        );
-        let _ = stream.write_all(header.as_bytes());
-        let _ = stream.write_all(body.as_bytes());
+        http_json_response(stream, 200, &body);
         return;
     }
     let result = crate::net_dashboard::update_check::check_for_update(tetra_core::STACK_VERSION);
     let body = result.to_json();
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
 }
 
 /// GET /api/whitelist — return the effective whitelist as JSON:
 /// `{"issi_whitelist":[...], "source":"override"|"config", "enabled":bool}`.
 /// `enabled` is false when the list is empty (open network).
-fn serve_whitelist_get(mut stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
+fn serve_whitelist_get(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
     let (list, source): (Vec<u32>, &str) = match shared_config {
         Some(cfg) => {
             let override_list = cfg.state_read().issi_whitelist_override.clone();
@@ -2103,12 +2493,7 @@ fn serve_whitelist_get(mut stream: TcpStream, shared_config: &Option<tetra_confi
         source,
         !list.is_empty()
     );
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
 }
 
 /// POST /api/whitelist — set the whitelist. Body: JSON array `[1,2,3]` or
@@ -2181,7 +2566,7 @@ fn serve_whitelist_post(
 // ---------------------------------------------------------------------------
 
 /// GET /api/wx — return the effective WX service settings as JSON.
-fn serve_wx_get(mut stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
+fn serve_wx_get(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
     let wx = match shared_config {
         Some(cfg) => cfg.effective_wx_service(),
         None => tetra_config::bluestation::CfgWxService::default(),
@@ -2196,12 +2581,7 @@ fn serve_wx_get(mut stream: TcpStream, shared_config: &Option<tetra_config::blue
         wx.periodic_icao.replace('\\', "\\\\").replace('"', "\\\""),
         wx.periodic_interval_secs
     );
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
 }
 
 /// POST /api/wx — update WX service settings. Body: JSON object with the same fields as
@@ -2512,7 +2892,7 @@ fn detect_cpu_descriptor() -> CpuDescriptor {
     )
 }
 
-fn serve_system_info(mut stream: TcpStream, config_path: &str, runtime_config_path: Option<&str>) {
+fn serve_system_info(stream: TcpStream, config_path: &str, runtime_config_path: Option<&str>, bs_started_at: Instant) {
     let product = dashboard_product_identity();
     let hostname = std::process::Command::new("hostname")
         .output()
@@ -2526,6 +2906,7 @@ fn serve_system_info(mut stream: TcpStream, config_path: &str, runtime_config_pa
         .flatten()
         .map(|f| f as u64)
         .unwrap_or(0);
+    let bs_uptime_secs = bs_started_at.elapsed().as_secs();
 
     let os_info = std::fs::read_to_string("/etc/os-release")
         .ok()
@@ -2683,6 +3064,8 @@ fn serve_system_info(mut stream: TcpStream, config_path: &str, runtime_config_pa
 
     let body = serde_json::to_string(&serde_json::json!({
         "hostname": hostname,
+        "bs_uptime_secs": bs_uptime_secs,
+        "host_uptime_secs": uptime_secs,
         "uptime_secs": uptime_secs,
         "os": os_info,
         "config_path": config_path,
@@ -2704,12 +3087,7 @@ fn serve_system_info(mut stream: TcpStream, config_path: &str, runtime_config_pa
     }))
     .unwrap_or_else(|_| "{}".to_string());
 
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2729,11 +3107,9 @@ fn dashboard_product_identity() -> DashboardProductIdentity {
     }
 }
 
-fn serve_config_list(mut stream: TcpStream, config_path: &str) {
-    let active_name = std::path::Path::new(config_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+fn serve_config_list(stream: TcpStream, config_path: &str) {
+    let runtime_active_name = active_config_filename(config_path);
+    let selected_name = read_active_config_marker(config_path).unwrap_or_else(|| runtime_active_name.clone());
     let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
 
     let mut profiles: Vec<serde_json::Value> = Vec::new();
@@ -2754,28 +3130,73 @@ fn serve_config_list(mut stream: TcpStream, config_path: &str) {
         for name in names {
             profiles.push(serde_json::json!({
                 "name": name,
-                "active": name == active_name,
+                "active": name == selected_name,
+                "runtime": name == runtime_active_name,
             }));
         }
     }
 
     let body = serde_json::to_string(&profiles).unwrap_or_else(|_| "[]".to_string());
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        body.len()
-    );
-    let _ = stream.write_all(header.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
+    http_json_response(stream, 200, &body);
+}
+
+fn request_profile_name(req_line: &str, prefix: &str) -> Option<String> {
+    request_path(req_line)
+        .and_then(|path| path.strip_prefix(prefix).map(str::to_string))
+        .and_then(|name| percent_decode_path(&name))
+}
+
+fn active_config_filename(config_path: &str) -> String {
+    std::path::Path::new(config_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "config.toml".to_string())
+}
+
+fn active_config_marker_path(config_path: &str) -> PathBuf {
+    PathBuf::from(format!("{config_path}.active"))
+}
+
+fn validate_config_profile_name(profile_name: &str) -> Result<String, String> {
+    let name = profile_name.trim();
+    if name.is_empty() {
+        return Err("profile name cannot be empty".to_string());
+    }
+    if name.contains('/') || name.contains('\\') || name.contains("..") {
+        return Err("invalid profile name".to_string());
+    }
+    if !name.ends_with(".toml") || name.ends_with(".bak") {
+        return Err("profile must be a non-backup .toml file".to_string());
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'))
+    {
+        return Err("profile name may contain only letters, numbers, '.', '_', '-' and '+'".to_string());
+    }
+    Ok(name.to_string())
+}
+
+fn read_active_config_marker(config_path: &str) -> Option<String> {
+    let marker_path = active_config_marker_path(config_path);
+    let marker = std::fs::read_to_string(marker_path).ok()?;
+    let name = validate_config_profile_name(marker.trim()).ok()?;
+    let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
+    if config_dir.join(&name).is_file() { Some(name) } else { None }
+}
+
+fn write_active_config_marker(config_path: &str, profile_name: &str) -> Result<(), String> {
+    let name = validate_config_profile_name(profile_name)?;
+    std::fs::write(active_config_marker_path(config_path), format!("{name}\n"))
+        .map_err(|e| format!("failed to write active config marker: {}", e))
 }
 
 /// Read a specific config profile and serve its content as plain text.
 fn serve_config_profile_get(stream: TcpStream, config_path: &str, profile_name: &str) {
-    if profile_name.contains('/') || profile_name.contains('\\') || profile_name.contains("..") {
-        return http_response(stream, 400, "invalid profile name");
-    }
-    if !profile_name.ends_with(".toml") {
-        return http_response(stream, 400, "profile must be a .toml file");
-    }
+    let profile_name = match validate_config_profile_name(profile_name) {
+        Ok(name) => name,
+        Err(e) => return http_response(stream, 400, &e),
+    };
     let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
     let profile_path = config_dir.join(profile_name);
     serve_config_get(stream, &profile_path.to_string_lossy());
@@ -2785,20 +3206,12 @@ fn serve_config_profile_get(stream: TcpStream, config_path: &str, profile_name: 
 /// The active config is identified by config_path; writing to it is rejected
 /// (use POST /api/config for that).
 fn save_config_profile(config_path: &str, profile_name: &str, content: &str) -> Result<(), String> {
-    if profile_name.contains('/') || profile_name.contains('\\') || profile_name.contains("..") {
-        return Err("invalid profile name".to_string());
-    }
-    if !profile_name.ends_with(".toml") {
-        return Err("profile must be a .toml file".to_string());
-    }
+    let profile_name = validate_config_profile_name(profile_name)?;
     let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
-    let profile_path = config_dir.join(profile_name);
+    let profile_path = config_dir.join(&profile_name);
 
     // Refuse to overwrite the active config through this endpoint
-    let active_name = std::path::Path::new(config_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_default();
+    let active_name = active_config_filename(config_path);
     if profile_name == active_name {
         return Err("cannot overwrite active config via profile editor — use the Config editor tab".to_string());
     }
@@ -2806,21 +3219,40 @@ fn save_config_profile(config_path: &str, profile_name: &str, content: &str) -> 
     std::fs::write(&profile_path, content.as_bytes()).map_err(|e| format!("failed to write profile: {}", e))
 }
 
-/// Copy selected profile over the active config_path, preserving a backup.
-fn activate_config_profile(config_path: &str, profile_name: &str) -> Result<(), String> {
-    // Security: profile_name must be a plain filename with no path separators
-    if profile_name.contains('/') || profile_name.contains('\\') || profile_name.contains("..") {
-        return Err("invalid profile name".to_string());
+fn delete_config_profile(config_path: &str, profile_name: &str) -> Result<(), String> {
+    let profile_name = validate_config_profile_name(profile_name)?;
+    let runtime_name = active_config_filename(config_path);
+    let selected_name = read_active_config_marker(config_path).unwrap_or_else(|| runtime_name.clone());
+
+    if profile_name == runtime_name {
+        return Err("cannot delete the runtime config".to_string());
     }
-    if !profile_name.ends_with(".toml") {
-        return Err("profile must be a .toml file".to_string());
+    if profile_name == selected_name {
+        return Err("cannot delete the active selected profile".to_string());
     }
 
     let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
-    let profile_path = config_dir.join(profile_name);
+    let profile_path = config_dir.join(&profile_name);
+    if !profile_path.is_file() {
+        return Err(format!("profile '{}' not found", profile_name));
+    }
+    std::fs::remove_file(&profile_path).map_err(|e| format!("failed to delete profile: {}", e))
+}
+
+/// Copy selected profile over the active config_path, preserving a backup.
+fn activate_config_profile(config_path: &str, profile_name: &str) -> Result<(), String> {
+    // Security: profile_name must be a plain filename with no path separators.
+    let profile_name = validate_config_profile_name(profile_name)?;
+
+    let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
+    let profile_path = config_dir.join(&profile_name);
 
     if !profile_path.exists() {
         return Err(format!("profile '{}' not found", profile_name));
+    }
+
+    if profile_name == active_config_filename(config_path) {
+        return write_active_config_marker(config_path, &profile_name);
     }
 
     // Backup current config before switching
@@ -2829,16 +3261,16 @@ fn activate_config_profile(config_path: &str, profile_name: &str) -> Result<(), 
         tracing::warn!("Dashboard: failed to backup config before profile switch: {}", e);
     }
 
-    std::fs::copy(&profile_path, config_path)
-        .map(|_| ())
-        .map_err(|e| format!("failed to copy profile: {}", e))
+    std::fs::copy(&profile_path, config_path).map_err(|e| format!("failed to copy profile: {}", e))?;
+    write_active_config_marker(config_path, &profile_name)
 }
 
 fn serve_html(mut stream: TcpStream) {
     let body = render_product_template(DASHBOARD_HTML);
     let body = body.as_bytes();
     let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        DASHBOARD_SECURITY_HEADERS,
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -2921,6 +3353,18 @@ fn request_path(req_line: &str) -> Option<String> {
     let target = req_line.split_whitespace().nth(1)?;
     let path = target.split('?').next().unwrap_or(target);
     Some(path.to_string())
+}
+
+fn request_query_param(req_line: &str, key: &str) -> Option<String> {
+    let target = req_line.split_whitespace().nth(1)?;
+    let query = target.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if name == key {
+            return percent_decode_path(value);
+        }
+    }
+    None
 }
 
 fn request_method(req_line: &str) -> Option<&str> {
@@ -3031,8 +3475,9 @@ fn serve_static_file(mut stream: TcpStream, path: &Path, mime: &str) {
         Ok(meta) => match std::fs::File::open(path) {
             Ok(mut file) => {
                 let header = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                     mime,
+                    DASHBOARD_SECURITY_HEADERS,
                     meta.len()
                 );
                 let _ = stream.write_all(header.as_bytes());
@@ -3049,7 +3494,8 @@ fn serve_config_get(mut stream: TcpStream, config_path: &str) {
         Ok(content) => {
             let body = content.as_bytes();
             let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                DASHBOARD_SECURITY_HEADERS,
                 body.len()
             );
             let _ = stream.write_all(header.as_bytes());
@@ -3062,9 +3508,10 @@ fn serve_config_get(mut stream: TcpStream, config_path: &str) {
 fn http_response(mut stream: TcpStream, code: u16, body: &str) {
     let status = if code == 200 { "OK" } else { "Error" };
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         code,
         status,
+        DASHBOARD_SECURITY_HEADERS,
         body.len(),
         body
     );
@@ -3076,9 +3523,10 @@ fn http_response(mut stream: TcpStream, code: u16, body: &str) {
 fn http_json_response(mut stream: TcpStream, code: u16, body: &str) {
     let status = if code == 200 { "OK" } else { "Error" };
     let resp = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
         code,
         status,
+        DASHBOARD_SECURITY_HEADERS,
         body.len(),
         body
     );
@@ -3280,8 +3728,8 @@ fn url_decode(s: &str) -> String {
 
 fn http_redirect(mut stream: TcpStream, location: &str) {
     let resp = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        location
+        "HTTP/1.1 302 Found\r\nLocation: {}\r\n{}Cache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        location, DASHBOARD_SECURITY_HEADERS
     );
     let _ = stream.write_all(resp.as_bytes());
 }
@@ -3296,10 +3744,13 @@ fn serve_login_success(mut stream: TcpStream, token: &str) {
     let resp = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/json\r\n\
+         {}\
+         Cache-Control: no-store\r\n\
          Content-Length: {}\r\n\
          Set-Cookie: fs_session={}; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800\r\n\
          Set-Cookie: fs_auth=1; Path=/; SameSite=Lax; Max-Age=604800\r\n\
          Connection: close\r\n\r\n{}",
+        DASHBOARD_SECURITY_HEADERS,
         body.len(),
         token,
         body
@@ -3311,6 +3762,11 @@ fn serve_logout(mut stream: TcpStream) {
     // Expire both cookies immediately; client navigates to /login next.
     let resp = "HTTP/1.1 302 Found\r\n\
                 Location: /login\r\n\
+                X-Content-Type-Options: nosniff\r\n\
+                X-Frame-Options: DENY\r\n\
+                Referrer-Policy: no-referrer\r\n\
+                Content-Security-Policy: frame-ancestors 'none'; object-src 'none'; base-uri 'none'\r\n\
+                Cache-Control: no-store\r\n\
                 Set-Cookie: fs_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0\r\n\
                 Set-Cookie: fs_auth=; Path=/; SameSite=Lax; Max-Age=0\r\n\
                 Content-Length: 0\r\n\
@@ -3323,8 +3779,11 @@ fn serve_login_page(mut stream: TcpStream) {
     let header = format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
+         {}\
+         Cache-Control: no-store\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n",
+        DASHBOARD_SECURITY_HEADERS,
         body.len()
     );
     let _ = stream.write_all(header.as_bytes());
@@ -3366,6 +3825,21 @@ mod tests {
         dir
     }
 
+    fn temp_config_dir(label: &str) -> PathBuf {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "nexus-bs-config-profile-test-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).expect("create temp config dir");
+        dir
+    }
+
     #[test]
     fn product_template_renders_current_nexus_bs_identity() {
         let rendered = render_product_template(
@@ -3373,10 +3847,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.61"));
+        assert!(rendered.contains("Nexus-BS v0.1.62"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.61"));
+        assert!(rendered.contains("Nexus-BS/v0.1.62"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -3471,13 +3945,91 @@ mod tests {
         assert!(request_is_api("POST /api/configure HTTP/1.1"));
         assert!(!request_matches("GET /api/system2 HTTP/1.1", "GET", "/api/system"));
         assert!(request_matches("GET /api/system?fresh=1 HTTP/1.1", "GET", "/api/system"));
+        assert!(request_matches("GET /api/snapshot HTTP/1.1", "GET", "/api/snapshot"));
+        assert!(request_matches("GET /api/calls HTTP/1.1", "GET", "/api/calls"));
+        assert!(request_matches("GET /api/site HTTP/1.1", "GET", "/api/site"));
+        assert!(request_matches(
+            "POST /api/service/restart HTTP/1.1",
+            "POST",
+            "/api/service/restart"
+        ));
+        assert!(request_matches(
+            "POST /api/service/stop-go HTTP/1.1",
+            "POST",
+            "/api/service/stop-go"
+        ));
+        assert!(request_matches("POST /api/logs/clear HTTP/1.1", "POST", "/api/logs/clear"));
         assert!(request_path_has_prefix(
             "GET /api/configs/profile.toml HTTP/1.1",
             "GET",
             "/api/configs/"
         ));
+        assert!(request_path_has_prefix(
+            "DELETE /api/configs/config%2B1.toml HTTP/1.1",
+            "DELETE",
+            "/api/configs/"
+        ));
         assert!(!request_is_api("GET /assets/app.js HTTP/1.1"));
         assert!(!request_is_api("GET /radios/2260618 HTTP/1.1"));
+    }
+
+    #[test]
+    fn dashboard_config_profile_name_is_decoded_and_sanitized() {
+        assert_eq!(
+            request_profile_name("GET /api/configs/config%2B1.toml HTTP/1.1", "/api/configs/").as_deref(),
+            Some("config+1.toml")
+        );
+        assert!(validate_config_profile_name("config+1.toml").is_ok());
+        assert!(validate_config_profile_name("../config.toml").is_err());
+        assert!(validate_config_profile_name("config.toml.bak").is_err());
+        assert!(validate_config_profile_name("bad name.toml").is_err());
+    }
+
+    #[test]
+    fn dashboard_config_profile_activation_copies_and_persists_selection_marker() {
+        let dir = temp_config_dir("activate");
+        let config_path = dir.join("config.toml");
+        let next_path = dir.join("config+1.toml");
+        fs::write(&config_path, "name = \"base\"\n").expect("write base config");
+        fs::write(&next_path, "name = \"next\"\n").expect("write next config");
+
+        activate_config_profile(config_path.to_string_lossy().as_ref(), "config+1.toml").expect("activate profile");
+
+        assert_eq!(fs::read_to_string(&config_path).expect("read active config"), "name = \"next\"\n");
+        assert_eq!(
+            read_active_config_marker(config_path.to_string_lossy().as_ref()).as_deref(),
+            Some("config+1.toml")
+        );
+        assert_eq!(
+            fs::read_to_string(active_config_marker_path(config_path.to_string_lossy().as_ref()))
+                .expect("read active marker")
+                .trim(),
+            "config+1.toml"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dashboard_config_profile_delete_refuses_active_and_removes_inactive_profiles() {
+        let dir = temp_config_dir("delete");
+        let config_path = dir.join("config.toml");
+        let active_path = dir.join("config+1.toml");
+        let stale_path = dir.join("config+2.toml");
+        fs::write(&config_path, "name = \"runtime\"\n").expect("write runtime config");
+        fs::write(&active_path, "name = \"active\"\n").expect("write active profile");
+        fs::write(&stale_path, "name = \"stale\"\n").expect("write stale profile");
+        write_active_config_marker(config_path.to_string_lossy().as_ref(), "config+1.toml").expect("write marker");
+
+        assert!(delete_config_profile(config_path.to_string_lossy().as_ref(), "config.toml").is_err());
+        assert!(delete_config_profile(config_path.to_string_lossy().as_ref(), "config+1.toml").is_err());
+        delete_config_profile(config_path.to_string_lossy().as_ref(), "config+2.toml").expect("delete inactive profile");
+
+        assert!(!stale_path.exists());
+        assert!(active_path.exists());
+        assert!(config_path.exists());
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3498,6 +4050,69 @@ mod tests {
             assert_eq!(active.load(Ordering::Acquire), 1);
         }
         assert_eq!(active.load(Ordering::Acquire), 0);
+    }
+
+    fn auth_status_value(auth: Option<(String, String)>, sessions: &SharedSessionStore, headers: &str) -> serde_json::Value {
+        serde_json::from_str(&dashboard_auth_status_json(&auth, sessions, headers)).expect("auth status json should parse")
+    }
+
+    #[test]
+    fn dashboard_auth_status_reports_open_dashboard_as_valid() {
+        let sessions = Arc::new(Mutex::new(SessionStore::new()));
+
+        let status = auth_status_value(None, &sessions, "");
+
+        assert_eq!(status["auth_required"], json!(false));
+        assert_eq!(status["session_valid"], json!(true));
+        assert_eq!(status["session_cookie"], json!("fs_session"));
+    }
+
+    #[test]
+    fn dashboard_auth_status_requires_session_when_credentials_are_set() {
+        let sessions = Arc::new(Mutex::new(SessionStore::new()));
+        let auth = Some(("admin".to_string(), "change-this".to_string()));
+
+        let status = auth_status_value(auth, &sessions, "GET / HTTP/1.1\r\n\r\n");
+
+        assert_eq!(status["auth_required"], json!(true));
+        assert_eq!(status["session_valid"], json!(false));
+    }
+
+    #[test]
+    fn dashboard_auth_status_accepts_valid_session_cookie() {
+        let sessions = Arc::new(Mutex::new(SessionStore::new()));
+        let token = sessions.lock().unwrap().create();
+        let auth = Some(("admin".to_string(), "change-this".to_string()));
+        let headers = format!("GET / HTTP/1.1\r\nCookie: theme=dark; fs_session={token}; fs_auth=1\r\n\r\n");
+
+        let status = auth_status_value(auth, &sessions, &headers);
+
+        assert_eq!(status["auth_required"], json!(true));
+        assert_eq!(status["session_valid"], json!(true));
+    }
+
+    #[test]
+    fn dashboard_session_cookie_parser_handles_cookie_lists() {
+        let headers = "GET / HTTP/1.1\r\nCookie: theme=dark; fs_session=ABC123; fs_auth=1\r\n\r\n";
+
+        assert_eq!(parse_session_cookie(headers).as_deref(), Some("ABC123"));
+    }
+
+    #[test]
+    fn dashboard_session_store_create_validate_and_invalidate() {
+        let mut sessions = SessionStore::new();
+        let token = sessions.create();
+
+        assert!(sessions.validate(&token));
+        sessions.invalidate(&token);
+        assert!(!sessions.validate(&token));
+    }
+
+    #[test]
+    fn dashboard_security_headers_are_present() {
+        assert!(DASHBOARD_SECURITY_HEADERS.contains("X-Content-Type-Options: nosniff"));
+        assert!(DASHBOARD_SECURITY_HEADERS.contains("X-Frame-Options: DENY"));
+        assert!(DASHBOARD_SECURITY_HEADERS.contains("frame-ancestors 'none'"));
     }
 
     #[test]
@@ -3552,9 +4167,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.61");
-        assert_eq!(product.version_tag, "v0.1.61");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.61");
+        assert_eq!(product.version, "0.1.62");
+        assert_eq!(product.version_tag, "v0.1.62");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.62");
     }
 
     #[test]
@@ -3607,6 +4222,31 @@ mod tests {
         assert_eq!(ms.energy_saving_mode, 7);
         assert_eq!(ms.energy_saving_frame, Some(11));
         assert_eq!(ms.energy_saving_multiframe, Some(42));
+    }
+
+    #[test]
+    fn dashboard_caches_and_serializes_health_snapshot() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        let snapshot = crate::health::registry().snapshot();
+
+        dashboard.handle_telemetry(TelemetryEvent::HealthSnapshot(snapshot.clone()));
+
+        let cached = dashboard
+            .state
+            .read()
+            .unwrap()
+            .last_health
+            .clone()
+            .expect("dashboard should cache last health snapshot");
+        assert_eq!(cached.unix_ms, snapshot.unix_ms);
+
+        let snapshot_json = dashboard_snapshot_json(&dashboard.state);
+        assert!(snapshot_json.contains("\"last_health\""));
+        assert!(snapshot_json.contains("\"overall\""));
+
+        let site_json = dashboard_site_json(&dashboard.state, &None);
+        assert!(site_json.contains("\"health\""));
+        assert!(site_json.contains("\"rf_cached\""));
     }
 
     #[test]

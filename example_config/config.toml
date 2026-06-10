@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.61 example configuration
+# Nexus-BS v0.1.62 example configuration
 #
 # This file is intentionally valid as-is so it can be parsed by tests and used
 # as a clean starting point. Before transmitting, edit frequencies, MCC/MNC,
@@ -38,7 +38,7 @@ service_name = "nexus-bs"
 
 [phy_io]
 
-# RF backend. Nexus-BS v0.1.61 supports the direct SoapySDR backend here.
+# RF backend. Nexus-BS v0.1.62 supports the direct SoapySDR backend here.
 # Keep this value exactly as shown unless a new backend is implemented.
 backend = "SoapySdr"
 
@@ -284,7 +284,7 @@ energy_saving_mode = "auto"
 ###############################################################################
 # WAP MVP OVER SDS
 #
-# Nexus-BS v0.1.61 includes a WAP MVP as an SDS Type4/WML delivery path driven
+# Nexus-BS v0.1.62 includes a WAP MVP as an SDS Type4/WML delivery path driven
 # by the control command, not as an always-on SNDCP/IP packet-data bearer.
 #
 # CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
@@ -370,17 +370,22 @@ energy_saving_mode = "auto"
 
 ###############################################################################
 
-# OPTIONAL: Web dashboard — accessible at http://<BTS-IP>:8080 (Nexus-BS)
+# OPTIONAL: Core dashboard API.
 #
-# Live view of terminals, active calls, log, config editor, kick and SDS.
+# In the recommended systemd deployment, the RF core exposes this only on
+# loopback and the separate `nexus-bs-dashboard` process serves the public
+# browser dashboard at http://<BTS-IP>:8080. If you run `nexus-bs` manually
+# without the separate dashboard process, you may set bind="0.0.0.0" and
+# port=8080 for the legacy all-in-one dashboard.
 #
 [dashboard]
-port = 8080
-bind = "0.0.0.0"
+port = 18080
+bind = "127.0.0.1"
 #
 # OPTIONAL: dashboard login — protect the dashboard with a username and password.
 # When set, the browser uses the Nexus-BS login page and an in-memory
-# `fs_session` cookie.
+# `fs_session` cookie. In split deployment, `nexus-bs-dashboard` checks this
+# core session before serving the browser UI or static assets.
 # Both username and password must be set together, or neither.
 #
 # SECURITY NOTE: without TLS the login POST still crosses the LAN in clear text.
@@ -392,14 +397,30 @@ bind = "0.0.0.0"
 # password = "change-this-before-exposing-the-dashboard"
 #
 # OPTIONAL: reserved path to the Nexus-BS git source directory for future OTA
-# update support. OTA update is disabled in Nexus-BS v0.1.61, and the dashboard
+# update support. OTA update is disabled in Nexus-BS v0.1.62, and the dashboard
 # button is grayed out. Keep this unset unless you are testing OTA code locally.
 # source_dir = "/opt/nexus-bs"
 #
-# OPTIONAL: external dashboard asset directory. The TETRA core keeps `/api/*`,
-# `/ws` and login handling, while `/` and static browser assets can be served
-# from this folder. Leave unset to use the embedded compatibility dashboard.
+# OPTIONAL: external dashboard asset directory for legacy all-in-one mode.
+# In the recommended split deployment, `nexus-bs-dashboard` serves this folder
+# and proxies `/api/*` plus `/ws` to the loopback-only core API above.
 # static_dir = "/home/chris/nexus-bs/dashboard"
+
+###############################################################################
+
+# Operational health snapshots.
+#
+# By default this feeds dashboard/telemetry with service-loop, Brew, CMCE voice,
+# SDS, UMAC congestion and RF timing health. Automatic restart stays disabled
+# unless the operator explicitly enables the bounded core-stall restart guard.
+#
+[health]
+enabled = true
+snapshot_interval_secs = 1
+core_stall_critical_ms = 10000
+restart_on_core_stall = false
+restart_after_critical_secs = 30
+restart_cooldown_secs = 600
 
 ###############################################################################
 

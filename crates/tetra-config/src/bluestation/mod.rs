@@ -28,6 +28,9 @@ pub use sec_telemetry::*;
 pub mod sec_control;
 pub use sec_control::*;
 
+pub mod sec_health;
+pub use sec_health::*;
+
 pub mod sec_security;
 pub use sec_security::*;
 

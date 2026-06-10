@@ -1,4 +1,6 @@
-use tetra_config::bluestation::{CfgCellInfo, CfgNetInfo, CfgPhyIo, CfgSecurity, CfgWxService, PhyBackend, StackConfig, StackMode};
+use tetra_config::bluestation::{
+    CfgCellInfo, CfgHealth, CfgNetInfo, CfgPhyIo, CfgSecurity, CfgWxService, PhyBackend, StackConfig, StackMode,
+};
 use tetra_core::{freqs::FreqInfo, ranges::SortedDisjointSsiRanges};
 
 /// Creates a default config for testing. It can still be modified as needed
@@ -21,6 +23,7 @@ pub fn default_test_config_bs() -> StackConfig {
         dashboard: None,
         telemetry: None,
         control: None,
+        health: CfgHealth::default(),
         security: CfgSecurity::default(),
         wx_service: CfgWxService::default(),
     }

@@ -129,9 +129,13 @@ fn register_subscriber(test: &mut ComponentTest, issi: u32, gssi: u32) {
 }
 
 fn submit_subscriber_update(test: &mut ComponentTest, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
+    submit_subscriber_update_from(test, TetraEntity::Mm, issi, groups, action);
+}
+
+fn submit_subscriber_update_from(test: &mut ComponentTest, src: TetraEntity, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
     test.submit_message(SapMsg {
         sap: Sap::Control,
-        src: TetraEntity::Mm,
+        src,
         dest: TetraEntity::Cmce,
         msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
     });
@@ -189,6 +193,10 @@ fn force_cmce_next_call_identifier(test: &mut ComponentTest, next_call_identifie
 
 fn cmce_debug_active_call_ids(test: &mut ComponentTest) -> Vec<u16> {
     cmce_bs_mut(test).debug_active_call_ids()
+}
+
+fn cmce_debug_subscriber_groups_for(test: &mut ComponentTest, issi: u32) -> Vec<u32> {
+    cmce_bs_mut(test).debug_subscriber_groups_for(issi)
 }
 
 fn drain_private_simplex_tail(test: &mut ComponentTest, dltime: TdmaTime) {
@@ -1423,6 +1431,45 @@ fn d_tx_granted_reporter(msgs: &[SapMsg], target_addr: TetraAddress, transmissio
         .expect("expected D-TX GRANTED reporter")
 }
 
+fn first_d_setup_reporter(msgs: &[SapMsg]) -> tetra_core::TxReporter {
+    msgs.iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).and_then(|_| prim.tx_reporter.clone()),
+            _ => None,
+        })
+        .expect("expected D-SETUP reporter")
+}
+
+fn network_group_ready_tuple(msgs: &[SapMsg], brew_uuid: uuid::Uuid) -> Option<(u16, u8)> {
+    msgs.iter().find_map(|msg| match &msg.msg {
+        SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
+            brew_uuid: ready_uuid,
+            call_id,
+            ts,
+            ..
+        }) if *ready_uuid == brew_uuid => Some((*call_id, *ts)),
+        _ => None,
+    })
+}
+
+fn transmit_network_group_setup_and_drain(
+    test: &mut ComponentTest,
+    setup_msgs: &[SapMsg],
+    brew_uuid: uuid::Uuid,
+) -> (u16, u8, Vec<SapMsg>) {
+    assert!(
+        network_group_ready_tuple(setup_msgs, brew_uuid).is_none(),
+        "network-origin group setup must wait for RF D-SETUP transmission before Brew ready"
+    );
+    let reporter = first_d_setup_reporter(setup_msgs);
+    reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    let (call_id, ts) = network_group_ready_tuple(&ready_msgs, brew_uuid)
+        .expect("network-origin group setup should report ready after D-SETUP transmission");
+    (call_id, ts, ready_msgs)
+}
+
 fn transmit_positive_group_grants_and_drain(test: &mut ComponentTest, msgs: &[SapMsg]) -> Vec<SapMsg> {
     let mut transmitted = 0;
     for msg in msgs {
@@ -1843,19 +1890,10 @@ fn start_network_group_call(
     });
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
-    let (call_id, ts) = setup_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid: ready_uuid,
-                call_id,
-                ts,
-                ..
-            }) if *ready_uuid == brew_uuid => Some((*call_id, *ts)),
-            _ => None,
-        })
-        .expect("network-origin group setup should report ready to Brew");
-    (call_id, ts, setup_msgs)
+    let (call_id, ts, ready_msgs) = transmit_network_group_setup_and_drain(test, &setup_msgs, brew_uuid);
+    let mut combined_msgs = setup_msgs;
+    combined_msgs.extend(ready_msgs);
+    (call_id, ts, combined_msgs)
 }
 
 fn start_group_call(test: &mut ComponentTest) -> u16 {
@@ -2367,6 +2405,11 @@ fn test_network_group_call_start_propagates_priority_to_d_setup() {
         vec![TetraAddress::issi(TEST_CALLED_ISSI)],
         "network-origin group Open should keep the group GSSI primary and carry the current speaker ISSI only as secondary"
     );
+    assert_eq!(
+        open_circuit.dl_media_source,
+        CircuitDlMediaSource::SwMI,
+        "network-origin group calls carry downlink speech from Brew/SwMI, not from local RF loopback"
+    );
 
     let setups: Vec<_> = setup_msgs
         .iter()
@@ -2386,17 +2429,294 @@ fn test_network_group_call_start_propagates_priority_to_d_setup() {
     assert_eq!(setup.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     assert!(!setup.transmission_request_permission);
     assert!(setup_prim.chan_alloc.is_some(), "group D-SETUP should carry traffic allocation");
+    assert!(
+        setup_prim.tx_reporter.is_some(),
+        "network-origin group D-SETUP should be reporter-tracked before Brew media is opened"
+    );
 
     assert!(
-        setup_msgs.iter().any(|msg| matches!(
-            &msg.msg,
-            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid: ready_uuid,
-                ..
-            }) if *ready_uuid == brew_uuid
-        )),
-        "network-origin group setup should notify Brew when the call is ready"
+        network_group_ready_tuple(&setup_msgs, brew_uuid).is_none(),
+        "network-origin group setup must not notify Brew ready before RF D-SETUP transmission"
     );
+
+    setup_prim.tx_reporter.as_ref().unwrap().mark_transmitted();
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    let swmi_update_pos = ready_msgs
+        .iter()
+        .position(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::SetDlMediaSource {
+                    ts: update_ts,
+                    dl_media_source: CircuitDlMediaSource::SwMI,
+                }) if *update_ts == open_circuit.ts
+            )
+        })
+        .expect("network-origin group ready should switch UMAC DL media source to SwMI before granting the floor");
+    let floor_granted_pos = ready_msgs
+        .iter()
+        .position(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::FloorGranted { .. })))
+        .expect("network-origin group ready should grant the RF floor");
+    assert!(
+        swmi_update_pos < floor_granted_pos,
+        "UMAC must switch to Brew/SwMI media before FloorGranted opens U-plane"
+    );
+    assert!(
+        network_group_ready_tuple(&ready_msgs, brew_uuid).is_some(),
+        "network-origin group setup should notify Brew after RF D-SETUP transmission"
+    );
+}
+
+#[test]
+fn test_brew_external_affiliate_counts_as_listener_without_shared_rf_registration() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    submit_subscriber_update(&mut test, TEST_ISSI, Vec::new(), BrewSubscriberAction::Register);
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    let external_issi = 2_261_313;
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+            issi: external_issi,
+            groups: vec![TEST_GSSI],
+            action: BrewSubscriberAction::Affiliate,
+        }),
+    });
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    {
+        let state = test.config.state_read();
+        assert!(
+            !state.subscribers.is_registered(external_issi),
+            "Brew/outside subscribers must not be registered as local RF subscribers"
+        );
+        assert!(
+            !state.subscribers.group_members(TEST_GSSI).contains(&external_issi),
+            "Brew/outside subscribers must not enter the RF/EG group-member registry"
+        );
+    }
+
+    test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    assert!(
+        count_umac_open(&setup_msgs) >= 1,
+        "external Brew affiliation should still count as a CMCE listener for group setup"
+    );
+    assert_eq!(
+        count_d_releases(&setup_msgs),
+        0,
+        "external Brew listener accounting must prevent a false no-listener rejection"
+    );
+}
+
+#[test]
+fn test_brew_external_only_affiliate_does_not_open_network_rf_downlink() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    submit_subscriber_update_from(
+        &mut test,
+        TetraEntity::Brew,
+        2_261_313,
+        vec![TEST_GSSI],
+        BrewSubscriberAction::Affiliate,
+    );
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallStart {
+            brew_uuid,
+            source_issi: TEST_OTHER_ISSI,
+            dest_gssi: TEST_GSSI,
+            priority: 7,
+        }),
+    });
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    // Brew subscriber events are interconnect state, not EN 300 392-2 MM
+    // group affiliation on the local air interface. With no local RF listener,
+    // a Brew-origin group call must not allocate a local traffic channel.
+    assert_eq!(count_network_call_end(&msgs, brew_uuid), 1);
+    assert_eq!(count_d_setups(&msgs), 0);
+    assert_eq!(count_umac_open(&msgs), 0);
+    assert!(
+        network_group_ready_tuple(&msgs, brew_uuid).is_none(),
+        "external-only listener state must not report RF media ready"
+    );
+}
+
+#[test]
+fn test_brew_echo_deaffiliate_does_not_remove_local_rf_affiliation() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    assert!(
+        cmce_debug_subscriber_groups_for(&mut test, TEST_ISSI).contains(&TEST_GSSI),
+        "test fixture should start with a real MM/RF affiliation"
+    );
+
+    submit_subscriber_update_from(
+        &mut test,
+        TetraEntity::Brew,
+        TEST_ISSI,
+        vec![TEST_GSSI],
+        BrewSubscriberAction::Affiliate,
+    );
+    test.run_stack(Some(1));
+    test.dump_sinks();
+    submit_subscriber_update_from(
+        &mut test,
+        TetraEntity::Brew,
+        TEST_ISSI,
+        vec![TEST_GSSI],
+        BrewSubscriberAction::Deaffiliate,
+    );
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    assert!(
+        cmce_debug_subscriber_groups_for(&mut test, TEST_ISSI).contains(&TEST_GSSI),
+        "Brew echo deaffiliate for the same ISSI must not clear the local RF affiliation"
+    );
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallStart {
+            brew_uuid,
+            source_issi: TEST_OTHER_ISSI,
+            dest_gssi: TEST_GSSI,
+            priority: 7,
+        }),
+    });
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert_eq!(count_network_call_end(&msgs, brew_uuid), 0);
+    assert!(
+        count_d_setups(&msgs) >= 1,
+        "local RF affiliation must still allow a Brew-origin group call to be set up"
+    );
+    assert!(count_umac_open(&msgs) >= 1);
+}
+
+#[test]
+fn test_network_group_speaker_change_updates_dashboard_after_rf_grant() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let (telemetry_sink, telemetry_source) = telemetry_channel();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.register_entity(CmceBs::new(test.config.clone(), Some(telemetry_sink), None));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew]);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let first_uuid = uuid::Uuid::new_v4();
+    let (call_id, _ts, _start_msgs) = start_network_group_call(&mut test, first_uuid, TEST_CALLED_ISSI, TEST_GSSI, 7);
+
+    let dashboard = DashboardServer::new("test.toml".to_string());
+    for event in drain_telemetry(&telemetry_source) {
+        dashboard.handle_telemetry(event);
+    }
+
+    let second_uuid = uuid::Uuid::new_v4();
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallStart {
+            brew_uuid: second_uuid,
+            source_issi: TEST_OTHER_ISSI,
+            dest_gssi: TEST_GSSI,
+            priority: 7,
+        }),
+    });
+    test.run_stack(Some(1));
+    let grant_msgs = test.dump_sinks();
+    assert!(
+        network_group_ready_tuple(&grant_msgs, second_uuid).is_none(),
+        "network speaker change must wait until RF D-TX GRANTED is transmitted before Brew ready/dashboard update"
+    );
+
+    let grant_reporter = d_tx_granted_reporter(
+        &grant_msgs,
+        TetraAddress::new(TEST_GSSI, SsiType::Gssi),
+        TransmissionGrant::GrantedToOtherUser,
+    );
+    grant_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    assert!(
+        network_group_ready_tuple(&ready_msgs, second_uuid).is_some(),
+        "network speaker change should notify Brew ready after RF D-TX GRANTED transmission"
+    );
+
+    let events = drain_telemetry(&telemetry_source);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::GroupCallSpeakerChanged {
+                call_id: changed_call_id,
+                gssi,
+                speaker_issi,
+            } if *changed_call_id == call_id && *gssi == TEST_GSSI && *speaker_issi == TEST_OTHER_ISSI
+        )),
+        "dashboard telemetry must publish the Brew network speaker change"
+    );
+    for event in events {
+        dashboard.handle_telemetry(event);
+    }
+
+    let state = dashboard.state.read().unwrap();
+    let call = state
+        .snapshot_calls()
+        .into_iter()
+        .find(|call| call.call_id == call_id)
+        .expect("dashboard should retain the reused network group call");
+    assert_eq!(call.active_speaker, Some(TEST_OTHER_ISSI));
+    assert_eq!(call.caller_issi, TEST_OTHER_ISSI);
 }
 
 #[test]
@@ -2480,18 +2800,7 @@ fn test_network_group_call_end_from_active_network_speaker_enters_hangtime_witho
     });
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
-    let (call_id, ts) = setup_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid: ready_uuid,
-                call_id,
-                ts,
-                ..
-            }) if *ready_uuid == brew_uuid => Some((*call_id, *ts)),
-            _ => None,
-        })
-        .expect("network-origin group setup should report ready to Brew");
+    let (call_id, ts, _ready_msgs) = transmit_network_group_setup_and_drain(&mut test, &setup_msgs, brew_uuid);
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -2547,6 +2856,95 @@ fn test_network_group_call_end_from_active_network_speaker_enters_hangtime_witho
 }
 
 #[test]
+fn test_network_group_call_end_before_rf_ready_releases_without_false_floor_idle() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallStart {
+            brew_uuid,
+            source_issi: TEST_CALLED_ISSI,
+            dest_gssi: TEST_GSSI,
+            priority: 7,
+        }),
+    });
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    assert!(
+        network_group_ready_tuple(&setup_msgs, brew_uuid).is_none(),
+        "Brew media must not be ready until RF D-SETUP transmission is reported"
+    );
+    let call_id = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .expect("network-origin group setup should emit D-SETUP");
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
+    });
+    test.run_stack(Some(1));
+    let mut release_msgs = test.dump_sinks();
+
+    assert_eq!(network_group_ready_tuple(&release_msgs, brew_uuid), None);
+    assert_eq!(
+        count_d_tx_ceased(&release_msgs),
+        0,
+        "not-yet-ready network calls must not emit false floor idle"
+    );
+    assert_eq!(count_umac_floor_released(&release_msgs), 0);
+    assert_eq!(
+        count_d_releases(&release_msgs),
+        2,
+        "early GROUP_IDLE should release the reserved group circuit with FACCH plus MCCH fallback D-RELEASE"
+    );
+    assert_eq!(count_network_call_end(&release_msgs, brew_uuid), 0);
+
+    let releases: Vec<_> = release_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim),
+            _ => None,
+        })
+        .collect();
+    assert!(releases.iter().all(|pdu| pdu.call_identifier == call_id));
+    assert!(
+        releases
+            .iter()
+            .all(|pdu| pdu.disconnect_cause == DisconnectCause::SwmiRequestedDisconnection)
+    );
+
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1, "Only FACCH D-RELEASE should be reporter-tracked");
+    reporters[0].mark_transmitted();
+
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
+    assert!(count_umac_call_ended_or_close(&closed_msgs) >= 2);
+    assert_eq!(count_network_call_end(&closed_msgs, brew_uuid), 1);
+    assert!(!cmce_debug_active_call_ids(&mut test).contains(&call_id));
+}
+
+#[test]
 fn test_network_group_hangtime_release_waits_for_reporter_before_network_call_end() {
     debug::setup_logging_verbose();
 
@@ -2576,17 +2974,7 @@ fn test_network_group_hangtime_release_waits_for_reporter_before_network_call_en
     });
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
-    let call_id = setup_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid: ready_uuid,
-                call_id,
-                ..
-            }) if *ready_uuid == brew_uuid => Some(*call_id),
-            _ => None,
-        })
-        .expect("network-origin group setup should report ready to Brew");
+    let (call_id, _ts, _ready_msgs) = transmit_network_group_setup_and_drain(&mut test, &setup_msgs, brew_uuid);
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -2726,7 +3114,7 @@ fn test_network_group_local_retake_after_network_end_does_not_transfer_call_owne
     let demand_msgs = test.dump_sinks();
     assert!(count_d_tx_granted(&demand_msgs) >= 1);
     assert_eq!(count_umac_floor_granted(&demand_msgs), 0);
-    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
+    let activation_msgs = transmit_positive_group_grant_and_assert_floor(
         &mut test,
         &demand_msgs,
         TetraAddress::issi(TEST_ISSI),
@@ -2734,6 +3122,26 @@ fn test_network_group_local_retake_after_network_end_does_not_transfer_call_owne
         TEST_ISSI,
         TEST_GSSI,
         ts,
+    );
+    let loopback_update_pos = activation_msgs
+        .iter()
+        .position(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::SetDlMediaSource {
+                    ts: update_ts,
+                    dl_media_source: CircuitDlMediaSource::LocalLoopback,
+                }) if *update_ts == ts
+            )
+        })
+        .expect("local retake after a network speaker should switch the bearer back to local loopback");
+    let floor_granted_pos = activation_msgs
+        .iter()
+        .position(|msg| matches!(&msg.msg, SapMsgInner::CmceCallControl(CallControl::FloorGranted { .. })))
+        .expect("local retake should grant the RF floor");
+    assert!(
+        loopback_update_pos < floor_granted_pos,
+        "UMAC must switch to local loopback before FloorGranted opens local group U-plane"
     );
     assert_eq!(count_network_call_end(&demand_msgs, brew_uuid), 0);
 
@@ -2795,17 +3203,7 @@ fn test_network_group_no_listener_release_reports_network_end_once_after_d_relea
     });
     test.run_stack(Some(1));
     let setup_msgs = test.dump_sinks();
-    let call_id = setup_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid: ready_uuid,
-                call_id,
-                ..
-            }) if *ready_uuid == brew_uuid => Some(*call_id),
-            _ => None,
-        })
-        .expect("network-origin group setup should report ready to Brew");
+    let (call_id, _ts, _ready_msgs) = transmit_network_group_setup_and_drain(&mut test, &setup_msgs, brew_uuid);
     assert_eq!(count_network_call_end(&setup_msgs, brew_uuid), 0);
 
     test.submit_message(build_mm_deaffiliate_msg(TEST_ISSI, TEST_GSSI));
@@ -3175,8 +3573,25 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
         UlDlAssignment::Dl
     );
 
-    assert_eq!(count_umac_floor_granted(&msgs), 1);
-    assert!(msgs.iter().any(|msg| {
+    assert_eq!(
+        count_umac_floor_granted(&msgs),
+        0,
+        "network preemption must wait for RF D-TX-GRANTED transmission before U-plane activation"
+    );
+    assert!(
+        network_group_ready_tuple(&msgs, brew_uuid).is_none(),
+        "network preemption must not report ready before RF D-TX-GRANTED transmission"
+    );
+    let grant_reporter = d_tx_granted_reporter(
+        &msgs,
+        TetraAddress::new(TEST_GSSI, SsiType::Gssi),
+        TransmissionGrant::GrantedToOtherUser,
+    );
+    grant_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&activation_msgs), 1);
+    assert!(activation_msgs.iter().any(|msg| {
         matches!(
             &msg.msg,
             SapMsgInner::CmceCallControl(CallControl::FloorGranted {
@@ -3187,16 +3602,7 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
             }) if *got_call_id == call_id && *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_GSSI
         )
     }));
-    assert!(msgs.iter().any(|msg| {
-        matches!(
-            &msg.msg,
-            SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid: ready_uuid,
-                call_id: ready_call_id,
-                ..
-            }) if *ready_uuid == brew_uuid && *ready_call_id == call_id
-        )
-    }));
+    assert_eq!(network_group_ready_tuple(&activation_msgs, brew_uuid), Some((call_id, active_ts)));
     assert_eq!(count_network_call_end(&msgs, brew_uuid), 0);
 }
 

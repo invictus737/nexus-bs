@@ -5,7 +5,7 @@
 # sent by the flat-folder /home/USER/nexus-bs/nexus-bs-control wrapper.
 
 [Unit]
-Description=Nexus-BS v0.1.61 local control service for %i
+Description=Nexus-BS v0.1.62 local control service for %i
 Documentation=man:systemd.service(5)
 After=network-online.target
 Wants=network-online.target
@@ -26,6 +26,9 @@ KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
+CPUAffinity=3
+CPUWeight=50
+Nice=5
 
 StandardOutput=journal
 StandardError=journal

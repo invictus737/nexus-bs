@@ -8,6 +8,8 @@
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
+use crate::health::HealthSnapshot;
+
 /// TelemetryEvent enum sent by a TetraEntity through the TelemetrySink
 /// then, serializable by any codec for transmission over the network,
 /// using any Transport.
@@ -126,6 +128,10 @@ pub enum TelemetryEvent {
         /// Individual sensor readings, in display order.
         sensors: Vec<SysSensor>,
     },
+    /// Operational health snapshot. Emitted by the observe-only health
+    /// monitor at a fixed low rate; dashboard/telemetry consumers must treat it
+    /// as status data, not a control path.
+    HealthSnapshot(HealthSnapshot),
 }
 
 /// A single host-system sensor reading. Kept flat for easy JSON serialisation

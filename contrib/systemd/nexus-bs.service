@@ -1,8 +1,9 @@
-# Legacy single-user sample systemd service file for Nexus-BS v0.1.61.
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.62.
 #
 # New deployments should prefer:
 #   contrib/systemd/nexus-bs@.service
 #   contrib/systemd/nexus-bs-control@.service
+#   contrib/systemd/nexus-bs-dashboard@.service
 #   contrib/systemd/journald-nexus-bs-volatile.conf
 #
 # Those templates keep runtime state under /run/nexus-bs-USER and use volatile
@@ -25,7 +26,7 @@
 # - see log with "journalctl -u nexus-bs --output=cat -f"
 
 [Unit]
-Description=Nexus-BS v0.1.61 TETRA base station service
+Description=Nexus-BS v0.1.62 TETRA base station service
 # network-online.target ensures the interface is UP and routable,
 # not just "declared active" like network.target.
 After=network-online.target
@@ -40,6 +41,8 @@ CPUSchedulingPriority=73
 WorkingDirectory=/home/user/nexus-bs/
 Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/user/nexus-bs/config.toml
 Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/user/nexus-bs/dashboard
+Environment=NEXUS_BS_CORE_DASHBOARD_BIND=127.0.0.1
+Environment=NEXUS_BS_CORE_DASHBOARD_PORT=18080
 
 # Reset the SXceiver/SoapySDR USB device before each start to prevent
 # stale hardware timestamp state causing "Too late to produce TX block" skips
@@ -60,13 +63,15 @@ TimeoutStopSec=20
 # on-failure covers: non-zero exit, killed by signal, timeout.
 # Does NOT restart on clean exit (systemctl stop) or SIGINT (graceful shutdown).
 Restart=on-failure
-RestartSec=10
+RestartSec=5
 RestartForceExitStatus=75
 OOMPolicy=stop
 MemoryMax=512M
 TasksMax=128
 LimitNOFILE=4096
 NoNewPrivileges=yes
+CPUAffinity=0 1 2
+CPUWeight=900
 
 # Remove start rate limiting entirely — let RestartSec govern the pace.
 # Without this, systemd stops trying after 5 restarts in 10s (the default).

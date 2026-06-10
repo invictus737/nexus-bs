@@ -119,8 +119,23 @@ impl BrewEvent {
         }
     }
 
-    pub(crate) fn is_critical(&self) -> bool {
-        !matches!(self, BrewEvent::VoiceFrame { .. } | BrewEvent::ServerError { .. })
+    pub(crate) fn requires_lossless_delivery(&self) -> bool {
+        matches!(
+            self,
+            BrewEvent::Connected { .. }
+                | BrewEvent::VersionDetected { .. }
+                | BrewEvent::Disconnected(_)
+                | BrewEvent::GroupCallStart { .. }
+                | BrewEvent::GroupCallEnd { .. }
+                | BrewEvent::SubscriberEvent { .. }
+                | BrewEvent::CircuitSetupRequest { .. }
+                | BrewEvent::CircuitSetupAccept { .. }
+                | BrewEvent::CircuitSetupReject { .. }
+                | BrewEvent::CircuitCallAlert { .. }
+                | BrewEvent::CircuitConnectRequest { .. }
+                | BrewEvent::CircuitConnectConfirm { .. }
+                | BrewEvent::CircuitCallRelease { .. }
+        )
     }
 }
 
@@ -288,21 +303,24 @@ impl<T: NetworkTransport> BrewWorker<T> {
     }
 
     fn enqueue_event(&mut self, event: BrewEvent) -> bool {
-        const CRITICAL_EVENT_TIMEOUT: Duration = Duration::from_millis(2);
-
         let label = event.label();
-        let critical = event.is_critical();
-        let sent = if critical {
-            match self.event_sender.send_timeout(event, CRITICAL_EVENT_TIMEOUT) {
+        let lossless = event.requires_lossless_delivery();
+        let sent = if lossless {
+            // Call/subscriber lifecycle events are control-plane state, not
+            // media. Dropping GROUP_IDLE or release events can leave CMCE
+            // holding a stale floor, so let the worker apply back-pressure
+            // instead of losing them. SDS/DTMF remain bounded here; their
+            // protocol-level retry/health handling is owned by their domains.
+            match self.event_sender.send(event) {
                 Ok(()) => true,
-                Err(crossbeam_channel::SendTimeoutError::Timeout(_)) | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => false,
+                Err(_) => false,
             }
         } else {
             self.event_sender.try_send(event).is_ok()
         };
 
         if !sent {
-            self.record_event_drop(label, critical);
+            self.record_event_drop(label, lossless);
         }
         sent
     }

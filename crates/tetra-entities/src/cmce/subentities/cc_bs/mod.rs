@@ -147,6 +147,18 @@ struct PendingGroupFloorActivation {
     started_at: TdmaTime,
 }
 
+struct PendingNetworkGroupReady {
+    brew_uuid: uuid::Uuid,
+    call_id: u16,
+    source_issi: u32,
+    dest_gssi: u32,
+    ts: u8,
+    usage: u8,
+    reporters: Vec<TxReporter>,
+    notify_speaker_changed: bool,
+    started_at: TdmaTime,
+}
+
 struct PendingIndividualConnectAck {
     reporter: TxReporter,
     stage: PendingIndividualConnectAckStage,
@@ -206,16 +218,23 @@ pub struct CcBsSubentity {
     pending_group_tx_ceased_tail_drains: HashMap<u16, PendingGroupTxCeasedTailDrain>,
     /// Group-call positive D-TX GRANTED deliveries waiting before U-plane activation.
     pending_group_floor_activations: HashMap<u16, PendingGroupFloorActivation>,
+    /// Brew-origin group-call setup/floor deliveries waiting before Brew media activation.
+    pending_network_group_readies: HashMap<u16, PendingNetworkGroupReady>,
     /// Direct private-call setup delivery guards before caller authorization.
     pending_individual_connect_acks: HashMap<u16, PendingIndividualConnectAck>,
     /// Brew-bridged individual connect waiting for the local RF leg to acknowledge D-CONNECT/D-CONNECT ACK.
     pending_network_individual_connects: HashMap<u16, PendingNetworkIndividualConnect>,
     /// Individual releases waiting for assigned-channel D-RELEASE transmission or a bounded guard timeout.
     pending_individual_releases: HashMap<u16, PendingIndividualRelease>,
-    /// Registered subscriber groups (ISSI -> set of GSSIs)
+    /// Local RF subscriber groups learned from MM (ISSI -> set of GSSIs).
     subscriber_groups: HashMap<u32, HashSet<u32>>,
-    /// Listener counts per GSSI
+    /// Local RF listener counts per GSSI.
     group_listeners: HashMap<u32, usize>,
+    /// Brew/interconnect subscriber groups. These count as external listeners
+    /// for routing decisions, but must never authorize RF floor requests.
+    external_subscriber_groups: HashMap<u32, HashSet<u32>>,
+    /// Brew/interconnect listener counts per GSSI.
+    external_group_listeners: HashMap<u32, usize>,
     /// Telemetry sink for call events (optional)
     telemetry: Option<crate::net_telemetry::channel::TelemetrySink>,
     /// Active echo service session (ISSI 999), if any

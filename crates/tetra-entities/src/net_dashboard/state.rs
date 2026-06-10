@@ -69,6 +69,8 @@ pub struct DashboardStateInner {
     pub last_sdr_health: Option<SdrHealthSnapshot>,
     /// Most recent host system health snapshot (temps, voltages, power).
     pub last_sys_health: Option<SysHealthSnapshot>,
+    /// Most recent Nexus-BS operational health snapshot.
+    pub last_health: Option<crate::health::HealthSnapshot>,
 }
 
 /// Fast-path visual snapshot — spectrum + IQ + RMS/peak. Refreshed several times
@@ -158,6 +160,7 @@ impl DashboardStateInner {
             last_tx_quality: None,
             last_sdr_health: None,
             last_sys_health: None,
+            last_health: None,
         }
     }
 
@@ -184,6 +187,10 @@ impl DashboardStateInner {
             self.log_ring.pop_front();
         }
         self.log_ring.push_back(entry);
+    }
+
+    pub fn clear_logs(&mut self) {
+        self.log_ring.clear();
     }
 
     pub fn snapshot_ms(&self) -> Vec<MsState> {

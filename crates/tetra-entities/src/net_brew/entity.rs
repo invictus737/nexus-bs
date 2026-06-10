@@ -3,7 +3,7 @@
 //! Transport-agnostic: the concrete transport (WebSocket, QUIC, TCP, …) is
 //! injected at construction time via [`BrewEntity::new`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,9 @@ use super::worker::{BrewCommand, BrewEvent, BrewWorker};
 
 /// Hangtime before releasing group call circuit to allow reuse without re-signaling.
 const GROUP_CALL_HANGTIME_DEFAULT_SECS: u64 = 5;
+/// Maximum time a Brew-origin group call may hold RF floor after RF setup
+/// completed without delivering one valid TCH/S voice frame.
+const NETWORK_GROUP_ZERO_MEDIA_GUARD: Duration = Duration::from_secs(3);
 const TETRA_ACELP_TCH_S_BITS: usize = 274;
 const BREW_STE_FRAME_BYTES: usize = 36;
 const BREW_STE_FRAME_BITS: u16 = (BREW_STE_FRAME_BYTES * 8) as u16;
@@ -37,29 +40,41 @@ const BREW_STE_HEADER_NORMAL_SPEECH: u8 = 0x80;
 const BREW_STE_UNUSED_TAIL_MASK: u8 = 0x3f;
 const BREW_EVENT_CHANNEL_CAPACITY: usize = 2048;
 const BREW_COMMAND_CHANNEL_CAPACITY: usize = 8192;
-const BREW_CRITICAL_COMMAND_TIMEOUT: Duration = Duration::from_millis(1);
+const BREW_NONCRITICAL_COMMAND_WATERMARK: usize = 256;
 
-fn send_brew_command(sender: &Sender<BrewCommand>, command: BrewCommand) -> bool {
+enum BrewCommandSendError {
+    Full(BrewCommand),
+    Disconnected(BrewCommand),
+}
+
+fn try_send_brew_command(sender: &Sender<BrewCommand>, command: BrewCommand) -> Result<(), BrewCommandSendError> {
+    match sender.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(crossbeam_channel::TrySendError::Full(command)) => Err(BrewCommandSendError::Full(command)),
+        Err(crossbeam_channel::TrySendError::Disconnected(command)) => Err(BrewCommandSendError::Disconnected(command)),
+    }
+}
+
+fn log_dropped_brew_command(command: &BrewCommand) {
     let label = command.label();
     let critical = command.is_critical();
-    let sent = if critical {
-        match sender.send_timeout(command, BREW_CRITICAL_COMMAND_TIMEOUT) {
-            Ok(()) => true,
-            Err(crossbeam_channel::SendTimeoutError::Timeout(_)) | Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => false,
-        }
-    } else {
-        sender.try_send(command).is_ok()
-    };
 
-    if !sent {
-        if critical {
-            tracing::warn!("BrewEntity: critical command queue overloaded; dropped {label}");
-        } else {
-            tracing::debug!("BrewEntity: non-critical command queue overloaded; dropped {label}");
+    if critical {
+        tracing::warn!("BrewEntity: critical command queue unavailable; dropped {label}");
+    } else {
+        crate::health::registry().incr_brew_noncritical_drop();
+        tracing::debug!("BrewEntity: non-critical command queue overloaded; dropped {label}");
+    }
+}
+
+fn send_brew_command(sender: &Sender<BrewCommand>, command: BrewCommand) -> bool {
+    match try_send_brew_command(sender, command) {
+        Ok(()) => true,
+        Err(BrewCommandSendError::Full(command) | BrewCommandSendError::Disconnected(command)) => {
+            log_dropped_brew_command(&command);
+            false
         }
     }
-
-    sent
 }
 
 // ─── Active call tracking ─────────────────────────────────────────
@@ -79,8 +94,12 @@ struct ActiveCall {
     source_issi: u32,
     /// Destination GSSI (from Brew)
     dest_gssi: u32,
-    /// Number of voice frames received
+    /// Number of valid voice frames accepted after RF resources were ready
     frame_count: u64,
+    /// Wall-clock time when CMCE reported RF resources ready for this call.
+    ready_at: Option<Instant>,
+    /// True for Brew-origin group calls, false for circuit-call media sessions.
+    guard_zero_media: bool,
 }
 
 /// Group call in hangtime with circuit still allocated.
@@ -184,6 +203,12 @@ pub struct BrewEntity {
     /// reach a terminal state before reporting success or failure upstream.
     pending_sds_reports: HashMap<Uuid, PendingSdsReport>,
 
+    /// Critical Brew control commands that could not be accepted by the worker
+    /// channel immediately. These are call/subscriber lifecycle edges; keeping
+    /// them for retry avoids losing GROUP_IDLE/release under media queue
+    /// pressure without blocking the TETRA core loop.
+    pending_critical_commands: VecDeque<BrewCommand>,
+
     /// Worker thread handle for graceful shutdown
     worker_handle: Option<thread::JoinHandle<()>>,
 }
@@ -237,6 +262,7 @@ impl BrewEntity {
             telemetry_sink: None,
             rssi_last_sent: HashMap::new(),
             pending_sds_reports: HashMap::new(),
+            pending_critical_commands: VecDeque::new(),
             worker_handle: Some(handle),
         }
     }
@@ -244,6 +270,90 @@ impl BrewEntity {
     /// Set telemetry sink for emitting brew status events.
     pub fn set_telemetry_sink(&mut self, sink: TelemetrySink) {
         self.telemetry_sink = Some(sink);
+    }
+
+    fn send_or_queue_brew_command(&mut self, command: BrewCommand) {
+        if command.is_critical() {
+            self.flush_pending_critical_brew_commands();
+            if !self.pending_critical_commands.is_empty() {
+                self.queue_critical_brew_command(command);
+                return;
+            }
+
+            match try_send_brew_command(&self.command_sender, command) {
+                Ok(()) => self.publish_brew_command_health(),
+                Err(BrewCommandSendError::Full(command)) => self.queue_critical_brew_command(command),
+                Err(BrewCommandSendError::Disconnected(command)) => self.handle_disconnected_brew_command(command),
+            }
+            return;
+        }
+
+        if !self.pending_critical_commands.is_empty() {
+            log_dropped_brew_command(&command);
+            self.publish_brew_command_health();
+            return;
+        }
+
+        if self.command_sender.len() >= BREW_NONCRITICAL_COMMAND_WATERMARK {
+            log_dropped_brew_command(&command);
+            self.publish_brew_command_health();
+            return;
+        }
+
+        if let Err(error) = try_send_brew_command(&self.command_sender, command) {
+            match error {
+                BrewCommandSendError::Full(command) => log_dropped_brew_command(&command),
+                BrewCommandSendError::Disconnected(command) => self.handle_disconnected_brew_command(command),
+            }
+        }
+        self.publish_brew_command_health();
+    }
+
+    fn queue_critical_brew_command(&mut self, command: BrewCommand) {
+        debug_assert!(command.is_critical());
+        let label = command.label();
+        self.pending_critical_commands.push_back(command);
+        let pending = self.pending_critical_commands.len();
+        if pending == 1 || pending.is_power_of_two() {
+            tracing::warn!("BrewEntity: deferred critical Brew command {label}; pending_critical_commands={pending}");
+        }
+        self.publish_brew_command_health();
+    }
+
+    fn flush_pending_critical_brew_commands(&mut self) {
+        while let Some(command) = self.pending_critical_commands.pop_front() {
+            let label = command.label();
+            match try_send_brew_command(&self.command_sender, command) {
+                Ok(()) => {
+                    tracing::debug!(
+                        "BrewEntity: flushed deferred critical Brew command {label}; remaining={}",
+                        self.pending_critical_commands.len()
+                    );
+                }
+                Err(BrewCommandSendError::Full(command)) => {
+                    self.pending_critical_commands.push_front(command);
+                    break;
+                }
+                Err(BrewCommandSendError::Disconnected(command)) => {
+                    self.handle_disconnected_brew_command(command);
+                    self.pending_critical_commands.clear();
+                    break;
+                }
+            }
+        }
+        self.publish_brew_command_health();
+    }
+
+    fn handle_disconnected_brew_command(&mut self, command: BrewCommand) {
+        let label = command.label();
+        tracing::warn!("BrewEntity: Brew worker command channel disconnected; dropping {label}");
+        self.connected = false;
+        self.set_network_connected(false, 0);
+        self.publish_brew_command_health();
+    }
+
+    fn publish_brew_command_health(&self) {
+        crate::health::registry().set_brew_command_backlog(self.command_sender.len(), self.pending_critical_commands.len());
     }
 
     /// Process all pending events from the worker thread
@@ -492,7 +602,7 @@ impl BrewEntity {
 
         if should_send {
             self.rssi_last_sent.insert(issi, now);
-            send_brew_command(&self.command_sender, BrewCommand::SendRssiUpdate { issi, rssi_dbfs });
+            self.send_or_queue_brew_command(BrewCommand::SendRssiUpdate { issi, rssi_dbfs });
             tracing::debug!("Brew: queued RSSI export issi={} rssi={:.1}dBFS", issi, rssi_dbfs);
         }
     }
@@ -507,7 +617,7 @@ impl BrewEntity {
                 self.subscriber_groups.entry(issi).or_insert_with(HashSet::new);
                 if issi_routable && self.connected {
                     tracing::info!("BrewEntity: subscriber register issi={} → REGISTER", issi);
-                    send_brew_command(&self.command_sender, BrewCommand::RegisterSubscriber { issi });
+                    self.send_or_queue_brew_command(BrewCommand::RegisterSubscriber { issi });
                 } else if !issi_routable {
                     tracing::debug!("BrewEntity: subscriber register issi={} (filtered, not sent to Brew)", issi);
                 } else {
@@ -526,15 +636,12 @@ impl BrewEntity {
                 if (issi_routable || had_group_subscription) && self.connected {
                     tracing::info!("BrewEntity: subscriber deregister issi={} → DEAFFILIATE + DEREGISTER", issi);
                     if had_group_subscription {
-                        send_brew_command(
-                            &self.command_sender,
-                            BrewCommand::DeaffiliateGroups {
-                                issi,
-                                groups: existing_groups,
-                            },
-                        );
+                        self.send_or_queue_brew_command(BrewCommand::DeaffiliateGroups {
+                            issi,
+                            groups: existing_groups,
+                        });
                     }
-                    send_brew_command(&self.command_sender, BrewCommand::DeregisterSubscriber { issi });
+                    self.send_or_queue_brew_command(BrewCommand::DeregisterSubscriber { issi });
                 } else if !issi_routable {
                     tracing::debug!("BrewEntity: subscriber deregister issi={} (filtered, not sent to Brew)", issi);
                 } else {
@@ -563,9 +670,9 @@ impl BrewEntity {
                             issi,
                             new_groups
                         );
-                        send_brew_command(&self.command_sender, BrewCommand::RegisterSubscriber { issi });
+                        self.send_or_queue_brew_command(BrewCommand::RegisterSubscriber { issi });
                     }
-                    send_brew_command(&self.command_sender, BrewCommand::AffiliateGroups { issi, groups: new_groups });
+                    self.send_or_queue_brew_command(BrewCommand::AffiliateGroups { issi, groups: new_groups });
                 } else if !new_groups.is_empty() {
                     tracing::debug!(
                         "BrewEntity: affiliate issi={} groups={:?} cached until Brew reconnect",
@@ -586,13 +693,10 @@ impl BrewEntity {
                 let removed_groups = self.brew_routable_groups(removed_groups);
                 if !removed_groups.is_empty() && self.connected {
                     tracing::info!("BrewEntity: deaffiliate issi={} → DEAFFILIATE groups={:?}", issi, removed_groups);
-                    send_brew_command(
-                        &self.command_sender,
-                        BrewCommand::DeaffiliateGroups {
-                            issi,
-                            groups: removed_groups,
-                        },
-                    );
+                    self.send_or_queue_brew_command(BrewCommand::DeaffiliateGroups {
+                        issi,
+                        groups: removed_groups,
+                    });
                 } else if !removed_groups.is_empty() {
                     tracing::debug!(
                         "BrewEntity: deaffiliate issi={} groups={:?} cached while Brew disconnected",
@@ -610,14 +714,20 @@ impl BrewEntity {
         }
     }
 
-    fn resync_subscribers(&self) {
-        for (issi, groups) in &self.subscriber_groups {
-            let gssi_list = self.brew_routable_groups(groups.iter().copied());
-            if !super::is_brew_issi_routable(&self.config, *issi) && gssi_list.is_empty() {
+    fn resync_subscribers(&mut self) {
+        let subscribers: Vec<(u32, Vec<u32>)> = self
+            .subscriber_groups
+            .iter()
+            .map(|(issi, groups)| (*issi, groups.iter().copied().collect()))
+            .collect();
+
+        for (issi, groups) in subscribers {
+            let gssi_list = self.brew_routable_groups(groups);
+            if !super::is_brew_issi_routable(&self.config, issi) && gssi_list.is_empty() {
                 tracing::debug!("BrewEntity: resync skipping issi={} (filtered)", issi);
                 continue;
             }
-            send_brew_command(&self.command_sender, BrewCommand::RegisterSubscriber { issi: *issi });
+            self.send_or_queue_brew_command(BrewCommand::RegisterSubscriber { issi });
             if gssi_list.is_empty() {
                 tracing::info!("BrewEntity: resync issi={} — registered, no group affiliations", issi);
             } else {
@@ -627,19 +737,14 @@ impl BrewEntity {
                     gssi_list.len(),
                     gssi_list
                 );
-                send_brew_command(
-                    &self.command_sender,
-                    BrewCommand::AffiliateGroups {
-                        issi: *issi,
-                        groups: gssi_list,
-                    },
-                );
+                self.send_or_queue_brew_command(BrewCommand::AffiliateGroups { issi, groups: gssi_list });
             }
         }
     }
 
     fn set_network_connected(&mut self, connected: bool, server_version: u8) {
         self.connected = connected;
+        crate::health::registry().set_brew_status(connected, server_version);
         let changed = {
             let mut state = self.config.state_write();
             if state.network_connected != connected {
@@ -680,6 +785,9 @@ impl BrewEntity {
                     call.source_issi
                 );
                 call.source_issi = source_issi;
+                call.frame_count = 0;
+                call.ready_at = None;
+                call.guard_zero_media = true;
 
                 // Flush stale audio from previous speaker immediately.
                 // ETSI EN 300 392-2 §14.8.43: when transmission grant changes,
@@ -736,7 +844,9 @@ impl BrewEntity {
                 usage: Some(hanging.usage),
                 source_issi,
                 dest_gssi,
-                frame_count: hanging.frame_count,
+                frame_count: 0,
+                ready_at: Some(Instant::now()),
+                guard_zero_media: true,
             };
             self.active_calls.insert(uuid, call);
             self.dl_jitter
@@ -775,6 +885,8 @@ impl BrewEntity {
             source_issi,
             dest_gssi,
             frame_count: 0,
+            ready_at: None,
+            guard_zero_media: true,
         };
         self.active_calls.insert(uuid, call);
         self.dl_jitter
@@ -892,19 +1004,24 @@ impl BrewEntity {
             return;
         };
 
-        call.frame_count += 1;
-
         // Check if resources have been allocated yet
         let Some(ts) = call.ts else {
             // Audio arrived before NetworkCallReady - drop it
-            if call.frame_count == 1 {
-                tracing::debug!(
-                    "BrewEntity: voice frame arrived before resources allocated, uuid={}, dropping",
-                    uuid
-                );
-            }
+            tracing::debug!(
+                "BrewEntity: voice frame arrived before resources allocated, uuid={}, dropping",
+                uuid
+            );
             return;
         };
+
+        // STE format: byte 0 = header (control bits), bytes 1-35 = 274 ACELP bits for TCH/S.
+        // Strip the STE header and pass only the ACELP payload.
+        if data.len() < 36 {
+            tracing::warn!("BrewEntity: voice frame too short ({} bytes, expected 36 STE bytes)", data.len());
+            return;
+        }
+
+        call.frame_count += 1;
 
         // Log first voice frame per call
         if call.frame_count == 1 {
@@ -917,18 +1034,53 @@ impl BrewEntity {
             );
         }
 
-        // STE format: byte 0 = header (control bits), bytes 1-35 = 274 ACELP bits for TCH/S.
-        // Strip the STE header and pass only the ACELP payload.
-        if data.len() < 36 {
-            tracing::warn!("BrewEntity: voice frame too short ({} bytes, expected 36 STE bytes)", data.len());
-            return;
-        }
         let acelp_data = data[1..].to_vec(); // 35 bytes = 280 bits, of which 274 are ACELP
 
         self.dl_jitter
             .entry(uuid)
             .or_insert_with(|| VoiceJitterBuffer::with_initial_latency(self.brew_config.jitter_initial_latency_frames as usize))
             .push(acelp_data);
+    }
+
+    fn release_zero_media_network_calls(&mut self, queue: &mut MessageQueue) {
+        let expired: Vec<Uuid> = self
+            .active_calls
+            .iter()
+            .filter_map(|(&uuid, call)| {
+                if call.guard_zero_media
+                    && call.frame_count == 0
+                    && call
+                        .ready_at
+                        .is_some_and(|ready_at| ready_at.elapsed() >= NETWORK_GROUP_ZERO_MEDIA_GUARD)
+                {
+                    Some(uuid)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for uuid in expired {
+            let Some(call) = self.active_calls.remove(&uuid) else {
+                continue;
+            };
+            tracing::warn!(
+                "BrewEntity: releasing silent network group call uuid={} call_id={:?} src={} gssi={} after {:?} with zero voice frames",
+                uuid,
+                call.call_id,
+                call.source_issi,
+                call.dest_gssi,
+                NETWORK_GROUP_ZERO_MEDIA_GUARD
+            );
+            self.dl_jitter.remove(&uuid);
+            self.draining_jitter.remove(&uuid);
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Brew,
+                dest: TetraEntity::Cmce,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid: uuid }),
+            });
+        }
     }
 
     fn drain_jitter_playout(&mut self, queue: &mut MessageQueue) {
@@ -1054,6 +1206,7 @@ impl BrewEntity {
             call.call_id = Some(call_id);
             call.ts = Some(ts);
             call.usage = Some(usage);
+            call.ready_at = Some(Instant::now());
         } else {
             // Race: CMCE finished allocating a circuit (call_id/ts/usage) for a call that
             // Brew has already torn down — e.g. a GROUP_IDLE or disconnect arrived between
@@ -1150,7 +1303,11 @@ impl TetraEntityTrait for BrewEntity {
         self.dltime = ts;
         // Process all pending events from the worker thread
         self.process_events(queue);
+        self.flush_pending_critical_brew_commands();
         self.drain_pending_sds_reports();
+        // Pragmatic Brew robustness guard: a network-origin GROUP_TX that never
+        // delivers media must not monopolize the RF group floor.
+        self.release_zero_media_network_calls(queue);
         // Feed one buffered frame at each traffic playout opportunity.
         self.drain_jitter_playout(queue);
         // Expire hanging calls that have exceeded hangtime
@@ -1185,6 +1342,7 @@ impl TetraEntityTrait for BrewEntity {
             SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id, ts }) => {
                 self.handle_local_call_end(call_id, ts);
             }
+            SapMsgInner::CmceCallControl(CallControl::SetDlMediaSource { .. }) => {}
             SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }) => {
                 self.drop_network_call(brew_uuid);
             }
@@ -1206,27 +1364,24 @@ impl TetraEntityTrait for BrewEntity {
                     return;
                 }
                 let wire_call = Self::map_network_to_brew_circuit_call(&call);
-                send_brew_command(
-                    &self.command_sender,
-                    BrewCommand::SendSetupRequest {
-                        uuid: brew_uuid,
-                        call: wire_call,
-                    },
-                );
+                self.send_or_queue_brew_command(BrewCommand::SendSetupRequest {
+                    uuid: brew_uuid,
+                    call: wire_call,
+                });
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupAccept { brew_uuid }) => {
                 if self.connected {
-                    send_brew_command(&self.command_sender, BrewCommand::SendSetupAccept { uuid: brew_uuid });
+                    self.send_or_queue_brew_command(BrewCommand::SendSetupAccept { uuid: brew_uuid });
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject { brew_uuid, cause }) => {
                 if self.connected {
-                    send_brew_command(&self.command_sender, BrewCommand::SendSetupReject { uuid: brew_uuid, cause });
+                    self.send_or_queue_brew_command(BrewCommand::SendSetupReject { uuid: brew_uuid, cause });
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid }) => {
                 if self.connected {
-                    send_brew_command(&self.command_sender, BrewCommand::SendCallAlert { uuid: brew_uuid });
+                    self.send_or_queue_brew_command(BrewCommand::SendCallAlert { uuid: brew_uuid });
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest { brew_uuid, call }) => {
@@ -1238,13 +1393,10 @@ impl TetraEntityTrait for BrewEntity {
                     return;
                 }
                 let wire_call = Self::map_network_to_brew_circuit_call(&call);
-                send_brew_command(
-                    &self.command_sender,
-                    BrewCommand::SendConnectRequest {
-                        uuid: brew_uuid,
-                        call: wire_call,
-                    },
-                );
+                self.send_or_queue_brew_command(BrewCommand::SendConnectRequest {
+                    uuid: brew_uuid,
+                    call: wire_call,
+                });
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                 brew_uuid,
@@ -1252,14 +1404,11 @@ impl TetraEntityTrait for BrewEntity {
                 permission,
             }) => {
                 if self.connected {
-                    send_brew_command(
-                        &self.command_sender,
-                        BrewCommand::SendConnectConfirm {
-                            uuid: brew_uuid,
-                            grant,
-                            permission,
-                        },
-                    );
+                    self.send_or_queue_brew_command(BrewCommand::SendConnectConfirm {
+                        uuid: brew_uuid,
+                        grant,
+                        permission,
+                    });
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady { brew_uuid, call_id, ts }) => {
@@ -1288,6 +1437,8 @@ impl TetraEntityTrait for BrewEntity {
                     source_issi: 0,
                     dest_gssi: 0,
                     frame_count: 0,
+                    ready_at: Some(Instant::now()),
+                    guard_zero_media: false,
                 });
                 self.dl_jitter
                     .entry(brew_uuid)
@@ -1299,20 +1450,17 @@ impl TetraEntityTrait for BrewEntity {
                 data,
             }) => {
                 if self.connected {
-                    send_brew_command(
-                        &self.command_sender,
-                        BrewCommand::SendDtmf {
-                            uuid: brew_uuid,
-                            length_bits,
-                            data,
-                        },
-                    );
+                    self.send_or_queue_brew_command(BrewCommand::SendDtmf {
+                        uuid: brew_uuid,
+                        length_bits,
+                        data,
+                    });
                 }
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid, cause }) => {
                 let was_active = self.drop_network_circuit(brew_uuid);
                 if was_active && self.connected {
-                    send_brew_command(&self.command_sender, BrewCommand::SendCallRelease { uuid: brew_uuid, cause });
+                    self.send_or_queue_brew_command(BrewCommand::SendCallRelease { uuid: brew_uuid, cause });
                 }
             }
             SapMsgInner::MmSubscriberUpdate(update) => {
@@ -1413,34 +1561,35 @@ impl BrewEntity {
         }
 
         // If we're already forwarding on this timeslot, treat as a talker change/update
-        if let Some(fwd) = self.ul_forwarded.get_mut(&ts) {
-            if fwd.call_id != call_id || fwd.dest_gssi != dest_gssi {
-                tracing::warn!(
-                    "BrewEntity: updating forwarded call on ts={} (was call_id={} gssi={}) -> (call_id={} gssi={})",
-                    ts,
-                    fwd.call_id,
-                    fwd.dest_gssi,
-                    call_id,
-                    dest_gssi
-                );
-            }
+        if let Some(uuid) = {
+            let fwd = self.ul_forwarded.get_mut(&ts);
+            fwd.map(|fwd| {
+                if fwd.call_id != call_id || fwd.dest_gssi != dest_gssi {
+                    tracing::warn!(
+                        "BrewEntity: updating forwarded call on ts={} (was call_id={} gssi={}) -> (call_id={} gssi={})",
+                        ts,
+                        fwd.call_id,
+                        fwd.dest_gssi,
+                        call_id,
+                        dest_gssi
+                    );
+                }
 
-            fwd.call_id = call_id;
-            fwd.source_issi = source_issi;
-            fwd.dest_gssi = dest_gssi;
-            fwd.frame_count = 0;
-
+                fwd.call_id = call_id;
+                fwd.source_issi = source_issi;
+                fwd.dest_gssi = dest_gssi;
+                fwd.frame_count = 0;
+                fwd.uuid
+            })
+        } {
             // Send GROUP_TX update for the new talker
-            send_brew_command(
-                &self.command_sender,
-                BrewCommand::SendGroupTx {
-                    uuid: fwd.uuid,
-                    source_issi,
-                    dest_gssi,
-                    priority: 0,
-                    service: 0, // TETRA encoded speech
-                },
-            );
+            self.send_or_queue_brew_command(BrewCommand::SendGroupTx {
+                uuid,
+                source_issi,
+                dest_gssi,
+                priority: 0,
+                service: 0, // TETRA encoded speech
+            });
             return;
         }
 
@@ -1456,16 +1605,13 @@ impl BrewEntity {
         );
 
         // Send GROUP_TX to TetraPack
-        send_brew_command(
-            &self.command_sender,
-            BrewCommand::SendGroupTx {
-                uuid,
-                source_issi,
-                dest_gssi,
-                priority: 0,
-                service: 0, // TETRA encoded speech
-            },
-        );
+        self.send_or_queue_brew_command(BrewCommand::SendGroupTx {
+            uuid,
+            source_issi,
+            dest_gssi,
+            priority: 0,
+            service: 0, // TETRA encoded speech
+        });
 
         // Track this forwarded call
         self.ul_forwarded.insert(
@@ -1517,13 +1663,10 @@ impl BrewEntity {
                 fwd.uuid,
                 fwd.frame_count
             );
-            send_brew_command(
-                &self.command_sender,
-                BrewCommand::SendGroupIdle {
-                    uuid: fwd.uuid,
-                    cause: 0, // Normal release
-                },
-            );
+            self.send_or_queue_brew_command(BrewCommand::SendGroupIdle {
+                uuid: fwd.uuid,
+                cause: 0, // Normal release
+            });
         }
     }
 
@@ -1570,25 +1713,23 @@ impl BrewEntity {
     /// Handle UL voice data from UMAC. If the timeslot is being forwarded to TetraPack,
     /// convert to STE format and send.
     fn handle_ul_voice(&mut self, ts: u8, acelp_bits: Vec<u8>) {
-        let Some(fwd) = self.ul_forwarded.get_mut(&ts) else {
+        let Some(uuid) = self.ul_forwarded.get_mut(&ts).map(|fwd| {
+            fwd.frame_count += 1;
+            fwd.uuid
+        }) else {
             return; // Not forwarded to TetraPack
         };
-
-        fwd.frame_count += 1;
 
         let Some(ste_data) = Self::build_brew_ste_voice_frame(&acelp_bits) else {
             tracing::warn!("BrewEntity: UL voice too short: {} bits", acelp_bits.len());
             return;
         };
 
-        send_brew_command(
-            &self.command_sender,
-            BrewCommand::SendVoiceFrame {
-                uuid: fwd.uuid,
-                length_bits: BREW_STE_FRAME_BITS,
-                data: ste_data,
-            },
-        );
+        self.send_or_queue_brew_command(BrewCommand::SendVoiceFrame {
+            uuid,
+            length_bits: BREW_STE_FRAME_BITS,
+            data: ste_data,
+        });
     }
 
     fn build_brew_ste_voice_frame(acelp_bits: &[u8]) -> Option<Vec<u8>> {
@@ -1681,7 +1822,7 @@ impl BrewEntity {
 
         for (uuid, status) in ready {
             self.pending_sds_reports.remove(&uuid);
-            send_brew_command(&self.command_sender, BrewCommand::SendSdsReport { uuid, status });
+            self.send_or_queue_brew_command(BrewCommand::SendSdsReport { uuid, status });
             tracing::info!(
                 "BrewEntity: SDS_REPORT uuid={} status={} -> Brew after air-interface result",
                 uuid,
@@ -1815,7 +1956,7 @@ impl BrewEntity {
     }
 
     /// Handle outgoing SDS from CMCE → Brew (local MS → network)
-    fn handle_sds_send(&self, sds: CmceSdsData) {
+    fn handle_sds_send(&mut self, sds: CmceSdsData) {
         if !self.connected {
             tracing::warn!(
                 "BrewEntity: not connected, dropping outgoing SDS {} -> {}",
@@ -1835,33 +1976,36 @@ impl BrewEntity {
             sds.user_defined_data.length_bits()
         );
 
-        send_brew_command(
-            &self.command_sender,
-            BrewCommand::SendSds {
-                uuid,
-                source: sds.source_issi,
-                destination: sds.dest_issi,
-                data: sds.user_defined_data.to_arr(),
-                length_bits: sds.user_defined_data.length_bits(),
-            },
-        );
+        self.send_or_queue_brew_command(BrewCommand::SendSds {
+            uuid,
+            source: sds.source_issi,
+            destination: sds.dest_issi,
+            data: sds.user_defined_data.to_arr(),
+            length_bits: sds.user_defined_data.length_bits(),
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::time::Instant;
 
     use crossbeam_channel::{Receiver, bounded};
     use tetra_config::bluestation::{SharedConfig, from_toml_str};
     use tetra_core::{TdmaTime, TxReporter};
+    use tetra_saps::SapMsgInner;
     use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
+    use tetra_saps::control::call_control::CallControl;
+    use uuid::Uuid;
 
     use super::{
-        BREW_COMMAND_CHANNEL_CAPACITY, BREW_EVENT_CHANNEL_CAPACITY, BREW_STE_FRAME_BITS, BREW_STE_FRAME_BYTES,
-        BREW_STE_HEADER_NORMAL_SPEECH, BREW_STE_UNUSED_TAIL_MASK, BrewEntity,
+        BREW_COMMAND_CHANNEL_CAPACITY, BREW_EVENT_CHANNEL_CAPACITY, BREW_NONCRITICAL_COMMAND_WATERMARK, BREW_STE_FRAME_BITS,
+        BREW_STE_FRAME_BYTES, BREW_STE_HEADER_NORMAL_SPEECH, BREW_STE_UNUSED_TAIL_MASK, BrewEntity, NETWORK_GROUP_ZERO_MEDIA_GUARD,
+        UlForwardKind, UlForwardedCall,
     };
     use crate::net_brew::worker::{BrewCommand, BrewEvent};
+    use crate::{MessageQueue, TetraEntityTrait};
 
     fn brew_test_config() -> SharedConfig {
         let toml = format!(
@@ -1895,10 +2039,103 @@ mod tests {
                 telemetry_sink: None,
                 rssi_last_sent: HashMap::new(),
                 pending_sds_reports: HashMap::new(),
+                pending_critical_commands: VecDeque::new(),
                 worker_handle: None,
             },
             command_receiver,
         )
+    }
+
+    fn drain_queue(queue: &mut MessageQueue) -> Vec<tetra_saps::SapMsg> {
+        let mut drained = Vec::new();
+        while let Some(msg) = queue.pop_front() {
+            drained.push(msg);
+        }
+        drained
+    }
+
+    #[test]
+    fn network_group_zero_media_guard_releases_rf_floor() {
+        let (mut entity, _rx) = brew_entity_without_worker();
+        let uuid = Uuid::new_v4();
+        let mut queue = MessageQueue::new();
+
+        entity.handle_group_call_start(&mut queue, uuid, 2261313, 226333, 0);
+        drain_queue(&mut queue);
+        entity.rx_network_call_ready(&mut queue, uuid, 15, 2, 15);
+        drain_queue(&mut queue);
+        entity.active_calls.get_mut(&uuid).expect("active network group call").ready_at =
+            Some(Instant::now() - NETWORK_GROUP_ZERO_MEDIA_GUARD - std::time::Duration::from_millis(1));
+
+        entity.release_zero_media_network_calls(&mut queue);
+        let released = drain_queue(&mut queue);
+
+        assert!(!entity.active_calls.contains_key(&uuid));
+        assert!(released.iter().any(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }) if *brew_uuid == uuid
+            )
+        }));
+    }
+
+    #[test]
+    fn network_group_zero_media_guard_ignores_call_after_valid_voice_frame() {
+        let (mut entity, _rx) = brew_entity_without_worker();
+        let uuid = Uuid::new_v4();
+        let mut queue = MessageQueue::new();
+
+        entity.handle_group_call_start(&mut queue, uuid, 2261313, 226333, 0);
+        drain_queue(&mut queue);
+        entity.rx_network_call_ready(&mut queue, uuid, 15, 2, 15);
+        drain_queue(&mut queue);
+        entity.handle_voice_frame(uuid, BREW_STE_FRAME_BITS, vec![0x80; BREW_STE_FRAME_BYTES]);
+        entity.active_calls.get_mut(&uuid).expect("active network group call").ready_at =
+            Some(Instant::now() - NETWORK_GROUP_ZERO_MEDIA_GUARD - std::time::Duration::from_millis(1));
+
+        entity.release_zero_media_network_calls(&mut queue);
+        let released = drain_queue(&mut queue);
+
+        assert!(entity.active_calls.contains_key(&uuid));
+        assert!(released.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }) if *brew_uuid == uuid
+            )
+        }));
+    }
+
+    #[test]
+    fn network_group_hangtime_reuse_resets_zero_media_guard() {
+        let (mut entity, _rx) = brew_entity_without_worker();
+        let first_uuid = Uuid::new_v4();
+        let second_uuid = Uuid::new_v4();
+        let mut queue = MessageQueue::new();
+
+        entity.handle_group_call_start(&mut queue, first_uuid, 2260580, 226333, 0);
+        drain_queue(&mut queue);
+        entity.rx_network_call_ready(&mut queue, first_uuid, 16, 2, 16);
+        drain_queue(&mut queue);
+        entity.handle_voice_frame(first_uuid, BREW_STE_FRAME_BITS, vec![0x80; BREW_STE_FRAME_BYTES]);
+        entity.handle_group_call_end(&mut queue, first_uuid, 0);
+        drain_queue(&mut queue);
+
+        entity.handle_group_call_start(&mut queue, second_uuid, 2261313, 226333, 0);
+        drain_queue(&mut queue);
+        let reused = entity.active_calls.get_mut(&second_uuid).expect("reused network group call");
+        assert_eq!(reused.frame_count, 0, "new speaker epoch must not inherit previous speaker media");
+        reused.ready_at = Some(Instant::now() - NETWORK_GROUP_ZERO_MEDIA_GUARD - std::time::Duration::from_millis(1));
+
+        entity.release_zero_media_network_calls(&mut queue);
+        let released = drain_queue(&mut queue);
+
+        assert!(!entity.active_calls.contains_key(&second_uuid));
+        assert!(released.iter().any(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }) if *brew_uuid == second_uuid
+            )
+        }));
     }
 
     #[test]
@@ -1914,6 +2151,109 @@ mod tests {
             received += 1;
         }
         assert_eq!(received, BREW_COMMAND_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn critical_group_idle_is_deferred_instead_of_dropped_when_command_queue_is_full() {
+        let (mut entity, rx) = brew_entity_without_worker();
+        let uuid = Uuid::new_v4();
+
+        for _ in 0..BREW_COMMAND_CHANNEL_CAPACITY {
+            entity
+                .command_sender
+                .try_send(BrewCommand::SendVoiceFrame {
+                    uuid,
+                    length_bits: BREW_STE_FRAME_BITS,
+                    data: vec![0; BREW_STE_FRAME_BYTES],
+                })
+                .expect("test pre-fills command channel");
+        }
+
+        entity.ul_forwarded.insert(
+            2,
+            UlForwardedCall {
+                uuid,
+                call_id: 77,
+                source_issi: 2260082,
+                dest_gssi: 226333,
+                frame_count: 3,
+                kind: UlForwardKind::Group,
+            },
+        );
+
+        entity.handle_local_call_tx_stopped(77, 2);
+        assert_eq!(entity.pending_critical_commands.len(), 1);
+
+        let _ = rx.try_recv().expect("free one worker command slot");
+        let mut queue = MessageQueue::new();
+        entity.tick_start(&mut queue, TdmaTime::default());
+
+        let mut saw_group_idle = false;
+        while let Ok(command) = rx.try_recv() {
+            if let BrewCommand::SendGroupIdle { uuid: sent_uuid, cause } = command {
+                assert_eq!(sent_uuid, uuid);
+                assert_eq!(cause, 0);
+                saw_group_idle = true;
+                break;
+            }
+        }
+
+        assert!(saw_group_idle, "critical GROUP_IDLE must be retried when queue pressure clears");
+        assert!(entity.pending_critical_commands.is_empty());
+    }
+
+    #[test]
+    fn noncritical_media_backlog_is_capped_before_group_idle() {
+        let (mut entity, rx) = brew_entity_without_worker();
+        let uuid = Uuid::new_v4();
+
+        for _ in 0..(BREW_NONCRITICAL_COMMAND_WATERMARK + 32) {
+            entity.send_or_queue_brew_command(BrewCommand::SendVoiceFrame {
+                uuid,
+                length_bits: BREW_STE_FRAME_BITS,
+                data: vec![0; BREW_STE_FRAME_BYTES],
+            });
+        }
+
+        assert_eq!(
+            rx.len(),
+            BREW_NONCRITICAL_COMMAND_WATERMARK,
+            "Brew media backlog should be capped so lifecycle commands have bounded latency"
+        );
+
+        entity.send_or_queue_brew_command(BrewCommand::SendGroupIdle { uuid, cause: 0 });
+
+        let mut voice_before_idle = 0usize;
+        loop {
+            match rx.try_recv().expect("GROUP_IDLE should be present after bounded media backlog") {
+                BrewCommand::SendVoiceFrame { .. } => voice_before_idle += 1,
+                BrewCommand::SendGroupIdle { uuid: sent_uuid, cause } => {
+                    assert_eq!(sent_uuid, uuid);
+                    assert_eq!(cause, 0);
+                    break;
+                }
+                other => panic!("unexpected command before GROUP_IDLE: {other:?}"),
+            }
+        }
+
+        assert_eq!(voice_before_idle, BREW_NONCRITICAL_COMMAND_WATERMARK);
+    }
+
+    #[test]
+    fn disconnected_worker_does_not_leave_unflushable_critical_backlog() {
+        let (mut entity, rx) = brew_entity_without_worker();
+        drop(rx);
+
+        entity.send_or_queue_brew_command(BrewCommand::SendGroupIdle {
+            uuid: Uuid::new_v4(),
+            cause: 0,
+        });
+
+        assert!(
+            entity.pending_critical_commands.is_empty(),
+            "critical commands should be queued only for a full live worker channel"
+        );
+        assert!(!entity.connected, "Brew command receiver loss should mark Brew disconnected");
     }
 
     fn subscriber_update(issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) -> MmSubscriberUpdate {

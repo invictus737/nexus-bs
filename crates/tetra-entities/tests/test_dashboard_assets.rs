@@ -28,15 +28,246 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "index.html must reference the deploy-copied application script"
     );
     assert!(
+        index.contains(r#"id="overviewHeard""#),
+        "overview page must include the integrated Last Heard table"
+    );
+    assert!(
+        index.contains(r#"class="traffic-detail-stack""#)
+            && index.contains(r#"id="radiosTable""#)
+            && index.contains(r#"id="callsTable""#)
+            && index.contains(r#"id="heardTable""#),
+        "Traffic page must contain detailed radio, call, and Last Heard views without separate workflow tabs"
+    );
+    assert!(
+        index.contains(r#"class="panel active-calls-panel""#)
+            && index.contains(r#"id="overviewCalls""#)
+            && !index.contains("Current Floor")
+            && !index.contains("Live Radios")
+            && !index.contains(r#"id="currentFloorPanel""#)
+            && !index.contains(r#"id="overviewRadios""#),
+        "Traffic page must make Active Calls the primary board and remove Current Floor/Live Radios overview panels"
+    );
+    assert!(
+        !index.contains(r#"data-page="radios""#)
+            && !index.contains(r#"data-page="calls""#)
+            && !index.contains(r#"data-page="lastheard""#)
+            && !index.contains(r#"id="page-radios""#)
+            && !index.contains(r#"id="page-calls""#)
+            && !index.contains(r#"id="page-lastheard""#),
+        "duplicated traffic workflow tabs must stay consolidated under the Traffic page"
+    );
+    assert!(
+        index.contains(r#"id="rfTxFreq""#)
+            && index.contains(r#"id="rfRxFreq""#)
+            && index.contains(r#"id="deviceMapPanel""#)
+            && index.contains(r#"id="diagramFrequency""#)
+            && index.contains(r#"id="slotGrid""#),
+        "System/RF Ops and Traffic pages must expose RF, slot, and active-call render targets"
+    );
+    assert!(
+        index.contains(r#"id="settingsSection""#) && index.contains(r#"id="aboutSection""#),
+        "dashboard must keep Settings/Admin and About/Credits sections"
+    );
+    assert!(
+        index.contains(r#"id="configManager""#) && index.contains(r#"id="configProfileSelect""#) && index.contains(r#"id="configEditor""#),
+        "Settings must expose config profile selection and current TOML editing controls"
+    );
+    assert!(
+        index.contains(r#"id="serviceRestartBtn""#)
+            && index.contains(r#"id="serviceShutdownBtn""#)
+            && index.contains(r#"id="serviceStopGoBtn""#)
+            && index.contains(r#"id="configDeleteBtn""#),
+        "Settings must expose service lifecycle controls and config profile deletion"
+    );
+    assert!(
+        index.contains(r#"id="logAutoScrollBtn""#) && index.contains(r#"id="logExportBtn""#) && index.contains(r#"id="logClearBtn""#),
+        "Logs page must expose pause/play autoscroll, export, and clear controls"
+    );
+    assert!(
+        !index.contains(r#"id="updateBtn""#),
+        "disabled OTA update controls must not be shown in the operator dashboard"
+    );
+    assert!(
+        index.contains(r#"name="nexus-bs-radioid-endpoint""#),
+        "dashboard must expose the RadioID endpoint as a configurable document setting"
+    );
+    assert!(
+        index.contains(r#"content="/api/radioid""#),
+        "RadioID lookup must use the same-origin dashboard proxy to avoid browser CORS failures"
+    );
+    assert!(
         app.contains(r#"fetch("/api/system""#),
         "external dashboard must keep using the core-owned system API"
+    );
+    assert!(
+        app.contains(r#"fetch("/api/site""#) && app.contains("SITE_REFRESH_MS"),
+        "external dashboard must read RF/cell/timeslot state from the core-owned site API"
+    );
+    assert!(
+        app.contains(r#"fetch("/api/snapshot""#) && app.contains("SNAPSHOT_REFRESH_MS"),
+        "external dashboard must periodically reconcile active calls from the core-owned snapshot API"
+    );
+    assert!(
+        app.contains(r#"fetchDashboardJson("/api/calls""#)
+            && app.contains("CALLS_REFRESH_MS = 1000")
+            && app.contains("CALLS_FETCH_TIMEOUT_MS"),
+        "active calls and speaker state must reconcile once per second through the lightweight calls API with a bounded fetch"
+    );
+    assert!(
+        app.contains("CALLS_FETCH_TIMEOUT_MS")
+            && app.contains("function fetchDashboardJson")
+            && app.contains("callStartedMsFromPayload")
+            && app.contains("reusesEndedCall")
+            && app.contains("speakerChanged")
+            && app.contains("callerChanged"),
+        "active-call polling must not remain blocked and reused TG91 call IDs must reset speaker/start state from snapshots"
+    );
+    assert!(
+        app.contains("setInterval(renderLiveTick, 1000)") && !app.contains("setInterval(renderAll, 1000)"),
+        "the browser must not redraw the whole dashboard every second just to tick call duration and uptime"
+    );
+    assert!(
+        !app.contains("renderCurrentFloor")
+            && app.contains("activePage: \"system\"")
+            && app.contains("pageScroll: new Map()")
+            && app.contains("function preserveActivePageScroll")
+            && app.contains("restorePageScroll(page, 0)")
+            && app.contains(r#"state.activePage === "logs" && state.logAutoScroll"#),
+        "dashboard tab changes and live renders must preserve per-page scroll without stale Current Floor code or hidden log autoscroll"
     );
     assert!(
         app.contains(r#"/ws`"#),
         "external dashboard must keep using the core-owned WebSocket endpoint"
     );
     assert!(
+        app.contains("RADIOID_MIN_INTERVAL_MS") && app.contains("RADIOID_MAX_QUEUE"),
+        "RadioID lookup must be rate-limited and bounded"
+    );
+    assert!(
+        app.contains("localStorage") && app.contains("RADIOID_CACHE_TTL_MS") && app.contains("nexus-bs.radioid.cache.v2"),
+        "RadioID lookup must use a persistent browser cache with a version that can invalidate stale payload shape"
+    );
+    assert!(
+        app.contains("function callMode") && app.contains(r#"label: "group""#),
+        "group calls must not be rendered as duplex calls"
+    );
+    assert!(
+        app.contains("function coreHealth") && app.contains("CORE_RECONNECT_GRACE_MS"),
+        "Core online/offline status must be debounced across WebSocket reconnects and HTTP health"
+    );
+    assert!(
+        index.contains(r#"id="railConsoleState""#)
+            && index.contains(r#"id="railTelemetryState""#)
+            && app.contains("railConsoleState")
+            && app.contains("railTelemetryState"),
+        "rail status must be live data, not static LOCAL/LIVE labels"
+    );
+    assert!(
+        app.contains("function setIndustrialTone")
+            && app.contains("diagramRfState")
+            && app.contains("diagramBrewState")
+            && css.contains("device-map"),
+        "dashboard must keep the industrial device-map view wired to live status"
+    );
+    assert!(
+        app.contains(r#"fetch("/api/configs""#)
+            && app.contains(r#"fetch("/api/configs/activate""#)
+            && app.contains("method: \"DELETE\"")
+            && app.contains("function duplicateSelectedConfig"),
+        "dashboard config manager must list, activate, and duplicate flat TOML config profiles"
+    );
+    assert!(
+        app.contains(r#"restart: "/api/service/restart""#)
+            && app.contains(r#"shutdown: "/api/service/shutdown""#)
+            && app.contains(r#"stopgo: "/api/service/stop-go""#)
+            && app.contains("function requestServiceAction"),
+        "dashboard must call the core-owned service lifecycle API"
+    );
+    assert!(
+        app.contains(r#"fetch("/api/logs/clear""#)
+            && app.contains("function exportLogs")
+            && app.contains("Log${logTimestampForFile()}.log")
+            && app.contains("logAutoScroll"),
+        "dashboard logs must support clear, export, and pause/play autoscroll"
+    );
+    assert!(
+        app.contains("function callAgeSeconds") && index.contains("<th>Seconds</th>"),
+        "call duration display must be a live seconds counter"
+    );
+    assert!(
+        app.contains("const MCC_TO_ISO")
+            && app.contains("function flagForIso")
+            && app.contains("function callCountryHtml")
+            && app.contains("function callCountryCandidates")
+            && app.contains("recentGroupSpeakerForCall(call)")
+            && app.contains("function normalizedSpeakerIssi")
+            && app.contains(r#"Number(call.gssi || 0) === issi"#)
+            && app.contains("function countryByRadioId")
+            && app.contains("const radioIdCountry = countryByRadioId(value)")
+            && app.contains("payload.country")
+            && app.contains("function instantSpeakerHtml")
+            && app.contains("ISSI ${esc(issi)}")
+            && app.contains("case \"speaker_changed\"")
+            && app.contains("202: \"GR\"")
+            && app.contains("226: \"RO\"")
+            && app.contains("750: \"FK\"")
+            && css.contains(".active-call-board")
+            && css.contains(".call-country")
+            && css.contains(".call-ts")
+            && css.contains(".speaker-issi"),
+        "active calls must render aligned country flag/code, TS, and instant speaker ISSI using broad MCC-to-country support"
+    );
+    assert!(
+        app.contains("GROUP_CALL_HANGTIME_UI_MS") && app.contains("function endCall"),
+        "group calls must remain visible briefly through hangtime so speaker-change events can update the row"
+    );
+    assert!(
+        app.contains("function callInHangtime") && app.contains("last speaker"),
+        "hangtime rows must not be counted or rendered as a current active speaker"
+    );
+    assert!(
+        app.contains("const currentCalls = activeCalls()")
+            && app.contains("const overview = currentCalls.map")
+            && app.contains("caller_issi: msg.speaker_issi"),
+        "the primary Active Calls board must not render stale hangtime calls, and speaker changes must refresh the operational caller ISSI"
+    );
+    assert!(
+        app.contains("preserveHangtime") && app.contains("retainedHangtimeCalls"),
+        "snapshot reconciliation must not erase locally retained group-call hangtime rows"
+    );
+    assert!(
+        app.contains("function refreshCallIdentities") && app.contains("queueRadioIdRefresh"),
+        "active call identities must be retried after QSO start/speaker changes"
+    );
+    assert!(
+        index.contains(r#"id="bsUptime""#) && app.contains("bs_uptime_secs"),
+        "system page must show Nexus-BS process uptime, not only host uptime"
+    );
+    assert!(
+        index.contains(r#"id="hostUptime""#) && app.contains("host_uptime_secs"),
+        "system page must label host uptime separately"
+    );
+    assert!(
         !css.contains("letter-spacing: -"),
         "dashboard CSS should not use negative letter spacing"
     );
+    assert!(
+        css.contains("overflow-anchor: none")
+            && css.contains(".page:not(.active)")
+            && css.contains("--dash-page-pad")
+            && !css.contains("Legacy structural baseline"),
+        "dashboard CSS must use one explicit page visibility contract and disable scroll anchoring on live panels"
+    );
+    assert!(
+        css.contains("@media (pointer: coarse)") && css.contains("@media (min-resolution: 2dppx)"),
+        "dashboard CSS must include touch-target and high-DPI density handling"
+    );
+    for (line_no, line) in css.lines().enumerate() {
+        assert!(
+            !(line.contains("font-size") && line.contains("vw")),
+            "dashboard CSS must not scale font size from viewport width at line {}: {}",
+            line_no + 1,
+            line
+        );
+    }
 }

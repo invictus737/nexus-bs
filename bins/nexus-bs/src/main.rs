@@ -98,6 +98,22 @@ fn dashboard_static_dir(config_static_dir: Option<String>) -> Option<String> {
     })
 }
 
+fn dashboard_core_bind(config_bind: String) -> String {
+    std::env::var("NEXUS_BS_CORE_DASHBOARD_BIND")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or(config_bind)
+}
+
+fn dashboard_core_port(config_port: u16) -> u16 {
+    std::env::var("NEXUS_BS_CORE_DASHBOARD_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .unwrap_or(config_port)
+}
+
 fn start_telemetry_worker(cfg: SharedConfig, telemetry_source: TelemetrySource) -> thread::JoinHandle<()> {
     let config = cfg.config();
     let tcfg = config.telemetry.as_ref().unwrap();
@@ -195,6 +211,24 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
     // (battery). Falls back gracefully if nothing is available.
     if let Some(ref sink) = tsink {
         tetra_entities::sys_telemetry::spawn_sys_health(sink.clone());
+        let health = cfg.config().health.clone();
+        if health.enabled {
+            let (action_sink, action_source) = tetra_entities::health::health_action_channel();
+            tetra_entities::health::spawn_health_action_worker(action_source);
+            tetra_entities::health::spawn_health_monitor(
+                sink.clone(),
+                tetra_entities::health::HealthMonitorConfig {
+                    snapshot_interval: std::time::Duration::from_secs(health.snapshot_interval_secs),
+                    thresholds: tetra_entities::health::HealthThresholds {
+                        service_critical_tick_age_ms: health.core_stall_critical_ms,
+                    },
+                    restart_on_core_stall: health.restart_on_core_stall,
+                    restart_after_critical: std::time::Duration::from_secs(health.restart_after_critical_secs),
+                    restart_cooldown: std::time::Duration::from_secs(health.restart_cooldown_secs),
+                    action_sink: Some(action_sink),
+                },
+            );
+        }
     }
 
     // Always build control links — dashboard needs them even without external control server
@@ -326,7 +360,9 @@ fn main() {
         let has_dashboard = cfg.config().dashboard.is_some();
 
         if has_dashboard {
-            let dash_cfg = cfg.config().dashboard.clone().unwrap();
+            let mut dash_cfg = cfg.config().dashboard.clone().unwrap();
+            dash_cfg.bind = dashboard_core_bind(dash_cfg.bind);
+            dash_cfg.port = dashboard_core_port(dash_cfg.port);
             let editable_config_path = dashboard_editable_config_path(&args.config);
             if editable_config_path != args.config {
                 tracing::info!(

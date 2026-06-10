@@ -81,6 +81,9 @@ pub fn apply_dashboard_patch(src: CfgDashboardDto) -> Result<CfgDashboard, Strin
     if src.port == 0 {
         return Err("dashboard: port cannot be 0".to_string());
     }
+    if src.bind.trim().is_empty() {
+        return Err("dashboard: bind cannot be empty".to_string());
+    }
     // Validate source_dir if provided: must be an existing directory.
     if let Some(ref sd) = src.source_dir {
         validate_existing_dir("source_dir", sd)?;
@@ -94,7 +97,7 @@ pub fn apply_dashboard_patch(src: CfgDashboardDto) -> Result<CfgDashboard, Strin
             if u.trim().is_empty() {
                 return Err("dashboard: username cannot be empty".to_string());
             }
-            if p.is_empty() {
+            if p.trim().is_empty() {
                 return Err("dashboard: password cannot be empty".to_string());
             }
         }
@@ -202,5 +205,55 @@ mod tests {
         assert!(err.contains("not a directory"));
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dashboard_auth_accepts_username_and_password_together() {
+        let mut dto = dashboard_dto_with_static_dir(None);
+        dto.username = Some("admin".to_string());
+        dto.password = Some("change-this".to_string());
+
+        let cfg = apply_dashboard_patch(dto).expect("paired credentials should parse");
+
+        assert_eq!(cfg.username.as_deref(), Some("admin"));
+        assert_eq!(cfg.password.as_deref(), Some("change-this"));
+    }
+
+    #[test]
+    fn dashboard_auth_rejects_partial_credentials() {
+        let mut user_only = dashboard_dto_with_static_dir(None);
+        user_only.username = Some("admin".to_string());
+        let err = apply_dashboard_patch(user_only).expect_err("username without password must fail");
+        assert!(err.contains("set both"));
+
+        let mut password_only = dashboard_dto_with_static_dir(None);
+        password_only.password = Some("change-this".to_string());
+        let err = apply_dashboard_patch(password_only).expect_err("password without username must fail");
+        assert!(err.contains("set both"));
+    }
+
+    #[test]
+    fn dashboard_auth_rejects_blank_credentials() {
+        let mut blank_user = dashboard_dto_with_static_dir(None);
+        blank_user.username = Some("  ".to_string());
+        blank_user.password = Some("change-this".to_string());
+        let err = apply_dashboard_patch(blank_user).expect_err("blank username must fail");
+        assert!(err.contains("username"));
+
+        let mut blank_password = dashboard_dto_with_static_dir(None);
+        blank_password.username = Some("admin".to_string());
+        blank_password.password = Some("  ".to_string());
+        let err = apply_dashboard_patch(blank_password).expect_err("blank password must fail");
+        assert!(err.contains("password"));
+    }
+
+    #[test]
+    fn dashboard_rejects_empty_bind_address() {
+        let mut dto = dashboard_dto_with_static_dir(None);
+        dto.bind = "  ".to_string();
+
+        let err = apply_dashboard_patch(dto).expect_err("empty bind must fail");
+
+        assert!(err.contains("bind"));
     }
 }

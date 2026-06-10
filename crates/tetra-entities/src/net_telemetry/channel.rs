@@ -1,4 +1,4 @@
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, bounded};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded};
 use std::time::Duration;
 
 use crate::net_telemetry::events::TelemetryEvent;
@@ -25,7 +25,12 @@ impl TelemetrySink {
     /// or the bounded queue is full, so telemetry cannot block RF/core paths.
     #[inline]
     pub fn send(&self, event: TelemetryEvent) {
-        let _ = self.tx.try_send(event);
+        let queue_len = self.tx.len();
+        match self.tx.try_send(event) {
+            Ok(()) => crate::health::registry().mark_telemetry_sent(self.tx.len()),
+            Err(TrySendError::Full(_)) => crate::health::registry().mark_telemetry_dropped_full(queue_len),
+            Err(TrySendError::Disconnected(_)) => crate::health::registry().mark_telemetry_dropped_disconnected(),
+        }
     }
 }
 
@@ -125,6 +130,23 @@ mod tests {
 
         let mut received = 0usize;
         while source.try_recv().is_some() {
+            received += 1;
+        }
+        assert_eq!(received, TELEMETRY_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn telemetry_health_snapshots_are_bounded_and_non_blocking_on_overflow() {
+        let (sink, source) = telemetry_channel();
+        let snapshot = crate::health::registry().snapshot();
+
+        for _ in 0..(TELEMETRY_CHANNEL_CAPACITY + 16) {
+            sink.send(TelemetryEvent::HealthSnapshot(snapshot.clone()));
+        }
+
+        let mut received = 0usize;
+        while let Some(event) = source.try_recv() {
+            assert!(matches!(event, TelemetryEvent::HealthSnapshot(_)));
             received += 1;
         }
         assert_eq!(received, TELEMETRY_CHANNEL_CAPACITY);

@@ -1,4 +1,5 @@
 pub mod html;
+pub mod radioid;
 pub mod server;
 pub mod state;
 pub mod update_check;

@@ -1,5 +1,261 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-10 00:55 EEST - Brew GSSI zero-media watchdog for 226333 stalls
+
+Scope:
+
+- Protocol-adjacent Brew/CMCE interconnect robustness patch. No private call,
+  SDS, WAP, parrot, MM attach, LLC or UMAC slot-allocation behavior changed.
+- Field issue: GSSI 226333 transmission appeared dead after Brew delivered
+  `GROUP_TX` and CMCE/UMAC granted RF floor on TS2, but no Brew voice frame
+  arrived. The active network-origin group call then held the RF floor until
+  normal call timeout.
+- Added a Brew-side first-media watchdog:
+  - starts only after CMCE reports `NetworkCallReady`;
+  - counts only valid post-ready STE/TCH-S voice frames;
+  - sends existing `NetworkCallEnd` to CMCE after 3 seconds with zero valid
+    media, letting CMCE emit the normal network-speaker floor release path;
+  - resets the zero-media epoch on network speaker changes and hangtime circuit
+    reuse so previous speaker audio cannot mask a new silent speaker.
+
+ETSI clause discipline:
+
+- EN 300 392-2 group call setup/floor/release behavior remains in CMCE:
+  group setup/floor grant per clause 14.5.2.1 / 14.5.2.2.1, remote speaker
+  cease via `D-TX CEASED`, and actual group teardown via `D-RELEASE`.
+- This watchdog is a pragmatic Brew/IP interconnect robustness guard, not an
+  ETSI air-interface timer and not a formal certification claim.
+
+Verification:
+
+- `cargo test -p tetra-entities net_brew::entity::tests::network_group_zero_media_guard_releases_rf_floor --locked` passed.
+- `cargo test -p tetra-entities net_brew::entity::tests::network_group_zero_media_guard_ignores_call_after_valid_voice_frame --locked` passed.
+- `cargo test -p tetra-entities net_brew::entity::tests::network_group_hangtime_reuse_resets_zero_media_guard --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_network_group_speaker_change_updates_dashboard_after_rf_grant --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs test_network_group_call_end_from_active_network_speaker_enters_hangtime_without_release --locked` passed.
+- `git diff --check` passed.
+
+Deploy evidence:
+
+- Deployed with `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Remote target: `chris@192.168.1.179`, flat runtime directory
+  `/home/chris/nexus-bs`.
+- Core SHA256:
+  `1292f74bf3085a69ec1b41c15554065d474a4ae2504684f2ea261218400bd48f`.
+- Control-service SHA256:
+  `90173861c34833d5feecf1d5a3ec2fb93fe9acfafe01f17fec81a374946b24f1`.
+- Dashboard SHA256:
+  `6d60d6c3c56685c872a73d0d9149b7789163c0e975d6d62093338c14fbad1d3a`.
+- `nexus-bs@chris.service`, `nexus-bs-control@chris.service` and
+  `nexus-bs-dashboard@chris.service` active/running since
+  `2026-06-10 00:57:15 EEST`.
+- Post-deploy `/api/snapshot` returned overall health `ok`, Brew v1 online,
+  RF timing healthy and zero pending Brew critical commands.
+- Post-deploy log showed a Brew-origin 226333 call from ISSI 2261313 reached
+  `NetworkCallReady` and received `voice frame #1` 15 ms later; zero-media
+  watchdog did not trigger for that valid media case.
+
+## 2026-06-09 09:38 EEST - Dashboard Overview Last Heard with cached RadioID labels
+
+Scope:
+
+- Dashboard-only patch. No TETRA PDU, CMCE, UMAC, MM, LLC, SDS, WAP or RF
+  behavior changed.
+- Integrated the `Last Heard` feed into the Overview page.
+- Added browser-side RadioID resolution for ISSI display as `callsign - name`
+  when available, with ISSI retained as the secondary identifier.
+- Lookup is intentionally off-core:
+  - runs in the browser, not in the BS TETRA stack loop;
+  - uses localStorage cache with positive and negative TTLs;
+  - uses one lookup in flight, bounded queue length, request spacing and retry
+    backoff;
+  - keeps the endpoint configurable through the dashboard document metadata.
+- This preserves the current dashboard-decoupling direction: UI enrichment must
+  not add blocking CPU/network work to core RF/CMCE/UMAC operation.
+
+Verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- No protocol compliance claim is made by this dashboard-only change.
+
+Deploy evidence:
+
+- Deployed with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote target: `chris@192.168.1.179`, flat runtime directory
+  `/home/chris/nexus-bs`.
+- Deployed commit marker: `4ab64b2e`.
+- Core SHA256:
+  `c0b84b0687d7603365c97d8397f23edc32be7b909aaf45926cf932849c231893`.
+- Control-service SHA256:
+  `e27f15d836d4927b678c3068965fdfee90a02f28abb4092bbd5398187c4a2e02`.
+- `nexus-bs@chris.service` active/running since `2026-06-09 10:08:01 EEST`.
+- `nexus-bs-control@chris.service` active/running since
+  `2026-06-09 10:08:00 EEST`.
+- Remote asset verification passed:
+  `/home/chris/nexus-bs/dashboard/index.html` contains `overviewHeard`;
+  `/home/chris/nexus-bs/dashboard/assets/app.js` contains the bounded RadioID
+  queue/cache code.
+- Remote `/api/system` returned `product_user_agent = Nexus-BS/v0.1.61`,
+  CPU `Broadcom Cortex-A53 1GHz 64-bit`, runtime config
+  `/run/nexus-bs-chris/config.toml`, persistent config
+  `/home/chris/nexus-bs/config.toml`.
+
+Follow-up fix:
+
+- Field issue: browser showed `RadioID pending`.
+- Root cause confirmed by direct HTTP check: RadioID returns valid JSON, but the
+  public response does not provide browser-readable CORS access for the
+  dashboard page.
+- Added a same-origin dashboard endpoint `GET /api/radioid?id=ISSI`.
+- `crates/tetra-entities/src/net_dashboard/radioid.rs`
+  - Normalizes RadioID payload to `{ok, issi, callsign, name, missing}`.
+  - Uses positive and negative TTL cache.
+  - Allows only one outbound RadioID fetch at a time.
+  - Applies global request spacing and per-ISSI failure backoff.
+  - Runs under dashboard HTTP workers, not in RF/CMCE/UMAC stack execution.
+- `dashboard/index.html` now points `nexus-bs-radioid-endpoint` to
+  `/api/radioid`.
+- Browser cache/queue remains in place, now talking to the same-origin endpoint.
+
+Follow-up verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities net_dashboard::radioid --locked` passed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `git diff --check` passed.
+
+Follow-up deploy evidence:
+
+- Redeployed with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Core SHA256:
+  `f3d18a9afcdbbad39a96815ec84b6df8bb69202fb1b29afdcb2b225922a07a25`.
+- Control-service SHA256:
+  `d54b4fbdc34e87a498c199b55c056b0e5945e7c6da3800be068b879eb538ed79`.
+- `nexus-bs@chris.service` active/running since `2026-06-09 10:16:21 EEST`.
+- `nexus-bs-control@chris.service` active/running since
+  `2026-06-09 10:16:21 EEST`.
+- Remote `GET /api/radioid?id=2260618` returned
+  `{"callsign":"YO3TCO","issi":2260618,"missing":false,"name":"Cristian","ok":true}`.
+- Remote `GET /api/radioid?id=2260616` returned
+  `{"callsign":"YO3TCO","issi":2260616,"missing":false,"name":"Cristian","ok":true}`.
+- Remote asset verification confirmed
+  `<meta name="nexus-bs-radioid-endpoint" content="/api/radioid">`.
+
+Second follow-up fix:
+
+- Field issue: the `Calls` tab showed TG91 / WW group calls as `duplex`, and
+  call age could appear stale instead of updating dynamically.
+- Root cause:
+  - UI rendered mode as `simplex ? simplex : duplex`, but group calls carry
+    `simplex=false` in the dashboard state because they are neither private
+    simplex nor private duplex.
+  - UI used the snapshot `started_secs_ago` value directly when it was nonzero,
+    so age froze after snapshot instead of advancing from `_startedMs`.
+- `dashboard/assets/app.js`
+  - Added `callMode()` so `call_type="group"` renders as `group`, not `duplex`.
+  - Added `callAgeSeconds()` so the `Calls` tab always shows a live seconds
+    counter.
+  - Added `callTargetHtml()` so group targets render as `TG N`, while private
+    targets still use ISSI/RadioID resolution.
+  - If a dashboard client receives `speaker_changed` without a prior
+    `call_started` event, it now recreates a minimal group-call row from the
+    event instead of silently ignoring it.
+- `dashboard/index.html`
+  - Renamed the Calls tab duration column from `Age` to `Seconds`.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - Added `gssi` to `speaker_changed` websocket frames for cleaner client-side
+    recovery.
+
+Second follow-up verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `git diff --check` passed.
+
+Second follow-up deploy evidence:
+
+- Redeployed with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Core SHA256:
+  `12e5db4c5a176d60a6c954306b41ac2be1587d55155b2b9f61217d65f1c7bab1`.
+- Control-service SHA256:
+  `cb2c4dce278c31dd64f128f6a69107c100acfd6dab2de3c08b1e3c2bee853619`.
+- `nexus-bs@chris.service` active/running since `2026-06-09 10:32:36 EEST`.
+- `nexus-bs-control@chris.service` active/running since
+  `2026-06-09 10:32:36 EEST`.
+- Remote asset verification passed:
+  `/home/chris/nexus-bs/dashboard/assets/app.js` contains `function callMode`;
+  `/home/chris/nexus-bs/dashboard/index.html` contains `<th>Seconds</th>`.
+
+Third follow-up fix:
+
+- Field issue: dashboard dynamic updates still missed the current speaker,
+  missed speaker changes around repeated TG91/WW PTTs, and could leave callsign
+  unresolved if RadioID was not ready on first attempt.
+- Root cause:
+  - `call_started` group WS frames did not carry `active_speaker`, so the first
+    speaker depended on client inference.
+  - Brew/TG91 calls often emit `GROUP_IDLE` while CMCE/UMAC still keep hangtime;
+    the dashboard deleted the call row immediately, so the next
+    `speaker_changed` could arrive without a stable row.
+  - RadioID retry was passive and tied mostly to render-time lookup.
+- `crates/tetra-entities/src/net_dashboard/server.rs`
+  - `GroupCallStarted` WS frames now include `active_speaker=caller_issi`.
+  - `GroupCallEnded` WS frames now include `call_type="group"` and `gssi`.
+- `dashboard/assets/app.js`
+  - Keeps group call rows visible for a bounded hangtime UI window after
+    `call_ended`, so reused TG91 calls can update the same row on
+    `speaker_changed`.
+  - Cancels the hangtime cleanup when a speaker-change/reuse arrives.
+  - Adds `upsertCall()` so snapshots, starts and speaker changes merge state
+    instead of replacing/losing context.
+  - Adds priority RadioID refresh after call start and speaker change, with
+    retries at start, 3 s and 8 s. Browser retry remains bounded; server-side
+    `/api/radioid` still rate-limits and caches.
+  - Reduces browser failure retry delay to 30 s; server backoff remains in
+    place to protect RadioID and core operation.
+- No TETRA air-interface behavior changed.
+
+Third follow-up verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo fmt -p tetra-entities` completed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `git diff --check` passed.
+
+Third follow-up deploy evidence:
+
+- Redeployed with `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Core SHA256:
+  `5e9955c50064d8b8c8890ede0329d6226478882ea30752d9c11be3aef2009070`.
+- Control-service SHA256:
+  `275268118907945fa72d59e64eed8c8000628665e52f8427060b55cb0e5b56e2`.
+- `nexus-bs@chris.service` active/running since `2026-06-09 10:43:54 EEST`.
+- `nexus-bs-control@chris.service` active/running since
+  `2026-06-09 10:43:53 EEST`.
+- Remote asset verification passed:
+  `/home/chris/nexus-bs/dashboard/assets/app.js` contains
+  `GROUP_CALL_HANGTIME_UI_MS`, `refreshCallIdentities`, and `active_speaker`.
+
+## 2026-06-09 09:23 EEST - Exported FlowStation delta history report
+
+Scope:
+
+- Exported the Nexus-BS vs FlowStation function-delta report to
+  `NEXUS_BS_FLOWSTATION_DELTA_REPORT.md`.
+- The report records the comparison date and exact compared releases:
+  Nexus-BS `v0.1.61-1-g4ab64b2` / `4ab64b2`, FlowStation `v0.2.7` /
+  `c2f0ee6`, and secondary FlowStation reference `v0.3.0` / `fcac34e`.
+- No TETRA protocol behavior changed.
+- This is engineering history only, not a formal TETRA/ETSI certification
+  statement.
+
 ## 2026-06-09 08:05 EEST - P0 runtime config persistence and first dashboard decoupling step
 
 Scope:
@@ -386,6 +642,133 @@ Verification:
 - `cargo test -p tetra-entities --test test_cmce_bs simplex_p2p --locked` passed: 13 tests.
 - `cargo check -p tetra-entities --locked` passed.
 - `git diff --check` passed.
+
+## 2026-06-09 11:58 EEST - Dashboard auth hardening and split static protection
+
+Scope:
+
+- Dashboard/API/security-only patch. No TETRA air-interface protocol, CMCE,
+  UMAC/MAC, LLC, MM, SDS, Brew media or RF audio behavior was changed.
+- Added public core `GET /api/auth/status` for split dashboard auth checks. It
+  reports only `auth_required`, `session_valid` and the cookie name; it never
+  exposes configured credentials.
+- Hardened the separate `nexus-bs-dashboard` front-end so static dashboard
+  routes (`/`, SPA routes and `/assets/*`) consult the loopback core auth status
+  before serving files when `[dashboard] username/password` are configured.
+- Added HTTP security headers to split dashboard static/error responses and
+  brought core dashboard JSON/HTML helper responses under the same no-store,
+  no-frame, no-sniff and no-referrer policy.
+- Tightened dashboard config validation: `bind` cannot be empty, credentials
+  must be set as a pair, username cannot be blank, and password cannot be blank.
+- Updated README/example config wording for optional dashboard auth in split
+  deployment. This is automated hardening/verification, not formal security or
+  ETSI/TETRA certification.
+
+Verification:
+
+- `cargo fmt -p tetra-config -p tetra-entities -p nexus-bs-dashboard --check`
+  passed.
+- `cargo test -p tetra-config dashboard --locked` passed: 7 dashboard config
+  tests.
+- `cargo test -p tetra-entities dashboard_auth_status --locked` passed: 3
+  core auth-status tests.
+- `cargo test -p tetra-entities dashboard_session --locked` passed: 2 session
+  cookie/store tests.
+- `cargo test -p tetra-entities dashboard_security_headers --locked` passed.
+- `cargo test -p nexus-bs-dashboard --locked` passed: 11 split front-end auth,
+  network auth-probe and path tests.
+- `cargo check -p tetra-config -p tetra-entities -p nexus-bs-dashboard --locked`
+  passed.
+- `node --check dashboard/assets/app.js` passed.
+- `git diff --check` passed.
+
+Deploy verification:
+
+- Built locally only and deployed to `chris@192.168.1.179` with
+  `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Remote SHA-256 after deploy:
+  - core `4496d51cade28597ba46f381e09fa81fc2bd88faa4f2013b52973741b11220e1`
+  - control `2b86bcc924bd47dd6b106739b7d7a3bb0f9e3c51c77b29955f70bb9a59e1ff0c`
+  - dashboard `6d60d6c3c56685c872a73d0d9149b7789163c0e975d6d62093338c14fbad1d3a`
+- Remote services active/running after final deploy:
+  - `nexus-bs@chris.service` PID `114223`
+  - `nexus-bs-control@chris.service` PID `114208`
+  - `nexus-bs-dashboard@chris.service` PID `114240`
+- Public dashboard proxy `GET http://127.0.0.1:8080/api/auth/status` returned
+  `{"auth_required":false,"session_cookie":"fs_session","session_valid":true}`
+  for the current testing config, where dashboard auth is not enabled.
+- Public dashboard `/` returned security headers:
+  `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`,
+  `Referrer-Policy: no-referrer`,
+  `Content-Security-Policy: frame-ancestors 'none'; object-src 'none'; base-uri 'none'`,
+  and `Cache-Control: no-store`.
+- Public `/api/system` returned Nexus-BS `v0.1.61`, user-agent
+  `Nexus-BS/v0.1.61`, stack `v0.1.61-4ab64b2e-modified`, runtime config
+  `/run/nexus-bs-chris/config.toml`, persistent config
+  `/home/chris/nexus-bs/config.toml`, CPU `Broadcom Cortex-A53 1GHz 64-bit`,
+  and SDR `SXceiver`.
+
+## 2026-06-09 12:20 EEST - External dashboard RF Ops/Traffic revamp
+
+Scope:
+
+- Dashboard/API-only observability patch. No TETRA air-interface protocol,
+  CMCE, UMAC/MAC scheduling, LLC/MM/SDS, RF audio or call-control behavior was
+  changed.
+- Ran a small read-only architect/QA swarm for eBTS field-dashboard content and
+  live-refresh correctness. Integrated findings locally; agents did not modify
+  RF/protocol code.
+- Added read-only `GET /api/site` in the core dashboard API. It reads existing
+  `SharedConfig` and cached dashboard telemetry only:
+  - MCC/MNC, LA, colour code, carrier, band, duplex spacing, derived TX/RX
+    frequencies and configured SoapySDR TX/RX/sample-rate/gains.
+  - Energy economy config label (`auto`, `StayAlive`, `EG1..EG7`).
+  - Current TS1-TS4 operational summary based on existing dashboard call state.
+  - Cached RF health/quality snapshots already carried by telemetry.
+- Revamped external dashboard assets in `dashboard/`:
+  - System/RF Ops page now shows host, carrier plan, RF device, signal quality,
+    and timeslot cards.
+  - Traffic page now has Current Floor, active calls, live radios, and integrated
+    Last Heard with cached RadioID resolution.
+  - Settings/Admin page now shows live cell/RF config values plus explicitly
+    disabled update/admin status.
+  - About page keeps Nexus-BS identity, version-by-runtime, Chris YO3TCO project
+    line, and BlueStation/FlowStation/SXCEIVER/all-contributors credits.
+- Fixed dashboard dynamic-refresh correctness:
+  - `/api/calls` reconciliation no longer clears `state.radios`, so the radio
+    table and registered count do not flicker between full snapshots.
+  - Core online/offline status is debounced across WebSocket reconnects and
+    recent successful REST polls; short WS reconnects no longer flash OFFLINE.
+  - Group-call hangtime is labelled as hangtime and excluded from active-call
+    counts. Last speaker is shown separately from current active speaker.
+  - `speaker_changed` no longer mutates the original group-call caller ISSI.
+  - Current Floor fields now render target, speaker, call ID, TS, call seconds,
+    and speaker seconds.
+  - `ts_voice`, `tx_visual`, `tx_quality`, `sdr_health`, and `sys_health` WS
+    events are consumed by the external dashboard state.
+  - RadioID lookup UI now distinguishes queued/pending/retrying/not-found while
+    keeping bounded queueing, localStorage cache and rate limiting.
+
+Verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo fmt -p tetra-entities` passed/applied formatting.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest_is_coherent --locked`
+  passed.
+- `cargo test -p tetra-entities dashboard_unknown_api_paths_are_reserved_from_spa_fallback --locked`
+  passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `cargo check -p nexus-bs-dashboard --locked` passed.
+- `git diff --check` passed.
+
+Next:
+
+- Deploy with `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Verify on `chris@192.168.1.179`:
+  - `curl http://127.0.0.1:8080/api/site`
+  - `curl http://127.0.0.1:8080/api/calls`
+  - systemd split remains: core on loopback API, external dashboard on `:8080`,
+    separate CPU affinity/cgroup from the RF/TETRA core.
 
 Next RF gate:
 
@@ -13049,3 +13432,1204 @@ Residual deploy observations:
 - The current watchdog proves RF router tick progress. It still does not prove
   independent helper-thread liveness for dashboard/control/telemetry/Brew; this
   remains tracked in `MISSION_READINESS.md`.
+
+## 2026-06-09 10:55 EEST - Dashboard active-call reconciliation and BS uptime
+
+Scope:
+
+- Dashboard/API-only observability patch. No CMCE, UMAC, MM, SDS, LLC, MAC or
+  RF scheduling behavior was changed.
+- Added `GET /api/snapshot`, reusing the same in-memory state payload that is
+  sent on WebSocket connect: registered MS list, active calls, log ring,
+  last-heard ring, Brew state and health snapshots.
+- Updated the external dashboard to poll `/api/snapshot` every 3 seconds as a
+  cheap reconciliation path when very short call events are missed or the
+  browser WebSocket stream briefly lags.
+- Preserved local group-call hangtime rows during snapshot reconciliation so the
+  UI does not erase the row between short Brew/TG91 talkspurts.
+- Added Nexus-BS process uptime as `bs_uptime_secs` in `/api/system`, while
+  keeping host uptime as `host_uptime_secs` and the legacy `uptime_secs`.
+- Added `BS Uptime` and `Host Uptime` fields to the System page; both tick in
+  the browser from the last `/api/system` sample.
+
+Verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo fmt -p tetra-entities` passed/applied formatting.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `cargo test -p tetra-entities dashboard_unknown_api_paths_are_reserved_from_spa_fallback --locked`
+  passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+## 2026-06-09 11:14 EEST - Hard split dashboard process from RF core
+
+Scope:
+
+- Runtime architecture patch. No TETRA air-interface protocol, CMCE call
+  control, MAC/UMAC scheduling, LLC/MM/SDS or RF audio behavior was changed.
+- Added new workspace binary/package `nexus-bs-dashboard`.
+- `nexus-bs-dashboard` serves public browser assets and proxies `/api/*`, `/ws`,
+  `/login` and `/logout` to the core dashboard API over loopback.
+- Added environment overrides in `nexus-bs`:
+  - `NEXUS_BS_CORE_DASHBOARD_BIND`
+  - `NEXUS_BS_CORE_DASHBOARD_PORT`
+- Updated systemd split:
+  - `nexus-bs@USER.service`: RF/TETRA core, loopback dashboard API on
+    `127.0.0.1:18080`, `CPUAffinity=0 1 2`, `CPUWeight=900`.
+  - `nexus-bs-dashboard@USER.service`: public dashboard front-end on
+    `0.0.0.0:8080`, proxy target `127.0.0.1:18080`, `CPUAffinity=3`,
+    `CPUWeight=20`, `Nice=5`, `MemoryMax=192M`.
+  - `nexus-bs-control@USER.service`: local control service retained separately,
+    `CPUAffinity=3`, `CPUWeight=50`, `Nice=5`.
+- Updated deploy script to build and deploy `nexus-bs-dashboard`, install all
+  three unit files, run `systemctl daemon-reload`, and restart
+  control -> core -> dashboard.
+- Updated example config and README: recommended deployment uses `[dashboard]`
+  as loopback-only core API (`127.0.0.1:18080`) and the separate dashboard
+  service as the public web UI.
+
+Verification:
+
+- `cargo check -p nexus-bs-dashboard --offline` updated `Cargo.lock` for the new
+  workspace member without downloading dependencies.
+- `cargo test -p nexus-bs-dashboard --locked` passed.
+- `cargo check -p nexus-bs -p nexus-bs-dashboard --locked` passed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `cargo test -p tetra-entities dashboard_unknown_api_paths_are_reserved_from_spa_fallback --locked`
+  passed.
+- `node --check dashboard/assets/app.js` passed.
+- `sh -n scripts/nexus-bs-test-deploy.sh` passed.
+- `git diff --check` passed.
+
+Deploy verification:
+
+- Built locally only and deployed to `chris@192.168.1.179` with
+  `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Remote service state after deploy:
+  - `nexus-bs@chris.service` active/running, main PID `98791`.
+  - `nexus-bs-control@chris.service` active/running, main PID `98777`.
+  - `nexus-bs-dashboard@chris.service` active/running, main PID `98807`.
+- Remote SHA-256:
+  - core `3ddbd52504979bcda32cfd679e8f7d2f16ac4026e3881296ecfa6efc54ac500c`
+  - control `d6c2678f29ec64342a5a16a0b93202bc9a1e8590138dab0059f9014449185f45`
+  - dashboard `f046e4e70e77c17b432b9c5947e623fbaaecd390bda1262ed743f74fdc60647f`
+- Remote socket verification:
+  - `127.0.0.1:18080` is owned by `nexus-bs` PID `98791`.
+  - `0.0.0.0:8080` is owned by `nexus-bs-dashboard` PID `98807`.
+- Remote cgroup/affinity verification:
+  - core: `CPUAffinity=0-2`, `CPUWeight=900`, `MemoryMax=512M`.
+  - dashboard: `CPUAffinity=3`, `CPUWeight=20`, `Nice=5`, `MemoryMax=192M`.
+  - control: `CPUAffinity=3`, `CPUWeight=50`, `Nice=5`.
+- Public front-end verification through `http://127.0.0.1:8080/` returned the
+  external dashboard HTML.
+- Public API proxy verification through `http://127.0.0.1:8080/api/calls`
+  returned `type=calls`, `calls=1`, `brew_online=true`, `brew_version=1`; the
+  loopback core API at `http://127.0.0.1:18080/api/calls` returned matching
+  call count.
+- Enabled `nexus-bs-dashboard@chris.service` for boot:
+  `systemctl is-enabled` returned `enabled`.
+
+Deploy verification:
+
+- Built locally only and deployed to `chris@192.168.1.179` with
+  `RUN_TESTS=0 POST_START_SLEEP=8 scripts/nexus-bs-test-deploy.sh`.
+- Remote services restarted successfully at `2026-06-09 10:57:03 EEST`:
+  `nexus-bs@chris.service` main PID `96123`,
+  `nexus-bs-control@chris.service` main PID `96110`.
+- Remote core binary SHA-256:
+  `cc209965746a83c34488b96d763245005802b7660f57de01ed58fe2f2c07790c`.
+- Remote control-service SHA-256:
+  `beaf8f1563265ece4f5c70ff4db9a0a87c7e0ce72a6b6d46e56aad095d278c15`.
+- Deployed dashboard assets contain `SNAPSHOT_REFRESH_MS` and `bsUptime`.
+- Live `/api/system` returned:
+  - `product_version_tag=v0.1.61`
+  - `stack_version=v0.1.61-4ab64b2e-modified`
+  - `bs_uptime_secs=29`
+  - `host_uptime_secs=602896`
+  - `cpu_model=Broadcom Cortex-A53 1GHz 64-bit`
+  - `sdr_name=SXceiver`
+- Live `/api/snapshot` returned:
+  - `type=snapshot`
+  - `ms=3`
+  - `calls=1`
+  - `last_heard=1`
+  - `brew_online=true`
+  - `brew_version=1`
+- A live snapshot sample showed a recent group call row:
+  `call_id=6`, `gssi=91`, `active_speaker=2357620`,
+  `started_secs_ago=7`, with last-heard timestamps `10:57:44` and `10:57:34`.
+
+## 2026-06-09 11:04 EEST - One-second active-call dashboard refresh
+
+Scope:
+
+- Dashboard/API-only observability patch. No TETRA air-interface protocol,
+  CMCE call control, MAC/UMAC scheduling, LLC/MM/SDS or RF audio behavior was
+  changed.
+- Added lightweight `GET /api/calls` for one-second active-call reconciliation:
+  it returns only active calls, last-heard summary and Brew status from the
+  in-memory dashboard state.
+- Updated the browser dashboard to poll `/api/calls` every second so Active
+  Calls and `active_speaker`/who-is-speaking update at one-second cadence.
+- Reduced full `/api/snapshot` polling from every 3 seconds to every 10 seconds;
+  it remains a broader reconciliation path for radios/logs/last-heard.
+- Removed the whole-dashboard `renderAll()` interval. The one-second UI tick now
+  updates only call duration cells and System uptime labels, avoiding expensive
+  table rebuilds.
+
+Important architecture note:
+
+- The dashboard static assets are external to the core binary and dashboard
+  HTTP/WS handling runs on separate threads, but the dashboard API is still
+  inside the `nexus-bs` process. A fully isolated dashboard binary/process with
+  its own systemd CPU affinity remains a separate P1 architecture item.
+
+Verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo fmt -p tetra-entities` passed/applied formatting.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+  passed.
+- `cargo test -p tetra-entities dashboard_unknown_api_paths_are_reserved_from_spa_fallback --locked`
+  passed.
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+## 2026-06-09 12:32 EEST - Dashboard visual polish pass
+
+Scope:
+
+- Dashboard UI-only polish pass. No CMCE, MM, MAC/UMAC, LLC, SDS, WAP, Brew
+  routing, RF audio, or air-interface protocol behavior was changed.
+- Integrated the two web-design audit findings into the external dashboard
+  assets:
+  - tightened the Nexus-BS operations-console visual hierarchy;
+  - made Traffic collapse before medium-width overflow;
+  - removed global table-cell nowrap so subscriber identities, destinations and
+    activity fields can fit better;
+  - added safer ellipsis constraints for topbar, panel headers, nav labels and
+    status tiles;
+  - capped long config/Soapy fields and log rows so they do not stretch cards;
+  - removed browser-dependent `:has()` status styling and now relies on explicit
+    JS state classes;
+  - changed narrow layouts so the sidebar and topbar no longer depend on a
+    fragile hard-coded sticky offset.
+
+Verification:
+
+- `node --check dashboard/assets/app.js` passed.
+- `cargo test -p tetra-entities external_dashboard_asset_manifest_is_coherent --locked`
+  passed.
+- `cargo test -p nexus-bs-dashboard --locked` passed.
+- `git diff --check` passed.
+- CSS scan confirmed no `:has()`, `:contains()` or negative letter-spacing in
+  `dashboard/assets/styles.css`.
+
+Deploy verification:
+
+- Deployed directly to `chris@192.168.1.179` with
+  `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Remote services restarted successfully at `2026-06-09 12:33:14 EEST`:
+  - `nexus-bs@chris.service` main PID `122267`;
+  - `nexus-bs-control@chris.service` main PID `122252`;
+  - `nexus-bs-dashboard@chris.service` main PID `122282`.
+- Remote dashboard binary SHA-256:
+  `6d60d6c3c56685c872a73d0d9149b7789163c0e975d6d62093338c14fbad1d3a`.
+- Public dashboard check from the workstation returned `HTTP 200` for
+  `http://192.168.1.179:8080/`.
+- Remote `/api/system` returned `product_user_agent=Nexus-BS/v0.1.61`,
+  `product_version_tag=v0.1.61`, `cpu_model=Broadcom Cortex-A53 1GHz 64-bit`,
+  `sdr_name=SXceiver`, and live process uptime.
+- Remote `/api/calls` returned `brew_online=true`, `brew_version=1`, and a live
+  group call row on GSSI 91, proving the dashboard has current live data to
+  render.
+- Remote CSS asset contains the new responsive `.traffic-grid table` rules and
+  has no `:has()` selectors.
+
+## 2026-06-09 13:09 EEST - Field log check: apparent group-call hang on GSSI 226777
+
+Scope:
+
+- Runtime log analysis only. No CMCE, MM, MAC/UMAC, LLC, SDS, WAP, Brew routing,
+  RF audio, dashboard, or config files were changed.
+
+Findings:
+
+- The reported apparent hang was observed on GSSI `226777`.
+- Remote config currently treats only `[1,90]` and `226333` as local-only
+  `local_ssi_ranges`; therefore `226777` is Brew-routable by design.
+- `call_id=75` from local ISSI `2260616` to GSSI `226777` started at `13:06:19`,
+  sent first accepted UL media, then released after tail-drained `D-TX CEASED`
+  and `D-RELEASE`.
+- `call_id=77` was not a local loop: it was a Brew/network-origin call from ISSI
+  `2260136` to GSSI `226777`. Local MS snapshot showed registered local ISSIs
+  `2260616`, `2260618`, and `2260082`; `2260136` was not local.
+- After Brew `GROUP_IDLE` for `call_id=77` at `13:07:45`, local ISSI `2260616`
+  requested floor on the same maintained call at `13:07:47`, was granted, and
+  forwarded to TetraPack as a new local Brew UUID.
+- The local over sent `GROUP_IDLE` at `13:07:56`; the maintained group call
+  expired hangtime and closed DL/UL TS2 at `13:08:01`.
+
+Conclusion:
+
+- The evidence does not show a permanently stuck BS call. It shows Brew-routed
+  group-call hangtime and network/local retake behavior on `226777`.
+- For strictly local RF group-call tests, use `226333` under the current config.
+  Testing on `226777` exercises Brew/TetraPack behavior and may stay open until
+  network `GROUP_IDLE` plus group hangtime expiry.
+
+## 2026-06-09 13:50 EEST - Brew/GSSI group-call lifecycle hardening before self-healing stage
+
+Scope:
+
+- Protocol repair for Brew-routed GSSI group calls only.
+- CMCE = call control on the TETRA RF side: owns D-SETUP, floor grant/cease and
+  D-RELEASE state.
+- Brew = external TetraPack/interconnect bridge: carries GROUP_TX/GROUP_IDLE,
+  voice frames, SDS and subscriber updates.
+- UMAC = lower RF scheduling/floor/media activation owner for assigned
+  timeslots.
+- No private simplex/P2P, duplex, parrot, MM attach, LLC timers, WAP, dashboard
+  UI, or encryption behavior was intentionally changed.
+
+ETSI clause-scoped basis:
+
+- EN 300 392-2 clause 14.5.2.1: group-call setup uses D-SETUP before the MS
+  treats the group call as established on RF.
+- EN 300 392-2 clause 14.5.2.2.1: D-TX GRANTED is the RF floor-control edge
+  before U-plane media is accepted for a speaker.
+- EN 300 392-2 clause 14.5.2.3: group-call teardown uses D-RELEASE; ordinary
+  floor idle is separate from call release.
+- EN 300 392-2 clause 23.8.5 traffic-tail ordering is preserved by keeping
+  existing reporter/tail-drain release paths.
+- This is clause-scoped engineering evidence only, not formal TETRA
+  certification.
+
+Implemented repair:
+
+- `BrewWorker::enqueue_event()` now applies lossless back-pressure only for
+  call/subscriber lifecycle events that can corrupt CMCE state if dropped
+  (`GROUP_TX`, `GROUP_IDLE`, circuit setup/connect/release, connected and
+  subscriber lifecycle). Voice, SDS, DTMF and server-error events remain bounded
+  so the network worker is not stalled by non-lifecycle flood.
+- `BrewEntity` no longer drops outbound critical lifecycle commands when the
+  worker command channel is full. It keeps a local retry queue for critical
+  commands and flushes it every tick.
+- `BrewEntity` caps non-critical command backlog with a media watermark so
+  accepted voice/RSSI/DTMF traffic cannot sit ahead of `GROUP_IDLE`/release for
+  an unbounded time.
+- `BrewEntity` now distinguishes a full worker channel from a disconnected
+  worker channel. Full means retry; disconnected means mark Brew down and avoid
+  an impossible-to-flush critical backlog.
+- CMCE network-origin group-call setup and speaker-change readiness remains
+  RF-reporter gated: `NetworkCallReady` is emitted only after D-SETUP or
+  D-TX GRANTED has actually been reported as transmitted.
+- New CMCE edge case: if Brew sends `GROUP_IDLE` before the RF-ready reporter
+  fires, CMCE cancels pending readiness and releases the reserved group circuit
+  with D-RELEASE instead of emitting false D-TX CEASED/FloorReleased and leaving
+  the call in hangtime.
+
+Verification:
+
+- `cargo test -p tetra-entities --lib net_brew::entity --locked` passed
+  (`21` tests).
+- `cargo test -p tetra-entities --lib net_brew --locked` passed (`35` tests).
+- `cargo test -p tetra-entities --test test_cmce_bs network_group --locked`
+  passed (`14` tests).
+- `cargo check -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
+Deploy verification:
+
+- Deployed directly to `chris@192.168.1.179` with
+  `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Build was local; no Rust compilation was performed on the Pi/TetraHS.
+- Remote deploy output:
+  - core binary SHA-256:
+    `5c873df9a56f7291f632f356d3e9727fb517883ab58549126cba01e9a6fd168e`;
+  - control binary SHA-256:
+    `bdfe4d58fe7bbac2da23eb2cf2874ed78ec994a9ca1593e2a2c46f01233171e7`;
+  - dashboard binary SHA-256:
+    `6d60d6c3c56685c872a73d0d9149b7789163c0e975d6d62093338c14fbad1d3a`.
+- Remote services restarted successfully at `2026-06-09 13:52:22 EEST`:
+  - `nexus-bs@chris.service` main PID `150039`;
+  - `nexus-bs-control@chris.service` main PID `150025`;
+  - `nexus-bs-dashboard@chris.service` main PID `150054`.
+- Public dashboard API check returned `/api/system` with
+  `product_user_agent=Nexus-BS/v0.1.61`, `cpu_model=Broadcom Cortex-A53 1GHz
+  64-bit`, `sdr_name=SXceiver`, runtime config
+  `/run/nexus-bs-chris/config.toml`, and live BS uptime.
+- Public `/api/calls` returned `brew_online=true`, `brew_version=1`, and a live
+  group-call row on GSSI `91`, proving the deployed dashboard/core path is
+  receiving live call telemetry after restart.
+
+Focused new/updated tests:
+
+- Critical `GROUP_IDLE` is deferred instead of dropped when the worker command
+  channel is full.
+- Non-critical media backlog is capped before `GROUP_IDLE`, bounding lifecycle
+  latency.
+- Worker channel disconnect does not leave unflushable critical backlog.
+- Network `GROUP_IDLE` before RF-ready releases with D-RELEASE and does not
+  emit false floor idle.
+
+Next stage after deploy/test:
+
+- Implement the separate self-healing/health-monitor goal as a sidecar-style
+  architecture, not mixed into this protocol repair: passive health snapshots
+  first, then bounded entity-owned remediation actions for service, voice, SDS,
+  P2P, congestion and RF desynchronization.
+
+## 2026-06-09 14:01 EEST - Self-healing P0 observe-only health monitor
+
+Scope:
+
+- First self-healing stage only: passive health observability.
+- No automatic RF, CMCE, UMAC, SDS, P2P, Brew, service restart, or PHY recovery
+  action is enabled in this patch.
+- No TETRA air-interface PDU, timer, field, call-control state transition, SDS
+  OTA delivery semantic, encryption path, or WAP behavior was intentionally
+  changed.
+
+Implemented:
+
+- Added `crates/tetra-entities/src/health/`:
+  - `HealthDomain`, `HealthSeverity`, `HealthMetric`,
+    `HealthDomainSnapshot`, `HealthSnapshot`, `HealthActionRecord`;
+  - global `HealthRegistry` backed by atomics;
+  - 1 Hz `health-monitor` sidecar thread that emits through the existing
+    bounded telemetry channel.
+- Added `TelemetryEvent::HealthSnapshot`.
+- Instrumented the router RF stack loop with:
+  - tick count;
+  - last tick age;
+  - last loop duration;
+  - current/max message queue length.
+- Instrumented Brew with:
+  - connected/disconnected state and server version;
+  - worker command queue length;
+  - pending critical command backlog;
+  - non-critical command drop counter.
+- Dashboard caches and serializes the latest health snapshot in the existing
+  snapshot/site/WS telemetry path. Serialization keeps the existing
+  clone-then-release-lock pattern so large health JSON does not hold dashboard
+  state locks while rendering.
+
+Technical intent:
+
+- Health monitor is a non-blocking observer. Hot paths only store atomics or
+  send through bounded telemetry.
+- P1 remediation must be entity-owned and bounded: the monitor may request
+  actions, but CMCE/UMAC/PHY/Brew must execute them through their existing safe
+  procedures. It must not mutate protocol tables directly.
+
+Verification:
+
+- `cargo test -p tetra-entities --lib health --locked` passed.
+- `cargo test -p tetra-entities --lib
+  net_telemetry::channel::tests::telemetry_health_snapshots_are_bounded_and_non_blocking_on_overflow
+  --locked` passed.
+- `cargo test -p tetra-entities --lib
+  net_dashboard::server::tests::dashboard_caches_and_serializes_health_snapshot
+  --locked` passed.
+- `cargo test -p tetra-entities --lib net_brew::entity --locked` passed
+  (`21` tests).
+- `cargo check -p tetra-entities -p nexus-bs --locked` passed.
+- `git diff --check` passed.
+
+Deploy verification:
+
+- Deployed directly to `chris@192.168.1.179` with
+  `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- Remote services restarted successfully at `2026-06-09 14:02:38 EEST`:
+  - `nexus-bs@chris.service` main PID `154291`;
+  - `nexus-bs-control@chris.service` main PID `154275`;
+  - `nexus-bs-dashboard@chris.service` main PID `154305`.
+- Public `/api/snapshot` returned `last_health.overall=ok` with:
+  - service `tick_age_ms=12`, `last_loop_us=15001`, queue length `0`;
+  - Brew connected, server version `1`, command queue length `0`,
+    pending critical command backlog `0`, non-critical drops `0`.
+- Public `/api/site` returned the same health snapshot under `rf_cached.health`.
+
+## 2026-06-09 14:09 EEST - Health config plumbing and wording cleanup
+
+Scope:
+
+- Configuration and observability cleanup only.
+- No automatic remediation, service restart, RF resync, call release, SDS retry,
+  P2P, group-call, WAP, MM attach, LLC, UMAC scheduling, or PHY protocol
+  behavior was changed.
+
+Implemented:
+
+- Added `[health]` configuration in `tetra-config`:
+  - `enabled = true` by default;
+  - `snapshot_interval_secs = 1`;
+  - `core_stall_critical_ms = 10000`;
+  - `restart_on_core_stall = false`;
+  - `restart_after_critical_secs = 30`;
+  - `restart_cooldown_secs = 600`.
+- Health monitor startup now respects `[health].enabled` and
+  `snapshot_interval_secs`.
+- Example config documents that health is observe-only in Nexus-BS v0.1.61 and
+  that automatic restart is intentionally default-off.
+- Dashboard `/api/site` now exposes the configured health settings alongside
+  the live health snapshot.
+- Reworded comments from "mission-critical health snapshot" to "operational
+  health snapshot" to avoid implying formal certification or validated
+  remediation behavior.
+
+Verification:
+
+- `cargo test -p tetra-config --lib health --locked` passed.
+- `cargo test -p tetra-config --lib bluestation::parsing::tests::test_health
+  --locked` passed.
+- `cargo test -p tetra-entities --lib health --locked` passed.
+- `cargo test -p tetra-entities --lib
+  net_dashboard::server::tests::dashboard_caches_and_serializes_health_snapshot
+  --locked` passed.
+- `cargo test -p tetra-entities --lib
+  net_telemetry::channel::tests::telemetry_health_snapshots_are_bounded_and_non_blocking_on_overflow
+  --locked` passed.
+- `cargo check -p tetra-config -p tetra-entities -p nexus-bs --locked` passed.
+- `git diff --check` passed.
+
+## 2026-06-09 14:29 EEST - Self-healing P1 health domains and bounded action bus
+
+Scope:
+
+- Added self-healing infrastructure and health observability only.
+- No CMCE private-simplex setup/release logic, parrot media logic, SDS routing
+  rules, MM attach semantics, LLC timers, or UMAC grant priority behavior was
+  changed.
+- Clause-scoped ETSI policy remains: CMCE/SDS/UMAC observations do not mutate
+  protocol state from the health monitor. Future remediation must use existing
+  EN 300 392-2 procedures such as D-RELEASE/D-DISCONNECT, D-SDS-DATA/D-STATUS
+  report handling, and MAC/UMAC owned queue/backpressure paths. No formal
+  certification is claimed.
+
+Implemented:
+
+- Added bounded health action bus:
+  - capacity `64`, `try_send` only;
+  - action backlog/drop counters;
+  - recent action ring bounded to `16` records;
+  - active action currently limited to `RestartService`.
+- Wired `[health]` core-stall policy into the monitor:
+  - `core_stall_critical_ms` feeds the service critical threshold;
+  - `restart_on_core_stall = false` remains the default;
+  - when explicitly enabled, restart requires persistent critical stall,
+    `restart_after_critical_secs`, and `restart_cooldown_secs`.
+- Extended health snapshots with domains:
+  - `service`: RF stack loop tick age, loop duration, message queue length;
+  - `telemetry`: bounded telemetry queue length and drops;
+  - `brew`: backhaul connected/version, command queue, critical backlog, drops;
+  - `voice`: CMCE group-call active/pending/floor waiter counts;
+  - `p2p`: CMCE private-call active/pending/release/floor waiter counts;
+  - `sds`: live SDS queue, pending SDS actions, SDS-TL context pressure;
+  - `congestion`: UMAC DL queue, RA ACK, TMA report and private UL media
+    pressure;
+  - `rf`: Soapy/SXceiver rxtx duration, TX-late and RX-loss counters.
+- Added non-blocking owner-side instrumentation:
+  - `TelemetrySink::send` now records sent/full/disconnected counters without
+    blocking;
+  - `CmceBs::tick_start` publishes CMCE and SDS stats after normal drains;
+  - `UmacBs::tick_start` publishes scheduler/TMA/private-media pressure after
+    normal finalization;
+  - Soapy RF timing updates the RF health counters at existing TX-late/RX-loss
+    points.
+- Updated example config wording to describe the expanded health domains while
+  keeping automatic restart explicit/default-off.
+
+Technical notes:
+
+- The health monitor does not call RF, CMCE, SDS, UMAC or Brew methods directly.
+- CMCE/SDS/UMAC/RF remediations beyond service restart are intentionally not
+  active yet; they require separate clause-scoped entity-owned actions and RF
+  field validation.
+- This gives Nexus-BS immediate detection/visibility for service, voice, SDS,
+  P2P, congestion and RF-desync symptoms, plus a safe default-off service
+  restart guard for persistent core-loop stalls.
+
+Verification:
+
+- `cargo test -p tetra-entities --lib health --locked` passed (`8` tests).
+- `cargo test -p tetra-entities --lib
+  telemetry_health_snapshots_are_bounded_and_non_blocking_on_overflow --locked`
+  passed.
+- `cargo test -p tetra-config --lib health --locked` passed (`5` tests).
+- `cargo check -p tetra-config -p tetra-entities -p nexus-bs --locked` passed.
+- `cargo test -p tetra-entities --test test_cmce_bs network_group --locked`
+  passed (`14` tests).
+- `cargo test -p tetra-entities --test test_sds_bs --locked` passed (`121`
+  tests).
+- `cargo test -p tetra-entities --test test_umac_bs tma_report --locked` passed
+  (`5` tests).
+- `cargo test -p tetra-entities --test test_umac_bs private_simplex --locked`
+  passed (`11` tests).
+- `cargo test -p tetra-entities --test test_umac_bs parrot --locked` passed
+  (`3` tests).
+- `git diff --check` passed.
+
+Next:
+
+- Deploy to the test BS with
+  `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+- After field traffic, inspect `/api/snapshot.last_health` for `voice`, `p2p`,
+  `sds`, `congestion` and `rf` domain changes before implementing any
+  entity-owned remediation actions.
+
+Follow-up fix before redeploy:
+
+- Live `/api/snapshot` after the first deploy showed `rf.rx_lost_samples`
+  overflowed when the SDR timing delta was negative (`-1200` samples from the
+  SXceiver startup path). The RF metric now clamps signed timing counters to
+  non-negative health counts before publishing them.
+- Added
+  `phy::components::soapy_dev::tests::health_counter_conversion_clamps_negative_timing_counts`.
+- Re-verified:
+  - `cargo test -p tetra-entities --lib
+    health_counter_conversion_clamps_negative_timing_counts --locked` passed.
+  - `cargo check -p tetra-config -p tetra-entities -p nexus-bs --locked`
+    passed.
+  - `git diff --check` passed.
+
+Warning audit and mitigation:
+
+- `dl_build_traffic_block: queued signaling on ts 2 but no stealing item`
+  occurred repeatedly while TS2 was carrying traffic and one queued DL
+  signalling item was not yet eligible as FACCH/STCH stealing. Health showed
+  `congestion.dl_queue_total=1`, so this was not observed as growing UMAC
+  congestion. The log level was reduced from `warn` to `debug`; real queue
+  pressure remains visible through the `congestion` health domain.
+- `SX1255 temperature read failed: SX1255 temperature sensor requires inactive
+  RX/TX streams` came from the periodic SDR health read. SXceiver/µCell are now
+  treated as devices where runtime temperature sensor reads are unsupported, so
+  Nexus-BS no longer calls the temp sensor while streams are active.
+- Startup RF timing warnings (`Lost -1200 samples`, `Too late to produce TX
+  block`, `Discarding TX samples in the past`) are still left visible because
+  they are useful startup/desync indicators if they persist; health counters now
+  report them without signed-count overflow.
+- One-shot corrupted uplink decode warnings such as `Failed parsing MacAccess:
+  BufferEnded { field: Some("ssi") }` are treated as RF/noise or partial burst
+  symptoms unless repeated; no protocol change was made.
+
+Additional verification:
+
+- `cargo test -p tetra-entities --lib
+  sxceiver_like_devices_skip_runtime_temperature_reads --locked` passed.
+- `cargo test -p tetra-entities --lib
+  health_counter_conversion_clamps_negative_timing_counts --locked` passed.
+- `cargo check -p tetra-config -p tetra-entities -p nexus-bs --locked` passed.
+- `git diff --check` passed.
+
+Live warning follow-up - 2026-06-09 14:43 EEST:
+
+- Rechecked the BS journal around the user-reported `14:36` warning window.
+  The repeated `dl_build_traffic_block: queued signaling on ts 2 but no
+  stealing item` entries were emitted by the previous `nexus-bs` process
+  (`pid=166330`) during rapid Brew TG91 floor changes and hangtime reuse.
+- The current deployed service was restarted at `14:41:26` (`pid=169061`).
+  In the current code this diagnostic is `debug`, not `warn`, and no
+  `queued signaling` WARN entries appeared after the restart.
+- Current `/api/snapshot` health after the check: `overall=ok`, with
+  `congestion=ok`, `rf=ok`, `brew=ok`, `voice=ok`, `p2p=ok`, and `sds=ok`.
+
+Group hangtime observation - 2026-06-09:
+
+- User clarified that "floor hold" means the visible terminal group-call
+  hangtime after releasing PTT. Live logs confirmed that the current lab config
+  has `legacy_gssi_group_call = true` and no explicit `hangtime_secs`, so
+  Nexus-BS uses `hangtime_secs=5` but the legacy compatibility path releases
+  local GSSI calls immediately after the tail-drained `D-TX CEASED`.
+- This is why Motorola/Hytera terminals can leave the group-call screen after
+  about 1-2 seconds: `D-TX CEASED` is followed immediately by `D-RELEASE`
+  (`SwmiRequestedDisconnection`) in the legacy no-handoff path.
+- ETSI EN 300 392-2 clause 14.5.2.2.1(e) defines the normal end-of-transmission
+  edge (`U-TX CEASED` then `D-TX CEASED`), while clause 3.1 defines
+  quasi-transmission-trunking channel hang-time as a short delayed channel
+  deallocation period. The current immediate release is a local Motorola/MR
+  compatibility policy, not a mandated ETSI hangtime value.
+
+System-code broadcast audit - 2026-06-09:
+
+- User asked whether the BlueStation/Nexus-BS `system_code = 3` logic is ETSI
+  correct. Rechecked EN 300 392-2 clause 21.4.4.2 table 21.76: SYNC system
+  code `0011b` identifies ETSI EN 300 392-2 V3.1.1 through the present
+  document family and related EN 300 392-7 V3.x references. The Nexus-BS
+  default `system_code = 3` in MAC-SYNC is clause-correct for the current
+  V+D stack target; it is not a terminal "class 3" setting.
+- Found adjacent broadcast inconsistency: UMAC precompute advertised security
+  class 1/2 support in MAC-SYSINFO extended services even when
+  `aie_service=false`. Because Nexus-BS does not implement air-interface
+  encryption/security procedures yet, MAC-SYSINFO security classes and
+  D-MLE-SYSINFO AIE advertisement are now fail-closed.
+- Clause scope: EN 300 392-2 clause 21.4.4.1 table 21.67 references the
+  EN 300 392-7 security information element; clause 21.4.4.2 table 21.76
+  covers `system_code`; the related security-class notes in clause 21.4.4.2a
+  reinforce that security-class bits have no meaning when AIE is unavailable.
+- Added tests:
+  - `test_mac_sync_defaults_to_etsi_v3_system_code`
+  - `test_sysinfo_does_not_advertise_aie_or_security_classes_until_security_is_implemented`
+- Re-verified:
+  - `rustfmt --edition 2024 crates/tetra-entities/src/umac/umac_bs.rs crates/tetra-entities/tests/test_umac_bs.rs --check`
+  - `cargo test -p tetra-entities --test test_umac_bs system_code --locked`
+  - `cargo test -p tetra-entities --test test_umac_bs security_classes --locked`
+  - `cargo test -p tetra-entities --test test_umac_bs sndcp_service --locked`
+  - `cargo check -p tetra-entities --locked`
+
+Dashboard Settings Config Manager - 2026-06-09:
+
+- User reported that Settings was incomplete: no current-config editor, no
+  config selection/activation, no duplicate/copy flow, and no persistent
+  selected config across reboot.
+- Scope is dashboard/admin config management only. No TETRA air-interface PDU,
+  CMCE, UMAC/MAC, MM, LLC, SDS, Brew media, WAP, encryption or RF behaviour was
+  intentionally changed.
+- Added a Settings `Config Manager` to the external dashboard assets:
+  - current `config.toml` editor via existing `/api/config`;
+  - profile selector backed by `/api/configs`;
+  - profile load/save via `/api/configs/<name>`;
+  - persistent activation via `/api/configs/activate`;
+  - duplicate flow that creates the next free `config+N.toml` in the same flat
+    Nexus-BS folder and loads it into the editor.
+- Backend hardening:
+  - profile names are percent-decoded from URL paths, so `config%2B1.toml`
+    becomes `config+1.toml`;
+  - profile names are restricted to flat `.toml` filenames with
+    letters/numbers/`.`/`_`/`-`/`+`, rejecting traversal and backup suffixes;
+  - activation copies the selected profile over persistent `config.toml` and
+    writes `config.toml.active` as a small marker so the dashboard remembers
+    the last selected profile after restart/reboot;
+  - selecting `config.toml` itself as active updates only the marker and does
+    not copy the file onto itself.
+- Runtime note: because the RF core normally runs a volatile `/run/.../config.toml`
+  copy, profile activation is persistent for the next service restart/reboot;
+  it does not hot-reconfigure the live TETRA stack.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --lib dashboard_config_profile --locked`
+    passed.
+  - `cargo test -p tetra-entities external_dashboard_asset_manifest --locked`
+    passed.
+  - `cargo check -p tetra-entities -p nexus-bs-dashboard --locked` passed.
+  - `cargo fmt -p tetra-entities -p nexus-bs-dashboard --check` passed.
+  - `git diff --check` passed.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote SHA-256 after deploy:
+    - core `03bd301b7517d925a1154781871de9835fe741e8af1a46fbeac8fb83045f9b8f`;
+    - control `8d80f02c27a8eac780a8d20027a9931bfc5c461badb759501439bb2a8a37a683`;
+    - dashboard `6d60d6c3c56685c872a73d0d9149b7789163c0e975d6d62093338c14fbad1d3a`.
+  - Remote services active/running since `2026-06-09 16:21:15 EEST`:
+    - `nexus-bs@chris.service` PID `195383`;
+    - `nexus-bs-control@chris.service` PID `195367`;
+    - `nexus-bs-dashboard@chris.service` PID `195398`.
+  - Remote asset check passed:
+    - `dashboard/index.html` contains `configManager`;
+    - `dashboard/assets/app.js` contains `duplicateSelectedConfig`;
+    - `dashboard/assets/styles.css` contains `config-editor`.
+  - Remote `GET /api/configs` through public dashboard returned HTTP 200 with
+    `config.toml` active/runtime.
+  - Remote `GET /api/system` through public dashboard returned HTTP 200 with
+    persistent config path `/home/chris/nexus-bs/config.toml`.
+
+Dashboard Service Controls and Log/Profile Operations - 2026-06-09:
+
+- User reported missing BS restart/shutdown/stop&go controls, missing config
+  profile delete, and weak Logs UX.
+- Scope is dashboard/admin lifecycle and volatile dashboard log handling only.
+  No TETRA air-interface protocol, CMCE call state machine, UMAC/MAC RF
+  scheduling, SDS, WAP, Brew voice, encryption, attach, affiliation, or floor
+  control behaviour was intentionally changed.
+- Added Settings/Admin service controls:
+  - `Restart BS` posts to `/api/service/restart`;
+  - `Shutdown BS` posts to `/api/service/shutdown`;
+  - `Stop & Go 5s` posts to `/api/service/stop-go`.
+- `Stop & Go 5s` semantics are explicit: the core exits immediately through
+  the normal lifecycle path, clearing volatile buffers/state by process stop;
+  systemd then starts it again after `RestartSec=5`. The button does not keep
+  the RF core alive for five seconds before stopping.
+- Added `ControlCommand::StopGoService { start_delay_secs: 5 }`, routed it to
+  CMCE, and mapped it to the existing systemd restart exit path. Updated
+  `contrib/systemd/nexus-bs@.service` and the legacy sample service to
+  `RestartSec=5`.
+- Added config profile deletion:
+  - UI button `Delete`;
+  - backend `DELETE /api/configs/<name>`;
+  - refuses to delete the runtime `config.toml` or active selected profile;
+  - keeps the same flat filename validation as the config manager.
+- Added Logs page operations:
+  - chronological log direction, newest entries at the bottom;
+  - pause/play autoscroll control;
+  - clear logs through `POST /api/logs/clear` against the in-memory ring;
+  - browser export as `LogYYYYMMDD-HHMMSS.log`.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo fmt -p tetra-entities -p nexus-bs-dashboard --check` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `cargo test -p tetra-entities --lib dashboard_config_profile --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib dashboard_unknown_api_paths_are_reserved_from_spa_fallback --locked` passed.
+  - `cargo test -p tetra-entities --lib test_route_stop_go_service_to_cmce --locked` passed.
+  - `cargo check -p tetra-entities -p nexus-bs-dashboard --locked` passed.
+  - `git diff --check` passed.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-09 16:39:02 EEST`:
+    - `nexus-bs@chris.service` PID `202567`;
+    - `nexus-bs-control@chris.service` PID `202553`;
+    - `nexus-bs-dashboard@chris.service` PID `202584`.
+  - Remote SHA-256 after deploy:
+    - core `04723de9524ef048a1c30e2ab243710fdbb1828c9f8c1cba308d00966e0440f4`;
+    - control `c46c2c45770ae793ac9eafb03299c023c5a007a20e4f680f1219794435c5c129`;
+    - dashboard binary `6d60d6c3c56685c872a73d0d9149b7789163c0e975d6d62093338c14fbad1d3a`.
+  - Remote `systemctl show nexus-bs@chris.service -p RestartUSec`
+    returned `RestartUSec=5s`.
+  - Remote dashboard assets contain `serviceStopGoBtn`, `configDeleteBtn`,
+    `logAutoScrollBtn`, `/api/service/stop-go`, and `/api/logs/clear`.
+  - Remote core dashboard APIs responded HTTP 200 for `/api/system` and
+    `/api/configs`.
+
+Rohde & Schwarz Style Dashboard Consolidation - 2026-06-09 21:35 EEST:
+
+- Scope is external dashboard UI/UX only. No TETRA air-interface protocol,
+  RF scheduling, CMCE private/group call control, SDS, WAP, Brew voice,
+  attach, affiliation, energy economy, encryption, or terminal compatibility
+  behaviour was intentionally changed.
+- Reworked the dashboard visual language toward the provided
+  Rohde & Schwarz transmitter-console reference:
+  - metallic grey/light-blue SCADA console shell;
+  - cyan active navigation/title treatment;
+  - green/amber/red status meters;
+  - beveled industrial panels, buttons, slot cards, and component nodes;
+  - functional RF device-map view with Core, RF Path, RF Device, Brew,
+    UMAC Scheduler, Output Stage, Antenna, Program, and RF Program Path.
+- Consolidated duplicated operator workflow:
+  - removed separate `Radios`, `Calls`, and `Last Heard` nav tabs/pages;
+  - kept their dynamic render targets and detailed tables under the
+    single `Traffic` page via `traffic-detail-stack`;
+  - preserved JS contracts for `overviewRadios`, `overviewCalls`,
+    `overviewHeard`, `radiosTable`, `callsTable`, and `heardTable`.
+- Removed the permanently disabled OTA update button from the operator
+  topbar.
+- Replaced static rail labels (`LOCAL`/`LIVE`) with live
+  `railConsoleState` and `railTelemetryState` values driven by the existing
+  core/WebSocket health model.
+- Wired RF Program Path to live RF state:
+  - `ON AIR` when RF config/visual/SDR health is available;
+  - `STANDBY` otherwise;
+  - SCADA tone follows `is-ok`/`is-warn`/`is-bad`.
+- Responsive/DPI hardening:
+  - native `rem` sizing and system fonts, no viewport-width font scaling;
+  - touch/coarse-pointer target sizing;
+  - high-DPI rendering polish;
+  - single-column operator status and meters at phone widths;
+  - horizontal scroll only where technical tables are intentionally wide;
+  - browser text-size adjustment left to OS/browser scaling.
+- Added dashboard asset tests for:
+  - consolidated Traffic workflow;
+  - absence of duplicate traffic nav/pages;
+  - absence of the disabled OTA button;
+  - live rail status IDs and JS wiring;
+  - touch/high-DPI CSS media support;
+  - no `font-size` rules based on `vw`.
+- Local visual QA screenshots:
+  - desktop: `/private/tmp/nexus-bs-rs-dashboard-responsive-desktop.png`;
+  - tablet: `/private/tmp/nexus-bs-rs-dashboard-responsive-tablet.png`;
+  - phone: `/private/tmp/nexus-bs-rs-dashboard-responsive-phone-2.png`.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `git diff --check` passed.
+
+Traffic TG91 Speaker/ISSI Reconciliation - 2026-06-09 23:51 EEST:
+
+- Scope is dashboard telemetry/state and external UI only. No ETSI TETRA
+  air-interface protocol, CMCE call setup/release, UMAC scheduling, SDS, WAP,
+  Brew media framing, MM attach, energy economy, or RF timing behaviour was
+  intentionally changed.
+- User reported that TG91 still did not show the expected speaker ISSI/country;
+  the current remote `/api/calls` response had no active call while
+  `/api/calls.last_heard` contained real TG91 speaker ISSIs, including US
+  RadioID-resolvable speakers. This pointed to dashboard reconciliation/stale
+  state rather than RF signalling.
+- Hardened group-call display for fast Brew/TG91 floors:
+  - dashboard backend now treats `GroupCallSpeakerChanged` as the operational
+    caller for the reused group-call record and resets the dashboard call timer;
+  - browser-side speaker normalization rejects a group GSSI value as a speaker
+    ISSI, so `TG91` cannot be rendered as the current talker;
+  - TG country/flag selection now considers the latest same-GSSI `last_heard`
+    speaker before falling back to the target GSSI/WW mapping;
+  - the large `Active Calls` board renders only currently active calls, while
+    CMCE detail rows may still show clearly labelled hangtime/last-speaker
+    records for short post-floor continuity.
+- Verification before deploy:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `git diff --check` passed.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-09 23:53:03 EEST`:
+    - `nexus-bs@chris.service` PID `280402`;
+    - `nexus-bs-control@chris.service` PID `280388`;
+    - `nexus-bs-dashboard@chris.service` PID `280419`.
+  - Remote asset contains `function normalizedSpeakerIssi`,
+    `const currentCalls = activeCalls()`, and
+    `caller_issi: msg.speaker_issi`.
+  - Remote `/api/calls` confirmed an active TG91 record with
+    `active_speaker=3144335`, `caller_issi=3144335`, `gssi=91`, `ts=3`,
+    and `started_secs_ago=2`.
+  - Remote RadioID proxy confirmed TG91 speakers `3219149` and `3223542` as
+    United States entries.
+
+Dashboard Brew Group Speaker Change Fix - 2026-06-10 00:24 EEST:
+
+- Scope is CMCE dashboard telemetry for Brew/network-origin group speaker
+  changes plus focused tests. No TETRA RF message encoding, UMAC scheduling,
+  floor-control grant construction, SDS, WAP, MM attach, energy economy, or
+  private-call protocol behaviour was intentionally changed.
+- Field report: dashboard showed `YO3TCO` while `YO8TEH` was speaking.
+  Remote checks confirmed:
+  - RadioID: `2260616 = YO3TCO`;
+  - RadioID: `2261313 = YO8TEH`;
+  - logs showed `CMCE: network call speaker change gssi=226333
+    new_speaker=2261313 (was 2260616)`;
+  - `/api/calls` still reported `active_speaker=2260616`.
+- Root cause:
+  - local group floor changes already emitted `GroupCallSpeakerChanged`;
+  - Brew/network group speaker changes reused the existing call and sent RF
+    D-TX GRANTED/network-ready, but did not publish the dashboard speaker
+    change event on that path.
+- Fix:
+  - `PendingNetworkGroupReady` now carries `notify_speaker_changed`;
+  - initial Brew network group start queues network-ready without the
+    speaker-change flag;
+  - Brew speaker-change reuse queues network-ready with the flag;
+  - after the RF control reporter confirms D-TX GRANTED/D-SETUP was
+    transmitted, CMCE emits `GroupCallSpeakerChanged`, which updates dashboard
+    `active_speaker` and operational `caller_issi`.
+- Verification before deploy:
+  - `rustfmt --edition 2024` on touched CMCE/test files passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_network_group_speaker_change_updates_dashboard_after_rf_grant --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_network_group_call_start_propagates_priority_to_d_setup --locked` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `git diff --check` passed.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-10 00:26:12 EEST` for core
+    and dashboard, `00:26:11 EEST` for control:
+    - `nexus-bs@chris.service` PID `289626`;
+    - `nexus-bs-control@chris.service` PID `289611`;
+    - `nexus-bs-dashboard@chris.service` PID `289642`.
+  - Remote `/api/calls` after restart showed a new active network group call
+    with `active_speaker=2260580`, `caller_issi=2260580`, `gssi=226333`,
+    matching the log line `source ISSI 2260580 GSSI 226333`.
+  - A live post-deploy YO3TCO->YO8TEH speaker-change was not yet observed in
+    the short verification window; the new focused CMCE test covers that exact
+    reused-call-id path.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-09 23:35:30 EEST`:
+    - `nexus-bs@chris.service` PID `272987`;
+    - `nexus-bs-control@chris.service` PID `272972`;
+    - `nexus-bs-dashboard@chris.service` PID `273003`.
+  - Remote dashboard asset contains `CALLS_FETCH_TIMEOUT_MS`,
+    `fetchDashboardJson("/api/calls"`, `speakerChanged`, and
+    `reusesEndedCall`.
+  - Remote `/api/calls` through the external dashboard returned a fresh TG91
+    active call with speaker `4220146` and `started_secs_ago=19`.
+  - Remote `/api/system` through the external dashboard returned HTTP 200.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-09 22:20:42 EEST`:
+    - `nexus-bs@chris.service` PID `246257`;
+    - `nexus-bs-control@chris.service` PID `246240`;
+    - `nexus-bs-dashboard@chris.service` PID `246274`.
+  - Remote dashboard asset check passed:
+    - `active-calls-panel` in `dashboard/index.html`;
+    - `MCC_TO_ISO` and `instantSpeakerHtml` in `dashboard/assets/app.js`;
+    - `speaker-issi` and `call-country` in `dashboard/assets/styles.css`.
+  - Remote core dashboard APIs responded HTTP 200 for `/api/system`,
+    `/api/calls`, and `/api/site`.
+  - `rg` confirmed no dashboard `font-size` rule uses viewport-width units.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-09 21:36:36 EEST`:
+    - `nexus-bs@chris.service` PID `233952`;
+    - `nexus-bs-control@chris.service` PID `233938`;
+    - `nexus-bs-dashboard@chris.service` PID `233969`.
+  - Remote dashboard asset check passed:
+    - `traffic-detail-stack`, `railConsoleState`, and `RF Program Path`
+      are present in `dashboard/index.html`;
+    - `pointer: coarse` and `min-resolution: 2dppx` are present in
+      `dashboard/assets/styles.css`;
+    - `diagramPathToggleState` is present in `dashboard/assets/app.js`.
+  - Remote core dashboard APIs responded HTTP 200 for `/api/system`,
+    `/api/site`, and `/api/configs`.
+
+Traffic Active Calls Board - 2026-06-09 22:19 EEST:
+
+- Scope is external dashboard UI/UX only. No TETRA air-interface protocol,
+  RF scheduling, CMCE call handling, SDS, WAP, Brew voice, attach,
+  affiliation, energy economy, encryption, or terminal compatibility
+  behaviour was intentionally changed.
+- Reworked the `Traffic` page around `Active Calls`:
+  - removed the useless `Current Floor` overview panel;
+  - removed the `Live Radios` overview panel from the top of Traffic;
+  - kept the full Subscriber Registry table under detailed traffic views;
+  - made `Active Calls` a large full-width operator board.
+- Active call cards now show:
+  - aligned country flag and country code;
+  - mode pill (`group`, `simplex`, `duplex`, `hangtime`);
+  - allocated timeslot as a fixed `TSn` badge;
+  - target talkgroup/ISSI;
+  - instant speaker ISSI as the dominant speaker field;
+  - RadioID callsign/name as secondary detail when already cached;
+  - call time in live seconds.
+- Speaker display source:
+  - `speaker_changed` WebSocket events update `active_speaker` immediately;
+  - the card displays that ISSI directly and does not depend on the removed
+    `Current Floor` UI.
+- Country flag handling:
+  - replaced the small hardcoded country list with a broad MCC-to-ISO map;
+  - flags are generated from ISO region code using Unicode regional
+    indicators;
+  - country names use browser `Intl.DisplayNames` with overrides for
+    worldwide/Kosovo.
+- Added asset-test coverage for:
+  - no `Current Floor` / `Live Radios` top Traffic panels;
+  - Active Calls as the primary board;
+  - aligned country flag/code, TS, and instant speaker ISSI;
+  - broad MCC-to-country support examples.
+- Local visual QA:
+  - `/private/tmp/nexus-bs-traffic-active-calls.png` empty board;
+  - `/private/tmp/nexus-bs-traffic-active-calls-mock-3.png` mock group call
+    with RO flag, TS3, speaker ISSI, and 42s call time.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `git diff --check` passed.
+
+Dashboard Scroll Stability Cleanup - 2026-06-09 22:55 EEST:
+
+- Scope is external dashboard UI/UX only. No TETRA air-interface protocol,
+  RF scheduling, CMCE call handling, SDS, WAP, Brew voice, attach,
+  affiliation, energy economy, encryption, or terminal compatibility
+  behaviour was intentionally changed.
+- Removed stale Traffic/Floor code paths after the Active Calls revamp:
+  - deleted the live tick call to the removed `renderCurrentFloor` path;
+  - replaced the old "no active floor" slot label with a neutral idle state.
+- Hardened tab scroll behaviour:
+  - dashboard now remembers `window.scrollY` per tab;
+  - switching tabs restores that tab's previous scroll position;
+  - live `renderAll`, one-second live ticks, and `/api/calls` refreshes
+    preserve the current tab scroll instead of allowing layout reflow jumps.
+- Reduced hidden-tab work:
+  - log WebSocket events no longer trigger full dashboard redraws;
+  - log rows are rebuilt only when the Logs tab is active;
+  - log auto-scroll is gated to the Logs tab and only scrolls the log list,
+    not the page viewport.
+- CSS cleanup:
+  - replaced the old "Legacy" dashboard comment with the current Nexus-BS
+    base-layout contract;
+  - consolidated page visibility under `.page:not(.active)` / `.page.active`;
+  - removed duplicate page padding overrides;
+  - disabled scroll anchoring on live dashboard containers.
+- Added asset-test coverage for:
+  - no stale `renderCurrentFloor` code;
+  - per-tab scroll state;
+  - Logs-only autoscroll;
+  - explicit page visibility and scroll-anchor rules.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `git diff --check` passed.
+  - Local Chrome headless scroll QA passed on static dashboard:
+    - Traffic hidden-log injection delta `0`;
+    - Traffic live-event injection delta `0`;
+    - Settings live-event injection delta `0`;
+  - Logs visible-log injection delta `0`;
+  - log list autoscroll remained internal and at bottom.
+
+Traffic Speaker Country Flag - 2026-06-09 23:05 EEST:
+
+- Scope is dashboard/RadioID display only. No TETRA air-interface protocol,
+  RF scheduling, CMCE call handling, SDS, WAP, Brew voice, attach,
+  affiliation, energy economy, encryption, or terminal compatibility
+  behaviour was intentionally changed.
+- User reported that TG91 active calls showed the `WW` worldwide flag, but the
+  useful operator view is the country of the current speaker.
+- Changed active-call country selection:
+  - group calls now prefer the live speaker ISSI, then caller/active speaker,
+    then called party, and only then the GSSI/TG fallback;
+  - TG91 still falls back to `WW` if no speaker/caller country is known.
+- Extended the same-origin RadioID proxy and browser cache payload:
+  - `/api/radioid` now preserves the RadioID `country` field;
+  - dashboard RadioID browser cache moved to `v2` so old cached entries without
+    country are not reused forever;
+  - active-call flag rendering first checks cached RadioID country, then falls
+    back to the numeric prefix/MCC map.
+- Field check basis:
+  - RadioID showed `3215250` / `3224585` as United States speakers and
+    `2320856` as Austria, confirming that the previous TG91 `WW` override hid
+    the actual speaker country.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `rustfmt --edition 2024 --check crates/tetra-entities/src/net_dashboard/radioid.rs` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `cargo test -p tetra-entities --lib normalizes_radioid_payload --locked` passed.
+  - `git diff --check` passed.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-09 23:04:35 EEST`:
+    - `nexus-bs@chris.service` PID `263487`;
+    - `nexus-bs-control@chris.service` PID `263473`;
+    - `nexus-bs-dashboard@chris.service` PID `263504`.
+  - Remote dashboard asset contains `nexus-bs.radioid.cache.v2`,
+    `countryByRadioId`, and `callCountryCandidates`.
+  - Remote `GET /api/radioid?id=3224428` returned callsign `KO6NCI` with
+    `country="United States"`, confirming TG91 speaker country data is
+    available to the dashboard.
+  - Remote `/api/system` through the external dashboard returned HTTP 200.
+
+Traffic Active Call Live Refresh Hardening - 2026-06-09 23:34 EEST:
+
+- Scope is external dashboard UI client only. No TETRA air-interface protocol,
+  RF scheduling, CMCE call handling, SDS, WAP, Brew voice, attach,
+  affiliation, energy economy, encryption, or terminal compatibility
+  behaviour was intentionally changed.
+- User reported that the Traffic page stayed on an old TG91 card
+  (`ISSI 3212802`, `259s`) while `/api/calls` already reported a newer active
+  speaker. Remote API check confirmed the core state was fresh:
+  `/api/calls` returned active speaker `3106191` with `started_secs_ago=16`.
+- Hardened the browser live update path:
+  - `/api/calls` polling now uses a bounded `fetchDashboardJson` helper with
+    `CALLS_FETCH_TIMEOUT_MS=2500`, so a stuck request cannot leave
+    `callsInflight=true` forever and freeze live updates;
+  - reused group `call_id` records reset `_startedMs` when an ended/hangtime
+    call is reused or when speaker/caller/target changes;
+  - WebSocket `speaker_changed` events without `started_secs_ago` also reset
+    the displayed call timer to the event time.
+- Local Chrome headless regression reproduced the stale-card scenario and
+  passed after the fix:
+  - before snapshot: `ISSI 3212802`, `259s`;
+  - after same `call_id=14` snapshot: `ISSI 3106191`, `16s`.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets external_dashboard_asset_manifest_is_coherent --locked` passed.
+  - `git diff --check` passed.
+
+Brew-Origin GSSI Downlink Media Source Hardening - 2026-06-10 01:43 EEST:
+
+- Scope is clause-scoped CMCE/UMAC group-call bearer control for Brew/TetraPack
+  network-origin group calls. No private call, SDS, WAP, parrot, encryption, or
+  dashboard UI behaviour was intentionally changed.
+- User reported that GSSI `226333` showed emission/signalling but terminals did
+  not decode audio. Remote logs before the patch showed:
+  - `GROUP_TX ... dst=226333`;
+  - `CMCE opening UMAC circuit ... media_source=LocalLoopback`;
+  - `BrewEntity: voice frame #1 ... len=36 bytes ts=2`.
+- ETSI air-interface baseline remains EN 300 392-2 clause 14.5.2.1 for group
+  setup, 14.5.2.2.1 for floor control, and 14.5.2.3 for release. The Brew
+  media-source selection is an internal SwMI/interconnect implementation detail,
+  not a formal conformance claim.
+- Fix:
+  - new Brew-origin group calls now open UMAC with
+    `CircuitDlMediaSource::SwMI`, so UMAC treats downlink speech as coming from
+    Brew/TetraPack rather than local RF loopback;
+  - added internal `CallControl::SetDlMediaSource` so maintained/reused group
+    bearers can switch media policy without tearing down the assigned channel;
+  - network speaker activation switches the bearer to `SwMI` before
+    `FloorGranted`;
+  - local RF floor retake switches the bearer back to `LocalLoopback` before
+    `FloorGranted`, preventing a regression where local group speech would be
+    suppressed after a Brew speaker ended.
+- Verification:
+  - `cargo fmt --check` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_network_group_call_start_propagates_priority_to_d_setup --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_network_group_local_retake_after_network_end_does_not_transfer_call_ownership --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_network_group_speaker_change_updates_dashboard_after_rf_grant --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_network_group_call_end_from_active_network_speaker_enters_hangtime_without_release --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs test_group_setup_sends_proceeding_connect_and_group_setup_with_allocations --locked` passed.
+  - `cargo check -p tetra-entities --locked` passed.
+  - `git diff --check` passed.
+- Deploy verification:
+  - Deployed to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Local build only; no Rust compilation on the Pi/TetraHS.
+  - Remote services active/running since `2026-06-10 01:42:00 EEST`:
+    - `nexus-bs@chris.service` PID `310398`;
+    - `nexus-bs-control@chris.service` PID `310384`;
+    - `nexus-bs-dashboard@chris.service` PID `310416`.
+  - Deployed core SHA:
+    `ba2c6056ba0c6a9721e4c5eea0b492806f85f0697d00a15af972aa3d4df89984`.
+  - Remote `/api/snapshot` reported overall health `ok`, Brew v1 online, and
+    no active calls at the time of post-deploy inspection.
+  - No post-final-deploy `GROUP_TX` on GSSI `226333` had arrived yet; next field
+    step is a controlled 226333 RF/Brew audio test and log readback.
+
+Brew External Subscriber Accounting Hardening and Nexus-BS v0.1.62 - 2026-06-10 09:38 EEST:
+
+- Scope is CMCE/Brew interconnect subscriber accounting plus release identity
+  bump. No private simplex/duplex, SDS, WAP, parrot, encryption, or RF U-plane
+  vocoder behaviour was intentionally changed.
+- User reported outside/Brew inconsistency:
+  `CMCE: not syncing affiliate for unknown ISSI 2261313 into shared subscriber registry`.
+- ETSI baseline remains clause-scoped: local RF group affiliation is an MM
+  air-interface procedure under EN 300 392-2, while Brew subscriber events are
+  interconnect state. This is not a formal TETRA certification claim.
+- Fix:
+  - CMCE now keeps Brew-origin subscriber updates out of the shared local RF
+    subscriber registry;
+  - Brew/external subscriber groups are tracked separately from local MM/RF
+    subscriber groups;
+  - external Brew listeners still count for local RF -> Brew group setup/routing;
+  - Brew -> RF network group setup now requires a real local RF listener, so an
+    external-only affiliate does not open a local RF downlink;
+  - Brew echo affiliate/deaffiliate for the same ISSI no longer removes the
+    local RF affiliation for that terminal.
+- Release bump:
+  - workspace/package identity moved from `v0.1.61` to `v0.1.62`;
+  - control protocol is now `nexus-bs-control-v0.1.62`;
+  - telemetry protocol is now `nexus-bs-telemetry-v0.1.62`;
+  - README, example config, and systemd sample descriptions now reference
+    `Nexus-BS v0.1.62`.
+- Verification:
+  - `cargo fmt --check` passed.
+  - `git diff --check` passed.
+  - `cargo test -p tetra-core product_identity_tracks_workspace_version --locked` passed.
+  - `cargo test -p tetra-entities control_protocol_tracks_nexus_bs_product_version --locked` passed.
+  - `cargo test -p tetra-entities telemetry_protocol_tracks_nexus_bs_product_version --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs brew --locked` passed: 12 tests.
+  - `cargo test -p tetra-entities --test test_cmce_bs network_group --locked` passed: 15 tests.
+- Deploy verification:
+  - Deployed locally built binaries to `chris@192.168.1.179` with
+    `RUN_TESTS=0 POST_START_SLEEP=10 scripts/nexus-bs-test-deploy.sh`.
+  - Remote services active/running since `2026-06-10 09:35:59 EEST`.
+  - Remote `/api/system` returned `product_user_agent=Nexus-BS/v0.1.62`,
+    `product_version_tag=v0.1.62`, and `stack_version=v0.1.62-4ab64b2e-modified`
+    for the pre-commit field deploy.
+  - Journal since `2026-06-10 09:35:59 EEST` had no entries matching
+    `not.*syncing.*affiliate`.
+  - Journal showed Brew echo affiliate handled on the external path:
+    `CMCE: external subscriber affiliate source=Brew issi=2260616 groups=[226333]`.

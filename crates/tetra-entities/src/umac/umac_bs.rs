@@ -980,13 +980,16 @@ impl UmacBs {
     pub fn generate_precomps(config: &SharedConfig) -> PrecomputedUmacPdus {
         let c = config.config();
 
-        // TODO FIXME make more/all parameters configurable
+        // EN 300 392-2 clause 21.4.4.1 table 21.67 carries security
+        // information by reference to EN 300 392-7 A.8.77. Nexus-BS does not
+        // implement air-interface encryption yet, so keep the broadcast
+        // fail-closed even if a direct StackConfig requests AIE.
         let ext_services = SysinfoExtendedServices {
             auth_required: false,
-            class1_supported: true,
-            class2_supported: true,
+            class1_supported: false,
+            class2_supported: false,
             class3_supported: false,
-            sck_n: Some(0),
+            sck_n: None,
             dck_retrieval_during_cell_select: None,
             dck_retrieval_during_cell_reselect: None,
             linked_gck_crypto_periods: None,
@@ -1067,7 +1070,10 @@ impl UmacBs {
                 // stub, so never advertise a WAP/IP bearer from MAC SYSINFO
                 // until SNDCP bearer support is actually implemented.
                 sndcp_service: false,
-                aie_service: c.cell.aie_service,
+                // Same fail-closed rule for air-interface encryption: do not
+                // advertise AIE until EN 300 392-7 security procedures are
+                // implemented and tested.
+                aie_service: false,
                 advanced_link: c.cell.advanced_link,
             },
         };
@@ -3331,6 +3337,17 @@ impl UmacBs {
             CallControl::Open(_) => {
                 self.rx_control_circuit_open(queue, prim);
             }
+            CallControl::SetDlMediaSource { ts, dl_media_source } => {
+                if self.channel_scheduler.set_circuit_dl_media_source(ts, dl_media_source) {
+                    tracing::info!("UMAC: set DL media source ts={} media_source={:?}", ts, dl_media_source);
+                } else {
+                    tracing::warn!(
+                        "UMAC: ignoring DL media source update for inactive circuit ts={} media_source={:?}",
+                        ts,
+                        dl_media_source
+                    );
+                }
+            }
             CallControl::Close(_, _) => {
                 self.rx_control_circuit_close(queue, prim);
             }
@@ -3534,6 +3551,11 @@ impl TetraEntityTrait for UmacBs {
         tracing::trace!("UmacBs tick: Pushing finalized timeslot to LMAC: {:?}", s);
         queue.push_back(s);
         self.emit_completed_tma_reports(queue);
+        let mut stats = self.channel_scheduler.health_stats();
+        stats.pending_tma_reports = self.pending_tma_reports.len();
+        stats.pending_private_ul_media_total = self.pending_private_ul_media.iter().map(VecDeque::len).sum();
+        stats.pending_stch = self.pending_stch.is_some();
+        crate::health::registry().set_umac_stats(stats);
     }
 }
 

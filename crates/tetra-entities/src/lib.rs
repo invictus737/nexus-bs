@@ -2,6 +2,7 @@
 
 pub mod cmce;
 pub mod entity_trait;
+pub mod health;
 pub mod llc;
 pub mod lmac;
 pub mod messagerouter;

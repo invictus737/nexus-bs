@@ -777,33 +777,11 @@ impl CcBsSubentity {
             );
         }
 
-        self.send_group_listener_d_tx_granted_facch(queue, call_id, source_issi, dest_gssi, ts, usage);
+        let ready_reporter = self.send_d_tx_granted_facch_reported(queue, call_id, source_issi, dest_gssi, ts, usage);
         self.reset_group_t310_after_floor_grant(call_id);
         self.refresh_group_cached_d_setup_speaker(call_id, source_issi);
 
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Umac,
-            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id,
-                source_issi,
-                dest_gssi,
-                ts,
-            }),
-        });
-
-        queue.push_back(SapMsg {
-            sap: Sap::Control,
-            src: TetraEntity::Cmce,
-            dest: TetraEntity::Brew,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                brew_uuid,
-                call_id,
-                ts,
-                usage,
-            }),
-        });
+        self.queue_network_group_ready(call_id, brew_uuid, source_issi, dest_gssi, ts, usage, vec![ready_reporter], true);
 
         Ok(())
     }
@@ -817,6 +795,7 @@ impl CcBsSubentity {
             tracing::debug!("FSM: ignoring network call end for pending group release call_id={}", call_id);
             return Ok(());
         }
+        let ended_before_ready = self.cancel_network_group_ready(call_id, "network group call ended before RF ready");
 
         let Some(call) = self.active_calls.get(&call_id).cloned() else {
             return Err(GroupTransitionError::UnknownCall(call_id));
@@ -824,6 +803,16 @@ impl CcBsSubentity {
 
         let state = call.state();
         Self::validate_group_transition(call_id, state, GroupEvent::NetworkCallEnd)?;
+
+        if ended_before_ready {
+            tracing::info!(
+                "FSM: releasing network group call_id={} before Brew media ready; uuid={:?}",
+                call_id,
+                call.brew_uuid
+            );
+            self.release_group_call(queue, call_id, DisconnectCause::SwmiRequestedDisconnection);
+            return Ok(());
+        }
 
         if matches!(state, GroupCallState::Transmitting) {
             if let Some(active_call) = self.active_calls.get_mut(&call_id) {

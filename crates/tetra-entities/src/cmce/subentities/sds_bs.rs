@@ -113,6 +113,16 @@ impl SdsBsSubentity {
         &self.config
     }
 
+    pub fn health_stats(&self) -> crate::health::SdsHealthStats {
+        let live_queue_len = self.config.state_read().live_sds_queue.len();
+        crate::health::SdsHealthStats {
+            live_queue_len,
+            pending_actions: self.pending_actions.len(),
+            tl_report_contexts: self.sds_tl_report_context.len(),
+            tl_report_context_evictions: crate::health::registry().sds_tl_report_context_evictions(),
+        }
+    }
+
     fn emit(&self, event: TelemetryEvent) {
         if let Some(sink) = &self.telemetry {
             sink.send(event);
@@ -375,6 +385,7 @@ impl SdsBsSubentity {
             };
             if oldest != key {
                 self.sds_tl_report_context.remove(&oldest);
+                crate::health::registry().incr_sds_tl_report_context_eviction();
             }
         }
     }

@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use tetra_core::{Direction, PhyBlockNum, TetraAddress};
-use tetra_saps::control::call_control::Circuit;
+use tetra_saps::control::call_control::{Circuit, CircuitDlMediaSource};
 
 pub const MAX_TX_DATA_BLOCKS_PER_TIMESLOT: usize = 18;
 
@@ -149,6 +149,24 @@ impl CircuitMgr {
                 return Default::default();
             }
         }
+    }
+
+    pub fn set_dl_media_source(&mut self, ts: u8, dl_media_source: CircuitDlMediaSource) -> bool {
+        if !(1..=4).contains(&ts) {
+            tracing::error!("UMAC CircuitMgr::set_dl_media_source: invalid timeslot {}", ts);
+            return false;
+        }
+
+        let mut updated = false;
+        if let Some(circuit) = &mut self.dl[ts as usize - 1] {
+            circuit.dl_media_source = dl_media_source;
+            updated = true;
+        }
+        if let Some(circuit) = &mut self.ul[ts as usize - 1] {
+            circuit.dl_media_source = dl_media_source;
+            updated = true;
+        }
+        updated
     }
 
     /// Put a block in the queue for transmission on an associated channel

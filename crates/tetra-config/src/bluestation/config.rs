@@ -2,7 +2,7 @@ use serde::Deserialize;
 use std::sync::{Arc, RwLock};
 use tetra_core::freqs::FreqInfo;
 
-use crate::bluestation::{CfgCellInfo, CfgControl, CfgNetInfo, CfgPhyIo, CfgSecurity, CfgWxService, PhyBackend, StackState};
+use crate::bluestation::{CfgCellInfo, CfgControl, CfgHealth, CfgNetInfo, CfgPhyIo, CfgSecurity, CfgWxService, PhyBackend, StackState};
 
 use super::sec_brew::CfgBrew;
 use super::sec_dashboard::CfgDashboard;
@@ -79,6 +79,9 @@ pub struct StackConfig {
 
     /// Control endpoint configuration
     pub control: Option<CfgControl>,
+
+    /// Operational health telemetry and future remediation configuration
+    pub health: CfgHealth,
 
     /// Access control / security configuration
     pub security: CfgSecurity,

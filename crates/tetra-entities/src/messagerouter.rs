@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::{TdmaTime, tetra_entities::TetraEntity};
@@ -189,6 +190,8 @@ impl MessageRouter {
         let mut ticks: usize = 0;
 
         loop {
+            let loop_started = Instant::now();
+
             // Check if we've been asked to stop (e.g. Ctrl+C)
             if let Some(ref flag) = running {
                 if !flag.load(Ordering::Relaxed) {
@@ -208,6 +211,7 @@ impl MessageRouter {
             // Send tick_end event and process final messages
             self.tick_end();
             crate::service_control::mark_stack_tick();
+            crate::health::registry().mark_router_tick(self.get_msgqueue_len(), loop_started.elapsed());
 
             // Check if we should stop
             ticks += 1;

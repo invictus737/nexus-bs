@@ -112,6 +112,13 @@ pub enum ControlCommand {
     /// Stop the Nexus-BS service (systemctl stop nexus-bs)
     ShutdownService,
 
+    /// Stop the Nexus-BS core now and let systemd bring it back after RestartSec.
+    ///
+    /// This intentionally exits the process instead of delaying inside the RF
+    /// core, so volatile buffers, call state, and radio runtime caches are
+    /// cleared before the next start.
+    StopGoService { start_delay_secs: u64 },
+
     /// Add a live SDS message to the broadcast queue.
     /// The message will be transmitted to all MSs on the cell at the next HMD interval,
     /// round-robining with the static Home Mode Display text.
