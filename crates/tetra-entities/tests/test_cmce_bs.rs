@@ -12558,6 +12558,82 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
 }
 
 #[test]
+fn test_p2p_duplex_request_to_simplex_only_called_ms_is_started_as_simplex() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    {
+        let mut state = test.config.state_write();
+        state.subscribers.register(TEST_ISSI);
+        state.subscribers.register(TEST_CALLED_ISSI);
+        assert!(state.subscribers.set_supports_duplex(TEST_CALLED_ISSI, Some(false)));
+    }
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.hook_method_selection = true;
+    u_setup.simplex_duplex_selection = true;
+    let (call_id, setup_msgs) = start_p2p_setup_with_u_setup(&mut test, u_setup);
+
+    let proceeding = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim),
+            _ => None,
+        })
+        .expect("caller should receive D-CALL PROCEEDING");
+    assert!(
+        !proceeding.simplex_duplex_selection,
+        "ClassOfMs simplex-only called MS should make BS proceed with simplex service"
+    );
+
+    let setup = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim),
+            _ => None,
+        })
+        .expect("called MS should receive D-SETUP");
+    assert!(
+        !setup.simplex_duplex_selection,
+        "D-SETUP to a simplex-only called MS must not advertise duplex service"
+    );
+    assert_eq!(setup.call_time_out, CallTimeout::T2m);
+    assert_eq!(count_umac_open(&setup_msgs), 0, "P2P setup must not open traffic before U-CONNECT");
+
+    let (mut connect_msgs, after_called_ack_msgs) = submit_p2p_connect_and_ack_called(
+        &mut test,
+        build_u_connect_custom_msg(TEST_CALLED_ISSI, call_id, true),
+        TEST_CALLED_ISSI,
+    );
+    assert_eq!(
+        count_umac_open(&connect_msgs),
+        1,
+        "simplex-only called MS must keep private call on one shared bearer even if U-CONNECT still carries duplex"
+    );
+    connect_msgs.extend(after_called_ack_msgs);
+
+    let d_connect = connect_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim),
+            _ => None,
+        })
+        .expect("caller should receive D-CONNECT after called connect delivery");
+    assert!(
+        !d_connect.simplex_duplex_selection,
+        "caller D-CONNECT must preserve the simplex fallback selected before bearer allocation"
+    );
+}
+
+#[test]
 fn test_p2p_duplex_request_accepts_called_simplex_offer() {
     debug::setup_logging_verbose();
 

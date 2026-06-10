@@ -1040,10 +1040,10 @@ impl CcBsSubentity {
         &mut self,
         queue: &mut MessageQueue,
         message: &SapMsg,
-        pdu_request: &USetup,
         call_id: u16,
         setup_timeout: CallTimeoutSetupPhase,
         hook_method_selection: bool,
+        simplex_duplex_selection: bool,
     ) {
         tracing::trace!("send_d_call_proceeding");
 
@@ -1056,7 +1056,7 @@ impl CcBsSubentity {
             call_identifier: call_id,
             call_time_out_set_up_phase: setup_timeout,
             hook_method_selection,
-            simplex_duplex_selection: pdu_request.simplex_duplex_selection,
+            simplex_duplex_selection,
             basic_service_information: None,
             call_status: None,
             notification_indicator: None,

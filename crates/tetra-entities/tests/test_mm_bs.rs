@@ -752,6 +752,56 @@ fn test_location_update_accept_scch_frame18_distribution_uses_slot1_for_class_of
 }
 
 #[test]
+fn test_location_update_records_duplex_capability_in_shared_subscriber_state() {
+    debug::setup_logging_verbose();
+
+    let issi = 2043018;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    let mut pdu = base_location_update_demand(LocationUpdateType::ItsiAttach, None);
+    pdu.class_of_ms = Some(ClassOfMs {
+        freq_simplex_duplex: false,
+        multislot_phase_mod: true,
+        concurrent_multicarrier: false,
+        voice: true,
+        e2e_encryption_not_supported: true,
+        circuit_mode_data: false,
+        tetra_packet_data: true,
+        fast_switching: false,
+        dck_encryption: false,
+        clch_needed: false,
+        concurrent_circuit_mode: false,
+        original_advanced_link: true,
+        minimum_mode: false,
+        carrier_specific_signalling: false,
+        authentication: false,
+        sck_encryption: false,
+        air_interface_version: 3,
+        common_scch: true,
+        reserved_21: false,
+        mac_d_blck: false,
+        extended_advanced_link: false,
+        d8psk: false,
+    });
+
+    submit_location_update_demand_with_handle(&mut test, issi, pdu, 0);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        contains_location_update_accept(&sink_msgs),
+        "location update with ClassOfMs should still be accepted"
+    );
+
+    let state = test.config.state_read();
+    assert_eq!(
+        state.subscribers.supports_duplex(issi),
+        Some(false),
+        "MM should mirror the ClassOfMs simplex-only capability for CMCE private-call admission"
+    );
+}
+
+#[test]
 fn test_bs_initiated_energy_saving_stays_pending_until_ms_response() {
     debug::setup_logging_verbose();
     let issi = 2040814;

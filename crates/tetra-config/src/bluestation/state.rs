@@ -37,6 +37,9 @@ pub struct Subscriber {
     pub issi: u32,
     // Set of attached GSSIs
     pub attached_groups: HashSet<u32>,
+    /// `None` until the MS reports Class of MS. `Some(false)` means the MS
+    /// advertised simplex-only service and must not be assigned duplex private calls.
+    pub supports_duplex: Option<bool>,
 }
 
 /// Per-MS energy economy allocation visible to lower layers.
@@ -214,6 +217,7 @@ impl SubscriberRegistry {
             Subscriber {
                 issi,
                 attached_groups: HashSet::new(),
+                supports_duplex: None,
             },
         );
     }
@@ -221,6 +225,18 @@ impl SubscriberRegistry {
     /// Gets mutable ref to subscriber only after MM explicitly registered it.
     pub fn get_subscriber_mut(&mut self, issi: u32) -> Option<&mut Subscriber> {
         self.subscribers.get_mut(&issi)
+    }
+
+    pub fn set_supports_duplex(&mut self, issi: u32, supports_duplex: Option<bool>) -> bool {
+        let Some(subscriber) = self.get_subscriber_mut(issi) else {
+            return false;
+        };
+        subscriber.supports_duplex = supports_duplex;
+        true
+    }
+
+    pub fn supports_duplex(&self, issi: u32) -> Option<bool> {
+        self.subscribers.get(&issi).and_then(|subscriber| subscriber.supports_duplex)
     }
 
     /// Deregister an ISSI, removing it from the registry and cleaning up any group affiliations
@@ -479,13 +495,34 @@ mod energy_saving_tests {
         let mut reg = SubscriberRegistry::new();
         reg.register(1001);
         reg.affiliate(1001, 91);
+        reg.set_supports_duplex(1001, Some(false));
         assert!(reg.has_group_members(91));
+        assert_eq!(reg.supports_duplex(1001), Some(false));
 
         reg.register(1001);
 
         assert!(reg.is_registered(1001));
         reg.deaffiliate(1001, 91);
         assert!(!reg.has_group_members(91));
+        assert_eq!(reg.supports_duplex(1001), None);
+    }
+
+    #[test]
+    fn test_subscriber_duplex_capability_is_explicit_and_registration_scoped() {
+        let mut reg = SubscriberRegistry::new();
+
+        assert!(!reg.set_supports_duplex(1001, Some(false)));
+        assert_eq!(reg.supports_duplex(1001), None);
+
+        reg.register(1001);
+        assert_eq!(reg.supports_duplex(1001), None);
+        assert!(reg.set_supports_duplex(1001, Some(false)));
+        assert_eq!(reg.supports_duplex(1001), Some(false));
+        assert!(reg.set_supports_duplex(1001, Some(true)));
+        assert_eq!(reg.supports_duplex(1001), Some(true));
+
+        reg.deregister(1001);
+        assert_eq!(reg.supports_duplex(1001), None);
     }
 
     #[test]
