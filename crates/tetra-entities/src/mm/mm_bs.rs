@@ -2392,18 +2392,6 @@ impl MmBs {
         // Store and log class_of_ms
         if let Some(ref class) = pdu.class_of_ms {
             tracing::info!("MS {} class_of_ms: {}", issi, class);
-            if !self
-                .config
-                .state_write()
-                .subscribers
-                .set_supports_duplex(issi, Some(class.freq_simplex_duplex))
-            {
-                tracing::debug!(
-                    "MM: ISSI {} ClassOfMs duplex={} not mirrored to shared subscriber state yet because registration publication is deferred",
-                    issi,
-                    class.freq_simplex_duplex
-                );
-            }
         }
         // Per ETSI EN 300 392-2 clauses 16.10.46 and 16.10.8: if the MS
         // signals clch_needed=true or common_scch=true, include the 6-bit

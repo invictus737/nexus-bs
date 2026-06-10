@@ -274,10 +274,10 @@ impl CcBsSubentity {
         self.send_d_call_proceeding(
             queue,
             message,
+            pdu,
             circuit.call_id,
             CallTimeoutSetupPhase::T10s,
             pdu.hook_method_selection,
-            pdu.simplex_duplex_selection,
         );
 
         // 2) D-CONNECT to caller.
@@ -640,32 +640,6 @@ impl CcBsSubentity {
             return;
         }
 
-        let mut effective_simplex_duplex = pdu.simplex_duplex_selection;
-        if effective_simplex_duplex {
-            let (calling_supports_duplex, called_supports_duplex) = {
-                let state = self.config.state_read();
-                (
-                    state.subscribers.supports_duplex(calling_party.ssi),
-                    state.subscribers.supports_duplex(called_addr.ssi),
-                )
-            };
-            if calling_supports_duplex == Some(false) || called_supports_duplex == Some(false) {
-                // EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 carry the
-                // negotiated simplex/duplex service through D-CALL PROCEEDING
-                // and D-SETUP. If Class of MS already says one local party is
-                // simplex-only, do not place that MS onto a duplex private
-                // assigned channel that it cannot sustain.
-                tracing::info!(
-                    "CMCE: downgrading requested duplex P2P U-SETUP from ISSI {} to ISSI {} to simplex because ClassOfMs duplex capability is caller={:?} called={:?}",
-                    calling_party.ssi,
-                    called_addr.ssi,
-                    calling_supports_duplex,
-                    called_supports_duplex
-                );
-                effective_simplex_duplex = false;
-            }
-        }
-
         // Allocate circuit(s). Duplex uses two traffic timeslots, one per MS, with cross-routing.
         let occupied_call_ids = self.occupied_call_ids();
         let (circuit_calling, circuit_called) = {
@@ -673,7 +647,7 @@ impl CcBsSubentity {
             let circuit_calling = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,
-                effective_simplex_duplex,
+                pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
                 TimeslotOwner::Cmce,
                 &occupied_call_ids,
@@ -698,12 +672,12 @@ impl CcBsSubentity {
                 }
             };
 
-            let circuit_called = if effective_simplex_duplex {
+            let circuit_called = if pdu.simplex_duplex_selection {
                 match self.circuits.allocate_circuit_for_call_with_allocator(
                     circuit_calling.call_id,
                     Direction::Both,
                     pdu.basic_service_information.communication_type,
-                    effective_simplex_duplex,
+                    pdu.simplex_duplex_selection,
                     &mut state.timeslot_alloc,
                     TimeslotOwner::Cmce,
                 ) {
@@ -760,29 +734,22 @@ impl CcBsSubentity {
             call_id,
             calling_issi: calling_party.ssi,
             called_issi: called_addr.ssi,
-            simplex: !effective_simplex_duplex,
+            simplex: !pdu.hook_method_selection,
             ts: calling_ts,
         });
 
         // Do not open traffic channel yet. Let called MS respond on MCCH.
-        self.send_d_call_proceeding(
-            queue,
-            message,
-            call_id,
-            CallTimeoutSetupPhase::T60s,
-            pdu.hook_method_selection,
-            effective_simplex_duplex,
-        );
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
 
-        let setup_grant = if !effective_simplex_duplex
+        let setup_grant = if !pdu.simplex_duplex_selection
             && pdu.hook_method_selection
             && Self::private_simplex_called_ms_transmits_first(
-                effective_simplex_duplex,
+                pdu.simplex_duplex_selection,
                 pdu.hook_method_selection,
                 pdu.request_to_transmit_send_data,
             ) {
             TransmissionGrant::Granted
-        } else if !effective_simplex_duplex && pdu.hook_method_selection {
+        } else if !pdu.simplex_duplex_selection && pdu.hook_method_selection {
             TransmissionGrant::GrantedToOtherUser
         } else {
             TransmissionGrant::NotGranted
@@ -790,13 +757,13 @@ impl CcBsSubentity {
 
         let d_setup = DSetup {
             call_identifier: call_id,
-            call_time_out: if effective_simplex_duplex {
+            call_time_out: if pdu.simplex_duplex_selection {
                 CallTimeout::Infinite
             } else {
                 self.config_call_timeout()
             },
             hook_method_selection: pdu.hook_method_selection,
-            simplex_duplex_selection: effective_simplex_duplex,
+            simplex_duplex_selection: pdu.simplex_duplex_selection,
             basic_service_information: pdu.basic_service_information.clone(),
             transmission_grant: setup_grant,
             transmission_request_permission: false,
@@ -856,7 +823,7 @@ impl CcBsSubentity {
                 called_ts,
                 calling_usage,
                 called_usage,
-                simplex_duplex: effective_simplex_duplex,
+                simplex_duplex: pdu.simplex_duplex_selection,
                 request_to_transmit_send_data: pdu.request_to_transmit_send_data,
                 state: IndividualCallState::CallSetupPending,
                 setup_timer_started: Some(self.dltime),
@@ -1060,14 +1027,7 @@ impl CcBsSubentity {
             brew_uuid
         );
 
-        self.send_d_call_proceeding(
-            queue,
-            message,
-            call_id,
-            CallTimeoutSetupPhase::T60s,
-            pdu.hook_method_selection,
-            pdu.simplex_duplex_selection,
-        );
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
 
         queue.push_back(SapMsg {
             sap: Sap::Control,
@@ -1221,14 +1181,7 @@ impl CcBsSubentity {
         // EN 300 392-2 table 14.62 carries the selected hook method. Preserve
         // the caller's setup method for this virtual service so terminals do
         // not render the local Parrot answer as a modified private call.
-        self.send_d_call_proceeding(
-            queue,
-            message,
-            call_id,
-            CallTimeoutSetupPhase::T10s,
-            pdu.hook_method_selection,
-            pdu.simplex_duplex_selection,
-        );
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T10s, pdu.hook_method_selection);
 
         let d_connect = DConnect {
             call_identifier: call_id,
@@ -1404,14 +1357,7 @@ impl CcBsSubentity {
         CcBsSubentity::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::LocalLoopback, Some(calling_party));
 
         // D-CALL-PROCEEDING
-        self.send_d_call_proceeding(
-            queue,
-            message,
-            call_id,
-            CallTimeoutSetupPhase::T10s,
-            pdu.hook_method_selection,
-            pdu.simplex_duplex_selection,
-        );
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T10s, pdu.hook_method_selection);
 
         // D-CONNECT — grant transmission immediately (full duplex, calling party talks)
         {

@@ -42,6 +42,7 @@ use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mm::enums::energy_saving_mode::EnergySavingMode;
 use tetra_pdus::mm::enums::location_update_type::LocationUpdateType;
+use tetra_pdus::mm::fields::class_of_ms::ClassOfMs;
 use tetra_pdus::mm::fields::group_identity_location_demand::GroupIdentityLocationDemand;
 use tetra_pdus::mm::fields::group_identity_uplink::GroupIdentityUplink;
 use tetra_pdus::mm::pdus::d_location_update_accept::DLocationUpdateAccept;
@@ -95,6 +96,33 @@ fn type3_marker() -> Type3FieldGeneric {
         field_id: 0,
         len: 8,
         data: 0xA5,
+    }
+}
+
+fn frequency_simplex_voice_class_of_ms() -> ClassOfMs {
+    ClassOfMs {
+        freq_simplex_duplex: false,
+        multislot_phase_mod: true,
+        concurrent_multicarrier: false,
+        voice: true,
+        e2e_encryption_not_supported: true,
+        circuit_mode_data: false,
+        tetra_packet_data: true,
+        fast_switching: false,
+        dck_encryption: false,
+        clch_needed: false,
+        concurrent_circuit_mode: false,
+        original_advanced_link: true,
+        minimum_mode: false,
+        carrier_specific_signalling: false,
+        authentication: false,
+        sck_encryption: false,
+        air_interface_version: 3,
+        common_scch: true,
+        reserved_21: false,
+        mac_d_blck: false,
+        extended_advanced_link: false,
+        d8psk: false,
     }
 }
 
@@ -326,6 +354,50 @@ fn submit_location_update_with_type_and_group_identity_location_demand(
 
     let mut sdu = BitBuffer::new_autoexpand(256);
     pdu.to_bitbuf(&mut sdu).expect("Failed to serialize ULocationUpdateDemand");
+    sdu.seek(0);
+
+    test.submit_message(SapMsg {
+        sap: Sap::LmmSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Mm,
+        msg: SapMsgInner::LmmMleUnitdataInd(LmmMleUnitdataInd {
+            sdu,
+            handle: 0,
+            received_address: TetraAddress::issi(issi),
+        }),
+    });
+}
+
+fn submit_location_update_with_group_and_class_of_ms(test: &mut ComponentTest, issi: u32, gssi: u32, class_of_ms: ClassOfMs) {
+    let pdu = ULocationUpdateDemand {
+        location_update_type: LocationUpdateType::ItsiAttach,
+        request_to_append_la: false,
+        cipher_control: false,
+        ciphering_parameters: None,
+        class_of_ms: Some(class_of_ms),
+        energy_saving_mode: None,
+        la_information: None,
+        ssi: None,
+        address_extension: None,
+        group_identity_location_demand: Some(GroupIdentityLocationDemand {
+            group_identity_attach_detach_mode: 1,
+            group_identity_uplink: Some(vec![GroupIdentityUplink {
+                class_of_usage: Some(0),
+                group_identity_detachment_uplink: None,
+                gssi: Some(gssi),
+                address_extension: None,
+                vgssi: None,
+            }]),
+        }),
+        group_report_response: None,
+        authentication_uplink: None,
+        extended_capabilities: None,
+        proprietary: None,
+    };
+
+    let mut sdu = BitBuffer::new_autoexpand(64);
+    pdu.to_bitbuf(&mut sdu)
+        .expect("Failed to serialize class-carrying ULocationUpdateDemand");
     sdu.seek(0);
 
     test.submit_message(SapMsg {
@@ -11744,6 +11816,98 @@ fn test_p2p_duplex_u_connect_waits_for_called_delivery_before_caller_d_connect()
 }
 
 #[test]
+fn test_p2p_duplex_from_frequency_simplex_ms_keeps_two_local_bearers() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Mm, TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    // EN 300 392-2 clause 16.10.5 / table 16.31 reports RF frequency
+    // simplex/duplex capability. Clause 23.1.3.1 still permits a frequency
+    // half-duplex MS to use single-slot duplex call service on the
+    // corresponding uplink/downlink slot pair, so CMCE must not translate this
+    // RF bit into a forced CMCE simplex private call.
+    submit_location_update_with_group_and_class_of_ms(&mut test, TEST_ISSI, TEST_GSSI, frequency_simplex_voice_class_of_ms());
+    test.run_stack(Some(1));
+    let caller_mm_msgs = test.dump_sinks();
+    assert!(
+        contains_location_update_accept(&caller_mm_msgs),
+        "caller frequency-simplex ClassOfMs registration should be accepted"
+    );
+
+    submit_location_update_with_group_and_class_of_ms(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI, frequency_simplex_voice_class_of_ms());
+    test.run_stack(Some(1));
+    let called_mm_msgs = test.dump_sinks();
+    assert!(
+        contains_location_update_accept(&called_mm_msgs),
+        "called frequency-simplex ClassOfMs registration should be accepted"
+    );
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.hook_method_selection = true;
+    u_setup.simplex_duplex_selection = true;
+    let (call_id, setup_msgs) = start_p2p_setup_with_u_setup(&mut test, u_setup);
+
+    let proceeding = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim),
+            _ => None,
+        })
+        .expect("caller should receive D-CALL PROCEEDING");
+    assert!(
+        proceeding.simplex_duplex_selection,
+        "ClassOfMs frequency-simplex bit must not downgrade caller D-CALL PROCEEDING to simplex"
+    );
+
+    let setup = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim),
+            _ => None,
+        })
+        .expect("called MS should receive D-SETUP");
+    assert!(
+        setup.simplex_duplex_selection,
+        "ClassOfMs frequency-simplex bit must not downgrade called D-SETUP to simplex"
+    );
+    assert_eq!(setup.call_time_out, CallTimeout::Infinite);
+    assert_eq!(count_umac_open(&setup_msgs), 0, "P2P setup must not open traffic before U-CONNECT");
+
+    let (connect_msgs, _after_called_ack_msgs) = submit_p2p_connect_and_ack_called(
+        &mut test,
+        build_u_connect_custom_msg(TEST_CALLED_ISSI, call_id, true),
+        TEST_CALLED_ISSI,
+    );
+
+    let open_circuits: Vec<_> = connect_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        open_circuits.len(),
+        2,
+        "local MS-MS private duplex must open one assigned bearer per MS"
+    );
+    assert!(
+        open_circuits.iter().all(|circuit| circuit.peer_ts.is_some()),
+        "duplex local bearers must be cross-routed with peer_ts on both legs"
+    );
+    assert_ne!(
+        open_circuits[0].ts, open_circuits[1].ts,
+        "local MS-MS private duplex needs two distinct traffic timeslots"
+    );
+}
+
+#[test]
 fn test_p2p_called_d_connect_ack_local_discard_retries_before_release() {
     debug::setup_logging_verbose();
 
@@ -12555,82 +12719,6 @@ fn test_p2p_local_private_call_preserves_hook_method_and_config_timeout_fields()
         assert_eq!(pdu.call_time_out, CallTimeout::T10m);
         assert_eq!(pdu.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     }
-}
-
-#[test]
-fn test_p2p_duplex_request_to_simplex_only_called_ms_is_started_as_simplex() {
-    debug::setup_logging_verbose();
-
-    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
-    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
-
-    test.populate_entities(
-        vec![TetraEntity::Cmce],
-        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
-    );
-    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
-    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
-    {
-        let mut state = test.config.state_write();
-        state.subscribers.register(TEST_ISSI);
-        state.subscribers.register(TEST_CALLED_ISSI);
-        assert!(state.subscribers.set_supports_duplex(TEST_CALLED_ISSI, Some(false)));
-    }
-
-    let mut u_setup = default_p2p_u_setup();
-    u_setup.hook_method_selection = true;
-    u_setup.simplex_duplex_selection = true;
-    let (call_id, setup_msgs) = start_p2p_setup_with_u_setup(&mut test, u_setup);
-
-    let proceeding = setup_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim),
-            _ => None,
-        })
-        .expect("caller should receive D-CALL PROCEEDING");
-    assert!(
-        !proceeding.simplex_duplex_selection,
-        "ClassOfMs simplex-only called MS should make BS proceed with simplex service"
-    );
-
-    let setup = setup_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim),
-            _ => None,
-        })
-        .expect("called MS should receive D-SETUP");
-    assert!(
-        !setup.simplex_duplex_selection,
-        "D-SETUP to a simplex-only called MS must not advertise duplex service"
-    );
-    assert_eq!(setup.call_time_out, CallTimeout::T2m);
-    assert_eq!(count_umac_open(&setup_msgs), 0, "P2P setup must not open traffic before U-CONNECT");
-
-    let (mut connect_msgs, after_called_ack_msgs) = submit_p2p_connect_and_ack_called(
-        &mut test,
-        build_u_connect_custom_msg(TEST_CALLED_ISSI, call_id, true),
-        TEST_CALLED_ISSI,
-    );
-    assert_eq!(
-        count_umac_open(&connect_msgs),
-        1,
-        "simplex-only called MS must keep private call on one shared bearer even if U-CONNECT still carries duplex"
-    );
-    connect_msgs.extend(after_called_ack_msgs);
-
-    let d_connect = connect_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim),
-            _ => None,
-        })
-        .expect("caller should receive D-CONNECT after called connect delivery");
-    assert!(
-        !d_connect.simplex_duplex_selection,
-        "caller D-CONNECT must preserve the simplex fallback selected before bearer allocation"
-    );
 }
 
 #[test]
