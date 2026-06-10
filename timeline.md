@@ -14793,3 +14793,34 @@ Private P2P Preemptive Transmission Interruption - 2026-06-10 16:18 EEST:
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `rustfmt --edition 2024 --check` passed on touched Rust files.
   - `git diff --check` passed.
+
+Private P2P Peer Clear Without Optional Imminent-Disconnect Notice - 2026-06-10 16:26 EEST:
+
+- After deploy of `af4f549`, user still reported Motorola `NO answer` on a
+  normal private simplex call.
+- Live log for `2260082 -> 2260618`, `call_id=4`, `16:23:12..16:23:40 EEST`
+  showed:
+  - `U-SETUP` priority `0`, so this was not a pre-emptive setup;
+  - normal `D-CONNECT ACKNOWLEDGE`, caller `D-CONNECT`, active simplex floor,
+    bidirectional `U-TX DEMAND`/`D-TX GRANTED`, and accepted UL media from both
+    ISSIs;
+  - final `U-DISCONNECT` cause `UserRequestedDisconnection`;
+  - BS sent peer `D-INFO` with notification `26` plus peer `D-RELEASE`
+    `UserRequestedDisconnection` with notification `26`.
+- Clause scope:
+  - EN 300 392-2 clause 14.5.1.3.1 permits the SwMI to inform the other MS of
+    private-call clearance by `D-DISCONNECT` or `D-RELEASE`;
+  - clause 14.5.1.2.2 f) says the SwMI may send the optional "Notice of
+    imminent call disconnection" notification. It is not required for normal
+    user-requested release.
+- Fix:
+  - keep the Motorola-safe peer `D-RELEASE` path;
+  - remove optional peer `D-INFO` imminent-disconnection notice;
+  - remove notification `26` from the peer `D-RELEASE`, leaving only
+    `DisconnectCause::UserRequestedDisconnection`.
+- Verification:
+  - `cargo test -p tetra-entities --test test_cmce_bs p2p_caller_disconnect --locked` passed: 3 tests.
+  - `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 192 tests.
+  - `cargo check -p tetra-entities --locked` passed.
+  - `rustfmt --edition 2024 --check` passed on touched files.
+  - `git diff --check` passed.

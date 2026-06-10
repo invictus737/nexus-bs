@@ -2376,14 +2376,13 @@ impl CcBsSubentity {
         disconnect_cause: DisconnectCause,
         peer_issi: u32,
     ) {
-        let reporters = self.send_established_individual_release_pdus_with_notice(
-            queue,
-            call_id,
-            call,
-            disconnect_cause,
-            Some(peer_issi),
-            Some(peer_issi),
-        );
+        // EN 300 392-2 clause 14.5.1.3.1 permits peer clear with D-RELEASE.
+        // Clause 14.5.1.2.2 f) makes the "imminent call disconnection"
+        // notification optional; live Motorola private-simplex tests render
+        // that optional notification as "No answer" on otherwise established
+        // calls. Keep the mandatory peer D-RELEASE, but do not add D-INFO or
+        // notification 26 on this compatibility-sensitive path.
+        let reporters = self.send_established_individual_release_pdus(queue, call_id, call, disconnect_cause, Some(peer_issi));
         if let Some(pending) = self.pending_individual_disconnect_release_acks.get_mut(&call_id) {
             pending.peer_release_reporters.extend(reporters);
             self.complete_individual_disconnect_if_ready(queue, call_id);

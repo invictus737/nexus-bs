@@ -1688,44 +1688,6 @@ fn assert_established_p2p_release_pdus_to(msgs: &[SapMsg], call_id: u16, disconn
     assert_eq!(facch_ssis, expected);
 }
 
-fn assert_imminent_disconnect_d_info_to(msgs: &[SapMsg], call_id: u16, expected_ssis: &[u32]) {
-    let infos: Vec<_> = msgs
-        .iter()
-        .filter_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_info(prim).map(|pdu| (prim, pdu)),
-            _ => None,
-        })
-        .collect();
-
-    assert_eq!(
-        infos.len(),
-        expected_ssis.len(),
-        "Established P2P release should precede D-RELEASE with one D-INFO imminent-disconnection notice per expected MS leg"
-    );
-
-    let mut facch_ssis = Vec::new();
-    for (prim, d_info) in infos {
-        assert_eq!(d_info.call_identifier, call_id);
-        assert_eq!(
-            d_info.notification_indicator,
-            Some(26),
-            "EN 300 392-2 clause 14.5.1.2.2 f: D-INFO should carry EN 300 392-9 notification 26"
-        );
-        assert_eq!(prim.main_address.ssi_type, SsiType::Issi);
-        assert_eq!(prim.layer2service, Layer2Service::Unacknowledged);
-        assert!(
-            prim.stealing_permission,
-            "imminent-disconnection D-INFO should use assigned-channel FACCH/STCH"
-        );
-        facch_ssis.push(prim.main_address.ssi);
-    }
-
-    facch_ssis.sort_unstable();
-    let mut expected = expected_ssis.to_vec();
-    expected.sort_unstable();
-    assert_eq!(facch_ssis, expected);
-}
-
 fn assert_no_d_info(msgs: &[SapMsg]) {
     assert!(
         !msgs
@@ -10063,8 +10025,8 @@ fn test_p2p_pending_individual_release_remains_busy_until_reporter_completion() 
         DisconnectCause::UserRequestedDisconnection,
         &[TEST_CALLED_ISSI],
     );
-    assert_imminent_disconnect_d_info_to(&peer_release_msgs, call_id, &[TEST_CALLED_ISSI]);
-    assert_release_notification_to(&peer_release_msgs, TEST_CALLED_ISSI, Some(26));
+    assert_no_d_info(&peer_release_msgs);
+    assert_release_notification_to(&peer_release_msgs, TEST_CALLED_ISSI, None);
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
     assert_eq!(peer_release_reporters.len(), 1);
 
@@ -15219,8 +15181,8 @@ fn test_p2p_caller_disconnect_tail_drains_when_mxp600_peer_holds_floor() {
         DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
-    assert_imminent_disconnect_d_info_to(&peer_release_msgs, call_id, &[LAB_ISSI_MXP600]);
-    assert_release_notification_to(&peer_release_msgs, LAB_ISSI_MXP600, Some(26));
+    assert_no_d_info(&peer_release_msgs);
+    assert_release_notification_to(&peer_release_msgs, LAB_ISSI_MXP600, None);
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
 
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
@@ -15335,8 +15297,8 @@ fn test_p2p_caller_disconnect_clears_mxp600_peer_with_release_after_peer_ceased_
         DisconnectCause::UserRequestedDisconnection,
         &[LAB_ISSI_MXP600],
     );
-    assert_imminent_disconnect_d_info_to(&peer_release_msgs, call_id, &[LAB_ISSI_MXP600]);
-    assert_release_notification_to(&peer_release_msgs, LAB_ISSI_MXP600, Some(26));
+    assert_no_d_info(&peer_release_msgs);
+    assert_release_notification_to(&peer_release_msgs, LAB_ISSI_MXP600, None);
     assert_eq!(count_umac_call_ended_or_close(&peer_release_msgs), 0);
 
     let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
