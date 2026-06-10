@@ -64,7 +64,8 @@ pub struct MmClientProperties {
     pub tei: Option<u64>,
     /// True after BS sends D-LOCATION-UPDATE-COMMAND at local watchdog expiry.
     /// If the terminal re-registers, this is cleared. If the grace period
-    /// expires while this is still true, the terminal is silently removed.
+    /// expires while this is still true, the local watchdog clears this flag
+    /// fail-soft and keeps the subscriber route intact for service continuity.
     pub pending_command_sent: bool,
     /// When Some, terminal has until this instant to respond to D-LOCATION-UPDATE-COMMAND.
     pub grace_expires_at: Option<std::time::Instant>,
@@ -224,7 +225,8 @@ impl MmClientMgr {
     }
 
     /// Mark that we sent D-LOCATION-UPDATE-COMMAND at local watchdog expiry.
-    /// Terminal has grace_secs to respond before being removed.
+    /// Terminal has grace_secs to respond before the watchdog abandons this
+    /// probe and retries at the next periodic interval.
     pub fn set_pending_command(&mut self, issi: u32, grace_secs: u32) {
         if let Some(client) = self.clients.get_mut(&issi) {
             client.pending_command_sent = true;
@@ -248,7 +250,7 @@ impl MmClientMgr {
             .iter()
             .filter(|(_, c)| {
                 if c.pending_command_sent {
-                    // Already sent COMMAND — remove if grace period expired
+                    // Already sent COMMAND — report once when grace expires.
                     c.grace_expires_at.map(|d| now >= d).unwrap_or(true)
                 } else {
                     // Normal local periodic-registration watchdog check.

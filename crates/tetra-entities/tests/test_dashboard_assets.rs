@@ -191,8 +191,16 @@ fn external_dashboard_asset_manifest_is_coherent() {
         app.contains("function setIndustrialTone")
             && app.contains("diagramRfState")
             && app.contains("diagramBrewState")
-            && css.contains("device-map"),
-        "dashboard must keep the industrial device-map view wired to live status"
+            && app.contains("diagramPhyState")
+            && app.contains("requestRfCarrierToggle")
+            && app.contains(r#"fetch("/api/rf/carrier""#)
+            && index.contains(r#"id="nodePhy""#)
+            && index.contains(r#"id="diagramPathToggle""#)
+            && index.contains(r#"<button type="button" class="path-toggle"#)
+            && css.contains("device-map")
+            && css.contains("minmax(190px, 220px)")
+            && css.contains("text-wrap: balance"),
+        "dashboard must keep the industrial device-map view wired to live status, RF carrier control, and readable component node titles"
     );
     assert!(
         app.contains(r#"fetch("/api/configs""#)
@@ -230,8 +238,12 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("function countryByRadioId")
             && app.contains("const radioIdCountry = countryByRadioId(value)")
             && app.contains("payload.country")
+            && app.contains("function activeCallIdentityHtml")
+            && app.contains("function callCardPartyHtml")
             && app.contains("function instantSpeakerHtml")
-            && app.contains("ISSI ${esc(issi)}")
+            && app.contains("ISSI ${esc(issiLabel || \"--\")}")
+            && app.contains("group-call-grid")
+            && !app.contains("<span>Caller</span>")
             && app.contains("case \"speaker_changed\"")
             && app.contains("202: \"GR\"")
             && app.contains("226: \"RO\"")
@@ -239,8 +251,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && css.contains(".active-call-board")
             && css.contains(".call-country")
             && css.contains(".call-ts")
+            && css.contains(".call-identity-callsign")
+            && css.contains(".call-card-grid > div > span")
             && css.contains(".speaker-issi"),
-        "active calls must render aligned country flag/code, TS, and instant speaker ISSI using broad MCC-to-country support"
+        "active calls must render aligned country flag/code, TS, unified group speaker identity, and high-legibility radio identity text"
     );
     assert!(
         app.contains("GROUP_CALL_HANGTIME_UI_MS") && app.contains("function endCall"),

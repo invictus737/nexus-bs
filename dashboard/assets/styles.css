@@ -1657,7 +1657,7 @@ h1 {
   grid-column: 1 / -1;
   grid-row: 2;
   display: grid;
-  grid-template-columns: minmax(180px, 220px) minmax(96px, 140px) minmax(180px, 1fr) minmax(170px, 1fr) minmax(112px, 140px);
+  grid-template-columns: minmax(230px, 270px) minmax(190px, 220px) minmax(250px, 1fr) minmax(280px, 1fr) minmax(126px, 150px);
   gap: 16px;
   align-items: center;
   margin-top: 4px;
@@ -1711,13 +1711,15 @@ h1 {
 .path-toggle strong,
 .antenna-stage strong {
   display: block;
-  overflow: hidden;
+  overflow: visible;
   color: #071722;
   font-size: 19px;
   font-weight: 900;
   line-height: 1.1;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  text-wrap: balance;
+  overflow-wrap: normal;
+  word-break: normal;
+  white-space: normal;
 }
 
 .component-node small,
@@ -1888,8 +1890,22 @@ h1 {
   bottom: auto;
   width: auto;
   min-height: 78px;
+  appearance: none;
   background: linear-gradient(180deg, #707274 0, #4c4f51 100%);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
   color: #f4f6f6;
+}
+
+.path-toggle:disabled {
+  cursor: wait;
+  filter: saturate(0.8);
+}
+
+.path-toggle:focus-visible {
+  outline: 3px solid rgba(18, 55, 70, 0.65);
+  outline-offset: 3px;
 }
 
 .path-toggle strong,
@@ -2415,7 +2431,7 @@ body {
 }
 
 .call-label,
-.call-card-grid span {
+.call-card-grid > div > span {
   color: #1a4255;
   font-size: 0.75rem;
   font-weight: 900;
@@ -2437,6 +2453,10 @@ body {
   display: grid;
   grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr) minmax(0, 0.8fr);
   gap: 0.625rem;
+}
+
+.group-call-grid {
+  grid-template-columns: minmax(0, 1.6fr) minmax(9.25rem, 0.6fr);
 }
 
 .call-card-grid > div {
@@ -2467,6 +2487,96 @@ body {
   white-space: normal;
 }
 
+.call-identity {
+  min-width: 0;
+  display: grid;
+  gap: 0.18rem;
+  font-kerning: normal;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+
+.call-identity-callsign {
+  min-width: 0;
+  overflow: hidden;
+  color: #061923;
+  font-size: 1.35rem;
+  font-weight: 950;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.call-identity-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #123f54;
+  font-size: 0.95rem;
+  font-weight: 850;
+  line-height: 1.12;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.call-identity-issi {
+  min-width: 0;
+  overflow: hidden;
+  color: #203943;
+  font-family: var(--mono);
+  font-feature-settings: "tnum" 1;
+  font-size: 0.95rem;
+  font-weight: 900;
+  line-height: 1.05;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.call-card-main .call-identity-callsign {
+  font-size: 2.15rem;
+}
+
+.call-card-main .call-identity-name {
+  font-size: 1.05rem;
+}
+
+.call-card-main .call-identity-issi {
+  font-size: 1rem;
+}
+
+.call-card-speaker .call-identity-callsign {
+  font-size: 1.65rem;
+}
+
+.call-card-speaker .call-identity-name {
+  font-size: 1rem;
+}
+
+.call-card-speaker .call-identity-issi {
+  font-size: 1.05rem;
+}
+
+.call-identity.pending .call-identity-callsign {
+  color: #8b670d;
+}
+
+.call-identity.unresolved .call-identity-callsign,
+.call-identity.muted .call-identity-callsign {
+  color: #52656d;
+}
+
+.call-identity.resolved .call-identity-callsign {
+  color: #035f7e;
+}
+
+.call-identity.builtin .call-identity-callsign {
+  color: #245f24;
+}
+
+.call-identity.muted .call-identity-name,
+.call-identity.muted .call-identity-issi {
+  color: #64757c;
+}
+
 .speaker-now {
   min-width: 0;
   display: grid;
@@ -2492,6 +2602,12 @@ body {
   font-size: 0.82rem;
   font-weight: 800;
   text-overflow: ellipsis;
+}
+
+.call-identity .speaker-issi {
+  color: #203943;
+  font-size: 1.05rem;
+  font-weight: 900;
 }
 
 .speaker-now.muted .speaker-issi,

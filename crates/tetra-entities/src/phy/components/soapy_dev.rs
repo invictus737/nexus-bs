@@ -43,6 +43,7 @@ pub struct RxTxDevSoapySdr {
     sdr: soapyio::SoapyIo,
     rx_dsp: Option<RxDsp>,
     tx_dsp: Option<TxDsp>,
+    tx_inhibited: bool,
     health: Option<SdrHealthMonitor>,
 }
 
@@ -121,6 +122,7 @@ impl RxTxDevSoapySdr {
                 None
             },
 
+            tx_inhibited: false,
             health: health_telemetry.map(SdrHealthMonitor::new),
 
             sdr,
@@ -143,6 +145,9 @@ impl RxTxDevSoapySdr {
     /// false if more data is needed
     /// or if it wants to wait before producing more.
     fn process_tx_block(&mut self, tx_slot: &[TxSlotBits]) -> Result<bool, RxTxDevError> {
+        if self.tx_inhibited || tx_slot.is_empty() {
+            return Ok(false);
+        }
         if let Some(tx_dsp) = &mut self.tx_dsp {
             if self.sdr.tx_possible() {
                 tx_dsp.process_block(&mut self.sdr, self.rx_dsp.as_ref().map(|rx_dsp| rx_dsp.rx_block_count), tx_slot)
@@ -156,6 +161,30 @@ impl RxTxDevSoapySdr {
 }
 
 impl RxTxDev for RxTxDevSoapySdr {
+    fn set_tx_inhibited(&mut self, inhibited: bool) -> Result<(), RxTxDevError> {
+        if self.tx_inhibited == inhibited {
+            return Ok(());
+        }
+
+        if inhibited {
+            if let Some(tx_dsp) = &mut self.tx_dsp {
+                tx_dsp.clear_after_inhibit();
+            }
+            self.sdr.set_tx_stream_active(false)?;
+            self.tx_inhibited = true;
+            tracing::warn!("PHY: SoapySDR TX stream deactivated for RF carrier inhibit");
+        } else {
+            self.sdr.set_tx_stream_active(true)?;
+            if let Some(tx_dsp) = &mut self.tx_dsp {
+                tx_dsp.realign_after_inhibit(&self.sdr)?;
+            }
+            self.tx_inhibited = false;
+            tracing::warn!("PHY: SoapySDR TX stream reactivated after RF carrier inhibit");
+        }
+
+        Ok(())
+    }
+
     fn rxtx_timeslot<'a>(
         &'a mut self,
         tx_slot: &[TxSlotBits],
@@ -480,6 +509,19 @@ impl TxDsp {
         // );
 
         Ok(true)
+    }
+
+    fn clear_after_inhibit(&mut self) {
+        self.fcfb.clear();
+        self.tx_signal_scratch.clear();
+    }
+
+    fn realign_after_inhibit(&mut self, sdr: &soapyio::SoapyIo) -> Result<(), RxTxDevError> {
+        let current_sample = sdr.tx_current_count()?;
+        let current_block = current_sample.div_euclid(self.fcfb.output_block_size() as SampleCount);
+        self.block_count = current_block + 2;
+        self.clear_after_inhibit();
+        Ok(())
     }
 }
 

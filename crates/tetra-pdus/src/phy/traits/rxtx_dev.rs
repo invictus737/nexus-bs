@@ -5,6 +5,7 @@ use tetra_core::TrainingSequence;
 pub enum RxTxDevError {
     RxEndOfData,
     RxReadError,
+    TxStreamError,
 }
 
 #[derive(Debug, Default)]
@@ -42,5 +43,9 @@ pub struct TxSlotBits<'a> {
 
 /// Trait for RX/TX devices that work with full slots.
 pub trait RxTxDev {
+    fn set_tx_inhibited(&mut self, _inhibited: bool) -> Result<(), RxTxDevError> {
+        Ok(())
+    }
+
     fn rxtx_timeslot(&mut self, tx_slot: &[TxSlotBits]) -> Result<Vec<Option<RxSlotBits<'_>>>, RxTxDevError>;
 }

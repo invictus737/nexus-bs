@@ -4195,7 +4195,7 @@ fn test_periodic_registration_command_abandons_pending_swmi_group_transaction() 
 }
 
 #[test]
-fn test_periodic_registration_grace_expiry_rejects_and_removes_groups_energy_and_stale_swmi_ack() {
+fn test_periodic_registration_grace_expiry_preserves_route_groups_energy_and_stale_swmi_ack() {
     debug::setup_logging_verbose();
     let issi = 2040818;
     let active_group = 3007;
@@ -4247,42 +4247,41 @@ fn test_periodic_registration_grace_expiry_rejects_and_removes_groups_energy_and
     }
 
     // EN 300 392-2 clauses 16.9.2.8 and 16.9.3.4: the SwMI first prompts a
-    // fresh registration with D-LOCATION UPDATE COMMAND. If the local watchdog
-    // grace period then expires without the expected U-LOCATION UPDATE DEMAND,
-    // clause 16.11.1.1 timer-expiry semantics map to REJECT(ExpiryOfTimer).
-    // Clause 16.8.6 keeps stale group ACKs from completing after registration
-    // has overridden the old group procedure.
+    // fresh registration with D-LOCATION UPDATE COMMAND. This local watchdog
+    // is not the MS-side T351 timer from clause 16.11.1.1; if the probe or ACK
+    // is lost during live traffic, fail-soft route preservation is safer than
+    // tearing down CMCE/Brew listener state while the MS can still be camped.
+    // Clause 16.8.6 still keeps stale group ACKs from completing after
+    // registration has overridden the old group procedure.
     expire_mm_registration_grace(&mut test, issi);
     test.run_stack(Some(1));
-    let reject_msgs = test.dump_sinks();
-    let reject = extract_location_update_reject(&reject_msgs);
-    assert_eq!(reject.location_update_type, LocationUpdateType::PeriodicLocationUpdating);
-    assert_eq!(reject.reject_cause, RejectCause::ExpiryOfTimer as u8);
-
-    let updates = subscriber_updates(&reject_msgs);
+    let timeout_msgs = test.dump_sinks();
     assert!(
-        updates
-            .iter()
-            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![active_group]),
-        "final removal must publish deaffiliation for cached groups"
+        !mm_downlink_pdu_types(&timeout_msgs).contains(&MmPduTypeDl::DLocationUpdateReject),
+        "lost periodic refresh probe must not send REJECT and force a service break"
     );
+
+    let updates = subscriber_updates(&timeout_msgs);
     assert!(
         updates
             .iter()
-            .any(|update| update.action == BrewSubscriberAction::Deregister && update.issi == issi),
-        "final removal must publish deregistration"
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate && update.action != BrewSubscriberAction::Deregister),
+        "periodic refresh timeout must not publish deaffiliation/deregistration for cached groups, got {updates:?}"
     );
 
     {
         let state = test.config.state_read();
-        assert!(!state.subscribers.is_registered(issi));
-        assert!(state.subscribers.group_members(active_group).is_empty());
-        assert!(!state.energy_saving.contains_key(&issi));
+        assert!(state.subscribers.is_registered(issi));
+        assert_eq!(state.subscribers.group_members(active_group), vec![issi]);
+        assert!(
+            state.energy_saving.contains_key(&issi),
+            "periodic refresh timeout must not discard cached EG assignment"
+        );
     }
     assert_eq!(
-        debug_mm_client_energy(&mut test, issi),
-        None,
-        "second expiry removes the MM client and its cached EG mode"
+        debug_mm_client_energy(&mut test, issi).map(|(mode, _, _)| mode),
+        Some(EnergySavingMode::Eg1),
+        "periodic refresh timeout must keep the MM client and cached EG mode"
     );
 
     submit_swmi_group_ack(&mut test, issi, handle, false, vec![]);
@@ -4290,7 +4289,7 @@ fn test_periodic_registration_grace_expiry_rejects_and_removes_groups_energy_and
     let stale_ack_msgs = test.dump_sinks();
     assert!(
         stale_ack_msgs.is_empty(),
-        "stale SwMI group ACK after final registration expiry must be ignored"
+        "stale SwMI group ACK after periodic refresh timeout must be ignored"
     );
     assert!(!test.config.state_read().subscribers.group_members(stale_group).contains(&issi));
 }

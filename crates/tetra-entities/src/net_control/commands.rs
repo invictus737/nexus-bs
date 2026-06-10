@@ -119,6 +119,10 @@ pub enum ControlCommand {
     /// cleared before the next start.
     StopGoService { start_delay_secs: u64 },
 
+    /// Runtime RF carrier inhibit. This is volatile operator state, not a
+    /// persisted config change: restart returns to carrier active.
+    SetRfCarrierInhibit { inhibited: bool },
+
     /// Add a live SDS message to the broadcast queue.
     /// The message will be transmitted to all MSs on the cell at the next HMD interval,
     /// round-robining with the static Home Mode Display text.

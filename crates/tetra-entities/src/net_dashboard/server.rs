@@ -1204,6 +1204,48 @@ fn serve_service_command(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>
     }
 }
 
+fn parse_rf_carrier_inhibited(value: &serde_json::Value) -> Result<bool, String> {
+    value
+        .get("inhibited")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| "expected JSON object with boolean field 'inhibited'".to_string())
+}
+
+fn serve_rf_carrier_post(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>, value: &serde_json::Value) {
+    let inhibited = match parse_rf_carrier_inhibited(value) {
+        Ok(inhibited) => inhibited,
+        Err(err) => {
+            http_response(stream, 400, &err);
+            return;
+        }
+    };
+    let Some(shared) = shared_config else {
+        http_response(stream, 503, "shared config unavailable");
+        return;
+    };
+
+    let changed = {
+        let mut state = shared.state_write();
+        let changed = state.carrier_inhibited != inhibited;
+        state.carrier_inhibited = inhibited;
+        changed
+    };
+
+    tracing::warn!(
+        "Dashboard: RF carrier {}{}",
+        if inhibited { "inhibited" } else { "enabled" },
+        if changed { "" } else { " (unchanged)" }
+    );
+    let body = serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "inhibited": inhibited,
+        "state": if inhibited { "carrier_inhibited" } else { "carrier_active" },
+        "message": if inhibited { "RF carrier inhibited" } else { "RF carrier active" },
+    }))
+    .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+    http_json_response(stream, 200, &body);
+}
+
 fn serve_clear_dashboard_logs(stream: TcpStream, state: &DashboardState) {
     if let Ok(mut s) = state.write() {
         s.clear_logs();
@@ -1474,6 +1516,19 @@ fn handle_connection(
     } else if request_matches(&req_line, "POST", "/api/service/stop-go") {
         drain_http_headers(&mut stream);
         serve_service_command(stream, &cmd_tx, "stop-go", ControlCommand::StopGoService { start_delay_secs: 5 });
+    } else if request_matches(&req_line, "POST", "/api/rf/carrier") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
+            }
+        };
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => serve_rf_carrier_post(buf.into_inner(), &shared_config, &value),
+            Err(e) => http_response(buf.into_inner(), 400, &format!("invalid JSON: {}", e)),
+        }
     } else if request_matches(&req_line, "POST", "/api/logs/clear") {
         drain_http_headers(&mut stream);
         serve_clear_dashboard_logs(stream, &state);
@@ -2159,6 +2214,7 @@ fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_conf
             .collect();
         let live_sds_queue_len = stack_state.live_sds_queue.len();
         let whitelist_override = stack_state.issi_whitelist_override.clone();
+        let carrier_inhibited = stack_state.carrier_inhibited;
         drop(stack_state);
 
         let whitelist_count = whitelist_override
@@ -2218,6 +2274,10 @@ fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_conf
                 "frequency_match": frequency_match,
             })),
             "timeslot_owners": timeslot_owners,
+            "rf_control": {
+                "carrier_inhibited": carrier_inhibited,
+                "carrier_state": if carrier_inhibited { "carrier_inhibited" } else { "carrier_active" },
+            },
             "services": {
                 "voice": cfg.cell.voice_service,
                 "sds_live_queue_len": live_sds_queue_len,
@@ -3853,10 +3913,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.62"));
+        assert!(rendered.contains("Nexus-BS v0.1.63"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.62"));
+        assert!(rendered.contains("Nexus-BS/v0.1.63"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -3964,6 +4024,7 @@ mod tests {
             "POST",
             "/api/service/stop-go"
         ));
+        assert!(request_matches("POST /api/rf/carrier HTTP/1.1", "POST", "/api/rf/carrier"));
         assert!(request_matches("POST /api/logs/clear HTTP/1.1", "POST", "/api/logs/clear"));
         assert!(request_path_has_prefix(
             "GET /api/configs/profile.toml HTTP/1.1",
@@ -3977,6 +4038,20 @@ mod tests {
         ));
         assert!(!request_is_api("GET /assets/app.js HTTP/1.1"));
         assert!(!request_is_api("GET /radios/2260618 HTTP/1.1"));
+    }
+
+    #[test]
+    fn dashboard_rf_carrier_parser_requires_boolean_inhibit_field() {
+        assert_eq!(
+            parse_rf_carrier_inhibited(&json!({ "inhibited": true })).expect("true is valid"),
+            true
+        );
+        assert_eq!(
+            parse_rf_carrier_inhibited(&json!({ "inhibited": false })).expect("false is valid"),
+            false
+        );
+        assert!(parse_rf_carrier_inhibited(&json!({})).is_err());
+        assert!(parse_rf_carrier_inhibited(&json!({ "inhibited": "true" })).is_err());
     }
 
     #[test]
@@ -4173,9 +4248,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.62");
-        assert_eq!(product.version_tag, "v0.1.62");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.62");
+        assert_eq!(product.version, "0.1.63");
+        assert_eq!(product.version_tag, "v0.1.63");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.63");
     }
 
     #[test]

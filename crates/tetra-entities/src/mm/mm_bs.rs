@@ -4055,39 +4055,24 @@ impl TetraEntityTrait for MmBs {
             //    COMMAND after RoamingLocationUpdating.
             let already_sent = self.client_mgr.is_pending_command(issi);
             if already_sent {
-                // Second expiry — terminal didn't respond to COMMAND within grace period.
-                // Send D-LOCATION-UPDATE-REJECT(ExpiryOfTimer) so the terminal knows it must
-                // re-attach. Without this, terminals like Sepura stay "connected" locally
-                // while the BS has already removed them, causing a silent desync.
-                let last_handle = self.client_mgr.get_client_by_issi(issi).map(|c| c.last_handle).unwrap_or(0);
+                // Grace expiry after BS-commanded periodic refresh.
+                //
+                // This watchdog is a local SwMI liveness probe, not the MS T351
+                // response timer. If the command or its ACK is lost during live
+                // voice activity, hard removal breaks CMCE/Brew listener state
+                // while the terminal may still be camped and usable. Fail soft:
+                // keep routing, groups, EG state, and retry at the next interval.
+                let groups: Vec<u32> = self
+                    .client_mgr
+                    .get_client_by_issi(issi)
+                    .map(|c| c.groups.iter().copied().collect())
+                    .unwrap_or_default();
                 tracing::info!(
-                    "MM: ISSI {} did not respond to D-LOCATION-UPDATE-COMMAND — sending REJECT and removing",
-                    issi
-                );
-                Self::send_d_location_update_reject_cause(
-                    queue,
+                    "MM: ISSI {} did not respond to D-LOCATION-UPDATE-COMMAND — preserving subscriber route groups={:?} and retrying at next periodic interval",
                     issi,
-                    last_handle,
-                    LocationUpdateType::PeriodicLocationUpdating,
-                    None,
-                    RejectCause::ExpiryOfTimer,
+                    groups
                 );
-                let detached = self.client_mgr.remove_client(issi);
-                if let Some(client) = detached {
-                    self.forget_energy_saving(issi);
-                    self.clear_solicited_group_report(issi);
-                    self.clear_critical_downlinks_for_issi(issi);
-                    self.abandon_pending_swmi_group_transaction(
-                        issi,
-                        "periodic registration reject/removal terminates pending SwMI group procedure",
-                    );
-                    self.config.state_write().subscribers.deregister(issi);
-                    if !client.groups.is_empty() {
-                        let groups: Vec<u32> = client.groups.iter().copied().collect();
-                        self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
-                    }
-                    self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
-                }
+                self.client_mgr.reset_registration_timer(issi);
                 continue;
             }
             // First expiry — send COMMAND and wait grace period (60s) for response.

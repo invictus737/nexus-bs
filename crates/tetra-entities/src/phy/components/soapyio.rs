@@ -257,6 +257,28 @@ impl SoapyIo {
         }
     }
 
+    pub fn set_tx_stream_active(&mut self, active: bool) -> Result<bool, RxTxDevError> {
+        let Some(tx) = &mut self.tx else {
+            return Ok(false);
+        };
+        if tx.active() == active {
+            return Ok(false);
+        }
+
+        let result = if active { tx.activate(None) } else { tx.deactivate(None) };
+        match result {
+            Ok(()) => Ok(true),
+            Err(err) => {
+                tracing::error!(
+                    "SoapySDR: Failed to {} TX stream: {}",
+                    if active { "activate" } else { "deactivate" },
+                    err
+                );
+                Err(RxTxDevError::TxStreamError)
+            }
+        }
+    }
+
     pub fn transmit(&mut self, buffer: &[StreamType], count: Option<SampleCount>) -> Result<(), RxTxDevError> {
         if let Some(tx) = &mut self.tx {
             if let Some(initial_time) = self.initial_time {
@@ -266,14 +288,14 @@ impl SoapyIo {
                     false,
                     1000000,
                 )
-                .map_err(|_| RxTxDevError::RxReadError)
+                .map_err(|_| RxTxDevError::TxStreamError)
             } else {
                 // initial_time is not available, so TX is not possible yet
-                Err(RxTxDevError::RxReadError)
+                Err(RxTxDevError::TxStreamError)
             }
         } else {
             // TX is disabled
-            Err(RxTxDevError::RxReadError)
+            Err(RxTxDevError::TxStreamError)
         }
     }
 

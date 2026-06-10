@@ -34,6 +34,7 @@ const state = {
   configEditorDirty: false,
   configEditorStatus: "idle",
   configBusy: false,
+  rfCarrierBusy: false,
   serviceBusy: false,
   serviceStatus: "idle",
   logAutoScroll: true,
@@ -359,6 +360,42 @@ function radioIdentityHtml(issi) {
   const failureUntil = Number(radioId.failureUntil.get(key) || 0);
   const status = failureUntil > Date.now() ? "lookup retrying" : radioId.queued.has(key) ? "queued" : "pending";
   return `<span class="identity pending"><span class="identity-primary">${esc(key)}</span><span class="identity-issi">${esc(status)}</span></span>`;
+}
+
+function activeCallIdentityHtml(issi, options = {}) {
+  const key = normalizeIssi(issi);
+  const speakerClass = options.speaker ? " speaker-now" : "";
+  const mutedClass = options.muted ? " muted" : "";
+  const issiClass = options.speaker ? "call-identity-issi speaker-issi" : "call-identity-issi";
+  const render = (stateClass, callsign, name, issiLabel = key) => `
+    <span class="call-identity ${esc(stateClass)}${speakerClass}${mutedClass}">
+      <span class="call-identity-callsign">${esc(callsign || "--")}</span>
+      <span class="call-identity-name">${esc(name || "RadioID pending")}</span>
+      <span class="${issiClass}">ISSI ${esc(issiLabel || "--")}</span>
+    </span>
+  `;
+
+  if (!validLookupIssi(issi)) return render("unresolved", "--", "invalid identity", issi || "--");
+
+  const builtin = builtinRadioIdentity(issi);
+  if (builtin) return render("resolved builtin", builtin.callsign || radioIdDisplay(builtin), builtin.name || "Built-in service", key);
+
+  const endpoint = radioIdEndpoint();
+  if (!endpoint) return render("unresolved", key, "RadioID disabled", key);
+
+  const entry = radioId.cache.get(key);
+  if (entry && validRadioIdCacheEntry(entry)) {
+    if (entry.callsign && !entry.missing) return render("resolved", entry.callsign, entry.name || entry.country || "Registered radio", key);
+    return render("unresolved", key, "not found", key);
+  }
+  if (entry) {
+    radioId.cache.delete(key);
+    scheduleRadioIdCacheSave();
+  }
+  queueRadioIdLookup(issi);
+  const failureUntil = Number(radioId.failureUntil.get(key) || 0);
+  const status = failureUntil > Date.now() ? "lookup retrying" : radioId.queued.has(key) ? "queued" : "pending";
+  return render("pending", key, status, key);
 }
 
 function destinationHtml(entry) {
@@ -966,6 +1003,48 @@ async function requestServiceAction(action) {
   }
 }
 
+function setSiteCarrierInhibited(inhibited) {
+  if (!state.site) state.site = {};
+  if (!state.site.config) state.site.config = {};
+  if (!state.site.config.rf_control) state.site.config.rf_control = {};
+  state.site.config.rf_control.carrier_inhibited = !!inhibited;
+  state.site.config.rf_control.carrier_state = inhibited ? "carrier_inhibited" : "carrier_active";
+}
+
+async function requestRfCarrierToggle() {
+  if (state.rfCarrierBusy || !state.site?.config?.available) return;
+  const current = !!state.site?.config?.rf_control?.carrier_inhibited;
+  const next = !current;
+  if (next && !window.confirm("Inhibit RF carrier?\nThe BS stays running, but on-air service will stop until RF Carrier is enabled again.")) {
+    return;
+  }
+
+  state.rfCarrierBusy = true;
+  renderStatus();
+  try {
+    const res = await fetch("/api/rf/carrier", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ inhibited: next }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    setSiteCarrierInhibited(!!body.inhibited);
+    await loadSite();
+  } catch (error) {
+    state.logs.push({
+      ts: new Date().toLocaleTimeString(),
+      level: "WARN",
+      msg: `RF carrier command failed: ${String(error.message || error).slice(0, 110)}`,
+    });
+  } finally {
+    state.rfCarrierBusy = false;
+    renderAll();
+  }
+}
+
 function liveSystemSeconds(field, fallbackField) {
   const sys = state.system || {};
   const raw = sys[field] ?? (fallbackField ? sys[fallbackField] : undefined);
@@ -1067,6 +1146,10 @@ function callCallingPartyHtml(call) {
   return call?.caller_issi ? radioIdentityHtml(call.caller_issi) : "--";
 }
 
+function callCardPartyHtml(issi) {
+  return issi ? activeCallIdentityHtml(issi) : "--";
+}
+
 function callCalledPartyHtml(call) {
   if (call?.call_type === "group") return callTargetHtml(call);
   return call?.called_issi ? radioIdentityHtml(call.called_issi) : "--";
@@ -1093,10 +1176,8 @@ function liveSpeakerIssi(call) {
 
 function instantSpeakerHtml(call) {
   const issi = liveSpeakerIssi(call);
-  if (!issi) return '<span class="speaker-now muted"><span class="speaker-issi">--</span><span class="speaker-detail">no active speaker</span></span>';
-  const entry = radioId.cache.get(normalizeIssi(issi));
-  const detail = entry && validRadioIdCacheEntry(entry) && radioIdDisplay(entry) ? radioIdDisplay(entry) : "RadioID pending";
-  return `<span class="speaker-now"><span class="speaker-issi">ISSI ${esc(issi)}</span><span class="speaker-detail">${esc(detail)}</span></span>`;
+  if (!issi) return '<span class="call-identity speaker-now muted"><span class="call-identity-callsign">--</span><span class="call-identity-name">no active speaker</span><span class="call-identity-issi speaker-issi">ISSI --</span></span>';
+  return activeCallIdentityHtml(issi, { speaker: true, muted: callInHangtime(call) });
 }
 
 const WORLD_FLAG = { flag: "🌐", code: "WW", label: "Worldwide" };
@@ -1249,12 +1330,12 @@ function callCardHtml(call) {
         </div>
         <div class="call-card-main">
           <span class="call-label">Called party</span>
-          <strong>${callCalledPartyHtml(call)}</strong>
+          <strong>${callCardPartyHtml(call.called_issi)}</strong>
         </div>
         <div class="call-card-grid private-call-grid">
           <div>
             <span>Calling party</span>
-            <strong>${callCallingPartyHtml(call)}</strong>
+            <strong>${callCardPartyHtml(call.caller_issi)}</strong>
           </div>
           <div>
             <span>Bearer</span>
@@ -1281,14 +1362,10 @@ function callCardHtml(call) {
         <span class="call-label">Target</span>
         <strong>${callTargetHtml(call)}</strong>
       </div>
-      <div class="call-card-grid">
+      <div class="call-card-grid group-call-grid">
         <div class="call-card-speaker">
           <span>${esc(speakerLabel)}</span>
           <strong>${instantSpeakerHtml(call)}</strong>
-        </div>
-        <div>
-          <span>Caller</span>
-          <strong>${callCallingPartyHtml(call)}</strong>
         </div>
         <div class="call-card-time">
           <span>Call time</span>
@@ -1329,17 +1406,29 @@ function renderStatus() {
   setStatusTone("brewStatusStrip", state.brewOnline ? "ok" : "warn");
 
   const rfOnline = !!(state.site?.config?.available || state.txVisual || state.sdrHealth);
-  setText("rfState", rfOnline ? "READY" : "WAITING");
-  setText("diagramRfState", rfOnline ? "READY" : "WAITING");
-  setText("diagramAntennaState", rfOnline ? "radiating carrier" : "RF path muted");
-  setText("diagramPathToggleState", rfOnline ? "ON AIR" : "STANDBY");
-  setIndustrialTone("mapRfMeter", rfOnline ? "ok" : "warn");
-  setIndustrialTone("nodeRfDevice", rfOnline ? "ok" : "warn");
-  setIndustrialTone("diagramPathToggle", rfOnline ? "ok" : "warn");
-  setClass("diagramPathToggle", "is-on", rfOnline);
-  setClass("rfState", "ok", rfOnline);
-  setClass("rfState", "warn", !rfOnline);
-  setStatusTone("rfOpsStatusStrip", rfOnline ? "ok" : "warn");
+  const carrierInhibited = !!state.site?.config?.rf_control?.carrier_inhibited;
+  const rfTone = carrierInhibited ? "bad" : rfOnline ? "ok" : "warn";
+  setText("rfState", carrierInhibited ? "INHIBITED" : rfOnline ? "READY" : "WAITING");
+  setText("diagramRfState", carrierInhibited ? "INHIBITED" : rfOnline ? "READY" : "WAITING");
+  setText("diagramAntennaState", carrierInhibited ? "carrier inhibited" : rfOnline ? "radiating carrier" : "RF path muted");
+  setText(
+    "diagramPathToggleState",
+    state.rfCarrierBusy ? "COMMAND PENDING" : carrierInhibited ? "CARRIER INHIBITED" : rfOnline ? "CARRIER ACTIVE" : "CONTROL UNAVAILABLE"
+  );
+  setIndustrialTone("mapRfMeter", rfTone);
+  setIndustrialTone("nodeRfDevice", rfTone);
+  setIndustrialTone("nodePhy", rfTone);
+  setIndustrialTone("diagramPathToggle", state.rfCarrierBusy ? "warn" : rfTone);
+  setClass("diagramPathToggle", "is-on", rfOnline && !carrierInhibited);
+  setClass("rfState", "ok", rfOnline && !carrierInhibited);
+  setClass("rfState", "warn", !rfOnline && !carrierInhibited);
+  setClass("rfState", "bad", carrierInhibited);
+  const carrierButton = $("diagramPathToggle");
+  if (carrierButton) {
+    carrierButton.disabled = state.rfCarrierBusy || !state.site?.config?.available;
+    carrierButton.setAttribute("aria-pressed", carrierInhibited ? "true" : "false");
+  }
+  setStatusTone("rfOpsStatusStrip", rfTone);
 
   const lastOkAge = state.lastHttpOkMs ? Math.floor((Date.now() - state.lastHttpOkMs) / 1000) : null;
   setText("systemTelemetryState", lastOkAge === null ? state.wsState.toUpperCase() : `${lastOkAge}s`);
@@ -1526,6 +1615,8 @@ function renderSite() {
   const txQuality = state.txQuality || cached.tx_quality || {};
   const sdrHealth = state.sdrHealth || cached.sdr_health || {};
   const sysHealth = state.sysHealth || cached.sys_health || {};
+  const carrierInhibited = !!cfg.rf_control?.carrier_inhibited;
+  const services = cfg.services || {};
 
   const txHz = soapy.tx_hz ?? cell.derived_dl_hz;
   const rxHz = soapy.rx_hz ?? cell.derived_ul_hz;
@@ -1541,11 +1632,33 @@ function renderSite() {
   setText("rfFrame18", compactBool(cell.frame_18_ext));
   setText("rfFreqMatch", soapy.frequency_match ? "matched" : cfg.available ? "check" : "--");
   setText("diagramFrequency", txHz ? fmtHz(txHz) : "--");
-  setText("diagramNetwork", cfg.network ? `${cfg.network.mcc}-${cfg.network.mnc} / CC ${cell.colour_code ?? "--"}` : "--");
+  setText(
+    "diagramNetwork",
+    cfg.network ? `${cfg.network.mcc}-${cfg.network.mnc} / LA ${cell.location_area ?? "--"} / CC ${cell.colour_code ?? "--"}` : "--"
+  );
   setText("diagramProgram", cell.main_carrier !== undefined ? `carrier ${cell.main_carrier}` : "local carrier");
 
   setText("rfDevice", soapy.device || state.system?.sdr_name || "auto");
   setText("diagramRfDevice", soapy.device || state.system?.sdr_name || "auto");
+  setText(
+    "diagramPhyState",
+    carrierInhibited
+      ? "TX inhibited, RX monitor"
+      : txQuality.evm_pct !== undefined
+        ? `pi/4-DQPSK, EVM ${fmtPct(txQuality.evm_pct)}`
+        : "pi/4-DQPSK, waiting TX"
+  );
+  setText(
+    "diagramServicesState",
+    [
+      services.voice ? "CMCE voice" : "voice off",
+      "MM attach",
+      `SDS q=${services.sds_live_queue_len ?? 0}`,
+      services.wx_service ? "WX SDS" : null,
+    ]
+      .filter(Boolean)
+      .join(", ")
+  );
   setText("rfSampleRate", soapy.sample_rate ? fmtHz(soapy.sample_rate, "kHz") : txVisual.sample_rate ? fmtHz(txVisual.sample_rate, "kHz") : "--");
   setText("rfPpm", soapy.ppm_err !== undefined ? `${Number(soapy.ppm_err).toFixed(2)} ppm` : "--");
   setText("rfChannels", `RX ${soapy.rx_ch ?? "auto"} / TX ${soapy.tx_ch ?? "auto"}`);
@@ -1999,6 +2112,7 @@ function initNav() {
   $("serviceRestartBtn")?.addEventListener("click", () => requestServiceAction("restart"));
   $("serviceShutdownBtn")?.addEventListener("click", () => requestServiceAction("shutdown"));
   $("serviceStopGoBtn")?.addEventListener("click", () => requestServiceAction("stopgo"));
+  $("diagramPathToggle")?.addEventListener("click", requestRfCarrierToggle);
   $("logAutoScrollBtn")?.addEventListener("click", () => {
     state.logAutoScroll = !state.logAutoScroll;
     renderLogs();

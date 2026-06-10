@@ -103,6 +103,30 @@ mod tests {
     }
 
     #[test]
+    fn test_roundtrip_bitcode_rf_carrier_inhibit() {
+        let codec = ControlCodecBitcode;
+        let cmd = ControlCommand::SetRfCarrierInhibit { inhibited: true };
+        let bytes = codec.encode_command(&cmd);
+        let decoded = codec.decode_command(&bytes).unwrap();
+        let ControlCommand::SetRfCarrierInhibit { inhibited } = decoded else {
+            panic!("expected SetRfCarrierInhibit");
+        };
+        assert!(inhibited);
+    }
+
+    #[test]
+    fn test_roundtrip_json_rf_carrier_inhibit() {
+        let codec = ControlCodecJson;
+        let cmd = ControlCommand::SetRfCarrierInhibit { inhibited: false };
+        let bytes = codec.encode_command(&cmd);
+        let decoded = codec.decode_command(&bytes).unwrap();
+        let ControlCommand::SetRfCarrierInhibit { inhibited } = decoded else {
+            panic!("expected SetRfCarrierInhibit");
+        };
+        assert!(!inhibited);
+    }
+
+    #[test]
     fn test_roundtrip_bitcode_send_raw_sds() {
         let codec = ControlCodecBitcode;
         let cmd = ControlCommand::SendRawSds {

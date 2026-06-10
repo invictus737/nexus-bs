@@ -336,6 +336,8 @@ pub struct StackState {
     pub timeslot_alloc: TimeslotAllocator,
     /// Backhaul/network connection to SwMI (e.g., Brew/TetraPack). False -> fallback mode.
     pub network_connected: bool,
+    /// Operator RF carrier inhibit latch. Runtime-only; defaults to carrier active after restart.
+    pub carrier_inhibited: bool,
     /// Centralized subscriber registry for local-first routing decisions.
     pub subscribers: SubscriberRegistry,
     /// Optional sidecar file storing local ISSIs that successfully registered.
@@ -521,6 +523,7 @@ impl Default for StackState {
         Self {
             timeslot_alloc: TimeslotAllocator::default(),
             network_connected: false,
+            carrier_inhibited: false,
             subscribers: SubscriberRegistry::new(),
             subscriber_recovery_path: None,
             energy_saving: HashMap::new(),

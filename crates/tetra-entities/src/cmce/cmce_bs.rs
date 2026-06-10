@@ -137,6 +137,16 @@ impl CmceBs {
                 );
                 crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::ZERO);
             }
+            ControlCommand::SetRfCarrierInhibit { inhibited } => {
+                let mut state = sds.shared_config().state_write();
+                let changed = state.carrier_inhibited != inhibited;
+                state.carrier_inhibited = inhibited;
+                tracing::warn!(
+                    "CMCE: RF carrier {}{}",
+                    if inhibited { "inhibited" } else { "enabled" },
+                    if changed { "" } else { " (unchanged)" }
+                );
+            }
             ControlCommand::AddLiveSds {
                 text,
                 protocol_id,

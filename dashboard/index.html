@@ -95,20 +95,20 @@
               <div class="component-stack exciters">
                 <div class="component-node" id="nodeRfDevice">
                   <span class="node-led"></span>
-                  <strong>RF Device</strong>
+                  <strong>SDR / RF Front-End</strong>
                   <small id="diagramRfDevice">SXceiver</small>
                 </div>
                 <div class="component-node secondary" id="nodeBrew">
                   <span class="node-led"></span>
-                  <strong>Brew</strong>
+                  <strong>Brew / SwMI Backhaul</strong>
                   <small id="diagramBrewState">LOCAL</small>
                 </div>
               </div>
 
-              <div class="path-switch" aria-hidden="true">
-                <span class="bus-line primary"></span>
-                <span class="bus-line secondary"></span>
-                <span class="switch-box"><i></i><i></i></span>
+              <div class="component-node baseband" id="nodePhy">
+                <span class="node-led"></span>
+                <strong>PHY / Baseband</strong>
+                <small id="diagramPhyState">pi/4-DQPSK, TX visual</small>
               </div>
 
               <div class="component-node controller" id="nodeScheduler">
@@ -119,8 +119,8 @@
 
               <div class="component-node output" id="nodeOutput">
                 <span class="node-led"></span>
-                <strong>Output Stage</strong>
-                <small>Voice, SDS, WAP</small>
+                <strong>Air Interface Services</strong>
+                <small id="diagramServicesState">CMCE voice, MM, SDS</small>
               </div>
 
               <div class="antenna-stage" aria-label="Antenna path">
@@ -131,15 +131,15 @@
             </div>
 
             <div class="program-card">
-              <strong>Program</strong>
+              <strong>Carrier Plan</strong>
               <span id="diagramFrequency">--</span>
               <small id="diagramNetwork">--</small>
             </div>
 
-            <div class="path-toggle is-warn" id="diagramPathToggle">
-              <strong>RF Program Path</strong>
+            <button type="button" class="path-toggle is-warn" id="diagramPathToggle" aria-pressed="false" aria-label="RF carrier control">
+              <strong>RF Carrier</strong>
               <span><i></i><em id="diagramPathToggleState">WAIT</em></span>
-            </div>
+            </button>
           </div>
         </section>
 
