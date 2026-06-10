@@ -9410,7 +9410,7 @@ fn test_group_pending_release_large_ptt_flood_is_ignored_without_signalling() {
 }
 
 #[test]
-fn test_group_release_pending_rejects_network_speaker_change_without_floor_signalling() {
+fn test_group_release_pending_allows_network_restart_while_old_release_drains() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -9434,9 +9434,9 @@ fn test_group_release_pending_rejects_network_speaker_change_without_floor_signa
     test.populate_entities(components, sinks);
 
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
-    let call_id = start_group_call(&mut test);
+    let (old_call_id, old_ts, _old_usage) = start_group_call_with_circuit(&mut test);
 
-    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, old_call_id));
     test.run_stack(Some(1));
     let release_msgs = test.dump_sinks();
     assert_eq!(count_d_releases(&release_msgs), 2);
@@ -9455,25 +9455,49 @@ fn test_group_release_pending_rejects_network_speaker_change_without_floor_signa
         }),
     });
     test.run_stack(Some(1));
-    let network_msgs = test.dump_sinks();
+    let setup_msgs = test.dump_sinks();
 
-    assert_eq!(count_network_call_end(&network_msgs, brew_uuid), 1);
-    assert_eq!(count_d_tx_interrupt(&network_msgs), 0);
-    assert_eq!(count_d_tx_granted(&network_msgs), 0);
-    assert_eq!(count_d_tx_ceased(&network_msgs), 0);
-    assert_eq!(count_umac_floor_granted(&network_msgs), 0);
-    assert_eq!(count_umac_floor_released(&network_msgs), 0);
+    assert_eq!(
+        count_network_call_end(&setup_msgs, brew_uuid),
+        0,
+        "Brew restart during stale pending release must not be dropped"
+    );
+    assert_eq!(count_d_releases(&setup_msgs), 0);
+    assert_eq!(count_d_setups(&setup_msgs), 1, "restart should send a fresh group D-SETUP");
+    assert_eq!(count_umac_open(&setup_msgs), 1, "restart should open one replacement circuit");
+    assert_eq!(
+        count_umac_call_ended_or_close(&setup_msgs),
+        0,
+        "restart must not close the stale pending-release circuit before D-RELEASE reporter/guard completion"
+    );
     assert!(
-        network_msgs.iter().all(|msg| {
-            !matches!(
-                &msg.msg,
-                SapMsgInner::CmceCallControl(CallControl::NetworkCallReady {
-                    brew_uuid: ready_uuid,
-                    ..
-                }) if *ready_uuid == brew_uuid
-            )
-        }),
-        "pending group release must not report network floor readiness"
+        network_group_ready_tuple(&setup_msgs, brew_uuid).is_none(),
+        "network restart must wait for fresh RF D-SETUP transmission before Brew media ready"
+    );
+
+    let replacement_circuit = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .expect("network restart should open one replacement circuit");
+    assert_ne!(
+        replacement_circuit.ts, old_ts,
+        "restart must use a different traffic slot from the pending release"
+    );
+
+    let new_call_id = first_d_setup_call_id(&setup_msgs);
+    assert_ne!(new_call_id, old_call_id, "restart should allocate a fresh group call id");
+
+    let reporter = first_d_setup_reporter(&setup_msgs);
+    reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    assert_eq!(
+        network_group_ready_tuple(&ready_msgs, brew_uuid),
+        Some((new_call_id, replacement_circuit.ts)),
+        "Brew media should become ready after the fresh D-SETUP reaches RF"
     );
 }
 

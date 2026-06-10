@@ -809,25 +809,9 @@ impl CcBsSubentity {
         if let Some((call_id, old_speaker)) = self
             .active_calls
             .iter()
-            .find(|(_, c)| c.dest_gssi == dest_gssi)
+            .find(|(id, c)| c.dest_gssi == dest_gssi && !self.pending_group_releases.contains_key(id))
             .map(|(id, c)| (*id, c.source_issi))
         {
-            if self.pending_group_releases.contains_key(&call_id) {
-                tracing::info!(
-                    "CMCE: rejecting network speaker change gssi={} source={} while group release is pending call_id={}",
-                    dest_gssi,
-                    source_issi,
-                    call_id
-                );
-                queue.push_back(SapMsg {
-                    sap: Sap::Control,
-                    src: TetraEntity::Cmce,
-                    dest: TetraEntity::Brew,
-                    msg: SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }),
-                });
-                return;
-            }
-
             // If a local MS currently holds the floor, only allow network
             // preemption when explicitly configured and when the incoming call
             // priority is an ETSI pre-emptive priority strictly above the
