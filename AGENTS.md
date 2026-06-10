@@ -18,15 +18,17 @@ Project laws:
   evidence.
 - Before any protocol/RF/CMCE/UMAC/MM/SDS/WAP/parrot behaviour change, identify
   the relevant ETSI EN 300 392-2 clause scope and keep changes test-backed.
+- Local ETSI/TETRA text cache lives in
+  `Docs/tetra-standards/cache/`; refresh it with
+  `Docs/tetra-standards/fetch_etsi_text.sh` if missing. Use this before
+  web-searching for TS/EN 300 392 clause text.
 - Inspect `git status --short` before edits and never revert user changes unless
   explicitly requested.
 
 Current runtime checkpoint:
 
-- Last deployed runtime commit is `74ce228` on branch `nexus-bs-v0.1.55`.
-- Runtime version `v0.1.62-74ce2282` deployed to `chris@192.168.1.179`.
-- Latest work was dashboard-only: fixed live scroll fighting, moved System
-  Timeslots above Host/Carrier Plan, removed Traffic Call Control/Activity Log,
-  consolidated Last Heard voice/SDS, and resolved Parrot `99999` locally.
-- A later commit may exist only to add this Codex bootstrap file; do not treat
-  that docs-only commit as a runtime deploy.
+- Rollback checkpoint explicitly requested by user: commit `80b8d1e`
+  (`fix: suppress unsupported private preemptive release cause`).
+- Runtime version `v0.1.62-80b8d1eb` deployed to `chris@192.168.1.179`.
+- If private P2P pre-emption work regresses service badly, use `80b8d1e` as the
+  known rollback base before continuing analysis.
