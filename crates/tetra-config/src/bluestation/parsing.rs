@@ -645,6 +645,7 @@ allowed_gssi_ranges = [
         assert!(!cfg.cell.transmission_interruption_enabled);
         assert!(cfg.cell.legacy_gssi_group_call);
         assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
+        assert_eq!(cfg.cell.periodic_registration_secs, 0);
         assert!(!cfg.cell.sndcp_service);
         assert!(cfg.dashboard.is_some());
         assert_eq!(cfg.service_name.as_deref(), Some("nexus-bs"));

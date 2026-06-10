@@ -1,5 +1,54 @@
 # Nexus-BS Project Timeline
 
+## 2026-06-10 12:36 EEST - Stop false Brew reconnect re-registration churn
+
+Scope:
+
+- Brew/MM availability patch and config-default hardening.
+- Field symptom: operator observed repeated TETRA station reconnects and Brew
+  reconnect indications during normal service.
+- Runtime evidence:
+  - systemd services did not restart (`NRestarts=0`);
+  - live logs showed `BrewReconnected` being emitted around normal Brew
+    `GROUP_TX` traffic;
+  - live logs also showed BS-initiated periodic registration refreshes every
+    `3600s` for local ISSIs.
+
+Root cause:
+
+- `BrewWorker` emitted `VersionDetected { v1 }` for every v1 `GROUP_TX` that
+  carried a mnemonic.
+- `BrewEntity` treated every `VersionDetected` as a real Brew reconnect and
+  forwarded `BrewReconnected` to MM.
+- MM's `BrewReconnected` handler sends `D-LOCATION-UPDATE-COMMAND` to locally
+  registered MS units, so normal Brew traffic could force unnecessary
+  re-registration.
+- Separately, `periodic_registration_secs = 3600` enabled an hourly local MM
+  watchdog that intentionally sends `D-LOCATION-UPDATE-COMMAND`; default is now
+  `0` so that watchdog is opt-in for 24x7 stability.
+
+ETSI clause discipline:
+
+- The patch does not change normal attach/group-affiliation acceptance,
+  group-call floor control, LLC, UMAC scheduling, SDS, WAP, RF or parrot
+  behavior.
+- It narrows when existing SwMI-initiated registration refresh is requested:
+  Brew protocol-version discovery is telemetry, not an EN 300 392-2
+  registration trigger.
+- The retained real-reconnect MM refresh remains the existing
+  `D-LOCATION-UPDATE-COMMAND` path scoped to EN 300 392-2 registration/location
+  update behavior; no formal conformance claim is made.
+
+Verification:
+
+- `cargo fmt -p tetra-config -p tetra-entities --check` passed.
+- `cargo test -p tetra-config --lib bluestation::parsing --locked` passed.
+- `cargo test -p tetra-entities --lib net_brew --locked` passed.
+- `cargo test -p tetra-entities --test test_mm_bs brew_reconnect --locked`
+  passed.
+- `cargo check -p tetra-config -p tetra-entities --locked` passed.
+- `git diff --check` passed.
+
 ## 2026-06-10 00:55 EEST - Brew GSSI zero-media watchdog for 226333 stalls
 
 Scope:

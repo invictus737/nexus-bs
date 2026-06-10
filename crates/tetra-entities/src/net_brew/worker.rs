@@ -123,7 +123,6 @@ impl BrewEvent {
         matches!(
             self,
             BrewEvent::Connected { .. }
-                | BrewEvent::VersionDetected { .. }
                 | BrewEvent::Disconnected(_)
                 | BrewEvent::GroupCallStart { .. }
                 | BrewEvent::GroupCallEnd { .. }
@@ -284,6 +283,8 @@ pub struct BrewWorker<T: NetworkTransport> {
     /// Last log timestamp per dropped event type, to keep overload visible
     /// without flooding the dashboard log tab during voice spikes.
     event_drop_last_log: HashMap<&'static str, Instant>,
+    /// Last Brew protocol version reported to the entity.
+    detected_server_version: u8,
 }
 
 impl<T: NetworkTransport> BrewWorker<T> {
@@ -299,6 +300,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
             pending_sds: HashMap::new(),
             event_drop_counts: HashMap::new(),
             event_drop_last_log: HashMap::new(),
+            detected_server_version: 0,
         }
     }
 
@@ -355,6 +357,14 @@ impl<T: NetworkTransport> BrewWorker<T> {
         }
     }
 
+    fn detect_server_version(&mut self, version: u8) {
+        if version == 0 || self.detected_server_version == version {
+            return;
+        }
+        self.detected_server_version = version;
+        self.enqueue_event(BrewEvent::VersionDetected { version });
+    }
+
     /// Main worker entry point — runs until disconnect or fatal error
     pub fn run(&mut self) {
         tracing::info!("BrewWorker: starting");
@@ -364,8 +374,9 @@ impl<T: NetworkTransport> BrewWorker<T> {
             match self.transport.connect() {
                 Ok(()) => {
                     tracing::info!("BrewWorker: transport connected");
+                    self.detected_server_version = self.transport.server_brew_version();
                     self.enqueue_event(BrewEvent::Connected {
-                        server_version: self.transport.server_brew_version(),
+                        server_version: self.detected_server_version,
                     });
                 }
                 Err(e) => {
@@ -713,7 +724,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     );
                     // Detect server version from mnemonic presence (v1 includes 34-byte mnemonic)
                     if gt.mnemonic.is_some() {
-                        self.enqueue_event(BrewEvent::VersionDetected { version: 1 });
+                        self.detect_server_version(1);
                     }
                     if !net_brew::is_brew_gssi_routable(&self.config, gt.destination) {
                         tracing::warn!("BrewWorker: dropping GROUP_TX to non-routable GSSI {}", gt.destination);

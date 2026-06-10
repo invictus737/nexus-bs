@@ -199,9 +199,10 @@ energy_saving_mode = "auto"
 # §16.9.2.8/§16.9.3.4 signalling: first expiry sends D-LOCATION-UPDATE-COMMAND
 # and waits a grace window; second grace expiry sends
 # D-LOCATION-UPDATE-REJECT (ExpiryOfTimer) and clears local registration state.
-# 0 = disabled — registrations never expire.
-# Default: 3600 (1 hour). Valid range when non-zero: 60–86400.
-# periodic_registration_secs = 3600
+# 0 = disabled — registrations never expire. Default: 0.
+# Set a non-zero value only if you intentionally want the BS to force periodic
+# registration refreshes; valid non-zero range: 60–86400.
+# periodic_registration_secs = 0
 
 ###############################################################################
 # OPTIONAL: Neighbor Cell Broadcast (NCB)

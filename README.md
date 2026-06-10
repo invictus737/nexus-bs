@@ -136,7 +136,7 @@ colour_code = 1
 | `call_preemptive` | `false` | Enable CMCE D-TX INTERRUPT for configured pre-emptive group-call floor withdrawal. Alias: `transmission_interruption_enabled` |
 | `legacy_gssi_group_call` | `false` | Compatibility profile for older terminals that fail same-speaker GSSI hangtime retake; releases local no-handoff group overs so the next PTT starts fresh setup |
 | `energy_saving_mode` | `auto` | Energy economy policy used by MM/UMAC scheduling; `auto` accepts the terminal-requested StayAlive/EG1..EG7 mode, explicit `eg1`..`eg7` may be used for lab forcing, and `stay_alive` disables sleep |
-| `periodic_registration_secs` | `3600` | Local periodic-registration watchdog; `0` = disabled |
+| `periodic_registration_secs` | `0` | Local periodic-registration watchdog; `0` = disabled, non-zero enables BS-forced registration refresh |
 | `allowed_gssi_ranges` | unset | Optional MM group provisioning ranges; unset accepts dynamic GSSIs, set ranges reject unprovisioned group attach as unknown group identity |
 
 ### Dashboard

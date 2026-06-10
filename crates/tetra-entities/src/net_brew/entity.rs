@@ -192,6 +192,8 @@ pub struct BrewEntity {
 
     /// Whether the worker is connected
     connected: bool,
+    /// Last Brew protocol version reported by the transport or inferred from messages.
+    server_version: u8,
     /// Optional telemetry sink for emitting brew status events
     telemetry_sink: Option<TelemetrySink>,
 
@@ -259,6 +261,7 @@ impl BrewEntity {
             ul_forwarded: HashMap::new(),
             subscriber_groups: HashMap::new(),
             connected: false,
+            server_version: 0,
             telemetry_sink: None,
             rssi_last_sent: HashMap::new(),
             pending_sds_reports: HashMap::new(),
@@ -362,26 +365,26 @@ impl BrewEntity {
             match event {
                 BrewEvent::Connected { server_version } => {
                     tracing::debug!("BrewEntity: connected to TetraPack server (Brew v{})", server_version);
+                    let was_connected = self.connected;
                     self.connected = true;
+                    self.server_version = server_version;
                     self.resync_subscribers();
                     self.set_network_connected(true, server_version);
+                    if !was_connected {
+                        queue.push_back(SapMsg {
+                            sap: tetra_core::Sap::Control,
+                            src: TetraEntity::Brew,
+                            dest: TetraEntity::Mm,
+                            msg: SapMsgInner::BrewReconnected,
+                        });
+                    }
                 }
                 BrewEvent::VersionDetected { version } => {
-                    tracing::info!("BrewEntity: server Brew version detected from message length: v{}", version);
-                    self.emit_brew_version(version);
-                    // Notify MM that Brew reconnected so it can send D-LOCATION-UPDATE-COMMAND
-                    // to all locally registered MS. Without this, MS units that were registered
-                    // before the disconnect believe they are still affiliated and do not
-                    // re-register — PTT calls are denied until the radio is power-cycled.
-                    queue.push_back(SapMsg {
-                        sap: tetra_core::Sap::Control,
-                        src: TetraEntity::Brew,
-                        dest: TetraEntity::Mm,
-                        msg: SapMsgInner::BrewReconnected,
-                    });
+                    self.update_detected_brew_version(version);
                 }
                 BrewEvent::Disconnected(reason) => {
                     tracing::warn!("BrewEntity: Brew backhaul disconnected: {} — releasing all active calls", reason);
+                    self.server_version = 0;
                     self.set_network_connected(false, 0);
                     // ETSI EN 300 392-2 §14.9.4: BS must release all circuits immediately
                     // when backhaul connection is lost. MS will receive D-RELEASE.
@@ -763,10 +766,19 @@ impl BrewEntity {
     }
 
     /// Emit a brew version upgrade event directly without changing connection state.
-    fn emit_brew_version(&self, version: u8) {
+    fn update_detected_brew_version(&mut self, version: u8) {
+        if version == 0 || self.server_version == version {
+            tracing::trace!("BrewEntity: server Brew version v{} already known", version);
+            return;
+        }
+        self.server_version = version;
+        tracing::info!("BrewEntity: server Brew version detected from message length: v{}", version);
+        if self.connected {
+            crate::health::registry().set_brew_status(true, version);
+        }
         if let Some(ref sink) = self.telemetry_sink {
             let _ = sink.send(TelemetryEvent::BrewConnected {
-                connected: true,
+                connected: self.connected,
                 server_version: version,
             });
         }
@@ -1991,7 +2003,7 @@ mod tests {
     use std::collections::{HashMap, HashSet, VecDeque};
     use std::time::Instant;
 
-    use crossbeam_channel::{Receiver, bounded};
+    use crossbeam_channel::{Receiver, Sender, bounded};
     use tetra_config::bluestation::{SharedConfig, from_toml_str};
     use tetra_core::{TdmaTime, TxReporter};
     use tetra_saps::SapMsgInner;
@@ -2016,9 +2028,9 @@ mod tests {
         SharedConfig::from_parts(cfg, None)
     }
 
-    fn brew_entity_without_worker() -> (BrewEntity, Receiver<BrewCommand>) {
+    fn brew_entity_with_event_sender() -> (BrewEntity, Receiver<BrewCommand>, Sender<BrewEvent>) {
         let config = brew_test_config();
-        let (_event_sender, event_receiver) = bounded::<BrewEvent>(BREW_EVENT_CHANNEL_CAPACITY);
+        let (event_sender, event_receiver) = bounded::<BrewEvent>(BREW_EVENT_CHANNEL_CAPACITY);
         let (command_sender, command_receiver) = bounded::<BrewCommand>(BREW_COMMAND_CHANNEL_CAPACITY);
         let brew_config = config.config().brew.clone().expect("brew config");
 
@@ -2036,6 +2048,7 @@ mod tests {
                 ul_forwarded: HashMap::new(),
                 subscriber_groups: HashMap::new(),
                 connected: true,
+                server_version: 1,
                 telemetry_sink: None,
                 rssi_last_sent: HashMap::new(),
                 pending_sds_reports: HashMap::new(),
@@ -2043,7 +2056,13 @@ mod tests {
                 worker_handle: None,
             },
             command_receiver,
+            event_sender,
         )
+    }
+
+    fn brew_entity_without_worker() -> (BrewEntity, Receiver<BrewCommand>) {
+        let (entity, command_receiver, _event_sender) = brew_entity_with_event_sender();
+        (entity, command_receiver)
     }
 
     fn drain_queue(queue: &mut MessageQueue) -> Vec<tetra_saps::SapMsg> {
@@ -2052,6 +2071,49 @@ mod tests {
             drained.push(msg);
         }
         drained
+    }
+
+    #[test]
+    fn brew_version_detection_does_not_force_mm_reregistration() {
+        let (mut entity, _rx, event_sender) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+
+        event_sender
+            .send(BrewEvent::VersionDetected { version: 1 })
+            .expect("test event can be queued");
+        entity.process_events(&mut queue);
+
+        assert!(
+            drain_queue(&mut queue)
+                .iter()
+                .all(|msg| !matches!(msg.msg, SapMsgInner::BrewReconnected)),
+            "Brew protocol version detection is not a Brew reconnect and must not force MS re-registration"
+        );
+    }
+
+    #[test]
+    fn brew_connected_transition_notifies_mm_once() {
+        let (mut entity, _rx, event_sender) = brew_entity_with_event_sender();
+        entity.connected = false;
+        entity.server_version = 0;
+        let mut queue = MessageQueue::new();
+
+        event_sender
+            .send(BrewEvent::Connected { server_version: 1 })
+            .expect("test connect event can be queued");
+        event_sender
+            .send(BrewEvent::Connected { server_version: 1 })
+            .expect("duplicate connect event can be queued");
+        entity.process_events(&mut queue);
+
+        let reconnects = drain_queue(&mut queue)
+            .iter()
+            .filter(|msg| matches!(msg.msg, SapMsgInner::BrewReconnected))
+            .count();
+        assert_eq!(
+            reconnects, 1,
+            "MM re-registration refresh should be tied to a real disconnected->connected transition"
+        );
     }
 
     #[test]

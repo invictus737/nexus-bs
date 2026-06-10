@@ -262,7 +262,7 @@ pub struct CfgCellInfo {
     /// 10 s MS-side registration response timer.
     /// MS must re-register within this interval or be deregistered by the BS.
     /// 0 = disabled — MS registrations never expire.
-    /// Default: 3600 (1 hour). Valid range when non-zero: 60–86400.
+    /// Default: 0 (disabled). Valid range when non-zero: 60–86400.
     pub periodic_registration_secs: u32,
 
     /// SwMI energy economy allocation.
@@ -349,7 +349,7 @@ pub struct CellInfoDto {
     #[serde(alias = "legacy_group_same_speaker_retake")]
     pub legacy_gssi_group_call: Option<bool>,
 
-    /// Periodic registration interval in seconds. 0 = disabled. Default: 3600.
+    /// Periodic registration interval in seconds. 0 = disabled. Default: 0.
     pub periodic_registration_secs: Option<u32>,
 
     /// Energy economy allocation: "auto", "stay_alive"/0 or "eg1".."eg7"/1..7.
@@ -431,7 +431,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         transmission_interruption_enabled: ci.transmission_interruption_enabled.unwrap_or(false),
         legacy_gssi_group_call: ci.legacy_gssi_group_call.unwrap_or(false),
         periodic_registration_secs: {
-            let v = ci.periodic_registration_secs.unwrap_or(3600);
+            let v = ci.periodic_registration_secs.unwrap_or(0);
             if v == 0 { 0 } else { v.clamp(60, 86400) }
         },
         energy_saving_mode: parse_energy_saving_mode(ci.energy_saving_mode)?,

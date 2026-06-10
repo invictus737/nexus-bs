@@ -86,7 +86,7 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         ul_inactivity_secs: 3,
         transmission_interruption_enabled: false,
         legacy_gssi_group_call: false,
-        periodic_registration_secs: 3600,
+        periodic_registration_secs: 0,
         energy_saving_mode: 0,
         sds_command_control: None,
     }
