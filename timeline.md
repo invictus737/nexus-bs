@@ -14740,3 +14740,23 @@ Dashboard Traffic Consolidation and Parrot Identity Fix - 2026-06-10 10:14 EEST:
   - this committed hotfix is intended for the follow-up redeploy so the live
     build id points at the traceable dashboard hotfix commit instead of the
     previous `099df5fd`.
+
+Private P2P Preemptive Cause Guard - 2026-06-10 15:36 EEST:
+
+- User reported Motorola private simplex P2P showing `Call preempted`.
+- Live config was verified with `call_preemptive = false`; journal showed no
+  BS-origin `D-TX INTERRUPT`. The visible cause came from local MS
+  `U-DISCONNECT PreEmptiveUseOfResource` being echoed by BS as
+  `D-RELEASE PreEmptiveUseOfResource`.
+- Clause scope: EN 300 392-2 table 14.46 and clause 14.5.1.2.1 f) scope
+  pre-emption to explicitly supported pre-emptive procedures; private-call
+  pre-emption is not supported by this SwMI, while clause 14.5.1.3.1 still
+  requires a normal D-RELEASE response to U-DISCONNECT.
+- Fix:
+  - individual/P2P `U-DISCONNECT PreEmptiveUseOfResource` is normalized to
+    `UserRequestedDisconnection` before D-RELEASE / tail-drain handling;
+  - group-call pre-emption paths are unchanged.
+- Verification:
+  - `cargo test -p tetra-entities --test test_cmce_bs preemptive_disconnect --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 191 tests.
+  - `git diff --check` passed.

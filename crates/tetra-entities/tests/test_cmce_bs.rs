@@ -891,11 +891,15 @@ fn build_u_release_with_unsupported_feature_msg(calling_issi: u32, call_id: u16,
 }
 
 fn build_u_disconnect_msg(calling_issi: u32, call_id: u16) -> SapMsg {
+    build_u_disconnect_with_cause_msg(calling_issi, call_id, DisconnectCause::UserRequestedDisconnection)
+}
+
+fn build_u_disconnect_with_cause_msg(calling_issi: u32, call_id: u16, disconnect_cause: DisconnectCause) -> SapMsg {
     build_u_disconnect_pdu_msg(
         calling_issi,
         UDisconnect {
             call_identifier: call_id,
-            disconnect_cause: DisconnectCause::UserRequestedDisconnection,
+            disconnect_cause,
             facility: None,
             proprietary: None,
         },
@@ -11737,6 +11741,64 @@ fn test_p2p_caller_invalid_call_identifier_during_caller_connect_ack_pending_rel
 }
 
 #[test]
+fn test_p2p_preemptive_disconnect_during_caller_connect_pending_is_sanitized() {
+    debug::setup_logging_verbose();
+
+    let shared = SharedConfig::from_parts(ComponentTest::get_default_test_config(StackMode::Bs), None);
+    let mut cmce = CmceBs::new(shared, None, None);
+    let mut queue = MessageQueue::new();
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, dltime);
+    let caller_connect_msgs = drain_message_queue(&mut queue);
+    let caller_reporter = d_connect_reporter(&caller_connect_msgs, TEST_ISSI);
+    caller_reporter.mark_transmitted();
+
+    cmce.rx_prim(
+        &mut queue,
+        build_u_disconnect_with_cause_msg(TEST_ISSI, call_id, DisconnectCause::PreEmptiveUseOfResource),
+    );
+    let release_msgs = drain_message_queue(&mut queue);
+
+    assert_eq!(count_d_disconnects(&release_msgs), 0);
+    assert_eq!(count_d_tx_interrupt(&release_msgs), 0);
+    assert_eq!(
+        count_umac_floor_granted(&release_msgs),
+        0,
+        "unsupported private pre-emption abort must not activate the simplex floor"
+    );
+
+    let releases: Vec<_> = release_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_release(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(releases.len(), 2);
+    assert!(
+        releases
+            .iter()
+            .all(|(_, pdu)| pdu.disconnect_cause == DisconnectCause::UserRequestedDisconnection),
+        "private-call U-DISCONNECT PreEmptiveUseOfResource is a terminal-local abort here; BS must not echo it as SwMI pre-emption"
+    );
+    assert!(releases.iter().any(|(prim, _)| prim.main_address.ssi == TEST_ISSI));
+    assert!(releases.iter().any(|(prim, _)| prim.main_address.ssi == TEST_CALLED_ISSI));
+}
+
+#[test]
 fn test_p2p_duplex_u_connect_waits_for_called_delivery_before_caller_d_connect() {
     debug::setup_logging_verbose();
 
@@ -12552,6 +12614,61 @@ fn test_simple_private_call_works_with_preemption_default_off() {
             .count(),
         1,
         "default-off simple private call should send one repeated unacknowledged D-CONNECT ACKNOWLEDGE"
+    );
+}
+
+#[test]
+fn test_simplex_p2p_preemptive_disconnect_cause_is_sanitized_when_unsupported() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    assert!(
+        !test.config.config().cell.transmission_interruption_enabled,
+        "call_preemptive/transmission_interruption_enabled must remain default-off"
+    );
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let call_id = start_active_p2p_call(&mut test);
+
+    test.submit_message(build_u_disconnect_with_cause_msg(
+        TEST_ISSI,
+        call_id,
+        DisconnectCause::PreEmptiveUseOfResource,
+    ));
+    test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_d_tx_interrupt(&initiator_release_msgs),
+        0,
+        "private P2P release must not emit D-TX INTERRUPT when pre-emption is unsupported"
+    );
+    assert_established_p2p_release_pdus_to(
+        &initiator_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_ISSI],
+    );
+    let release_ack_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(release_ack_reporters.len(), 1);
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let peer_release_msgs = test.dump_sinks();
+    assert_eq!(count_d_disconnects(&peer_release_msgs), 0);
+    assert_established_p2p_release_pdus_to(
+        &peer_release_msgs,
+        call_id,
+        DisconnectCause::UserRequestedDisconnection,
+        &[TEST_CALLED_ISSI],
     );
 }
 

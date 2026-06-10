@@ -2,6 +2,32 @@ use super::super::dtmf::{DtmfKind, decode_dtmf, pack_type3_bits_to_bytes};
 use super::*;
 
 impl CcBsSubentity {
+    fn normalize_individual_u_disconnect_cause(
+        &self,
+        call_id: u16,
+        call: &IndividualCall,
+        sender: TetraAddress,
+        disconnect_cause: DisconnectCause,
+    ) -> DisconnectCause {
+        if disconnect_cause != DisconnectCause::PreEmptiveUseOfResource {
+            return disconnect_cause;
+        }
+
+        // EN 300 392-2 table 14.46 and clause 14.5.1.2.1 f) scope
+        // pre-emption to explicitly supported pre-emptive procedures. This
+        // SwMI does not support private-call pre-emption, so do not echo a
+        // terminal-local "pre-empted" abort as a SwMI pre-emption D-RELEASE.
+        tracing::warn!(
+            "CMCE: normalizing unsupported private-call U-DISCONNECT cause PreEmptiveUseOfResource to UserRequestedDisconnection call_id={} sender={} calling={} called={} state={:?}",
+            call_id,
+            sender.ssi,
+            call.calling_addr.ssi,
+            call.called_addr.ssi,
+            call.state
+        );
+        DisconnectCause::UserRequestedDisconnection
+    }
+
     fn push_direct_d_tx_not_granted(
         queue: &mut MessageQueue,
         call_id: u16,
@@ -875,15 +901,21 @@ impl CcBsSubentity {
         pdu: UDisconnect,
     ) {
         let call_id = pdu.call_identifier;
-        let disconnect_cause = pdu.disconnect_cause;
+        let raw_disconnect_cause = pdu.disconnect_cause;
 
         if let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() {
+            let disconnect_cause = self.normalize_individual_u_disconnect_cause(call_id, &call_snapshot, sender, raw_disconnect_cause);
             tracing::info!(
-                "U-DISCONNECT (individual) call_id={} from ISSI {} state={:?} cause={}",
+                "U-DISCONNECT (individual) call_id={} from ISSI {} state={:?} cause={}{}",
                 call_id,
                 sender.ssi,
                 call_snapshot.state,
-                disconnect_cause
+                disconnect_cause,
+                if disconnect_cause != raw_disconnect_cause {
+                    " (normalized from PreEmptiveUseOfResource)"
+                } else {
+                    ""
+                }
             );
             if matches!(call_snapshot.state, IndividualCallState::DisconnectPending { .. }) {
                 tracing::debug!(
@@ -977,7 +1009,7 @@ impl CcBsSubentity {
             "U-DISCONNECT: non-call-owner ISSI {} rejected for call_id={} cause={}",
             sender.ssi,
             call_id,
-            disconnect_cause
+            raw_disconnect_cause
         );
 
         let d_release = DRelease {
