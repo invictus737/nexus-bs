@@ -50,7 +50,7 @@
         <div class="page-head">
           <div>
             <h2 id="systemHeading">System</h2>
-            <p>Host, runtime, RF chain.</p>
+            <p>Host, runtime, RF chain, and registered terminals.</p>
           </div>
         </div>
 
@@ -150,6 +150,16 @@
           <div class="slot-grid" id="slotGrid"></div>
         </section>
 
+        <section class="panel subscriber-registry-panel" aria-labelledby="radiosHeading">
+          <div class="panel-head"><h2 id="radiosHeading">Subscriber Registry</h2><span id="radiosUpdated">live</span></div>
+          <div class="table-wrap tall">
+            <table>
+              <thead><tr><th>ISSI</th><th>Affiliated Groups</th><th>RSSI dBFS</th><th>Energy Economy</th><th>Last Seen</th></tr></thead>
+              <tbody id="radiosTable"></tbody>
+            </table>
+          </div>
+        </section>
+
         <div class="grid two system-grid">
           <section class="panel">
             <div class="panel-head"><h2>Host</h2><span id="hostName">--</span></div>
@@ -215,7 +225,7 @@
         <div class="page-head">
           <div>
             <h2 id="trafficHeading">Traffic</h2>
-            <p>Air-interface voice, SDS, and subscriber state.</p>
+            <p>Air-interface voice, SDS, and call activity.</p>
           </div>
         </div>
 
@@ -241,18 +251,6 @@
               </table>
             </div>
           </section>
-
-          <div class="traffic-detail-stack" aria-label="Detailed traffic views">
-            <section class="panel">
-              <div class="panel-head"><h2 id="radiosHeading">Subscriber Registry</h2><span id="radiosUpdated">live</span></div>
-              <div class="table-wrap tall">
-                <table>
-                  <thead><tr><th>ISSI</th><th>Affiliated Groups</th><th>RSSI dBFS</th><th>Energy Economy</th><th>Last Seen</th></tr></thead>
-                  <tbody id="radiosTable"></tbody>
-                </table>
-              </div>
-            </section>
-          </div>
         </div>
       </section>
 

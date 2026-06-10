@@ -457,7 +457,8 @@ h1 {
 
 .lower-system,
 .slot-panel,
-.slot-panel + .system-grid {
+.slot-panel + .subscriber-registry-panel,
+.subscriber-registry-panel + .system-grid {
   margin-top: 14px;
 }
 
@@ -1271,13 +1272,11 @@ body {
   height: 48px;
   border-radius: 2px;
   border-color: #7e878b;
-  background:
-    linear-gradient(180deg, transparent 0 28%, #4bb95a 29% 41%, transparent 42% 100%),
-    linear-gradient(180deg, #d8dbdb 0, #a9adaf 100%);
+  background: #050709;
   color: transparent;
-  box-shadow: inset 0 2px 1px rgba(255,255,255,0.9), inset 0 -2px 2px rgba(0,0,0,0.25);
+  box-shadow: inset 0 1px 1px rgba(255,255,255,0.35), inset 0 -2px 2px rgba(0,0,0,0.35);
   overflow: hidden;
-  padding: 2px;
+  padding: 0;
 }
 
 .brand-mark::before,
@@ -2310,13 +2309,8 @@ body {
 .metrics,
 .status-strip,
 .slot-grid,
-.traffic-detail-stack {
+.subscriber-registry-panel {
   gap: var(--dash-gap);
-}
-
-.traffic-detail-stack {
-  display: grid;
-  margin-top: var(--dash-gap);
 }
 
 .active-calls-panel {
@@ -2691,7 +2685,7 @@ button {
   -webkit-overflow-scrolling: touch;
 }
 
-.traffic-detail-stack table {
+.subscriber-registry-panel table {
   min-width: 48rem;
 }
 
@@ -2844,7 +2838,7 @@ button {
     min-width: 42rem;
   }
 
-  .traffic-detail-stack table {
+  .subscriber-registry-panel table {
     min-width: 46rem;
   }
 

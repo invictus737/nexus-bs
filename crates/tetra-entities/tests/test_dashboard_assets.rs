@@ -40,13 +40,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "overview page must include the integrated Last Heard table"
     );
     assert!(
-        index.contains(r#"class="traffic-detail-stack""#)
+        index.contains(r#"class="panel subscriber-registry-panel""#)
             && index.contains(r#"id="radiosTable""#)
+            && !index.contains(r#"class="traffic-detail-stack""#)
             && !index.contains(r#"id="callsTable""#)
             && !index.contains(r#"id="heardTable""#)
             && !index.contains("Call Control")
             && !index.contains("Activity Log"),
-        "Traffic page must keep the subscriber registry while removing redundant Call Control and Activity Log panels"
+        "Subscriber Registry must live under System while redundant Traffic Call Control and Activity Log panels stay removed"
     );
     assert!(
         index.contains(r#"class="panel active-calls-panel""#)
@@ -75,11 +76,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "System/RF Ops and Traffic pages must expose RF, slot, and active-call render targets"
     );
     let timeslots_pos = index.find("<h2>Timeslots</h2>").expect("Timeslots panel should exist");
+    let registry_pos = index
+        .find(r#"<h2 id="radiosHeading">Subscriber Registry</h2>"#)
+        .expect("Subscriber Registry panel should exist");
     let host_pos = index.find("<h2>Host</h2>").expect("Host panel should exist");
     let carrier_pos = index.find("<h2>Carrier Plan</h2>").expect("Carrier Plan panel should exist");
     assert!(
-        timeslots_pos < host_pos && timeslots_pos < carrier_pos,
-        "System page must show Timeslots before Host and Carrier Plan details"
+        timeslots_pos < registry_pos && registry_pos < host_pos && timeslots_pos < carrier_pos,
+        "System page must show Subscriber Registry directly after Timeslots and before Host/Carrier Plan details"
     );
     assert!(
         index.contains(r#"id="settingsSection""#) && index.contains(r#"id="aboutSection""#),
