@@ -2396,14 +2396,14 @@ body {
 .call-ts {
   display: inline-grid;
   place-items: center;
-  min-width: 4.25rem;
+  min-width: 5.4rem;
   min-height: 2.25rem;
   margin-left: auto;
   border: 2px solid #57727d;
   background: linear-gradient(180deg, #7fd7ef 0, #24a4cd 58%, #0d789f 100%);
   color: #061923;
   font-family: var(--mono);
-  font-size: 1rem;
+  font-size: 0.95rem;
   font-weight: 900;
   line-height: 1;
 }

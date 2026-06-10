@@ -457,6 +457,7 @@ function callsPayloadKey(msg) {
         Math.floor(Number(call.started_secs_ago || 0)),
         call.simplex,
         call.ts,
+        call.secondary_ts,
       ].join(":")
     )
     .sort()
@@ -1062,6 +1063,15 @@ function callTargetHtml(call) {
   return "--";
 }
 
+function callCallingPartyHtml(call) {
+  return call?.caller_issi ? radioIdentityHtml(call.caller_issi) : "--";
+}
+
+function callCalledPartyHtml(call) {
+  if (call?.call_type === "group") return callTargetHtml(call);
+  return call?.called_issi ? radioIdentityHtml(call.called_issi) : "--";
+}
+
 function callSpeakerHtml(call) {
   const speaker = liveSpeakerIssi(call);
   if (speaker && !callInHangtime(call)) return radioIdentityHtml(speaker);
@@ -1222,11 +1232,43 @@ function callCountryHtml(call) {
 }
 
 function callSlotHtml(call) {
-  return `<span class="call-ts">${call?.ts ? `TS${esc(call.ts)}` : "TS--"}</span>`;
+  const primary = call?.ts ? `TS${esc(call.ts)}` : "TS--";
+  const secondary = call?.secondary_ts ? `+TS${esc(call.secondary_ts)}` : "";
+  return `<span class="call-ts">${primary}${secondary}</span>`;
 }
 
 function callCardHtml(call) {
   const mode = callMode(call);
+  if (call?.call_type !== "group") {
+    return `
+      <article class="active-call-card mode-${esc(mode.className)}">
+        <div class="call-card-top">
+          ${callCountryHtml(call)}
+          <span class="pill ${mode.className}">${esc(mode.label)}</span>
+          ${callSlotHtml(call)}
+        </div>
+        <div class="call-card-main">
+          <span class="call-label">Called party</span>
+          <strong>${callCalledPartyHtml(call)}</strong>
+        </div>
+        <div class="call-card-grid private-call-grid">
+          <div>
+            <span>Calling party</span>
+            <strong>${callCallingPartyHtml(call)}</strong>
+          </div>
+          <div>
+            <span>Bearer</span>
+            <strong>${call?.secondary_ts ? "2 TS" : "1 TS"}</strong>
+          </div>
+          <div class="call-card-time">
+            <span>Call time</span>
+            <strong data-call-seconds="${esc(call.call_id)}">${callAgeSeconds(call)}s</strong>
+          </div>
+        </div>
+      </article>
+    `;
+  }
+
   const speakerLabel = callInHangtime(call) ? "Last speaker" : "Speaker";
   return `
     <article class="active-call-card mode-${esc(mode.className)}">
@@ -1246,7 +1288,7 @@ function callCardHtml(call) {
         </div>
         <div>
           <span>Caller</span>
-          <strong>${call?.caller_issi ? radioIdentityHtml(call.caller_issi) : "--"}</strong>
+          <strong>${callCallingPartyHtml(call)}</strong>
         </div>
         <div class="call-card-time">
           <span>Call time</span>
@@ -1449,7 +1491,7 @@ async function clearLogs() {
 }
 
 function slotCall(ts) {
-  return activeCalls().find((call) => Number(call.ts) === Number(ts));
+  return activeCalls().find((call) => Number(call.ts) === Number(ts) || Number(call.secondary_ts) === Number(ts));
 }
 
 function renderSlots() {

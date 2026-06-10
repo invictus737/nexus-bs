@@ -736,6 +736,7 @@ impl CcBsSubentity {
             called_issi: called_addr.ssi,
             simplex: !pdu.hook_method_selection,
             ts: calling_ts,
+            secondary_ts: if called_ts != calling_ts { Some(called_ts) } else { None },
         });
 
         // Do not open traffic channel yet. Let called MS respond on MCCH.
@@ -1277,6 +1278,7 @@ impl CcBsSubentity {
             called_issi: crate::cmce::subentities::cc_bs::parrot::PARROT_ISSI,
             simplex: true,
             ts,
+            secondary_ts: None,
         });
 
         if let Some(session) = &self.parrot_session {

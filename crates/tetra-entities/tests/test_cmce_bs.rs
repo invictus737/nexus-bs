@@ -10261,6 +10261,7 @@ fn test_p2p_setup_to_parrot_99999_opens_separate_local_simplex_service() {
                 called_issi,
                 simplex,
                 ts,
+                ..
             } => Some((*call_id, *calling_issi, *called_issi, *simplex, *ts)),
             _ => None,
         })

@@ -2852,11 +2852,7 @@ function handleMsg(msg){
       (msg.ms||[]).forEach(m=>{state.ms[m.issi]={...m,_last_seen_ts:Date.now()-(m.last_seen_secs_ago||0)*1000,energy_saving_mode:m.energy_saving_mode||0,energy_saving_frame:m.energy_saving_frame??null,energy_saving_multiframe:m.energy_saving_multiframe??null};});
       (msg.calls||[]).forEach(c=>{
         state.calls[c.call_id]={...c,started_at:Date.now()-(c.started_secs_ago||0)*1000};
-        if(c.ts&&c.ts>=2){
-          const lbl=c.call_type==='group'?`GSSI ${c.gssi}`:(c.called_issi?`ISSI ${c.called_issi}`:'P2P');
-          const sub=c.call_type==='group'?t('call_group'):(c.simplex?t('call_p2p_s'):t('call_p2p_d'));
-          tsSetCall(c.ts,c.call_id,c.call_type,lbl,sub);
-        }
+        markCallTimeslots(c);
       });
       if(msg.log&&msg.log.length){document.getElementById('log-container').innerHTML='';msg.log.forEach(e=>appendLog(e));}
       setBrewStatus(!!msg.brew_online,msg.brew_version||0);
@@ -2890,12 +2886,8 @@ function handleMsg(msg){
     case 'call_started':
       state.calls[msg.call_id]={...msg,started_at:Date.now()};
       if(msg.last_heard)pushLastHeard(msg.last_heard);
-      if(msg.ts&&msg.ts>=2){
-        const lbl=msg.call_type==='group'?`GSSI ${msg.gssi}`:(msg.called_issi?`ISSI ${msg.called_issi}`:'P2P');
-        const sub=msg.call_type==='group'?t('call_group'):(msg.simplex?t('call_p2p_s'):t('call_p2p_d'));
-        tsSetCall(msg.ts,msg.call_id,msg.call_type,lbl,sub);
-        updateTsBlocks();
-      }
+      markCallTimeslots(msg);
+      updateTsBlocks();
       renderCalls();renderLastHeard();break;
     case 'call_ended':
       tsClearCall(msg.call_id);updateTsBlocks();
@@ -3050,6 +3042,13 @@ function formatDur(s){
 function tsSetCall(ts, call_id, call_type, label, sub){
   if(ts<2||ts>4)return;
   tsState[ts-1]={call_id,call_type,label,sub,voice_ts:null,started_at:Date.now()};
+}
+function markCallTimeslots(call){
+  const slots=[call.ts,call.secondary_ts].filter((ts,idx,arr)=>ts&&ts>=2&&ts<=4&&arr.indexOf(ts)===idx);
+  if(!slots.length)return;
+  const lbl=call.call_type==='group'?`GSSI ${call.gssi}`:(call.called_issi?`ISSI ${call.called_issi}`:'P2P');
+  const sub=call.call_type==='group'?t('call_group'):(call.simplex?t('call_p2p_s'):t('call_p2p_d'));
+  slots.forEach(ts=>tsSetCall(ts,call.call_id,call.call_type,lbl,sub));
 }
 function tsClearCall(call_id){
   for(let i=1;i<4;i++){if(tsState[i]&&tsState[i].call_id===call_id)tsState[i]=null;}

@@ -40,6 +40,7 @@ pub enum TelemetryEvent {
         called_issi: u32,
         simplex: bool,
         ts: u8,
+        secondary_ts: Option<u8>,
     },
     /// Individual call ended
     IndividualCallEnded { call_id: u16 },

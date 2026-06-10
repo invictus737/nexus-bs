@@ -27,6 +27,7 @@ pub struct CallState {
     pub started_secs_ago: u64,
     pub simplex: bool,
     pub ts: u8,
+    pub secondary_ts: Option<u8>,
 }
 
 /// Log entry
@@ -140,6 +141,7 @@ pub struct CallEntry {
     pub started_at: Instant,
     pub simplex: bool,
     pub ts: u8,
+    pub secondary_ts: Option<u8>,
 }
 
 pub type DashboardState = Arc<RwLock<DashboardStateInner>>;
@@ -226,6 +228,7 @@ impl DashboardStateInner {
                 started_secs_ago: c.started_at.elapsed().as_secs(),
                 simplex: c.simplex,
                 ts: c.ts,
+                secondary_ts: c.secondary_ts,
             })
             .collect()
     }

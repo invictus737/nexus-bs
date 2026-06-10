@@ -795,6 +795,7 @@ impl DashboardServer {
                             started_at: Instant::now(),
                             simplex: false,
                             ts: *ts,
+                            secondary_ts: None,
                         },
                     );
                     s.push_last_heard(*caller_issi, "call_group", *gssi);
@@ -822,6 +823,7 @@ impl DashboardServer {
                     called_issi,
                     simplex,
                     ts,
+                    secondary_ts,
                 } => {
                     s.calls.insert(
                         *call_id,
@@ -835,6 +837,7 @@ impl DashboardServer {
                             started_at: Instant::now(),
                             simplex: *simplex,
                             ts: *ts,
+                            secondary_ts: *secondary_ts,
                         },
                     );
                     s.push_last_heard(*calling_issi, "call_individual", *called_issi);
@@ -1037,8 +1040,9 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             called_issi,
             simplex,
             ts,
+            secondary_ts,
         } => {
-            serde_json::json!({"type":"call_started","call_id":call_id,"call_type":"individual","caller_issi":calling_issi,"called_issi":called_issi,"simplex":simplex,"ts":ts,"last_heard":{"issi":calling_issi,"activity":"call_individual","dest":called_issi}})
+            serde_json::json!({"type":"call_started","call_id":call_id,"call_type":"individual","caller_issi":calling_issi,"called_issi":called_issi,"simplex":simplex,"ts":ts,"secondary_ts":secondary_ts,"last_heard":{"issi":calling_issi,"activity":"call_individual","dest":called_issi}})
         }
         TelemetryEvent::IndividualCallEnded { call_id } => serde_json::json!({"type":"call_ended","call_id":call_id}),
         TelemetryEvent::BrewConnected { connected, server_version } => {
@@ -2241,11 +2245,13 @@ fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_conf
 
     let mut timeslots = Vec::new();
     for ts in 1..=4u8 {
-        let call = calls.iter().find(|call| call.ts == ts);
+        let call = calls.iter().find(|call| call.ts == ts || call.secondary_ts == Some(ts));
+        let secondary = call.is_some_and(|call| call.secondary_ts == Some(ts));
         timeslots.push(serde_json::json!({
             "ts": ts,
             "role": if ts == 1 { "control" } else { "traffic" },
             "state": if ts == 1 { "control" } else if call.is_some() { "active" } else { "idle" },
+            "secondary": secondary,
             "call": call,
         }));
     }
