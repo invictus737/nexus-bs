@@ -14760,3 +14760,36 @@ Private P2P Preemptive Cause Guard - 2026-06-10 15:36 EEST:
   - `cargo test -p tetra-entities --test test_cmce_bs preemptive_disconnect --locked` passed.
   - `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 191 tests.
   - `git diff --check` passed.
+
+Private P2P Preemptive Transmission Interruption - 2026-06-10 16:18 EEST:
+
+- User clarified that Motorola appears to require private simplex P2P
+  pre-emptive handling rather than only suppressing the terminal-visible
+  `PreEmptiveUseOfResource` release cause.
+- Clause scope:
+  - EN 300 392-2 clause 14.5.1.2.1 f): a pre-emptive `U-TX DEMAND` shall be
+    answered by `D-TX INTERRUPT` to the current transmitting MS, then
+    `D-TX GRANTED` to the requester when SwMI supports interruption;
+  - table 14.46: call priority 12..=15 are pre-emptive priorities;
+  - table 14.85: TX demand priority 2/3 are pre-emptive/emergency
+    pre-emptive priorities.
+- Fix:
+  - local P2P `U-SETUP` with call priority 12..=15 is accepted and propagated
+    into `D-SETUP` instead of being rejected as unsupported private
+    pre-emption;
+  - simplex P2P `U-TX DEMAND` priority 2/3 from the non-holder interrupts the
+    current floor holder with `D-TX INTERRUPT(GrantedToOtherUser)` and sends
+    one positive `D-TX GRANTED` to the requester when
+    `call_preemptive` / `transmission_interruption_enabled` is true;
+  - default-off behaviour still queues priority 2/3 requests without
+    `D-TX INTERRUPT`;
+  - `U-DISCONNECT PreEmptiveUseOfResource` remains normalized to
+    `UserRequestedDisconnection` outside a SwMI-initiated pre-emption release
+    so terminals do not see a false BS-origin pre-emption clear cause.
+- Verification:
+  - `cargo test -p tetra-entities --test test_cmce_bs p2p_preemptive --locked` passed: 6 tests.
+  - `cargo test -p tetra-entities --test test_cmce_bs group_preemptive --locked` passed: 5 tests.
+  - `cargo test -p tetra-entities --test test_cmce_bs --locked` passed: 192 tests.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `rustfmt --edition 2024 --check` passed on touched Rust files.
+  - `git diff --check` passed.

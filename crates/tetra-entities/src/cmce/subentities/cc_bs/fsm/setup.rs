@@ -436,26 +436,15 @@ impl CcBsSubentity {
 
         if Self::is_preemptive_call_priority(pdu.call_priority) {
             tracing::info!(
-                "CMCE: rejecting pre-emptive P2P U-SETUP from issi={} priority={} (private call interruption not supported)",
+                "CMCE: accepting pre-emptive-priority P2P U-SETUP from issi={} priority={} (transmission interruption enabled={})",
                 calling_party.ssi,
-                pdu.call_priority
+                pdu.call_priority,
+                self.config.config().cell.transmission_interruption_enabled
             );
             // EN 300 392-2 table 14.46 defines priorities 12..=15 as
-            // pre-emptive. Clause 14.5.1.2.1 f) makes private-call
-            // interruption conditional on SwMI support. This stack only
-            // implements configured group transmission interruption, so reject
-            // private pre-emption rather than accepting partial semantics.
-            // Clause 14.5.1.3.2 uses D-RELEASE when the request cannot be
-            // supported.
-            Self::reject_u_setup_before_call_id(
-                queue,
-                calling_party,
-                prim.handle,
-                prim.link_id,
-                prim.endpoint_id,
-                DisconnectCause::RequestedServiceNotAvailable,
-            );
-            return;
+            // pre-emptive. Accepting the call priority in U-SETUP is distinct
+            // from active transmission interruption, which is driven by
+            // U-TX DEMAND priorities 2/3 under clause 14.5.1.2.1 f).
         }
 
         let is_issi_address = pdu.called_party_type_identifier == tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier::Ssi

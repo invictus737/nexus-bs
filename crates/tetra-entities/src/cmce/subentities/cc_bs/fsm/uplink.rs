@@ -14,11 +14,12 @@ impl CcBsSubentity {
         }
 
         // EN 300 392-2 table 14.46 and clause 14.5.1.2.1 f) scope
-        // pre-emption to explicitly supported pre-emptive procedures. This
-        // SwMI does not support private-call pre-emption, so do not echo a
-        // terminal-local "pre-empted" abort as a SwMI pre-emption D-RELEASE.
+        // pre-emption to explicitly supported pre-emptive procedures. A
+        // U-DISCONNECT cause alone is not evidence that this SwMI initiated
+        // or accepted a private-call transmission interruption, so do not echo
+        // a terminal-local "pre-empted" abort as a SwMI pre-emption D-RELEASE.
         tracing::warn!(
-            "CMCE: normalizing unsupported private-call U-DISCONNECT cause PreEmptiveUseOfResource to UserRequestedDisconnection call_id={} sender={} calling={} called={} state={:?}",
+            "CMCE: normalizing private-call U-DISCONNECT cause PreEmptiveUseOfResource to UserRequestedDisconnection outside an active SwMI pre-emption release call_id={} sender={} calling={} called={} state={:?}",
             call_id,
             sender.ssi,
             call.calling_addr.ssi,
@@ -525,6 +526,78 @@ impl CcBsSubentity {
             if let Some(holder_issi) = call.floor_holder
                 && holder_issi != requesting_party.ssi
             {
+                let may_preempt = self.config.config().cell.transmission_interruption_enabled
+                    && Self::is_preemptive_tx_demand_priority(pdu.tx_demand_priority);
+                if may_preempt {
+                    tracing::info!(
+                        "U-TX DEMAND (individual) call_id={} pre-emptive priority={} from ISSI {} interrupting floor holder ISSI {}",
+                        call_id,
+                        pdu.tx_demand_priority,
+                        requesting_party.ssi,
+                        holder_issi
+                    );
+
+                    self.cancel_matching_individual_tx_ceased_tail_drain(call_id, holder_issi);
+                    if let Some(c) = self.individual_calls.get_mut(&call_id) {
+                        c.queued_tx_demand = None;
+                        c.set_floor_holder(requesting_party.ssi);
+                    }
+
+                    // EN 300 392-2 clause 14.5.1.2.1 f) and table 14.85:
+                    // when SwMI supports interruption, a pre-emptive U-TX
+                    // DEMAND withdraws the current simplex private speaker by
+                    // D-TX INTERRUPT, then grants the requester.
+                    self.send_d_tx_interrupt_facch(
+                        queue,
+                        call_id,
+                        peer_addr,
+                        requesting_party.ssi,
+                        peer_ts,
+                        peer_usage,
+                        TransmissionGrant::GrantedToOtherUser,
+                    );
+                    Self::push_individual_d_tx_granted(
+                        queue,
+                        call_id,
+                        requesting_party,
+                        req_ts,
+                        req_usage,
+                        UlDlAssignment::Both,
+                        TransmissionGrant::Granted,
+                        requesting_party.ssi,
+                    );
+
+                    queue.push_back(SapMsg {
+                        sap: Sap::Control,
+                        src: TetraEntity::Cmce,
+                        dest: TetraEntity::Umac,
+                        msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                            call_id,
+                            source_issi: requesting_party.ssi,
+                            dest_gssi: peer_addr.ssi,
+                            ts: req_ts,
+                        }),
+                    });
+
+                    if (call.called_over_brew || call.calling_over_brew)
+                        && let Some(brew_uuid) = call.brew_uuid
+                    {
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Cmce,
+                            dest: TetraEntity::Brew,
+                            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                                call_id,
+                                source_issi: requesting_party.ssi,
+                                dest_gssi: peer_addr.ssi,
+                                ts: req_ts,
+                            }),
+                        });
+                        let _ = brew_uuid;
+                    }
+                    return;
+                }
+
                 let queue_result = self
                     .individual_calls
                     .get_mut(&call_id)

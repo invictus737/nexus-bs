@@ -25,7 +25,7 @@ pub(in crate::cmce::subentities::cc_bs) enum GroupTransitionError {
 }
 
 impl CcBsSubentity {
-    fn is_preemptive_tx_demand_priority(priority: u8) -> bool {
+    pub(in crate::cmce::subentities::cc_bs) fn is_preemptive_tx_demand_priority(priority: u8) -> bool {
         matches!(priority, 2 | 3)
     }
 

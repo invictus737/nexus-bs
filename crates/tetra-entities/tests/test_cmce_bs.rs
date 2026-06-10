@@ -9731,13 +9731,13 @@ fn test_unsolicited_group_owner_u_release_does_not_disconnect_active_group_call(
 }
 
 #[test]
-fn test_p2p_preemptive_u_setup_default_off_rejects_without_call_setup() {
+fn test_p2p_preemptive_u_setup_default_off_starts_call_setup() {
     debug::setup_logging_verbose();
 
     // EN 300 392-2 table 14.46 defines call priorities 12..=15 as
-    // pre-emptive. Clause 14.5.1.2.1 f) is conditional on SwMI interruption
-    // support, so default-off handling rejects before allocating an
-    // individual call identity.
+    // pre-emptive. Accepting the call priority in U-SETUP is not the same as
+    // active transmission interruption; default-off still only affects later
+    // U-TX DEMAND priority 2/3 interruption.
     for priority in 12..=15 {
         let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
         let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
@@ -9749,21 +9749,29 @@ fn test_p2p_preemptive_u_setup_default_off_rejects_without_call_setup() {
         u_setup.call_priority = priority;
         u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
 
-        test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
-        test.run_stack(Some(1));
-        let msgs = test.dump_sinks();
+        let (_call_id, msgs) = start_p2p_setup_with_u_setup(&mut test, u_setup);
 
-        assert_p2p_setup_rejected_with_dummy_call_id(&msgs, TEST_ISSI);
+        let setup = msgs
+            .iter()
+            .find_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim),
+                _ => None,
+            })
+            .expect("pre-emptive-priority P2P U-SETUP should emit D-SETUP");
+        assert_eq!(setup.call_priority, priority);
+        assert_eq!(count_d_releases(&msgs), 0, "priority {priority}");
+        assert_eq!(count_d_setups(&msgs), 1, "priority {priority}");
+        assert_eq!(count_umac_open(&msgs), 0, "priority {priority}");
     }
 }
 
 #[test]
-fn test_p2p_preemptive_u_setup_group_interruption_enabled_still_rejects_without_call_setup() {
+fn test_p2p_preemptive_u_setup_interruption_enabled_starts_call_setup() {
     debug::setup_logging_verbose();
 
-    // EN 300 392-2 clause 14.5.1.2.1 f) is specific to private-call
-    // interruption support. Group transmission interruption being configured
-    // does not make P2P pre-emption supported.
+    // EN 300 392-2 table 14.46 pre-emptive call priority is preserved in the
+    // private D-SETUP. Actual stop-transmission pre-emption is driven later by
+    // U-TX DEMAND priority 2/3 under clause 14.5.1.2.1 f).
     for priority in 12..=15 {
         let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
         let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
@@ -9777,12 +9785,18 @@ fn test_p2p_preemptive_u_setup_group_interruption_enabled_still_rejects_without_
         u_setup.call_priority = priority;
         u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
 
-        test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
-        test.run_stack(Some(1));
-        let msgs = test.dump_sinks();
+        let (_call_id, msgs) = start_p2p_setup_with_u_setup(&mut test, u_setup);
 
-        assert_p2p_setup_rejected_with_dummy_call_id(&msgs, TEST_ISSI);
-        assert_eq!(count_d_setups(&msgs), 0, "priority {priority}");
+        let setup = msgs
+            .iter()
+            .find_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim),
+                _ => None,
+            })
+            .expect("pre-emptive-priority P2P U-SETUP should emit D-SETUP");
+        assert_eq!(setup.call_priority, priority);
+        assert_eq!(count_d_releases(&msgs), 0, "priority {priority}");
+        assert_eq!(count_d_setups(&msgs), 1, "priority {priority}");
         assert_eq!(count_umac_open(&msgs), 0, "priority {priority}");
     }
 }
@@ -13731,20 +13745,17 @@ fn test_simplex_p2p_u_tx_demand_from_non_holder_is_queued_without_floor_handoff(
 }
 
 #[test]
-fn test_simplex_p2p_preemptive_u_tx_demand_with_group_interruption_enabled_is_queued_without_interrupt() {
+fn test_simplex_p2p_preemptive_u_tx_demand_default_off_is_queued_without_interrupt() {
     debug::setup_logging_verbose();
 
     // EN 300 392-2 clause 14.5.1.2.1 b) is the baseline when the SwMI does
     // not support private-call transmission interruption: wait for U-TX CEASED
     // and explicitly queue/reject the request. EN 300 392-2 table 14.85
     // marks priorities 2 and 3 as pre-emptive/emergency, but the local config
-    // flag is scoped to group-call D-TX INTERRUPT support and must not
-    // silently enable P2P pre-emption.
+    // keeps D-TX INTERRUPT support default-off.
     for tx_demand_priority in [2, 3] {
         let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
-        let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
-        config.cell.transmission_interruption_enabled = true;
-        let mut test = ComponentTest::from_config(config, Some(dltime));
+        let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
 
         test.populate_entities(
             vec![TetraEntity::Cmce],
@@ -13783,6 +13794,101 @@ fn test_simplex_p2p_preemptive_u_tx_demand_with_group_interruption_enabled_is_qu
         assert_eq!(grant_prim.sdu.get_len(), 25, "priority {tx_demand_priority}");
         assert_eq!(count_d_tx_ceased(&demand_msgs), 0, "priority {tx_demand_priority}");
         assert_eq!(count_umac_floor_granted(&demand_msgs), 0, "priority {tx_demand_priority}");
+        assert_eq!(count_umac_floor_released(&demand_msgs), 0, "priority {tx_demand_priority}");
+    }
+}
+
+#[test]
+fn test_simplex_p2p_preemptive_u_tx_demand_enabled_interrupts_current_speaker_before_grant() {
+    debug::setup_logging_verbose();
+
+    // EN 300 392-2 clause 14.5.1.2.1 f) and table 14.85: with SwMI
+    // transmission interruption support enabled, priority 2/3 U-TX DEMAND
+    // interrupts the current simplex private transmitter and grants the
+    // requester.
+    for tx_demand_priority in [2, 3] {
+        let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+        let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+        config.cell.transmission_interruption_enabled = true;
+        let mut test = ComponentTest::from_config(config, Some(dltime));
+
+        test.populate_entities(
+            vec![TetraEntity::Cmce],
+            vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+        );
+        register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+        register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+        let call_id = start_active_p2p_call(&mut test);
+
+        test.submit_message(build_u_tx_demand_msg_with_priority(TEST_CALLED_ISSI, call_id, tx_demand_priority));
+        test.run_stack(Some(1));
+        let demand_msgs = test.dump_sinks();
+
+        let interrupts: Vec<_> = demand_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_interrupt(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            interrupts.len(),
+            1,
+            "pre-emptive P2P request should interrupt exactly the current speaker for priority {tx_demand_priority}"
+        );
+        let (interrupt_prim, interrupt) = &interrupts[0];
+        assert_eq!(interrupt_prim.main_address.ssi, TEST_ISSI, "priority {tx_demand_priority}");
+        assert_eq!(interrupt_prim.main_address.ssi_type, SsiType::Issi, "priority {tx_demand_priority}");
+        assert!(interrupt_prim.stealing_permission, "priority {tx_demand_priority}");
+        assert_eq!(
+            interrupt_prim
+                .chan_alloc
+                .as_ref()
+                .expect("D-TX INTERRUPT must carry assigned-channel allocation")
+                .ul_dl_assigned,
+            UlDlAssignment::Dl,
+            "priority {tx_demand_priority}"
+        );
+        assert_eq!(
+            interrupt.transmission_grant,
+            TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+            "priority {tx_demand_priority}"
+        );
+        assert_eq!(
+            interrupt.transmitting_party_type_identifier,
+            Some(1),
+            "priority {tx_demand_priority}"
+        );
+        assert_eq!(
+            interrupt.transmitting_party_address_ssi,
+            Some(TEST_CALLED_ISSI as u64),
+            "priority {tx_demand_priority}"
+        );
+
+        let grants: Vec<_> = demand_msgs
+            .iter()
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            grants.len(),
+            1,
+            "pre-emptive P2P request should grant exactly the requester for priority {tx_demand_priority}"
+        );
+        let (grant_prim, grant) = &grants[0];
+        assert_eq!(grant_prim.main_address.ssi, TEST_CALLED_ISSI, "priority {tx_demand_priority}");
+        assert_eq!(
+            grant.transmission_grant,
+            TransmissionGrant::Granted.into_raw() as u8,
+            "priority {tx_demand_priority}"
+        );
+        assert_eq!(grant.transmitting_party_type_identifier, None, "priority {tx_demand_priority}");
+        assert_eq!(grant.transmitting_party_address_ssi, None, "priority {tx_demand_priority}");
+        assert_eq!(grant_prim.sdu.get_len(), 25, "priority {tx_demand_priority}");
+        assert_eq!(count_d_tx_ceased(&demand_msgs), 0, "priority {tx_demand_priority}");
+        assert_eq!(count_umac_floor_granted(&demand_msgs), 1, "priority {tx_demand_priority}");
         assert_eq!(count_umac_floor_released(&demand_msgs), 0, "priority {tx_demand_priority}");
     }
 }

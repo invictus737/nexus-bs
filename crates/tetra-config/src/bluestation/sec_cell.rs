@@ -243,9 +243,9 @@ pub struct CfgCellInfo {
     /// Default: 3 seconds. Range: 1–30.
     pub ul_inactivity_secs: u32,
 
-    /// Enable CMCE group-call transmission interruption using D-TX INTERRUPT.
-    /// Default: false. When false, the SwMI does not pre-empt an MS that
-    /// currently has group-call transmit permission.
+    /// Enable CMCE transmission interruption using D-TX INTERRUPT.
+    /// Default: false. When false, the SwMI queues or rejects requests instead
+    /// of pre-empting an MS that currently has transmit permission.
     pub transmission_interruption_enabled: bool,
 
     /// Enable the Nexus-BS legacy GSSI compatibility profile.
