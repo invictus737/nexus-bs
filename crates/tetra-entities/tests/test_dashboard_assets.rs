@@ -14,7 +14,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let index_path = root.join("dashboard/index.html");
     let app_path = root.join("dashboard/assets/app.js");
     let css_path = root.join("dashboard/assets/styles.css");
-    let logo_path = root.join("dashboard/assets/nexus-bs-logo.png");
+    let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
 
     let index = std::fs::read_to_string(&index_path).expect("dashboard index.html should exist");
@@ -30,10 +30,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
         index.contains(r#"<script src="/assets/app.js" defer></script>"#),
         "index.html must reference the deploy-copied application script"
     );
-    assert!(logo_path.is_file(), "dashboard logo asset must exist on disk");
+    assert!(logo_path.is_file(), "dashboard vector logo asset must exist on disk");
     assert!(
-        deploy_script.contains("dashboard/assets/nexus-bs-logo.png"),
-        "deploy script must copy the dashboard logo asset to the remote static directory"
+        index.contains(r#"src="/assets/nexus-bs-logo.svg""#) && !index.contains(r#"id="buildLabel""#) && !app.contains("buildLabel"),
+        "brand area must use the vector logo and show only the Nexus-BS wordmark without a version label"
+    );
+    assert!(
+        deploy_script.contains("dashboard/assets/nexus-bs-logo.svg"),
+        "deploy script must copy the dashboard vector logo asset to the remote static directory"
     );
     assert!(
         index.contains(r#"id="overviewHeard""#),
@@ -206,7 +210,6 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("diagramPhyState")
             && app.contains("requestRfCarrierToggle")
             && app.contains(r#"fetch("/api/rf/carrier""#)
-            && index.contains(r#"src="/assets/nexus-bs-logo.png""#)
             && index.contains(r#"id="nodePhy""#)
             && index.contains(r#"id="diagramPathToggle""#)
             && index.contains(r#"<button type="button" class="path-toggle"#)

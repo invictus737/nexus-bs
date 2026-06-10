@@ -1695,7 +1695,6 @@ function renderSite() {
 
 function renderSystem() {
   const sys = state.system || {};
-  setText("buildLabel", sys.product_version_tag || "--");
   setText("subtitle", sys.stack_version || "Nexus-BS local TETRA eBTS");
   setText("hostName", sys.hostname || "--");
   setText("productName", sys.product_name && sys.product_version_tag ? `${sys.product_name} ${sys.product_version_tag}` : "--");
