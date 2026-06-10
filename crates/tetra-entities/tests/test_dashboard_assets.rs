@@ -14,10 +14,13 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let index_path = root.join("dashboard/index.html");
     let app_path = root.join("dashboard/assets/app.js");
     let css_path = root.join("dashboard/assets/styles.css");
+    let logo_path = root.join("dashboard/assets/nexus-bs-logo.png");
+    let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
 
     let index = std::fs::read_to_string(&index_path).expect("dashboard index.html should exist");
     let app = std::fs::read_to_string(&app_path).expect("dashboard app.js should exist");
     let css = std::fs::read_to_string(&css_path).expect("dashboard styles.css should exist");
+    let deploy_script = std::fs::read_to_string(&deploy_script_path).expect("deploy script should exist");
 
     assert!(
         index.contains(r#"<link rel="stylesheet" href="/assets/styles.css">"#),
@@ -26,6 +29,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
     assert!(
         index.contains(r#"<script src="/assets/app.js" defer></script>"#),
         "index.html must reference the deploy-copied application script"
+    );
+    assert!(logo_path.is_file(), "dashboard logo asset must exist on disk");
+    assert!(
+        deploy_script.contains("dashboard/assets/nexus-bs-logo.png"),
+        "deploy script must copy the dashboard logo asset to the remote static directory"
     );
     assert!(
         index.contains(r#"id="overviewHeard""#),
