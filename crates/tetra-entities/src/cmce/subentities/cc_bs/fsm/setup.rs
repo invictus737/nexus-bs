@@ -718,28 +718,46 @@ impl CcBsSubentity {
             called_usage
         );
 
+        let force_hook = self.config.config().cell.force_private_p2p_hook_signalling;
+        let effective_hook_method_selection = pdu.hook_method_selection || force_hook;
+        if force_hook && !pdu.hook_method_selection {
+            tracing::info!(
+                "CMCE: local P2P hook override call_id={} caller={} called={}: offering on/off-hook signalling instead of requested direct through-connect",
+                call_id,
+                calling_party.ssi,
+                called_addr.ssi
+            );
+        }
+
         // Emit telemetry event for dashboard
         self.emit(crate::net_telemetry::TelemetryEvent::IndividualCallStarted {
             call_id,
             calling_issi: calling_party.ssi,
             called_issi: called_addr.ssi,
-            simplex: !pdu.hook_method_selection,
+            simplex: !pdu.simplex_duplex_selection,
             ts: calling_ts,
             secondary_ts: if called_ts != calling_ts { Some(called_ts) } else { None },
         });
 
         // Do not open traffic channel yet. Let called MS respond on MCCH.
-        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T60s, pdu.hook_method_selection);
+        self.send_d_call_proceeding(
+            queue,
+            message,
+            pdu,
+            call_id,
+            CallTimeoutSetupPhase::T60s,
+            effective_hook_method_selection,
+        );
 
         let setup_grant = if !pdu.simplex_duplex_selection
-            && pdu.hook_method_selection
+            && effective_hook_method_selection
             && Self::private_simplex_called_ms_transmits_first(
                 pdu.simplex_duplex_selection,
-                pdu.hook_method_selection,
+                effective_hook_method_selection,
                 pdu.request_to_transmit_send_data,
             ) {
             TransmissionGrant::Granted
-        } else if !pdu.simplex_duplex_selection && pdu.hook_method_selection {
+        } else if !pdu.simplex_duplex_selection && effective_hook_method_selection {
             TransmissionGrant::GrantedToOtherUser
         } else {
             TransmissionGrant::NotGranted
@@ -752,7 +770,7 @@ impl CcBsSubentity {
             } else {
                 self.config_call_timeout()
             },
-            hook_method_selection: pdu.hook_method_selection,
+            hook_method_selection: effective_hook_method_selection,
             simplex_duplex_selection: pdu.simplex_duplex_selection,
             basic_service_information: pdu.basic_service_information.clone(),
             transmission_grant: setup_grant,

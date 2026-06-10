@@ -186,6 +186,11 @@ legacy_gssi_group_call = true
 # Simple private call works with this left off.
 call_preemptive = false
 
+# Compatibility override for local private P2P calls where a terminal requests
+# direct through-connect but renders that private simplex call as "No answer".
+# Default and ETSI baseline: false. Enable only for controlled Motorola A/B tests.
+force_private_p2p_hook_signalling = false
+
 # Energy economy allocation. "auto" accepts the terminal-requested
 # StayAlive/EG1..EG7 mode and does not impose a BS-initiated mode when the
 # terminal did not ask for one. Use explicit EG values only for controlled lab

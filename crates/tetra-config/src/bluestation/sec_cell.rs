@@ -248,6 +248,13 @@ pub struct CfgCellInfo {
     /// of pre-empting an MS that currently has transmit permission.
     pub transmission_interruption_enabled: bool,
 
+    /// Force local private P2P calls to use on/off-hook signalling even when
+    /// the calling MS requests direct through-connect.
+    ///
+    /// This is a local compatibility override for terminals that render
+    /// direct-setup private simplex calls as not answered. Default: false.
+    pub force_private_p2p_hook_signalling: bool,
+
     /// Enable the Nexus-BS legacy GSSI compatibility profile.
     ///
     /// This is a local compatibility mode for older TETRA terminals that fail
@@ -343,6 +350,11 @@ pub struct CellInfoDto {
     #[serde(alias = "call_preemptive")]
     pub transmission_interruption_enabled: Option<bool>,
 
+    /// Local compatibility override for private P2P direct setup.
+    #[serde(alias = "private_p2p_force_hook")]
+    #[serde(alias = "private_call_force_hook")]
+    pub force_private_p2p_hook_signalling: Option<bool>,
+
     /// Local compatibility mode for older terminals that do not reliably retake
     /// same-speaker GSSI floor during hangtime.
     #[serde(alias = "legacy_group_call")]
@@ -429,6 +441,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         },
         ul_inactivity_secs: ci.ul_inactivity_secs.unwrap_or(3).clamp(1, 30),
         transmission_interruption_enabled: ci.transmission_interruption_enabled.unwrap_or(false),
+        force_private_p2p_hook_signalling: ci.force_private_p2p_hook_signalling.unwrap_or(false),
         legacy_gssi_group_call: ci.legacy_gssi_group_call.unwrap_or(false),
         periodic_registration_secs: {
             let v = ci.periodic_registration_secs.unwrap_or(0);

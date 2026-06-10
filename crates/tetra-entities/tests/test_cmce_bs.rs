@@ -12103,6 +12103,96 @@ fn test_p2p_hook_other_ms_connect_waits_for_called_ack_then_seeds_called_floor()
 }
 
 #[test]
+fn test_p2p_hook_override_offers_on_off_hook_for_direct_setup() {
+    debug::setup_logging_verbose();
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.force_private_p2p_hook_signalling = true;
+    let shared = SharedConfig::from_parts(config, None);
+    let (telemetry_sink, telemetry_source) = telemetry_channel();
+    let mut cmce = CmceBs::new(shared, Some(telemetry_sink), None);
+    let mut queue = MessageQueue::new();
+
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_ISSI, TEST_GSSI);
+    register_subscriber_to_cmce(&mut cmce, &mut queue, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(TEST_CALLED_ISSI as u64);
+    assert!(!u_setup.hook_method_selection, "test input models Motorola direct setup");
+
+    cmce.rx_prim(&mut queue, build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    let setup_msgs = drain_message_queue(&mut queue);
+    let call_id = first_d_setup_call_id(&setup_msgs);
+
+    let d_call_proceeding = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_ISSI => parse_d_call_proceeding(prim),
+            _ => None,
+        })
+        .expect("caller should receive D-CALL PROCEEDING");
+    assert!(
+        d_call_proceeding.hook_method_selection,
+        "compatibility override should offer on/off-hook signalling to the caller"
+    );
+
+    let d_setup = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_CALLED_ISSI => parse_d_setup(prim),
+            _ => None,
+        })
+        .expect("called MS should receive D-SETUP");
+    assert!(
+        d_setup.hook_method_selection,
+        "compatibility override should offer on/off-hook signalling to the called MS"
+    );
+    assert_eq!(
+        d_setup.transmission_grant,
+        TransmissionGrant::GrantedToOtherUser,
+        "direct-setup caller first-floor polarity must be preserved when only the hook method is overridden"
+    );
+    let start_event = drain_telemetry(&telemetry_source)
+        .into_iter()
+        .find_map(|event| match event {
+            TelemetryEvent::IndividualCallStarted {
+                call_id,
+                calling_issi,
+                called_issi,
+                simplex,
+                secondary_ts,
+                ..
+            } => Some((call_id, calling_issi, called_issi, simplex, secondary_ts)),
+            _ => None,
+        })
+        .expect("local P2P setup should publish dashboard telemetry");
+    assert_eq!(
+        start_event,
+        (call_id, TEST_ISSI, TEST_CALLED_ISSI, true, None),
+        "dashboard simplex/duplex state must come from simplex_duplex_selection, not hook_method_selection"
+    );
+
+    cmce.rx_prim(&mut queue, build_u_connect_msg(TEST_CALLED_ISSI, call_id));
+    let ack_msgs = drain_message_queue(&mut queue);
+    acknowledge_called_d_connect_ack(&ack_msgs, TEST_CALLED_ISSI);
+    cmce.tick_start(&mut queue, TdmaTime { h: 0, m: 1, f: 1, t: 1 });
+    let after_called_ack_msgs = drain_message_queue(&mut queue);
+
+    let d_connect = after_called_ack_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address.ssi == TEST_ISSI => parse_d_connect(prim),
+            _ => None,
+        })
+        .expect("caller should receive D-CONNECT after called ACK");
+    assert!(
+        d_connect.hook_method_selection,
+        "caller D-CONNECT should preserve the offered on/off-hook method"
+    );
+    assert_eq!(d_connect.transmission_grant, TransmissionGrant::Granted);
+}
+
+#[test]
 fn test_p2p_u_connect_opens_circuit_and_sends_connect_pair_with_allocations() {
     debug::setup_logging_verbose();
 
@@ -12655,9 +12745,14 @@ fn test_example_config_simple_private_call_works_with_preemption_default_off() {
     let config_toml = include_str!("../../../example_config/config.toml");
     let config = from_toml_str(config_toml).expect("example config should parse");
     assert!(config_toml.contains("call_preemptive = false"));
+    assert!(config_toml.contains("force_private_p2p_hook_signalling = false"));
     assert!(
         !config.cell.transmission_interruption_enabled,
         "example config must keep call_preemptive/transmission_interruption_enabled default-off"
+    );
+    assert!(
+        !config.cell.force_private_p2p_hook_signalling,
+        "example config must keep the private P2P hook override default-off"
     );
     assert!(
         config.cell.legacy_gssi_group_call,

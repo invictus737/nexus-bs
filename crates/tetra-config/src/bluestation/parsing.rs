@@ -487,6 +487,19 @@ restart_recovery_issis = [1234]
     }
 
     #[test]
+    fn test_private_p2p_hook_override_accepts_flag_and_aliases() {
+        for input in [
+            "force_private_p2p_hook_signalling = true",
+            "private_p2p_force_hook = true",
+            "private_call_force_hook = true",
+        ] {
+            let toml = minimal_toml(input);
+            let cfg = from_toml_str(&toml).expect("parse failed");
+            assert!(cfg.cell.force_private_p2p_hook_signalling, "input: {input}");
+        }
+    }
+
+    #[test]
     fn test_legacy_gssi_group_call_accepts_explicit_flag_and_aliases() {
         for input in [
             "legacy_gssi_group_call = true",
@@ -636,6 +649,7 @@ allowed_gssi_ranges = [
         // interruption conditional on SwMI support; the shipped example keeps
         // that support disabled unless the operator explicitly enables it.
         assert!(toml.contains("call_preemptive = false"));
+        assert!(toml.contains("force_private_p2p_hook_signalling = false"));
         assert!(toml.contains("legacy_gssi_group_call = true"));
         assert!(toml.contains("energy_saving_mode = \"auto\""));
         assert!(toml.contains("# static_dir = "));
@@ -643,6 +657,7 @@ allowed_gssi_ranges = [
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));
         assert!(!cfg.cell.transmission_interruption_enabled);
+        assert!(!cfg.cell.force_private_p2p_hook_signalling);
         assert!(cfg.cell.legacy_gssi_group_call);
         assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
         assert_eq!(cfg.cell.periodic_registration_secs, 0);
