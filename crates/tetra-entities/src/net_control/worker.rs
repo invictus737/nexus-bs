@@ -118,7 +118,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
             ControlCommand::RestartService => TetraEntity::Cmce,
             ControlCommand::ShutdownService => TetraEntity::Cmce,
             ControlCommand::StopGoService { .. } => TetraEntity::Cmce,
-            ControlCommand::SetRfCarrierInhibit { .. } => TetraEntity::Cmce,
+            ControlCommand::SetRfCarrierInhibit { .. } => TetraEntity::Mm,
             ControlCommand::AddLiveSds { .. } => TetraEntity::Cmce,
             ControlCommand::DeleteLiveSds { .. } => TetraEntity::Cmce,
             ControlCommand::ClearLiveSds => TetraEntity::Cmce,
@@ -215,9 +215,9 @@ mod tests {
     }
 
     #[test]
-    fn test_route_rf_carrier_inhibit_to_cmce() {
+    fn test_route_rf_carrier_inhibit_to_mm() {
         let target = ControlWorker::<MockTransport>::route_control_command(&ControlCommand::SetRfCarrierInhibit { inhibited: true });
-        assert_eq!(target, TetraEntity::Cmce);
+        assert_eq!(target, TetraEntity::Mm);
     }
 
     #[test]

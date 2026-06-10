@@ -387,14 +387,22 @@ fn main() {
             // Propagate SharedConfig so the dashboard can read live SDS queue state.
             dashboard.set_shared_config(cfg.clone());
 
-            // Create a control link so dashboard can send commands to CMCE
+            // Create control links so dashboard can send ordinary commands to
+            // CMCE and RF carrier lifecycle commands directly to MM.
             let dash_cmd_tx = {
                 use tetra_core::tetra_entities::TetraEntity;
                 cdispatchers.get(&TetraEntity::Cmce).map(|d| d.clone_sender())
             };
+            let dash_rf_cmd_tx = {
+                use tetra_core::tetra_entities::TetraEntity;
+                cdispatchers.get(&TetraEntity::Mm).map(|d| d.clone_sender())
+            };
 
             if let Some(tx) = dash_cmd_tx {
                 dashboard.set_cmd_sender(tx);
+            }
+            if let Some(tx) = dash_rf_cmd_tx {
+                dashboard.set_rf_cmd_sender(tx);
             }
 
             // start() must be called before Arc::new() because it takes &mut self

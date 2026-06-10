@@ -1,4 +1,4 @@
-use crate::net_control::ControlEndpoint;
+use crate::net_control::{ControlCommand, ControlEndpoint};
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::{MessageQueue, TetraEntityTrait, net_brew};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -63,6 +63,7 @@ pub struct MmBs {
     restart_recovery_cache_last_flush: Option<TdmaTime>,
     pending_critical_downlinks: HashMap<MleHandle, PendingCriticalMmDownlink>,
     next_critical_downlink_handle: MleHandle,
+    pending_rf_carrier_inhibit_at: Option<TdmaTime>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -174,6 +175,7 @@ impl MmBs {
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 2 * 18 * 4;
     const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 150;
     const RESTART_RECOVERY_CACHE_FLUSH_TIMESLOTS: i32 = 18 * 4;
+    const RF_CARRIER_INHIBIT_NOTIFY_GUARD_TIMESLOTS: i32 = 2 * 18 * 4;
     // Local acceptance window for the group-report phase requested by
     // D-LOCATION UPDATE COMMAND(group identity report=1), per EN 300 392-2
     // clause 16.4.4. This is not an ETSI timer value; it matches the local
@@ -233,6 +235,7 @@ impl MmBs {
             restart_recovery_cache_last_flush: None,
             pending_critical_downlinks: HashMap::new(),
             next_critical_downlink_handle: 0x8000_0000,
+            pending_rf_carrier_inhibit_at: None,
         }
     }
 
@@ -1891,6 +1894,39 @@ impl MmBs {
                 );
                 return;
             }
+        }
+
+        if self.rf_carrier_shutdown_in_progress() {
+            tracing::warn!(
+                "MM: rejecting U-LOCATION UPDATE DEMAND from ISSI {} during RF carrier inhibit shutdown",
+                received_issi
+            );
+            self.abandon_pending_swmi_group_transaction(
+                received_issi,
+                "RF carrier inhibit shutdown rejects registration and keeps the local registry empty",
+            );
+            self.clear_solicited_group_report(received_issi);
+            self.clear_critical_downlinks_for_issi(received_issi);
+            self.forget_restart_recovery_issi(received_issi);
+            let groups = self
+                .client_mgr
+                .get_client_by_issi(received_issi)
+                .map(|client| {
+                    let mut groups: Vec<u32> = client.groups.iter().copied().collect();
+                    groups.sort_unstable();
+                    groups
+                })
+                .unwrap_or_default();
+            self.cleanup_ms_for_rf_carrier_inhibit(queue, received_issi, groups);
+            Self::send_d_location_update_reject_cause(
+                queue,
+                received_issi,
+                prim.handle,
+                pdu.location_update_type,
+                pdu.address_extension,
+                RejectCause::NetworkFailure,
+            );
+            return;
         }
 
         // Migration not supported: ETSI 16.4.1.1 case b) requires identity exchange via
@@ -3757,6 +3793,117 @@ impl MmBs {
         queue.push_back(msg);
     }
 
+    fn set_rf_carrier_inhibited_state(&mut self, inhibited: bool, context: &str) -> bool {
+        let mut state = self.config.state_write();
+        let changed = state.carrier_inhibited != inhibited;
+        state.carrier_inhibited = inhibited;
+        tracing::warn!(
+            "MM: RF carrier {}{} ({})",
+            if inhibited { "hard-inhibit armed" } else { "enabled" },
+            if changed { "" } else { " (unchanged)" },
+            context
+        );
+        changed
+    }
+
+    fn apply_pending_rf_carrier_inhibit_if_due(&mut self) {
+        let Some(apply_at) = self.pending_rf_carrier_inhibit_at else {
+            return;
+        };
+        if self.dltime.diff(apply_at) < 0 {
+            return;
+        }
+
+        self.pending_rf_carrier_inhibit_at = None;
+        self.set_rf_carrier_inhibited_state(true, "notification guard elapsed");
+    }
+
+    fn rf_carrier_shutdown_in_progress(&self) -> bool {
+        self.pending_rf_carrier_inhibit_at.is_some() || self.config.state_read().carrier_inhibited
+    }
+
+    fn cleanup_ms_for_rf_carrier_inhibit(&mut self, queue: &mut MessageQueue, issi: u32, groups: Vec<u32>) {
+        if !groups.is_empty() {
+            self.emit_subscriber_update(queue, issi, groups, BrewSubscriberAction::Deaffiliate);
+        }
+        self.emit_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+        self.client_mgr.remove_client(issi);
+        self.forget_energy_saving(issi);
+        self.clear_solicited_group_report(issi);
+        self.clear_critical_downlinks_for_issi(issi);
+        self.forget_restart_recovery_issi(issi);
+        self.config.state_write().subscribers.deregister(issi);
+    }
+
+    fn notify_and_remove_registered_ms_for_rf_carrier_inhibit(&mut self, queue: &mut MessageQueue) -> usize {
+        let clients = self.client_mgr.all_clients_snapshot();
+        if clients.is_empty() {
+            tracing::info!("MM: RF carrier inhibit requested with no registered MS to notify");
+            return 0;
+        }
+
+        let client_count = clients.len();
+        tracing::warn!(
+            "MM: RF carrier inhibit notifying and deregistering {} registered MS unit(s)",
+            client_count
+        );
+        for (issi, handle, groups) in clients {
+            tracing::info!(
+                "MM: RF carrier inhibit notifying ISSI {} with D-LOCATION-UPDATE-COMMAND handle={} groups={:?}",
+                issi,
+                handle,
+                groups
+            );
+            // EN 300 392-2 clause 16.4.3 permits SwMI-initiated registration
+            // with D-LOCATION UPDATE COMMAND at any time. Use it as the final
+            // on-air MM notice before the local operator removes RF service.
+            self.send_d_location_update_command(queue, issi, handle);
+            self.abandon_pending_swmi_group_transaction(
+                issi,
+                "RF carrier inhibit starts operator outage cleanup and invalidates pending SwMI group procedure",
+            );
+            self.cleanup_ms_for_rf_carrier_inhibit(queue, issi, groups);
+        }
+
+        client_count
+    }
+
+    fn handle_rf_carrier_inhibit_request(&mut self, queue: &mut MessageQueue, inhibited: bool, source: TetraEntity) {
+        if inhibited {
+            if self.config.state_read().carrier_inhibited {
+                tracing::warn!("MM: RF carrier inhibit requested by {:?} but carrier is already inhibited", source);
+                self.pending_rf_carrier_inhibit_at = None;
+                return;
+            }
+            if let Some(apply_at) = self.pending_rf_carrier_inhibit_at {
+                tracing::warn!(
+                    "MM: RF carrier inhibit requested by {:?} while notification guard is already pending until {}",
+                    source,
+                    apply_at
+                );
+                return;
+            }
+
+            let removed = self.notify_and_remove_registered_ms_for_rf_carrier_inhibit(queue);
+            if removed == 0 {
+                self.set_rf_carrier_inhibited_state(true, "no registered MS required notification");
+                return;
+            }
+
+            let apply_at = self.dltime.add_timeslots(Self::RF_CARRIER_INHIBIT_NOTIFY_GUARD_TIMESLOTS);
+            self.pending_rf_carrier_inhibit_at = Some(apply_at);
+            tracing::warn!(
+                "MM: RF carrier hard inhibit scheduled at {} after {} TDMA timeslot notification guard",
+                apply_at,
+                Self::RF_CARRIER_INHIBIT_NOTIFY_GUARD_TIMESLOTS
+            );
+            return;
+        }
+
+        self.pending_rf_carrier_inhibit_at = None;
+        self.set_rf_carrier_inhibited_state(false, "operator enable request");
+    }
+
     /// Sends a D-LOCATION UPDATE REJECT PDU (ETSI clause 16.9.2.9)
     fn send_d_location_update_reject_cause(
         queue: &mut MessageQueue,
@@ -4010,16 +4157,29 @@ impl TetraEntityTrait for MmBs {
         self.sync_restart_recovery_cache_path();
         self.flush_restart_recovery_cache_if_due(false);
 
-        if let Some(cep) = &self.control {
-            while let Some(cmd) = cep.try_recv() {
-                match cmd {
-                    _ => {
-                        tracing::warn!("MM: ignoring unsupported control command {:?}", cmd);
-                    }
+        let control_commands: Vec<ControlCommand> = self
+            .control
+            .as_ref()
+            .map(|cep| {
+                let mut commands = Vec::new();
+                while let Some(cmd) = cep.try_recv() {
+                    commands.push(cmd);
+                }
+                commands
+            })
+            .unwrap_or_default();
+        for cmd in control_commands {
+            match cmd {
+                ControlCommand::SetRfCarrierInhibit { inhibited } => {
+                    self.handle_rf_carrier_inhibit_request(queue, inhibited, TetraEntity::Mm);
+                }
+                _ => {
+                    tracing::warn!("MM: ignoring unsupported control command {:?}", cmd);
                 }
             }
         }
 
+        self.apply_pending_rf_carrier_inhibit_if_due();
         self.expire_pending_energy_saving(ts);
         self.expire_pending_swmi_group_transactions(queue, ts);
         self.expire_pending_solicited_group_reports(queue, ts);
@@ -4121,6 +4281,9 @@ impl TetraEntityTrait for MmBs {
                 match message.msg {
                     SapMsgInner::BrewReconnected => {
                         self.rx_brew_reconnected(queue);
+                    }
+                    SapMsgInner::RfCarrierInhibit { inhibited } => {
+                        self.handle_rf_carrier_inhibit_request(queue, inhibited, message.src);
                     }
                     SapMsgInner::MsRssiUpdate { issi, rssi_dbfs } => {
                         self.client_mgr.update_client_rssi(issi, rssi_dbfs);

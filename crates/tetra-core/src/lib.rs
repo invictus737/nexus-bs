@@ -20,7 +20,7 @@ pub const GIT_HASH: &str = git_version::git_version!(
     args = ["--always", "--dirty=-modified", "--match=", "--abbrev=8"],
     fallback = "unknown"
 );
-/// Full stack version string, e.g. "v0.1.63-g2aad62c"
+/// Full stack version string, e.g. "v0.1.64-g2aad62c"
 pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", PRODUCT_VERSION_TAG, GIT_HASH);
 
 pub mod address;
@@ -58,10 +58,10 @@ mod tests {
     #[test]
     fn product_identity_tracks_workspace_version() {
         assert_eq!(PRODUCT_NAME, "Nexus-BS");
-        assert_eq!(PRODUCT_VERSION, "0.1.63");
-        assert_eq!(PRODUCT_VERSION_TAG, "v0.1.63");
-        assert_eq!(PRODUCT_USER_AGENT, "Nexus-BS/v0.1.63");
-        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.63");
-        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.63");
+        assert_eq!(PRODUCT_VERSION, "0.1.64");
+        assert_eq!(PRODUCT_VERSION_TAG, "v0.1.64");
+        assert_eq!(PRODUCT_USER_AGENT, "Nexus-BS/v0.1.64");
+        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.64");
+        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.64");
     }
 }

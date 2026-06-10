@@ -6,6 +6,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Direction, Layer2Service, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, TxState, debug};
 use tetra_entities::cmce::cmce_bs::CmceBs;
+use tetra_entities::net_control::{ControlCommand, make_control_link};
 use tetra_entities::net_dashboard::DashboardServer;
 use tetra_entities::net_telemetry::{TelemetryEvent, TelemetrySource, telemetry_channel};
 use tetra_entities::{MessageQueue, TetraEntityTrait};
@@ -80,6 +81,29 @@ const PRIVATE_RELEASE_DELIVERY_GUARD_TIMESLOTS: i32 = 2 * TETRA_TIMESLOTS_PER_SE
 const PRIVATE_DISCONNECT_RESPONSE_GUARD_TIMESLOTS: i32 = 5 * TETRA_TIMESLOTS_PER_SECOND;
 const PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS: i32 = 16;
 const PRIVATE_SIMPLEX_CONNECT_ACK_UNACKED_REPETITIONS: u8 = 3;
+
+#[test]
+fn test_cmce_forwards_rf_carrier_inhibit_to_mm() {
+    debug::setup_logging_verbose();
+    let (dispatcher, endpoint) = make_control_link();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.register_entity(CmceBs::new(test.config.clone(), None, Some(endpoint)));
+    test.populate_entities(vec![], vec![TetraEntity::Mm]);
+
+    dispatcher.send(ControlCommand::SetRfCarrierInhibit { inhibited: true });
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    assert!(
+        msgs.iter()
+            .any(|msg| { msg.dest == TetraEntity::Mm && matches!(&msg.msg, SapMsgInner::RfCarrierInhibit { inhibited } if *inhibited) }),
+        "CMCE must forward legacy RF carrier commands to MM for registry cleanup"
+    );
+    assert!(
+        !test.config.state_read().carrier_inhibited,
+        "CMCE must not hard-inhibit RF directly before MM can notify registered MS"
+    );
+}
 
 fn unique_restart_recovery_path(label: &str) -> String {
     let nanos = std::time::SystemTime::now()

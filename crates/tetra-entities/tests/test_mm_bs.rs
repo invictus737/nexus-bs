@@ -8,6 +8,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, debug};
 use tetra_entities::mm::mm_bs::MmBs;
+use tetra_entities::net_control::{ControlCommand, make_control_link};
 use tetra_entities::net_dashboard::server::DashboardServer;
 use tetra_entities::net_dashboard::state::MsState;
 use tetra_entities::net_telemetry::{
@@ -4358,6 +4359,205 @@ fn test_brew_reconnected_marks_registration_pending_and_abandons_swmi_group_tran
 }
 
 #[test]
+fn test_rf_carrier_inhibit_notifies_and_removes_registered_ms() {
+    debug::setup_logging_verbose();
+    let first_issi = 2_260_616;
+    let second_issi = 2_260_618;
+    let first_handle = 0x1111;
+    let second_handle = 0x2222;
+    let first_group = 226_333;
+    let second_group = 226_444;
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(CfgBrew {
+        host: "127.0.0.1".to_string(),
+        port: 443,
+        tls: false,
+        username: None,
+        password: None,
+        reconnect_delay: std::time::Duration::from_secs(1),
+        jitter_initial_latency_frames: 0,
+        feature_sds_enabled: false,
+        feature_rssi_export: false,
+        whitelisted_ssis: None,
+    });
+    let (dispatcher, endpoint) = make_control_link();
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.register_entity(MmBs::new(test.config.clone(), None, Some(endpoint)));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce, TetraEntity::Brew]);
+
+    submit_location_update_with_type_and_handle(&mut test, first_issi, LocationUpdateType::ItsiAttach, None, first_handle);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_attach_detach_group_identity(&mut test, first_issi, false, Some(vec![first_group]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    submit_location_update_with_type_and_handle(&mut test, second_issi, LocationUpdateType::ItsiAttach, None, second_handle);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    submit_attach_detach_group_identity(&mut test, second_issi, false, Some(vec![first_group, second_group]));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.config.state_write().energy_saving.insert(
+        first_issi,
+        EnergySavingAssignment {
+            mode: EnergySavingMode::Eg1 as u8,
+            frame: Some(1),
+            multiframe: Some(1),
+            awake_until: None,
+            suspension_count: 0,
+        },
+    );
+
+    dispatcher.send(ControlCommand::SetRfCarrierInhibit { inhibited: true });
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    let mut commands = location_update_commands(&msgs);
+    commands.sort_by_key(|(issi, _, _)| *issi);
+    assert_eq!(
+        commands.len(),
+        2,
+        "RF OFF must send one final D-LOCATION-UPDATE-COMMAND per registered MS"
+    );
+    assert_eq!(commands[0].0, first_issi);
+    assert_eq!(commands[0].1, first_handle);
+    assert!(commands[0].2.group_identity_report);
+    assert_eq!(commands[1].0, second_issi);
+    assert_eq!(commands[1].1, second_handle);
+    assert!(commands[1].2.group_identity_report);
+
+    let cmce_updates = subscriber_updates_to(&msgs, TetraEntity::Cmce);
+    assert!(cmce_updates.iter().any(|update| update.issi == first_issi
+        && update.action == BrewSubscriberAction::Deaffiliate
+        && update.groups == vec![first_group]));
+    assert!(cmce_updates.iter().any(|update| update.issi == second_issi
+        && update.action == BrewSubscriberAction::Deaffiliate
+        && update.groups == vec![first_group, second_group]));
+    assert!(
+        cmce_updates
+            .iter()
+            .any(|update| update.issi == first_issi && update.action == BrewSubscriberAction::Deregister)
+    );
+    assert!(
+        cmce_updates
+            .iter()
+            .any(|update| update.issi == second_issi && update.action == BrewSubscriberAction::Deregister)
+    );
+
+    let brew_updates = subscriber_updates_to(&msgs, TetraEntity::Brew);
+    assert!(
+        brew_updates
+            .iter()
+            .any(|update| update.issi == first_issi && update.action == BrewSubscriberAction::Deregister),
+        "RF OFF must also deregister Brew-routable subscribers"
+    );
+    assert!(
+        brew_updates
+            .iter()
+            .any(|update| update.issi == second_issi && update.action == BrewSubscriberAction::Deregister),
+        "RF OFF must also deregister Brew-routable subscribers"
+    );
+
+    {
+        let state = test.config.state_read();
+        assert!(!state.subscribers.is_registered(first_issi));
+        assert!(!state.subscribers.is_registered(second_issi));
+        assert!(state.subscribers.group_members(first_group).is_empty());
+        assert!(state.subscribers.group_members(second_group).is_empty());
+        assert!(!state.energy_saving.contains_key(&first_issi));
+        assert!(
+            !state.carrier_inhibited,
+            "hard RF inhibit must wait for the notification guard instead of cutting the final MM command"
+        );
+    }
+    assert!(debug_mm_client_energy(&mut test, first_issi).is_none());
+    assert!(debug_mm_client_energy(&mut test, second_issi).is_none());
+
+    test.run_stack(Some(150));
+    assert!(
+        test.config.state_read().carrier_inhibited,
+        "hard RF inhibit should apply after the notification guard elapses"
+    );
+}
+
+#[test]
+fn test_rf_carrier_inhibit_rejects_reregistration_during_shutdown_guard() {
+    debug::setup_logging_verbose();
+    let issi = 2_260_616;
+    let registration_handle = 0x1234;
+    let retry_handle = 0x2345;
+
+    let (dispatcher, endpoint) = make_control_link();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.register_entity(MmBs::new(test.config.clone(), None, Some(endpoint)));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_type_and_handle(&mut test, issi, LocationUpdateType::ItsiAttach, None, registration_handle);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    dispatcher.send(ControlCommand::SetRfCarrierInhibit { inhibited: true });
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+    assert!(
+        !test.config.state_read().carrier_inhibited,
+        "notification guard keeps RF available briefly for final downlink delivery"
+    );
+
+    submit_location_update_with_type_and_handle(&mut test, issi, LocationUpdateType::DemandLocationUpdating, None, retry_handle);
+    test.run_stack(Some(1));
+    let msgs = test.dump_sinks();
+
+    let reject = extract_location_update_reject(&msgs);
+    assert_eq!(reject.reject_cause, RejectCause::NetworkFailure as u8);
+    assert!(
+        !mm_downlink_pdu_types(&msgs).contains(&MmPduTypeDl::DLocationUpdateAccept),
+        "RF shutdown must not accept a new registration during the notification guard"
+    );
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+    assert!(debug_mm_client_energy(&mut test, issi).is_none());
+
+    test.run_stack(Some(150));
+    assert!(test.config.state_read().carrier_inhibited);
+    assert!(!test.config.state_read().subscribers.is_registered(issi));
+}
+
+#[test]
+fn test_rf_carrier_enable_cancels_pending_hard_inhibit() {
+    debug::setup_logging_verbose();
+    let issi = 2_260_616;
+    let handle = 0x1234;
+
+    let (dispatcher, endpoint) = make_control_link();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
+    test.register_entity(MmBs::new(test.config.clone(), None, Some(endpoint)));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    submit_location_update_with_type_and_handle(&mut test, issi, LocationUpdateType::ItsiAttach, None, handle);
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    dispatcher.send(ControlCommand::SetRfCarrierInhibit { inhibited: true });
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    assert!(!test.config.state_read().carrier_inhibited);
+
+    dispatcher.send(ControlCommand::SetRfCarrierInhibit { inhibited: false });
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+    test.run_stack(Some(150));
+
+    assert!(
+        !test.config.state_read().carrier_inhibited,
+        "operator RF enable must cancel a pending delayed hard inhibit"
+    );
+}
+
+#[test]
 fn test_unmatched_swmi_group_ack_is_ignored() {
     debug::setup_logging_verbose();
     let issi = 2040814;
@@ -7524,6 +7724,16 @@ fn contains_attach_detach_ack(msgs: &[SapMsg]) -> bool {
 
 fn subscriber_updates(msgs: &[SapMsg]) -> Vec<&MmSubscriberUpdate> {
     msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::MmSubscriberUpdate(update) => Some(update),
+            _ => None,
+        })
+        .collect()
+}
+
+fn subscriber_updates_to(msgs: &[SapMsg], dest: TetraEntity) -> Vec<&MmSubscriberUpdate> {
+    msgs.iter()
+        .filter(|msg| msg.dest == dest)
         .filter_map(|msg| match &msg.msg {
             SapMsgInner::MmSubscriberUpdate(update) => Some(update),
             _ => None,

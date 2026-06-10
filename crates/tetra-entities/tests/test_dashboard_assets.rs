@@ -194,9 +194,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("diagramPhyState")
             && app.contains("requestRfCarrierToggle")
             && app.contains(r#"fetch("/api/rf/carrier""#)
+            && index.contains(r#"src="/assets/nexus-bs-logo.png""#)
             && index.contains(r#"id="nodePhy""#)
             && index.contains(r#"id="diagramPathToggle""#)
             && index.contains(r#"<button type="button" class="path-toggle"#)
+            && css.contains("brand-logo")
             && css.contains("device-map")
             && css.contains("minmax(190px, 220px)")
             && css.contains("text-wrap: balance"),

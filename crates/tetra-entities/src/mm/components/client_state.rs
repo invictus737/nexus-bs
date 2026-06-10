@@ -318,6 +318,21 @@ impl MmClientMgr {
             .map(|c| (c.issi, c.last_handle))
     }
 
+    /// Deterministic snapshot of every known client for operator-wide cleanup.
+    pub fn all_clients_snapshot(&self) -> Vec<(u32, u32, Vec<u32>)> {
+        let mut clients: Vec<(u32, u32, Vec<u32>)> = self
+            .clients
+            .values()
+            .map(|client| {
+                let mut groups: Vec<u32> = client.groups.iter().copied().collect();
+                groups.sort_unstable();
+                (client.issi, client.last_handle, groups)
+            })
+            .collect();
+        clients.sort_by_key(|(issi, _, _)| *issi);
+        clients
+    }
+
     /// Update the last known L2 handle for a registered client.
     pub fn set_client_handle(&mut self, issi: u32, handle: u32) {
         if let Some(client) = self.clients.get_mut(&issi) {

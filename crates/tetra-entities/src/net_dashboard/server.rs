@@ -567,6 +567,7 @@ pub struct DashboardServer {
     /// Shared stack config — used to read live_sds_queue from StackState.
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     cmd_tx: Option<CmdSender>,
+    rf_cmd_tx: Option<CmdSender>,
     update_state: SharedUpdateState,
     /// Optional override for the OTA update source directory.
     /// If None, the update routine auto-detects.
@@ -596,6 +597,7 @@ impl DashboardServer {
             runtime_config_path: None,
             shared_config: None,
             cmd_tx: None,
+            rf_cmd_tx: None,
             update_state: Arc::new(Mutex::new(UpdateState::new())),
             source_dir_override: None,
             static_dir: None,
@@ -609,6 +611,10 @@ impl DashboardServer {
 
     pub fn set_cmd_sender(&mut self, tx: CmdSender) {
         self.cmd_tx = Some(tx);
+    }
+
+    pub fn set_rf_cmd_sender(&mut self, tx: CmdSender) {
+        self.rf_cmd_tx = Some(tx);
     }
 
     /// Provide the SharedConfig so the dashboard can read live SDS queue state.
@@ -652,6 +658,7 @@ impl DashboardServer {
         let config_path = self.config_path.clone();
         let runtime_config_path = self.runtime_config_path.clone();
         let cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.cmd_tx.take()));
+        let rf_cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.rf_cmd_tx.take()));
         let update_state = Arc::clone(&self.update_state);
         let source_dir_override = self.source_dir_override.clone();
         let static_dir = self.static_dir.clone();
@@ -692,6 +699,7 @@ impl DashboardServer {
                     let config_path = config_path.clone();
                     let runtime_config_path = runtime_config_path.clone();
                     let cmd_tx = Arc::clone(&cmd_tx);
+                    let rf_cmd_tx = Arc::clone(&rf_cmd_tx);
                     let update_state = Arc::clone(&update_state);
                     let source_dir_override = source_dir_override.clone();
                     let static_dir = static_dir.clone();
@@ -710,6 +718,7 @@ impl DashboardServer {
                             config_path,
                             runtime_config_path,
                             cmd_tx,
+                            rf_cmd_tx,
                             update_state,
                             source_dir_override,
                             static_dir,
@@ -1211,7 +1220,7 @@ fn parse_rf_carrier_inhibited(value: &serde_json::Value) -> Result<bool, String>
         .ok_or_else(|| "expected JSON object with boolean field 'inhibited'".to_string())
 }
 
-fn serve_rf_carrier_post(stream: TcpStream, shared_config: &Option<tetra_config::bluestation::SharedConfig>, value: &serde_json::Value) {
+fn serve_rf_carrier_post(stream: TcpStream, rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
     let inhibited = match parse_rf_carrier_inhibited(value) {
         Ok(inhibited) => inhibited,
         Err(err) => {
@@ -1219,28 +1228,26 @@ fn serve_rf_carrier_post(stream: TcpStream, shared_config: &Option<tetra_config:
             return;
         }
     };
-    let Some(shared) = shared_config else {
-        http_response(stream, 503, "shared config unavailable");
+
+    let accepted = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited });
+    if !accepted {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "inhibited": inhibited,
+            "state": "carrier_command_unavailable",
+            "error": "RF carrier control channel unavailable",
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"RF carrier control channel unavailable"}"#.to_string());
+        http_json_response(stream, 503, &body);
         return;
-    };
+    }
 
-    let changed = {
-        let mut state = shared.state_write();
-        let changed = state.carrier_inhibited != inhibited;
-        state.carrier_inhibited = inhibited;
-        changed
-    };
-
-    tracing::warn!(
-        "Dashboard: RF carrier {}{}",
-        if inhibited { "inhibited" } else { "enabled" },
-        if changed { "" } else { " (unchanged)" }
-    );
+    tracing::warn!("Dashboard: RF carrier {} requested", if inhibited { "inhibit" } else { "enable" });
     let body = serde_json::to_string(&serde_json::json!({
         "ok": true,
         "inhibited": inhibited,
-        "state": if inhibited { "carrier_inhibited" } else { "carrier_active" },
-        "message": if inhibited { "RF carrier inhibited" } else { "RF carrier active" },
+        "state": if inhibited { "carrier_inhibit_queued" } else { "carrier_enable_queued" },
+        "message": if inhibited { "RF carrier inhibit queued" } else { "RF carrier enable queued" },
     }))
     .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
     http_json_response(stream, 200, &body);
@@ -1291,6 +1298,7 @@ fn handle_connection(
     config_path: String,
     runtime_config_path: Option<String>,
     cmd_tx: Arc<Mutex<Option<CmdSender>>>,
+    rf_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     update_state: SharedUpdateState,
     source_dir_override: Option<String>,
     static_dir: Option<String>,
@@ -1526,7 +1534,7 @@ fn handle_connection(
             }
         };
         match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(value) => serve_rf_carrier_post(buf.into_inner(), &shared_config, &value),
+            Ok(value) => serve_rf_carrier_post(buf.into_inner(), &rf_cmd_tx, &value),
             Err(e) => http_response(buf.into_inner(), 400, &format!("invalid JSON: {}", e)),
         }
     } else if request_matches(&req_line, "POST", "/api/logs/clear") {
@@ -3913,10 +3921,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.63"));
+        assert!(rendered.contains("Nexus-BS v0.1.64"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.63"));
+        assert!(rendered.contains("Nexus-BS/v0.1.64"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -4248,9 +4256,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.63");
-        assert_eq!(product.version_tag, "v0.1.63");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.63");
+        assert_eq!(product.version, "0.1.64");
+        assert_eq!(product.version_tag, "v0.1.64");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.64");
     }
 
     #[test]

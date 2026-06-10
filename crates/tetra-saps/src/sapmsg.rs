@@ -99,6 +99,13 @@ pub enum SapMsgInner {
     /// Brew disconnect do not re-register and PTT calls are denied until power-cycle.
     BrewReconnected,
 
+    /// Operator RF carrier inhibit request. MM owns the registered MS context,
+    /// so it performs the final on-air notification and registry cleanup before
+    /// allowing PHY to hard-gate TX.
+    RfCarrierInhibit {
+        inhibited: bool,
+    },
+
     // CMCE SDS <-> Brew SDS routing
     CmceSdsData(CmceSdsData),
     CmceSdsStatus(CmceSdsStatus),
@@ -137,6 +144,7 @@ impl Display for SapMsgInner {
             // Control/Brew
             SapMsgInner::MmSubscriberUpdate(_) => write!(f, "MmSubscriberUpdate"),
             SapMsgInner::MsRssiUpdate { issi, rssi_dbfs } => write!(f, "MsRssiUpdate(issi={}, rssi={:.1}dBFS)", issi, rssi_dbfs),
+            SapMsgInner::RfCarrierInhibit { inhibited } => write!(f, "RfCarrierInhibit(inhibited={})", inhibited),
             SapMsgInner::CmceSdsData(_) => write!(f, "CmceSdsData"),
             SapMsgInner::CmceSdsStatus(_) => write!(f, "CmceSdsStatus"),
 

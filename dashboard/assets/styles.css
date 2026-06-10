@@ -79,6 +79,7 @@ button {
 }
 
 .brand-mark {
+  position: relative;
   flex: 0 0 auto;
   width: 36px;
   height: 36px;
@@ -91,6 +92,13 @@ button {
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 800;
+}
+
+.brand-logo {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
 }
 
 .brand-name {
@@ -1268,12 +1276,19 @@ body {
     linear-gradient(180deg, #d8dbdb 0, #a9adaf 100%);
   color: transparent;
   box-shadow: inset 0 2px 1px rgba(255,255,255,0.9), inset 0 -2px 2px rgba(0,0,0,0.25);
+  overflow: hidden;
+  padding: 2px;
 }
 
 .brand-mark::before,
 .brand-mark::after {
   content: "";
   position: absolute;
+}
+
+.brand-logo {
+  border-radius: 1px;
+  filter: saturate(1.08) contrast(1.06);
 }
 
 .brand-name {
