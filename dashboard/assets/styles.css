@@ -584,6 +584,49 @@ td .pill {
   vertical-align: middle;
 }
 
+.subscriber-groups {
+  min-width: 14rem;
+  white-space: normal;
+}
+
+.group-list {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+
+.group-summary {
+  min-height: 20px;
+  border: 1px solid #42505a;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  background: #172027;
+  color: var(--muted);
+  font-family: var(--sans);
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1.15;
+  white-space: nowrap;
+}
+
+.group-summary strong {
+  color: var(--text);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.group-chips {
+  display: flex;
+  min-width: 0;
+  gap: 4px;
+  flex-wrap: wrap;
+}
+
 .identity-primary {
   min-width: 0;
   overflow: hidden;
@@ -1997,6 +2040,16 @@ tbody tr:hover {
 .pill.blue {
   border-color: #167fa5;
   background: linear-gradient(180deg, #79d4ef 0, #2da9d0 100%);
+  color: #061923;
+}
+
+.group-summary {
+  border-color: #66767d;
+  background: linear-gradient(180deg, #eef2f2 0, #b8c4c8 100%);
+  color: #163c50;
+}
+
+.group-summary strong {
   color: #061923;
 }
 

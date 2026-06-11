@@ -1069,7 +1069,13 @@ function eeLabel(radio) {
 
 function groupLabel(groups) {
   if (!groups || !groups.length) return '<span class="empty">No Group</span>';
-  return groups.map((g) => `<span class="pill blue">${esc(g)}</span>`).join(" ");
+  const uniqueGroups = [...new Set(groups.map((g) => Number(g)).filter((g) => Number.isFinite(g)))];
+  const summary =
+    uniqueGroups.length > 1
+      ? `<span class="group-summary">Scan list <strong>${uniqueGroups.length}</strong></span>`
+      : '<span class="group-summary">Group</span>';
+  const chips = uniqueGroups.map((g) => `<span class="pill blue">${esc(g)}</span>`).join("");
+  return `<span class="group-list${uniqueGroups.length > 1 ? " is-scan-list" : ""}">${summary}<span class="group-chips">${chips}</span></span>`;
 }
 
 function rssiLabel(value) {
@@ -1453,7 +1459,7 @@ function renderRadios() {
   const rows = sortedRadios().map((radio) => `
     <tr>
       <td>${radioIdentityHtml(radio.issi)}</td>
-      <td>${groupLabel(radio.groups)}</td>
+      <td class="subscriber-groups">${groupLabel(radio.groups)}</td>
       <td>${rssiLabel(radio.rssi_dbfs)}</td>
       <td><span class="pill ${radio.energy_saving_mode ? "amber" : "green"}">${esc(eeLabel(radio))}</span></td>
       <td>${esc(radioLastSeen(radio))}</td>
