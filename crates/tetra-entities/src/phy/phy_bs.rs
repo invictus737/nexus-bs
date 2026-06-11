@@ -388,6 +388,12 @@ impl<D: RxTxDev> PhyBs<D> {
             match cmd {
                 ControlCommand::RunTxCalibration { calibration_path } => {
                     tracing::warn!("PHY: TX DC/IQ calibration requested path={}", calibration_path);
+                    if !self.carrier_inhibited_applied {
+                        let err = "RF carrier must be hard-inhibited in PHY before TX calibration".to_string();
+                        tracing::error!("PHY: TX DC/IQ calibration refused: {}", err);
+                        crate::rf_calibration::mark_failed(err);
+                        continue;
+                    }
                     crate::rf_calibration::mark_calibrating(&calibration_path);
                     match self.rxtxdev.run_tx_calibration(&calibration_path) {
                         Ok(()) => crate::rf_calibration::mark_calibrated("PHY calibration finished"),

@@ -1270,10 +1270,29 @@ fn serve_rf_calibration_status(stream: TcpStream, config_path: &str) {
 
 fn serve_rf_calibration_run(
     stream: TcpStream,
+    state: &DashboardState,
     config_path: &str,
     rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
     phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
 ) {
+    let active_calls = match state.read() {
+        Ok(snapshot) => snapshot.snapshot_calls(),
+        Err(_) => {
+            http_json_response(stream, 503, r#"{"ok":false,"error":"dashboard state unavailable"}"#);
+            return;
+        }
+    };
+    if !active_calls.is_empty() {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": "RF calibration refused while calls are active",
+            "calls": active_calls,
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"RF calibration refused while calls are active"}"#.to_string());
+        http_json_response(stream, 423, &body);
+        return;
+    }
+
     let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path);
     let calibration_path_string = calibration_path.display().to_string();
     if let Err(err) = crate::rf_calibration::try_start(&calibration_path_string) {
@@ -1304,12 +1323,14 @@ fn serve_rf_calibration_run(
     let rf_sender = rf_cmd_tx.lock().ok().and_then(|guard| guard.clone());
 
     let config_path_string = config_path.to_string();
-    std::thread::Builder::new()
-        .name("rf-calibration".into())
-        .spawn(move || {
-            run_rf_calibration_orchestrator(config_path_string, calibration_path_string, rf_sender, phy_sender);
-        })
-        .ok();
+    if let Err(err) = std::thread::Builder::new().name("rf-calibration".into()).spawn(move || {
+        run_rf_calibration_orchestrator(config_path_string, calibration_path_string, rf_sender, phy_sender);
+    }) {
+        crate::rf_calibration::mark_failed(format!("failed to start RF calibration orchestrator: {}", err));
+        let _ = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: false });
+        http_json_response(stream, 503, r#"{"ok":false,"error":"failed to start RF calibration orchestrator"}"#);
+        return;
+    }
 
     let body = serde_json::to_string(&serde_json::json!({
         "ok": true,
@@ -1742,7 +1763,7 @@ fn handle_connection(
         }
     } else if request_matches(&req_line, "POST", "/api/rf/calibration/run") {
         drain_http_headers(&mut stream);
-        serve_rf_calibration_run(stream, &config_path, &rf_cmd_tx, &phy_cmd_tx);
+        serve_rf_calibration_run(stream, &state, &config_path, &rf_cmd_tx, &phy_cmd_tx);
     } else if request_matches(&req_line, "GET", "/api/rf/calibration/status") {
         drain_http_headers(&mut stream);
         serve_rf_calibration_status(stream, &config_path);

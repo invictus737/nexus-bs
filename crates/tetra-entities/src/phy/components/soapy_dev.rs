@@ -186,6 +186,7 @@ impl RxTxDev for RxTxDevSoapySdr {
     }
 
     fn run_tx_calibration(&mut self, calibration_path: &str) -> Result<(), String> {
+        let was_inhibited = self.tx_inhibited;
         if let Some(tx_dsp) = &mut self.tx_dsp {
             tx_dsp.clear_after_inhibit();
         }
@@ -193,7 +194,30 @@ impl RxTxDev for RxTxDevSoapySdr {
             .set_tx_stream_active(false)
             .map_err(|err| format!("deactivate TX stream before calibration: {:?}", err))?;
         self.tx_inhibited = true;
-        self.sdr.run_tx_calibration(calibration_path).map(|_| ())
+        let result = self.sdr.run_tx_calibration(calibration_path).map(|_| ());
+
+        if !was_inhibited {
+            let restore_result = (|| {
+                self.sdr
+                    .set_tx_stream_active(true)
+                    .map_err(|err| format!("reactivate TX stream after calibration: {:?}", err))?;
+                if let Some(tx_dsp) = &mut self.tx_dsp {
+                    tx_dsp
+                        .realign_after_inhibit(&self.sdr)
+                        .map_err(|err| format!("realign TX DSP after calibration: {:?}", err))?;
+                }
+                self.tx_inhibited = false;
+                Ok(())
+            })();
+            if let Err(restore_err) = restore_result {
+                tracing::error!("PHY: failed to restore TX after direct calibration command: {}", restore_err);
+                if result.is_ok() {
+                    return Err(restore_err);
+                }
+            }
+        }
+
+        result
     }
 
     fn rxtx_timeslot<'a>(

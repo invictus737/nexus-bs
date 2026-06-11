@@ -115,6 +115,7 @@ pub struct TxCalibrationDevice {
     pub tx_antenna: String,
     pub rx_antenna: String,
     pub loopback_source: String,
+    pub pa_setting: String,
     pub tx_gains_fingerprint: String,
     pub rx_gains_fingerprint: String,
 }
@@ -133,8 +134,8 @@ impl Default for TxCalibrationLimits {
         Self {
             tx_dc_abs_max: 0.08,
             tx_iq_abs_max: 0.25,
-            min_carrier_improvement_db: 1.0,
-            min_image_improvement_db: 1.0,
+            min_carrier_improvement_db: 3.0,
+            min_image_improvement_db: 3.0,
         }
     }
 }
@@ -145,14 +146,20 @@ pub struct TxCalibrationPoint {
     pub label: String,
     pub tx: TxCalibrationCoefficients,
     pub carrier_leakage_dbc: f64,
+    pub carrier_leakage_dbfs: f64,
     pub image_rejection_db: f64,
     pub evm_proxy_pct: f64,
     pub signal_dbfs: f64,
     pub noise_floor_dbfs: f64,
+    pub loopback_floor_dbfs: f64,
+    pub rx_baseline_dbfs: f64,
+    pub floor_drift_db: f64,
+    pub max_component_abs: f64,
+    pub clipped_fraction: f64,
     pub snr_db: f64,
 }
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TxCalibrationCoefficients {
     pub dc_i: f64,
@@ -168,6 +175,8 @@ pub struct TxCalibrationReport {
     pub image_rejection_improvement_db: f64,
     pub evm_proxy_improvement_pct: f64,
     pub accepted: bool,
+    pub accepted_dc: bool,
+    pub accepted_iq: bool,
     pub summary: String,
 }
 
@@ -205,11 +214,32 @@ pub fn validate_tx_calibration_file(file: &TxCalibrationFile) -> Result<(), Stri
     validate_coefficients("calibrated.tx", file.calibrated.tx, &file.limits)?;
     for (name, value) in [
         ("reference.carrier_leakage_dbc", file.reference.carrier_leakage_dbc),
+        ("reference.carrier_leakage_dbfs", file.reference.carrier_leakage_dbfs),
         ("reference.image_rejection_db", file.reference.image_rejection_db),
         ("reference.evm_proxy_pct", file.reference.evm_proxy_pct),
+        ("reference.signal_dbfs", file.reference.signal_dbfs),
+        ("reference.noise_floor_dbfs", file.reference.noise_floor_dbfs),
+        ("reference.loopback_floor_dbfs", file.reference.loopback_floor_dbfs),
+        ("reference.rx_baseline_dbfs", file.reference.rx_baseline_dbfs),
+        ("reference.floor_drift_db", file.reference.floor_drift_db),
+        ("reference.max_component_abs", file.reference.max_component_abs),
+        ("reference.clipped_fraction", file.reference.clipped_fraction),
+        ("reference.snr_db", file.reference.snr_db),
         ("calibrated.carrier_leakage_dbc", file.calibrated.carrier_leakage_dbc),
+        ("calibrated.carrier_leakage_dbfs", file.calibrated.carrier_leakage_dbfs),
         ("calibrated.image_rejection_db", file.calibrated.image_rejection_db),
         ("calibrated.evm_proxy_pct", file.calibrated.evm_proxy_pct),
+        ("calibrated.signal_dbfs", file.calibrated.signal_dbfs),
+        ("calibrated.noise_floor_dbfs", file.calibrated.noise_floor_dbfs),
+        ("calibrated.loopback_floor_dbfs", file.calibrated.loopback_floor_dbfs),
+        ("calibrated.rx_baseline_dbfs", file.calibrated.rx_baseline_dbfs),
+        ("calibrated.floor_drift_db", file.calibrated.floor_drift_db),
+        ("calibrated.max_component_abs", file.calibrated.max_component_abs),
+        ("calibrated.clipped_fraction", file.calibrated.clipped_fraction),
+        ("calibrated.snr_db", file.calibrated.snr_db),
+        ("report.carrier_leakage_improvement_db", file.report.carrier_leakage_improvement_db),
+        ("report.image_rejection_improvement_db", file.report.image_rejection_improvement_db),
+        ("report.evm_proxy_improvement_pct", file.report.evm_proxy_improvement_pct),
     ] {
         if !value.is_finite() {
             return Err(format!("{name} must be finite"));
@@ -256,6 +286,7 @@ mod tests {
                 tx_antenna: "TX".to_string(),
                 rx_antenna: "RX".to_string(),
                 loopback_source: "rx_internal_lb".to_string(),
+                pa_setting: "AUTO".to_string(),
                 tx_gains_fingerprint: "DAC=9.00,MIXER=30.00".to_string(),
                 rx_gains_fingerprint: "LNA=42.00,PGA=16.00".to_string(),
                 ..Default::default()
@@ -265,10 +296,16 @@ mod tests {
                 label: "neutral".to_string(),
                 tx: TxCalibrationCoefficients::default(),
                 carrier_leakage_dbc: -30.0,
+                carrier_leakage_dbfs: -50.0,
                 image_rejection_db: 25.0,
                 evm_proxy_pct: 4.5,
                 signal_dbfs: -20.0,
                 noise_floor_dbfs: -75.0,
+                loopback_floor_dbfs: -80.0,
+                rx_baseline_dbfs: -65.0,
+                floor_drift_db: 0.2,
+                max_component_abs: 0.20,
+                clipped_fraction: 0.0,
                 snr_db: 55.0,
             },
             calibrated: TxCalibrationPoint {
@@ -280,10 +317,16 @@ mod tests {
                     iq_q: -0.04,
                 },
                 carrier_leakage_dbc: -48.0,
+                carrier_leakage_dbfs: -68.0,
                 image_rejection_db: 41.0,
                 evm_proxy_pct: 1.2,
                 signal_dbfs: -20.0,
                 noise_floor_dbfs: -76.0,
+                loopback_floor_dbfs: -81.0,
+                rx_baseline_dbfs: -65.0,
+                floor_drift_db: -0.1,
+                max_component_abs: 0.18,
+                clipped_fraction: 0.0,
                 snr_db: 56.0,
             },
             applied: TxCalibrationCoefficients {
@@ -297,6 +340,8 @@ mod tests {
                 image_rejection_improvement_db: 16.0,
                 evm_proxy_improvement_pct: 3.3,
                 accepted: true,
+                accepted_dc: true,
+                accepted_iq: true,
                 summary: "accepted".to_string(),
             },
             ..Default::default()

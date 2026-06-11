@@ -1105,8 +1105,9 @@ function renderCalibration() {
   const accepted = !!summary.accepted;
   const active = !!status.active || !!state.calibrationBusy;
   const phase = status.status || "idle";
+  const failed = phase === "failed";
 
-  setText("calibrationStatus", active ? phase.toUpperCase() : accepted ? "APPLIED" : phase.toUpperCase());
+  setText("calibrationStatus", active ? phase.toUpperCase() : accepted && !failed ? "APPLIED" : phase.toUpperCase());
   setText("calibrationPath", status.path || "calibration.toml");
   setText(
     "calibrationApplied",
@@ -1126,7 +1127,10 @@ function renderCalibration() {
     "calibrationEvm",
     metricBeforeAfter(reference.evm_proxy_pct, calibrated.evm_proxy_pct, "%", summary.evm_proxy_improvement_pct)
   );
-  setText("calibrationActionStatus", active ? "running; service restart follows accepted result" : summary.summary || status.error || "traffic outage required");
+  setText(
+    "calibrationActionStatus",
+    active ? "running; service restart follows accepted result" : failed ? status.error || summary.summary || "calibration failed" : summary.summary || status.error || "traffic outage required"
+  );
   setText("calibrationLog", status.log || (summary.summary ? `${summary.summary}\n` : ""));
   const button = $("calibrationRunBtn");
   if (button) button.disabled = active || state.calibrationBusy || !state.site?.config?.available;
