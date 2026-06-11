@@ -45,6 +45,8 @@ const TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB: f64 = 3.0;
 const TX_CAL_ACCEPT_MAX_FLOOR_DRIFT_DB: f64 = 3.0;
 const TX_CAL_LOW_FLOOR_DBFS: f64 = -115.0;
 const TX_CAL_LOW_FLOOR_MIN_SNR_DB: f64 = 70.0;
+const TX_CAL_DC_ACTUATOR_PROBE_STEP: f64 = 0.04;
+const TX_CAL_DC_ACTUATOR_MIN_RESPONSE_DB: f64 = 6.0;
 const TX_CAL_IQ_MIN_COEFF_DELTA: f64 = 0.005;
 const TX_CAL_CONFIRM_MIN_CARRIER_IMPROVEMENT_DB: f64 = 6.0;
 const TX_CAL_CONFIRM_GOOD_CARRIER_DBC: f64 = -40.0;
@@ -516,6 +518,17 @@ impl SoapyIo {
                 }
             }
 
+            let dc_actuator = self.probe_tx_dc_actuator_response(
+                &mut rx_stream,
+                &mut tx_stream,
+                rx_baseline,
+                &tone,
+                tone_hz,
+                neutral,
+                &limits,
+                &mut timing,
+            )?;
+
             let (mut best, mut best_meas) = self.search_tx_dc_calibration_grid(
                 &mut rx_stream,
                 &mut tx_stream,
@@ -672,6 +685,7 @@ impl SoapyIo {
                 tetra_known_evm_candidate_safe(reference_meas.tetra_known, final_meas.tetra_known, candidate_has_iq);
             let image_quality_ok = calibration_image_quality_ok(&final_meas);
             let final_quality_ok = calibration_final_quality_ok(&final_meas, &confirmation);
+            let rf_limiting = rf_limiting_factor_with_dc_actuator(&final_meas, tetra_known_quality_ok, Some(dc_actuator));
             let accepted = applied != TxCalibrationCoefficients::default()
                 && dc_preaccepted
                 && confirmation.confirmed
@@ -729,7 +743,13 @@ impl SoapyIo {
                     tetra_known_rms_evm_improvement_pct: tetra_known_rms_improvement,
                     tetra_known_peak_evm_improvement_pct: tetra_known_peak_improvement,
                     tetra_known_evm_quality_ok: tetra_known_quality_ok,
-                    rf_limiting_factor: rf_limiting_factor(&final_meas, tetra_known_quality_ok).to_string(),
+                    tx_dc_actuator_step: Some(dc_actuator.step),
+                    tx_dc_actuator_carrier_span_db: Some(dc_actuator.carrier_span_db),
+                    tx_dc_actuator_min_carrier_dbc: Some(dc_actuator.min_carrier_dbc),
+                    tx_dc_actuator_max_carrier_dbc: Some(dc_actuator.max_carrier_dbc),
+                    tx_dc_actuator_readback_ok: dc_actuator.readback_ok,
+                    tx_dc_actuator_effective: dc_actuator.effective,
+                    rf_limiting_factor: rf_limiting.to_string(),
                     accepted,
                     accepted_dc,
                     accepted_iq,
@@ -758,8 +778,9 @@ impl SoapyIo {
                             String::new()
                         };
                         let known_suffix = tetra_known_summary_suffix(&reference_meas, &final_meas);
+                        let dc_actuator_suffix = tx_dc_actuator_summary_suffix(Some(dc_actuator));
                         format!(
-                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB{}{}",
+                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB{}{}{}",
                             accepted_mode,
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
@@ -773,6 +794,7 @@ impl SoapyIo {
                             confirmation.carrier_spread_db,
                             confirmation.signal_spread_db,
                             known_suffix,
+                            dc_actuator_suffix,
                             timing_suffix
                         )
                     } else {
@@ -785,8 +807,9 @@ impl SoapyIo {
                             String::new()
                         };
                         let known_suffix = tetra_known_summary_suffix(&reference_meas, &final_meas);
+                        let dc_actuator_suffix = tx_dc_actuator_summary_suffix(Some(dc_actuator));
                         format!(
-                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} known_evm_safe={} confirm spread carrier {:.1} dB signal {:.1} dB{}{}",
+                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} known_evm_safe={} confirm spread carrier {:.1} dB signal {:.1} dB{}{}{}",
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
                             final_meas.carrier_leakage_dbc,
@@ -804,6 +827,7 @@ impl SoapyIo {
                             confirmation.carrier_spread_db,
                             confirmation.signal_spread_db,
                             known_suffix,
+                            dc_actuator_suffix,
                             timing_suffix
                         )
                     },
@@ -975,6 +999,80 @@ impl SoapyIo {
         let candidate_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate, timing, true)?;
         let confirmation = calibration_confirmation(reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
         Ok((confirmation, candidate_b))
+    }
+
+    fn probe_tx_dc_actuator_response(
+        &mut self,
+        rx: &mut soapysdr::RxStream<StreamType>,
+        tx: &mut soapysdr::TxStream<StreamType>,
+        rx_baseline: CalibrationRxBaseline,
+        tone: &[StreamType],
+        tone_hz: f64,
+        neutral: TxCalibrationCoefficients,
+        limits: &TxCalibrationLimits,
+        timing: &mut CalibrationTiming,
+    ) -> Result<TxDcActuatorDiagnostic, String> {
+        let step = TX_CAL_DC_ACTUATOR_PROBE_STEP.min(limits.tx_dc_abs_max).max(0.0);
+        if step <= 0.0 {
+            return Ok(TxDcActuatorDiagnostic::default());
+        }
+
+        let probes = [
+            TxCalibrationCoefficients { dc_i: step, ..neutral },
+            TxCalibrationCoefficients { dc_i: -step, ..neutral },
+            TxCalibrationCoefficients { dc_q: step, ..neutral },
+            TxCalibrationCoefficients { dc_q: -step, ..neutral },
+        ];
+
+        let mut min_carrier_dbc = f64::INFINITY;
+        let mut max_carrier_dbc = f64::NEG_INFINITY;
+        let mut readback_ok = true;
+        for coeffs in probes {
+            let meas = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, coeffs, timing, false)?;
+            min_carrier_dbc = min_carrier_dbc.min(meas.carrier_leakage_dbc);
+            max_carrier_dbc = max_carrier_dbc.max(meas.carrier_leakage_dbc);
+            match self.dev.dc_offset(soapysdr::Direction::Tx, self.tx_ch) {
+                Ok((read_i, read_q)) => {
+                    let i_ok = (read_i - coeffs.dc_i).abs() <= 1.0e-6;
+                    let q_ok = (read_q - coeffs.dc_q).abs() <= 1.0e-6;
+                    readback_ok &= i_ok && q_ok;
+                    if !i_ok || !q_ok {
+                        tracing::warn!(
+                            "SoapySDR: TX DC actuator readback mismatch set=({:+.5},{:+.5}) read=({:+.5},{:+.5})",
+                            coeffs.dc_i,
+                            coeffs.dc_q,
+                            read_i,
+                            read_q
+                        );
+                    }
+                }
+                Err(err) => {
+                    readback_ok = false;
+                    tracing::warn!("SoapySDR: TX DC actuator readback failed: {}", err);
+                }
+            }
+        }
+
+        let carrier_span_db = max_carrier_dbc - min_carrier_dbc;
+        let effective = readback_ok && carrier_span_db >= TX_CAL_DC_ACTUATOR_MIN_RESPONSE_DB;
+        tracing::warn!(
+            "SoapySDR: TX DC actuator probe step={:.5} carrier span={:.1} dB min={:.1} max={:.1} dBc readback_ok={} effective={}",
+            step,
+            carrier_span_db,
+            min_carrier_dbc,
+            max_carrier_dbc,
+            readback_ok,
+            effective
+        );
+
+        Ok(TxDcActuatorDiagnostic {
+            step,
+            carrier_span_db,
+            min_carrier_dbc,
+            max_carrier_dbc,
+            readback_ok,
+            effective,
+        })
     }
 
     fn search_tx_dc_calibration_grid(
@@ -1491,6 +1589,16 @@ struct TetraKnownEvmMeasurement {
     timing_sample: f64,
     frequency_rotation_rad_per_symbol: f64,
     symbols_used: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct TxDcActuatorDiagnostic {
+    step: f64,
+    carrier_span_db: f64,
+    min_carrier_dbc: f64,
+    max_carrier_dbc: f64,
+    readback_ok: bool,
+    effective: bool,
 }
 
 impl From<evm::ModulationAccuracy> for TetraKnownEvmMeasurement {
@@ -2406,6 +2514,32 @@ fn tetra_known_summary_suffix(reference: &CalibrationMeasurement, candidate: &Ca
     }
 }
 
+fn tx_dc_actuator_summary_suffix(diagnostic: Option<TxDcActuatorDiagnostic>) -> String {
+    match diagnostic {
+        Some(diagnostic) => format!(
+            ", TX DC actuator step {:.3} span {:.1} dB readback_ok={} effective={}",
+            diagnostic.step, diagnostic.carrier_span_db, diagnostic.readback_ok, diagnostic.effective
+        ),
+        None => String::new(),
+    }
+}
+
+fn rf_limiting_factor_with_dc_actuator(
+    meas: &CalibrationMeasurement,
+    tetra_known_quality_ok: bool,
+    dc_actuator: Option<TxDcActuatorDiagnostic>,
+) -> &'static str {
+    if meas.carrier_leakage_dbc > TX_CAL_GOOD_CARRIER_DBC {
+        if dc_actuator.is_some_and(|diag| !diag.readback_ok) {
+            return "tx_dc_actuator_readback_failed";
+        }
+        if dc_actuator.is_some_and(|diag| !diag.effective) {
+            return "tx_dc_actuator_no_effect";
+        }
+    }
+    rf_limiting_factor(meas, tetra_known_quality_ok)
+}
+
 fn rf_limiting_factor(meas: &CalibrationMeasurement, tetra_known_quality_ok: bool) -> &'static str {
     if meas.snr_db < TX_CAL_ACCEPT_MIN_SNR_DB {
         "loopback_snr_or_noise_floor"
@@ -2674,6 +2808,24 @@ mod tests {
 
         assert!(dc_calibration_search_score(&better) < dc_calibration_search_score(&reference));
         assert!(dc_calibration_search_score(&better) < dc_calibration_search_score(&unstable));
+    }
+
+    #[test]
+    fn tx_dc_actuator_no_effect_is_reported_as_limiting_factor() {
+        let meas = calibration_measurement(-20.0, 43.0, 9.5, -34.0);
+        let diagnostic = TxDcActuatorDiagnostic {
+            step: 0.04,
+            carrier_span_db: 0.2,
+            min_carrier_dbc: -20.1,
+            max_carrier_dbc: -19.9,
+            readback_ok: true,
+            effective: false,
+        };
+
+        assert_eq!(
+            rf_limiting_factor_with_dc_actuator(&meas, true, Some(diagnostic)),
+            "tx_dc_actuator_no_effect"
+        );
     }
 
     #[test]

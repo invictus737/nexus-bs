@@ -188,6 +188,12 @@ pub struct TxCalibrationReport {
     pub tetra_known_rms_evm_improvement_pct: Option<f64>,
     pub tetra_known_peak_evm_improvement_pct: Option<f64>,
     pub tetra_known_evm_quality_ok: bool,
+    pub tx_dc_actuator_step: Option<f64>,
+    pub tx_dc_actuator_carrier_span_db: Option<f64>,
+    pub tx_dc_actuator_min_carrier_dbc: Option<f64>,
+    pub tx_dc_actuator_max_carrier_dbc: Option<f64>,
+    pub tx_dc_actuator_readback_ok: bool,
+    pub tx_dc_actuator_effective: bool,
     pub rf_limiting_factor: String,
     pub accepted: bool,
     pub accepted_dc: bool,
@@ -337,6 +343,10 @@ pub fn validate_tx_calibration_file(file: &TxCalibrationFile) -> Result<(), Stri
             "report.tetra_known_peak_evm_improvement_pct",
             file.report.tetra_known_peak_evm_improvement_pct,
         ),
+        ("report.tx_dc_actuator_step", file.report.tx_dc_actuator_step),
+        ("report.tx_dc_actuator_carrier_span_db", file.report.tx_dc_actuator_carrier_span_db),
+        ("report.tx_dc_actuator_min_carrier_dbc", file.report.tx_dc_actuator_min_carrier_dbc),
+        ("report.tx_dc_actuator_max_carrier_dbc", file.report.tx_dc_actuator_max_carrier_dbc),
     ] {
         if let Some(value) = value {
             if !value.is_finite() {
@@ -459,6 +469,12 @@ mod tests {
                 tetra_known_rms_evm_improvement_pct: Some(3.4),
                 tetra_known_peak_evm_improvement_pct: Some(6.5),
                 tetra_known_evm_quality_ok: true,
+                tx_dc_actuator_step: Some(0.04),
+                tx_dc_actuator_carrier_span_db: Some(20.0),
+                tx_dc_actuator_min_carrier_dbc: Some(-48.0),
+                tx_dc_actuator_max_carrier_dbc: Some(-28.0),
+                tx_dc_actuator_readback_ok: true,
+                tx_dc_actuator_effective: true,
                 rf_limiting_factor: "within_known_evm_gate".to_string(),
                 accepted: true,
                 accepted_dc: true,
@@ -502,6 +518,8 @@ mod tests {
         assert_eq!(parsed.device.rx_gains_fingerprint, "LNA=42.00,PGA=16.00");
         assert_eq!(parsed.reference.tetra_known_symbols_used, Some(192));
         assert_eq!(parsed.report.tetra_known_rms_evm_improvement_pct, Some(3.4));
+        assert_eq!(parsed.report.tx_dc_actuator_carrier_span_db, Some(20.0));
+        assert!(parsed.report.tx_dc_actuator_readback_ok);
         assert_eq!(parsed.report.rf_limiting_factor, "within_known_evm_gate");
         assert!(parsed.report.accepted);
     }

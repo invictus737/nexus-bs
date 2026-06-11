@@ -14972,3 +14972,26 @@ RF Calibration DC Search Hardening - 2026-06-11 18:20 EEST:
     passed.
   - `cargo check -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+RF Calibration TX DC Actuator Diagnostic - 2026-06-11 18:35 EEST:
+
+- Field run on `2a1d130` proved the 2D DC grid was not missing a better point:
+  zero DC remained the best carrier-leak measurement inside the configured
+  limits, with known-symbol TETRA EVM still around commercial-grade values.
+- Fix:
+  - calibration now runs explicit TX DC actuator probes at controlled I/Q
+    offsets;
+  - each probe uses SoapySDR TX DC readback and measures carrier-leak span
+    through RF loopback;
+  - report schema records actuator step, carrier span, min/max carrier leak,
+    readback status, and effective/no-effect classification;
+  - RF limiting factor now reports `tx_dc_actuator_no_effect` or
+    `tx_dc_actuator_readback_failed` when carrier leak is still limiting and
+    the DC actuator is not proven effective.
+- Verification:
+  - `cargo test -p tetra-config --lib bluestation::sec_phy_soapy --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked`
+    passed.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `git diff --check` passed.
