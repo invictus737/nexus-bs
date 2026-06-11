@@ -23,6 +23,8 @@ const TX_CAL_PREFILL_BLOCKS: usize = 8;
 const TX_CAL_SETTLE_BLOCKS: usize = 3;
 const TX_CAL_CAPTURE_BLOCKS: usize = 3;
 const TX_CAL_MIN_SNR_DB: f64 = 25.0;
+const TX_CAL_FREQ_MATCH_TOLERANCE_HZ: f64 = 50.0;
+const TX_CAL_SAMPLE_RATE_MATCH_TOLERANCE_HZ: f64 = 1.0;
 const SOAPY_SX_LOOPBACK_ANTENNA: &str = "LB";
 const SOAPY_SX_PA_SETTING: &str = "PA";
 
@@ -99,6 +101,22 @@ struct TxCalibrationSession {
     original_rx_antenna: Option<String>,
     original_pa_setting: Option<String>,
     loopback_source: String,
+}
+
+#[derive(Clone, Debug)]
+struct TxCalibrationRuntimeConfig {
+    name: String,
+    live_rx_carrier_hz: f64,
+    live_tx_carrier_hz: f64,
+    live_rx_center_hz: f64,
+    live_tx_center_hz: f64,
+    sample_rate_hz: f64,
+    rx_ch: usize,
+    tx_ch: usize,
+    rx_ant: String,
+    tx_ant: String,
+    rx_gains_fingerprint: String,
+    tx_gains_fingerprint: String,
 }
 
 impl SoapyIo {
@@ -210,7 +228,33 @@ impl SoapyIo {
                 );
             }
 
-            apply_configured_tx_calibration(&dev, tx_ch, soapy_cfg);
+            let runtime_calibration_config = TxCalibrationRuntimeConfig {
+                name: sdr_name.clone(),
+                live_rx_carrier_hz: live_rx_carrier_hz.unwrap_or(rx_freq.unwrap_or_default()),
+                live_tx_carrier_hz: live_tx_carrier_hz.unwrap_or(tx_freq.unwrap_or_default()),
+                live_rx_center_hz: dev
+                    .frequency(soapysdr::Direction::Rx, rx_ch)
+                    .unwrap_or_else(|_| rx_freq.unwrap_or_default()),
+                live_tx_center_hz: dev
+                    .frequency(soapysdr::Direction::Tx, tx_ch)
+                    .unwrap_or_else(|_| tx_freq.unwrap_or_default()),
+                sample_rate_hz: tx_fs,
+                rx_ch,
+                tx_ch,
+                rx_ant: dev
+                    .antenna(soapysdr::Direction::Rx, rx_ch)
+                    .ok()
+                    .or_else(|| rx_ant_configured.clone())
+                    .unwrap_or_else(|| "auto".to_string()),
+                tx_ant: dev
+                    .antenna(soapysdr::Direction::Tx, tx_ch)
+                    .ok()
+                    .or_else(|| tx_ant_configured.clone())
+                    .unwrap_or_else(|| "auto".to_string()),
+                rx_gains_fingerprint: gains_fingerprint(&rx_gain_configured),
+                tx_gains_fingerprint: gains_fingerprint(&tx_gain_configured),
+            };
+            apply_configured_tx_calibration(&dev, tx_ch, soapy_cfg, &runtime_calibration_config);
         }
 
         let rx_args = args_from_pairs(&rx_args_configured);
@@ -1010,7 +1054,12 @@ impl CalibrationMeasurement {
     }
 }
 
-fn apply_configured_tx_calibration(dev: &soapysdr::Device, tx_ch: usize, soapy_cfg: &CfgSoapySdr) {
+fn apply_configured_tx_calibration(
+    dev: &soapysdr::Device,
+    tx_ch: usize,
+    soapy_cfg: &CfgSoapySdr,
+    runtime_config: &TxCalibrationRuntimeConfig,
+) {
     if !soapy_cfg.tx_calibration_enabled {
         return;
     }
@@ -1022,6 +1071,14 @@ fn apply_configured_tx_calibration(dev: &soapysdr::Device, tx_ch: usize, soapy_c
             return;
         }
     };
+    if let Err(err) = validate_tx_calibration_matches_runtime_config(&calibration, runtime_config) {
+        tracing::error!(
+            "SoapySDR: TX calibration enabled but {} does not match current resolved RX/TX config: {}; not applying stale DC/IQ",
+            path,
+            err
+        );
+        return;
+    }
 
     let coeffs = calibration.applied;
     if soapy_cfg.tx_calibration_apply_dc {
@@ -1060,6 +1117,101 @@ fn apply_configured_tx_calibration(dev: &soapysdr::Device, tx_ch: usize, soapy_c
         coeffs.iq_q,
         calibration.report.summary
     );
+}
+
+fn validate_tx_calibration_matches_runtime_config(
+    calibration: &TxCalibrationFile,
+    runtime: &TxCalibrationRuntimeConfig,
+) -> Result<(), String> {
+    let device = &calibration.device;
+    let expected_duplex_shift_hz = runtime.live_tx_carrier_hz - runtime.live_rx_carrier_hz;
+    let mut mismatches = Vec::new();
+
+    if device.name != runtime.name {
+        mismatches.push(format!("device.name stored={} current={}", device.name, runtime.name));
+    }
+    compare_hz(
+        &mut mismatches,
+        "tx_frequency_hz",
+        device.tx_frequency_hz,
+        runtime.live_tx_carrier_hz,
+        TX_CAL_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_hz(
+        &mut mismatches,
+        "rx_frequency_hz",
+        device.rx_frequency_hz,
+        runtime.live_rx_carrier_hz,
+        TX_CAL_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_hz(
+        &mut mismatches,
+        "tx_center_frequency_hz",
+        device.tx_center_frequency_hz,
+        runtime.live_tx_center_hz,
+        TX_CAL_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_hz(
+        &mut mismatches,
+        "rx_center_frequency_hz",
+        device.rx_center_frequency_hz,
+        runtime.live_rx_center_hz,
+        TX_CAL_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_hz(
+        &mut mismatches,
+        "duplex_shift_hz",
+        device.duplex_shift_hz,
+        expected_duplex_shift_hz,
+        TX_CAL_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_hz(
+        &mut mismatches,
+        "sample_rate_hz",
+        device.sample_rate_hz,
+        runtime.sample_rate_hz,
+        TX_CAL_SAMPLE_RATE_MATCH_TOLERANCE_HZ,
+    );
+    if device.tx_channel != runtime.tx_ch {
+        mismatches.push(format!("tx_channel stored={} current={}", device.tx_channel, runtime.tx_ch));
+    }
+    if device.rx_channel != runtime.rx_ch {
+        mismatches.push(format!("rx_channel stored={} current={}", device.rx_channel, runtime.rx_ch));
+    }
+    if !antenna_matches(&device.tx_antenna, &runtime.tx_ant) {
+        mismatches.push(format!("tx_antenna stored={} current={}", device.tx_antenna, runtime.tx_ant));
+    }
+    if !antenna_matches(&device.rx_antenna, &runtime.rx_ant) {
+        mismatches.push(format!("rx_antenna stored={} current={}", device.rx_antenna, runtime.rx_ant));
+    }
+    if device.tx_gains_fingerprint != runtime.tx_gains_fingerprint {
+        mismatches.push(format!(
+            "tx_gains stored={} current={}",
+            device.tx_gains_fingerprint, runtime.tx_gains_fingerprint
+        ));
+    }
+    if device.rx_gains_fingerprint != runtime.rx_gains_fingerprint {
+        mismatches.push(format!(
+            "rx_gains stored={} current={}",
+            device.rx_gains_fingerprint, runtime.rx_gains_fingerprint
+        ));
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches.join("; "))
+    }
+}
+
+fn compare_hz(mismatches: &mut Vec<String>, name: &str, stored: f64, current: f64, tolerance_hz: f64) {
+    if !stored.is_finite() || !current.is_finite() || (stored - current).abs() > tolerance_hz {
+        mismatches.push(format!("{name} stored={stored:.3} current={current:.3}"));
+    }
+}
+
+fn antenna_matches(stored: &str, current: &str) -> bool {
+    stored == current || stored == "auto" || current == "auto"
 }
 
 fn calibration_tone(sample_rate: f64, tone_hz: f64, amplitude: f32, len: usize) -> Vec<StreamType> {
@@ -1244,6 +1396,70 @@ fn temperature_sensor_reads_supported(settings_name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn runtime_calibration_config() -> TxCalibrationRuntimeConfig {
+        TxCalibrationRuntimeConfig {
+            name: "SXceiver".to_string(),
+            live_rx_carrier_hz: 431_362_500.0,
+            live_tx_carrier_hz: 438_362_500.0,
+            live_rx_center_hz: 431_342_500.0,
+            live_tx_center_hz: 438_362_512.0,
+            sample_rate_hz: 600_000.0,
+            rx_ch: 0,
+            tx_ch: 0,
+            rx_ant: "RX".to_string(),
+            tx_ant: "TX".to_string(),
+            rx_gains_fingerprint: "LNA=42.00,PGA=16.00".to_string(),
+            tx_gains_fingerprint: "DAC=9.00,MIXER=30.00".to_string(),
+        }
+    }
+
+    fn calibration_file_for_runtime(runtime: &TxCalibrationRuntimeConfig) -> TxCalibrationFile {
+        TxCalibrationFile {
+            schema_version: 1,
+            status: "calibrated".to_string(),
+            device: TxCalibrationDevice {
+                name: runtime.name.clone(),
+                tx_frequency_hz: runtime.live_tx_carrier_hz,
+                rx_frequency_hz: runtime.live_rx_carrier_hz,
+                tx_center_frequency_hz: runtime.live_tx_center_hz,
+                rx_center_frequency_hz: runtime.live_rx_center_hz,
+                calibration_frequency_hz: runtime.live_tx_center_hz,
+                duplex_shift_hz: runtime.live_tx_carrier_hz - runtime.live_rx_carrier_hz,
+                sample_rate_hz: runtime.sample_rate_hz,
+                tx_channel: runtime.tx_ch,
+                rx_channel: runtime.rx_ch,
+                tx_antenna: runtime.tx_ant.clone(),
+                rx_antenna: runtime.rx_ant.clone(),
+                loopback_source: "rx_internal_lb".to_string(),
+                tx_gains_fingerprint: runtime.tx_gains_fingerprint.clone(),
+                rx_gains_fingerprint: runtime.rx_gains_fingerprint.clone(),
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tx_calibration_accepts_matching_resolved_runtime_config() {
+        let runtime = runtime_calibration_config();
+        let calibration = calibration_file_for_runtime(&runtime);
+
+        validate_tx_calibration_matches_runtime_config(&calibration, &runtime).expect("matching resolved runtime config must be accepted");
+    }
+
+    #[test]
+    fn tx_calibration_rejects_stale_runtime_config() {
+        let runtime = runtime_calibration_config();
+        let mut calibration = calibration_file_for_runtime(&runtime);
+        calibration.device.rx_frequency_hz -= 25_000.0;
+        calibration.device.tx_gains_fingerprint = "DAC=6.00,MIXER=30.00".to_string();
+
+        let err = validate_tx_calibration_matches_runtime_config(&calibration, &runtime)
+            .expect_err("stale RX/TX/gain calibration must be rejected");
+
+        assert!(err.contains("rx_frequency_hz"));
+        assert!(err.contains("tx_gains"));
+    }
 
     #[test]
     fn sxceiver_like_devices_skip_runtime_temperature_reads() {
