@@ -14946,3 +14946,29 @@ RF Calibration Report Preservation - 2026-06-11 18:05 EEST:
     passed.
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+RF Calibration DC Search Hardening - 2026-06-11 18:20 EEST:
+
+- Field run on `edcf18f` preserved rejected reports correctly, but the
+  calibration still found no safe DC/IQ candidate:
+  - known-symbol TETRA EVM was real and usable at about 2.27% RMS / 4.17%
+    peak;
+  - carrier leak stayed around -20.2 dBc;
+  - limiting factor was `tx_dc_carrier_leak`.
+- Fix:
+  - replaced axis-only TX DC hill climb with a 2D I/Q grid search using coarse
+    and fine steps across the configured DC limits;
+  - retained a raw best carrier-leak candidate separately from the scored best
+    candidate so unusually good measurements are not discarded just because
+    they look extreme;
+  - promoted raw best candidates into confirmation when their core capture
+    quality is valid;
+  - allowed pre-confirmation DC/IQ candidates through when the noise floor is
+    very low and SNR is high, even if floor drift in dB looks large; final
+    acceptance still requires repeated confirmation and known-symbol EVM
+    safety.
+- Verification:
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked`
+    passed.
+  - `cargo check -p tetra-entities --locked` passed.
+  - `git diff --check` passed.

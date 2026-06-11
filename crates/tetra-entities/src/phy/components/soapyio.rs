@@ -516,34 +516,27 @@ impl SoapyIo {
                 }
             }
 
-            let mut best = neutral;
-            let mut best_meas = reference_meas;
-
-            for step in [0.04, 0.02, 0.01, 0.005] {
-                for axis in [CalibrationAxis::DcI, CalibrationAxis::DcQ] {
-                    let mut axis_best = best;
-                    let mut axis_meas = best_meas;
-                    for direction in [-1.0, 1.0] {
-                        let candidate = with_axis_delta(best, axis, step * direction, &limits);
-                        let meas = self.capture_calibration_measurement(
-                            &mut rx_stream,
-                            &mut tx_stream,
-                            rx_baseline,
-                            &tone,
-                            tone_hz,
-                            candidate,
-                            &mut timing,
-                            false,
-                        )?;
-                        if meas.carrier_leakage_dbc < axis_meas.carrier_leakage_dbc {
-                            axis_best = candidate;
-                            axis_meas = meas;
-                        }
-                    }
-                    best = axis_best;
-                    best_meas = axis_meas;
-                }
-            }
+            let (mut best, mut best_meas) = self.search_tx_dc_calibration_grid(
+                &mut rx_stream,
+                &mut tx_stream,
+                rx_baseline,
+                &tone,
+                tone_hz,
+                neutral,
+                reference_meas,
+                &limits,
+                &mut timing,
+            )?;
+            tracing::warn!(
+                "SoapySDR: TX DC search best dc=({:+.5},{:+.5}) carrier {:.1}->{:.1} dBc signal {:.1} dBFS snr {:.1} dB floor_drift {:.1} dB",
+                best.dc_i,
+                best.dc_q,
+                reference_meas.carrier_leakage_dbc,
+                best_meas.carrier_leakage_dbc,
+                best_meas.signal_dbfs,
+                best_meas.snr_db,
+                best_meas.floor_drift_db
+            );
 
             let dc_best = best;
             let dc_best_meas = best_meas;
@@ -982,6 +975,82 @@ impl SoapyIo {
         let candidate_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate, timing, true)?;
         let confirmation = calibration_confirmation(reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
         Ok((confirmation, candidate_b))
+    }
+
+    fn search_tx_dc_calibration_grid(
+        &mut self,
+        rx: &mut soapysdr::RxStream<StreamType>,
+        tx: &mut soapysdr::TxStream<StreamType>,
+        rx_baseline: CalibrationRxBaseline,
+        tone: &[StreamType],
+        tone_hz: f64,
+        neutral: TxCalibrationCoefficients,
+        reference: CalibrationMeasurement,
+        limits: &TxCalibrationLimits,
+        timing: &mut CalibrationTiming,
+    ) -> Result<(TxCalibrationCoefficients, CalibrationMeasurement), String> {
+        let mut best = neutral;
+        let mut best_meas = reference;
+        let mut best_score = dc_calibration_search_score(&best_meas);
+        let mut raw_best = neutral;
+        let mut raw_best_meas = reference;
+
+        for step in [0.08, 0.04, 0.02, 0.01, 0.005] {
+            let anchor = best;
+            for delta_i in [-step, 0.0, step] {
+                for delta_q in [-step, 0.0, step] {
+                    if delta_i == 0.0 && delta_q == 0.0 {
+                        continue;
+                    }
+                    let candidate = TxCalibrationCoefficients {
+                        dc_i: (anchor.dc_i + delta_i).clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
+                        dc_q: (anchor.dc_q + delta_q).clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
+                        ..neutral
+                    };
+                    if candidate == best {
+                        continue;
+                    }
+                    let meas = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate, timing, false)?;
+                    if meas.carrier_leakage_dbc < raw_best_meas.carrier_leakage_dbc {
+                        raw_best = candidate;
+                        raw_best_meas = meas;
+                    }
+                    let score = dc_calibration_search_score(&meas);
+                    if score < best_score {
+                        best = candidate;
+                        best_meas = meas;
+                        best_score = score;
+                    }
+                }
+            }
+        }
+
+        if raw_best != best {
+            tracing::warn!(
+                "SoapySDR: TX DC search raw best dc=({:+.5},{:+.5}) carrier {:.1} dBc snr {:.1} dB floor_drift {:.1} dB max {:.3} clip {:.4}; scored best dc=({:+.5},{:+.5}) carrier {:.1} dBc",
+                raw_best.dc_i,
+                raw_best.dc_q,
+                raw_best_meas.carrier_leakage_dbc,
+                raw_best_meas.snr_db,
+                raw_best_meas.floor_drift_db,
+                raw_best_meas.max_component_abs,
+                raw_best_meas.clipped_fraction,
+                best.dc_i,
+                best.dc_q,
+                best_meas.carrier_leakage_dbc
+            );
+            if calibration_capture_core_quality_ok(&raw_best_meas)
+                && raw_best_meas.carrier_leakage_dbc < best_meas.carrier_leakage_dbc - TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB
+            {
+                tracing::warn!(
+                    "SoapySDR: TX DC raw best has valid capture core; promoting it to confirmation instead of discarding an extreme carrier-leak result"
+                );
+                best = raw_best;
+                best_meas = raw_best_meas;
+            }
+        }
+
+        Ok((best, best_meas))
     }
 
     fn capture_calibration_measurement(
@@ -2268,6 +2337,10 @@ fn calibration_final_quality_ok(meas: &CalibrationMeasurement, confirmation: &Ca
         && (calibration_floor_stable(meas) || (confirmation.confirmed && calibration_low_floor_warning_ok(meas)))
 }
 
+fn calibration_preconfirmation_quality_ok(meas: &CalibrationMeasurement) -> bool {
+    calibration_capture_core_quality_ok(meas) && (calibration_floor_stable(meas) || calibration_low_floor_warning_ok(meas))
+}
+
 fn calibration_image_quality_ok(meas: &CalibrationMeasurement) -> bool {
     meas.image_rejection_db >= TX_CAL_GOOD_IMAGE_REJECTION_DB && meas.evm_proxy_pct <= TX_CAL_ACCEPT_MAX_EVM_PROXY_PCT
 }
@@ -2351,7 +2424,7 @@ fn rf_limiting_factor(meas: &CalibrationMeasurement, tetra_known_quality_ok: boo
 
 fn dc_calibration_accepted(reference: &CalibrationMeasurement, candidate: &CalibrationMeasurement) -> bool {
     let improvement = reference.carrier_leakage_dbc - candidate.carrier_leakage_dbc;
-    calibration_capture_quality_ok(candidate)
+    calibration_preconfirmation_quality_ok(candidate)
         && candidate.carrier_leakage_dbc <= TX_CAL_ACCEPT_CARRIER_DBC
         && (improvement >= TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB || candidate.carrier_leakage_dbc <= TX_CAL_GOOD_CARRIER_DBC)
 }
@@ -2364,7 +2437,7 @@ fn iq_calibration_accepted(
 ) -> bool {
     let image_improvement = candidate.image_rejection_db - reference.image_rejection_db;
     let coeff_delta = iq_coeff_delta(reference_coeffs, candidate_coeffs);
-    calibration_capture_quality_ok(candidate)
+    calibration_preconfirmation_quality_ok(candidate)
         && coeff_delta >= TX_CAL_IQ_MIN_COEFF_DELTA
         && candidate.carrier_leakage_dbc <= TX_CAL_ACCEPT_CARRIER_DBC
         && candidate.image_rejection_db >= TX_CAL_ACCEPT_IMAGE_REJECTION_DB
@@ -2426,6 +2499,20 @@ fn with_axis_delta(
         CalibrationAxis::IqQ => coeffs.iq_q = (coeffs.iq_q + delta).clamp(-limits.tx_iq_abs_max, limits.tx_iq_abs_max),
     }
     coeffs
+}
+
+fn dc_calibration_search_score(meas: &CalibrationMeasurement) -> f64 {
+    let mut score = meas.carrier_leakage_dbc;
+    if meas.snr_db < TX_CAL_ACCEPT_MIN_SNR_DB {
+        score += (TX_CAL_ACCEPT_MIN_SNR_DB - meas.snr_db) * 4.0;
+    }
+    if meas.max_component_abs > TX_CAL_MAX_COMPONENT_ABS {
+        score += (meas.max_component_abs - TX_CAL_MAX_COMPONENT_ABS) * 100.0;
+    }
+    if meas.clipped_fraction > TX_CAL_MAX_CLIPPED_FRACTION {
+        score += (meas.clipped_fraction - TX_CAL_MAX_CLIPPED_FRACTION) * 1000.0;
+    }
+    score
 }
 
 fn iq_calibration_score(meas: &CalibrationMeasurement) -> f64 {
@@ -2579,6 +2666,17 @@ mod tests {
     }
 
     #[test]
+    fn tx_dc_search_score_prefers_clean_carrier_leak_reduction() {
+        let reference = calibration_measurement(-20.0, 43.0, 9.5, -34.0);
+        let better = calibration_measurement(-31.0, 43.0, 3.0, -34.0);
+        let mut unstable = calibration_measurement(-34.0, 43.0, 2.5, -34.0);
+        unstable.snr_db = 20.0;
+
+        assert!(dc_calibration_search_score(&better) < dc_calibration_search_score(&reference));
+        assert!(dc_calibration_search_score(&better) < dc_calibration_search_score(&unstable));
+    }
+
+    #[test]
     fn tetra_calibration_pattern_is_symbol_periodic() {
         let symbols = tetra_calibration_reference_symbols(TX_CAL_TETRA_PATTERN_SYMBOLS * 2).expect("reference symbols");
 
@@ -2668,6 +2766,22 @@ mod tests {
         assert!(confirmation.confirmed);
         assert!(!calibration_capture_quality_ok(&candidate_b));
         assert!(calibration_final_quality_ok(&candidate_b, &confirmation));
+    }
+
+    #[test]
+    fn tx_calibration_dc_preaccept_allows_low_floor_warning_before_confirmation() {
+        let reference = calibration_measurement(-20.2, 45.0, 9.8, -34.0);
+        let mut candidate = calibration_measurement(-32.5, 45.0, 2.4, -34.0);
+        candidate.floor_before_dbfs = -128.5;
+        candidate.floor_after_dbfs = -120.8;
+        candidate.loopback_floor_dbfs = -120.8;
+        candidate.floor_drift_db = 7.7;
+        candidate.floor_drift_abs_db = 7.7;
+        candidate.snr_db = 86.8;
+
+        assert!(!calibration_capture_quality_ok(&candidate));
+        assert!(calibration_low_floor_warning_ok(&candidate));
+        assert!(dc_calibration_accepted(&reference, &candidate));
     }
 
     #[test]
