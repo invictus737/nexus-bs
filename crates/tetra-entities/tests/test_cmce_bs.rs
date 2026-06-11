@@ -4795,6 +4795,109 @@ fn test_network_origin_brew_private_d_connect_ack_transmitted_without_l2_ack_ope
     );
 }
 
+#[test]
+fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_ack_opens_media_without_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    let mut call = default_network_circuit_call(TEST_ISSI, TEST_CALLED_ISSI);
+    call.priority = 11;
+    call.duplex = 1;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
+            brew_uuid,
+            call: call.clone(),
+        }),
+    });
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let setup = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("network-origin private duplex setup should emit D-SETUP");
+    assert!(setup.1.simplex_duplex_selection);
+    let call_id = setup.1.call_identifier;
+
+    test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, true, true));
+    test.run_stack(Some(1));
+    let connect_request_msgs = test.dump_sinks();
+    let connect_request = connect_request_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+                brew_uuid: request_uuid,
+                call,
+            }) if *request_uuid == brew_uuid => Some(call),
+            _ => None,
+        })
+        .expect("called MS duplex U-CONNECT should be forwarded to Brew");
+    assert_eq!(connect_request.duplex, 1);
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+            brew_uuid,
+            grant: TransmissionGrant::Granted.into_raw() as u8,
+            permission: 0,
+        }),
+    });
+    test.run_stack(Some(1));
+    let confirm_msgs = test.dump_sinks();
+
+    let connect_ack = confirm_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect_acknowledge(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("network duplex connect confirm should emit D-CONNECT-ACKNOWLEDGE");
+    assert_eq!(connect_ack.0.main_address.ssi, TEST_CALLED_ISSI);
+    assert_eq!(connect_ack.0.layer2service, Layer2Service::Acknowledged);
+    assert!(connect_ack.0.tx_reporter.is_some());
+    assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
+    assert!(count_umac_open(&confirm_msgs) >= 1);
+    assert_eq!(
+        count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
+        0,
+        "duplex Brew media waits until local D-CONNECT ACK has at least reached RF"
+    );
+
+    let connect_ack_reporter = called_d_connect_ack_reporter(&confirm_msgs, TEST_CALLED_ISSI);
+    connect_ack_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let after_transmit_only_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_umac_floor_granted(&after_transmit_only_msgs),
+        0,
+        "duplex private calls must not use the simplex floor-control path"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
+        1,
+        "network-origin duplex Brew media opens after local RF D-CONNECT ACK transmission"
+    );
+}
+
 /// Test that late-entry D-SETUP re-sends are throttled when the previous
 /// D-SETUP's TxReceipt is still in Pending state (UMAC hasn't transmitted it yet),
 /// and that they resume once the receipt reaches a final state.

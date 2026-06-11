@@ -188,12 +188,17 @@ impl CcBsSubentity {
     }
 
     fn pending_network_duplex_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
-        // Duplex does not use simplex floor-control; only the local-caller
-        // Brew bridge path may complete after RF D-CONNECT transmission.
+        // Duplex does not use simplex floor-control. Brew bridge media may be
+        // opened after the local connect PDU has reached RF on either leg:
+        // D-CONNECT for local-origin calls, D-CONNECT ACK for network-origin.
         pending.simplex_duplex
             && matches!(
                 (pending.kind, pending.grant),
                 (PendingNetworkIndividualConnectKind::LocalCallerDConnect, TransmissionGrant::Granted)
+                    | (
+                        PendingNetworkIndividualConnectKind::LocalCalledDConnectAck,
+                        TransmissionGrant::Granted
+                    )
             )
     }
 
