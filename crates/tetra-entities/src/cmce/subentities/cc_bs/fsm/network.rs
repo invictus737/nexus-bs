@@ -174,9 +174,14 @@ impl CcBsSubentity {
     }
 
     fn pending_network_individual_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
-        pending.kind == PendingNetworkIndividualConnectKind::LocalCalledDConnectAck
-            && !pending.simplex_duplex
-            && pending.grant == TransmissionGrant::GrantedToOtherUser
+        !pending.simplex_duplex
+            && matches!(
+                (pending.kind, pending.grant),
+                (
+                    PendingNetworkIndividualConnectKind::LocalCalledDConnectAck,
+                    TransmissionGrant::GrantedToOtherUser
+                ) | (PendingNetworkIndividualConnectKind::LocalCallerDConnect, TransmissionGrant::Granted)
+            )
     }
 
     pub(in crate::cmce::subentities::cc_bs) fn drain_pending_network_individual_connects(&mut self, queue: &mut MessageQueue) {

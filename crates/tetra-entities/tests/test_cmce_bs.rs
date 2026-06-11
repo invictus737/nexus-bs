@@ -4453,7 +4453,7 @@ fn test_brew_private_simplex_remote_floor_idle_grants_queued_local_ptt() {
 }
 
 #[test]
-fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_does_not_open_media() {
+fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_opens_local_caller_media() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -4507,18 +4507,18 @@ fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_does_not_
 
     assert_eq!(
         count_umac_floor_granted(&after_transmit_only_msgs),
-        0,
-        "Annex D.4/D.5: local D-CONNECT transmission alone must not authorize first simplex traffic"
+        1,
+        "local caller-first Brew simplex opens the local floor after RF D-CONNECT transmission"
     );
     assert_eq!(
         count_network_circuit_connect_confirm(&after_transmit_only_msgs, brew_uuid),
-        0,
-        "Brew connect confirm waits for local D-CONNECT L2 ACK, not only MAC transmission"
+        1,
+        "local caller-first Brew simplex confirms after local RF D-CONNECT transmission"
     );
     assert_eq!(
         count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
-        0,
-        "Brew media waits for local D-CONNECT L2 ACK, not only MAC transmission"
+        1,
+        "local caller-first Brew simplex opens Brew media after local RF D-CONNECT transmission"
     );
 }
 
