@@ -4943,9 +4943,9 @@ fn test_network_origin_brew_private_call_updates_dashboard_last_heard() {
                 && *calling_issi == TEST_ISSI
                 && *called_issi == TEST_CALLED_ISSI
                 && !*simplex
-                && secondary_ts.is_none()
+                && secondary_ts.is_some()
         )),
-        "network-origin Brew P2P setup must publish individual-call dashboard telemetry"
+        "network-origin Brew duplex P2P setup must publish the secondary bearer timeslot"
     );
 
     let dashboard = DashboardServer::new("test.toml".to_string());
@@ -5113,7 +5113,32 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     assert_eq!(connect_ack.0.layer2service, Layer2Service::Acknowledged);
     assert!(connect_ack.0.tx_reporter.is_some());
     assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
-    assert!(count_umac_open(&confirm_msgs) >= 1);
+    let open_circuits: Vec<_> = confirm_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        open_circuits.len(),
+        2,
+        "network-origin private duplex must open one local called bearer and one network/calling bearer"
+    );
+    assert_ne!(
+        open_circuits[0].ts, open_circuits[1].ts,
+        "network-origin private duplex bearers must use distinct traffic timeslots"
+    );
+    assert_eq!(
+        open_circuits[0].peer_ts,
+        Some(open_circuits[1].ts),
+        "called bearer must cross-route to the calling/network bearer"
+    );
+    assert_eq!(
+        open_circuits[1].peer_ts,
+        Some(open_circuits[0].ts),
+        "calling/network bearer must cross-route to the called bearer"
+    );
     assert_eq!(
         count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
         0,
@@ -5134,6 +5159,107 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
         count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
         1,
         "network-origin duplex Brew media opens after local RF D-CONNECT ACK transmission"
+    );
+}
+
+#[test]
+fn test_network_origin_brew_private_duplex_accepts_local_simplex_offer_without_leaking_second_bearer() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    let mut call = default_network_circuit_call(TEST_ISSI, TEST_CALLED_ISSI);
+    call.priority = 11;
+    call.duplex = 1;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
+            brew_uuid,
+            call: call.clone(),
+        }),
+    });
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let setup = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim),
+            _ => None,
+        })
+        .expect("network-origin private duplex setup should emit D-SETUP");
+    assert!(setup.simplex_duplex_selection);
+    let call_id = setup.call_identifier;
+
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+    assert_eq!(
+        test.config.state_read().timeslot_alloc.owner(3),
+        Some(TimeslotOwner::Cmce),
+        "duplex setup should reserve the second bearer before the local MS answers"
+    );
+
+    test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, false));
+    test.run_stack(Some(1));
+    let connect_request_msgs = test.dump_sinks();
+    let connect_request = connect_request_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+                brew_uuid: request_uuid,
+                call,
+            }) if *request_uuid == brew_uuid => Some(call),
+            _ => None,
+        })
+        .expect("called MS simplex U-CONNECT should be forwarded to Brew");
+    assert_eq!(
+        connect_request.duplex, 0,
+        "local simplex offer must be mapped to Brew CONNECT_REQUEST as simplex"
+    );
+    assert_eq!(
+        test.config.state_read().timeslot_alloc.owner(3),
+        None,
+        "unused network/calling bearer must be released when the local MS offers simplex"
+    );
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+            brew_uuid,
+            grant: TransmissionGrant::Granted.into_raw() as u8,
+            permission: 0,
+        }),
+    });
+    test.run_stack(Some(1));
+    let confirm_msgs = test.dump_sinks();
+    let open_circuits: Vec<_> = confirm_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::Open(circuit)) => Some(circuit),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        open_circuits.len(),
+        1,
+        "Brew-origin duplex downgraded by local simplex offer should open exactly one shared bearer"
+    );
+    assert_eq!(open_circuits[0].peer_ts, None);
+    assert_eq!(
+        open_circuits[0].active_addr,
+        Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi))
     );
 }
 

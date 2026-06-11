@@ -816,18 +816,31 @@ impl CcBsSubentity {
             call_id
         );
         if call_snapshot.called_ts != call_snapshot.calling_ts {
-            if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, call_snapshot.called_ts) {
-                tracing::debug!(
-                    "CMCE: released unused duplex called-side bearer call_id={} ts={} after simplex offer",
-                    call_id,
-                    circuit.ts
-                );
+            if call_snapshot.calling_over_brew && !call_snapshot.called_over_brew {
+                if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, call_snapshot.calling_ts) {
+                    tracing::debug!(
+                        "CMCE: released unused duplex Brew-calling bearer call_id={} ts={} after simplex offer",
+                        call_id,
+                        circuit.ts
+                    );
+                }
+                self.release_timeslot(call_snapshot.calling_ts);
+                call_snapshot.calling_ts = call_snapshot.called_ts;
+                call_snapshot.calling_usage = call_snapshot.called_usage;
+            } else {
+                if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, call_snapshot.called_ts) {
+                    tracing::debug!(
+                        "CMCE: released unused duplex called-side bearer call_id={} ts={} after simplex offer",
+                        call_id,
+                        circuit.ts
+                    );
+                }
+                self.release_timeslot(call_snapshot.called_ts);
+                call_snapshot.called_ts = call_snapshot.calling_ts;
+                call_snapshot.called_usage = call_snapshot.calling_usage;
             }
-            self.release_timeslot(call_snapshot.called_ts);
         }
         call_snapshot.simplex_duplex = false;
-        call_snapshot.called_ts = call_snapshot.calling_ts;
-        call_snapshot.called_usage = call_snapshot.calling_usage;
         call_snapshot.call_timeout = self.config_call_timeout();
         if let Some(network_call) = &mut call_snapshot.network_call {
             network_call.duplex = 0;
@@ -835,7 +848,9 @@ impl CcBsSubentity {
 
         if let Some(call) = self.individual_calls.get_mut(&call_id) {
             call.simplex_duplex = call_snapshot.simplex_duplex;
+            call.calling_ts = call_snapshot.calling_ts;
             call.called_ts = call_snapshot.called_ts;
+            call.calling_usage = call_snapshot.calling_usage;
             call.called_usage = call_snapshot.called_usage;
             call.call_timeout = call_snapshot.call_timeout;
             if let Some(network_call) = &mut call.network_call {

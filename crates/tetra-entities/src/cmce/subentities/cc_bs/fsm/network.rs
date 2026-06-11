@@ -344,9 +344,9 @@ impl CcBsSubentity {
         let simplex_duplex = call.duplex != 0;
 
         let occupied_call_ids = self.occupied_call_ids();
-        let circuit_called = {
+        let (circuit_called, circuit_calling) = {
             let mut state = self.config.state_write();
-            match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
+            let circuit_called = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 communication,
                 simplex_duplex,
@@ -374,12 +374,55 @@ impl CcBsSubentity {
                     });
                     return;
                 }
-            }
+            };
+
+            let circuit_calling = if simplex_duplex {
+                match self.circuits.allocate_circuit_for_call_with_allocator(
+                    circuit_called.call_id,
+                    Direction::Both,
+                    communication,
+                    simplex_duplex,
+                    &mut state.timeslot_alloc,
+                    TimeslotOwner::Cmce,
+                ) {
+                    Ok(circuit) => Some(circuit.clone()),
+                    Err(e) => {
+                        let _ = self.circuits.close_circuit(Direction::Both, circuit_called.ts);
+                        let _ = state.timeslot_alloc.release(TimeslotOwner::Cmce, circuit_called.ts);
+                        tracing::info!(
+                            "CMCE: rejecting Brew setup request uuid={} src={} dst={} (second duplex allocation failed: {:?})",
+                            brew_uuid,
+                            call.source_issi,
+                            call.destination,
+                            e
+                        );
+                        queue.push_back(SapMsg {
+                            sap: Sap::Control,
+                            src: TetraEntity::Cmce,
+                            dest: TetraEntity::Brew,
+                            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
+                                brew_uuid,
+                                cause: DisconnectCause::CongestionInInfrastructure.into_raw() as u8,
+                            }),
+                        });
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            (circuit_called.clone(), circuit_calling)
         };
 
         let call_id = circuit_called.call_id;
-        let ts = circuit_called.ts;
-        let usage = circuit_called.usage;
+        let called_ts = circuit_called.ts;
+        let called_usage = circuit_called.usage;
+        let (calling_ts, calling_usage) = if let Some(calling) = &circuit_calling {
+            (calling.ts, calling.usage)
+        } else {
+            (called_ts, called_usage)
+        };
         let call_timeout = Self::network_circuit_call_timeout(call.timeout, CallTimeout::T5m);
         let hook_method_selection = Self::network_circuit_hook_method(call.method);
         let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
@@ -387,12 +430,15 @@ impl CcBsSubentity {
         let calling_issi = call.source_issi;
 
         tracing::info!(
-            "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
+            "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts(called)={} usage(called)={} ts(calling)={} usage(calling)={} duplex={} number='{}'",
             brew_uuid,
             call_id,
             call.source_issi,
             call.destination,
-            ts,
+            called_ts,
+            called_usage,
+            calling_ts,
+            calling_usage,
             simplex_duplex,
             call.number
         );
@@ -460,10 +506,10 @@ impl CcBsSubentity {
                 called_handle: None,
                 called_link_id: None,
                 called_endpoint_id: None,
-                calling_ts: ts,
-                called_ts: ts,
-                calling_usage: usage,
-                called_usage: usage,
+                calling_ts,
+                called_ts,
+                calling_usage,
+                called_usage,
                 simplex_duplex,
                 request_to_transmit_send_data: false,
                 state: IndividualCallState::IncomingSetupPending,
@@ -487,8 +533,8 @@ impl CcBsSubentity {
                 calling_issi,
                 called_issi: called_addr.ssi,
                 simplex: !simplex_duplex,
-                ts,
-                secondary_ts: None,
+                ts: called_ts,
+                secondary_ts: if calling_ts != called_ts { Some(calling_ts) } else { None },
             });
         } else if let Err(err) = create_result {
             match err {
@@ -788,7 +834,34 @@ impl CcBsSubentity {
             speech_service,
             etee_encrypted,
         };
-        Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.called_addr));
+        let called_peer_ts = if call.simplex_duplex && call.calling_ts != call.called_ts {
+            Some(call.calling_ts)
+        } else {
+            None
+        };
+        Self::signal_umac_circuit_open(queue, &circuit, called_peer_ts, CircuitDlMediaSource::SwMI, Some(call.called_addr));
+
+        if call.simplex_duplex && call.calling_ts != call.called_ts {
+            let calling_circuit = CmceCircuit {
+                ts_created: self.dltime,
+                direction: Direction::Both,
+                ts: call.calling_ts,
+                call_id,
+                usage: call.calling_usage,
+                circuit_mode,
+                comm_type,
+                simplex_duplex: call.simplex_duplex,
+                speech_service,
+                etee_encrypted,
+            };
+            Self::signal_umac_circuit_open(
+                queue,
+                &calling_circuit,
+                Some(call.called_ts),
+                CircuitDlMediaSource::SwMI,
+                Some(call.calling_addr),
+            );
+        }
 
         self.pending_network_individual_connects.insert(
             call_id,
