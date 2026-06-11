@@ -858,7 +858,7 @@ impl DashboardServer {
                             secondary_ts: *secondary_ts,
                         },
                     );
-                    s.push_last_heard(*calling_issi, "call_individual", *called_issi);
+                    s.push_last_heard(*calling_issi, individual_call_last_heard_activity(*simplex), *called_issi);
                     s.push_log("INFO", format!("P2P call {} started: {} -> {}", call_id, calling_issi, called_issi));
                 }
                 TelemetryEvent::IndividualCallEnded { call_id } => {
@@ -1060,7 +1060,8 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             ts,
             secondary_ts,
         } => {
-            serde_json::json!({"type":"call_started","call_id":call_id,"call_type":"individual","caller_issi":calling_issi,"called_issi":called_issi,"simplex":simplex,"ts":ts,"secondary_ts":secondary_ts,"last_heard":{"issi":calling_issi,"activity":"call_individual","dest":called_issi}})
+            let activity = individual_call_last_heard_activity(*simplex);
+            serde_json::json!({"type":"call_started","call_id":call_id,"call_type":"individual","caller_issi":calling_issi,"called_issi":called_issi,"simplex":simplex,"ts":ts,"secondary_ts":secondary_ts,"last_heard":{"issi":calling_issi,"activity":activity,"dest":called_issi}})
         }
         TelemetryEvent::IndividualCallEnded { call_id } => serde_json::json!({"type":"call_ended","call_id":call_id}),
         TelemetryEvent::BrewConnected { connected, server_version } => {
@@ -1127,6 +1128,10 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
         }),
     };
     serde_json::to_string(&v).ok()
+}
+
+fn individual_call_last_heard_activity(simplex: bool) -> &'static str {
+    if simplex { "call_p2p_simplex" } else { "call_p2p_duplex" }
 }
 
 // ---------------------------------------------------------------------------

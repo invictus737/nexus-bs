@@ -2046,7 +2046,8 @@ const LANGS={
     th_dest:'Destination',th_speaker:'Speaker',th_duration:'Duration',
     th_time:'Time',th_activity:'Activity',
     last_heard_title:'Last Heard',no_activity:'No activity yet',
-    act_call_group:'Group Call',act_call_individual:'P2P Call',act_sds:'SDS',
+    act_call_group:'Group voice',act_call_individual:'P2P simplex',
+    act_call_p2p_simplex:'P2P simplex',act_call_p2p_duplex:'P2P duplex',act_sds:'SDS',
     online_badge:'ONLINE',kick:'Kick',sds:'SDS',wap:'WAP',
     call_group:'GROUP',call_p2p_s:'P2P-S',call_p2p_d:'P2P-D',
     confirm_kick:'Kick ISSI {issi}?\nTerminal will be deregistered and forced to re-attach.',
@@ -2116,7 +2117,8 @@ const LANGS={
     th_dest:'Destinatar',th_speaker:'Vorbitor',th_duration:'Durată',
     th_time:'Oră',th_activity:'Activitate',
     last_heard_title:'Ultima Activitate',no_activity:'Nicio activitate încă',
-    act_call_group:'Apel Grup',act_call_individual:'Apel P2P',act_sds:'SDS',
+    act_call_group:'Group voice',act_call_individual:'P2P simplex',
+    act_call_p2p_simplex:'P2P simplex',act_call_p2p_duplex:'P2P duplex',act_sds:'SDS',
     online_badge:'ONLINE',kick:'Kick',sds:'SDS',wap:'WAP',
     call_group:'GRUP',call_p2p_s:'P2P-S',call_p2p_d:'P2P-D',
     confirm_kick:'Kick ISSI {issi}?\nTerminalul va fi deînregistrat și forțat să se reconecteze.',
@@ -2185,7 +2187,8 @@ const LANGS={
     th_dest:'Ziel',th_speaker:'Sprecher',th_duration:'Dauer',
     th_time:'Zeit',th_activity:'Aktivität',
     last_heard_title:'Zuletzt Gehört',no_activity:'Noch keine Aktivität',
-    act_call_group:'Gruppenruf',act_call_individual:'P2P-Ruf',act_sds:'SDS',
+    act_call_group:'Group voice',act_call_individual:'P2P simplex',
+    act_call_p2p_simplex:'P2P simplex',act_call_p2p_duplex:'P2P duplex',act_sds:'SDS',
     online_badge:'ONLINE',kick:'Entfernen',sds:'SDS',wap:'WAP',
     call_group:'GRUPPE',call_p2p_s:'P2P-S',call_p2p_d:'P2P-D',
     confirm_kick:'ISSI {issi} entfernen?\nDas Terminal wird abgemeldet und zur Neuanmeldung gezwungen.',
@@ -2254,7 +2257,8 @@ const LANGS={
     th_dest:'Destino',th_speaker:'Hablante',th_duration:'Duración',
     th_time:'Hora',th_activity:'Actividad',
     last_heard_title:'Última Actividad',no_activity:'Sin actividad aún',
-    act_call_group:'Llamada Grupo',act_call_individual:'Llamada P2P',act_sds:'SDS',
+    act_call_group:'Group voice',act_call_individual:'P2P simplex',
+    act_call_p2p_simplex:'P2P simplex',act_call_p2p_duplex:'P2P duplex',act_sds:'SDS',
     online_badge:'EN LÍNEA',kick:'Expulsar',sds:'SDS',wap:'WAP',
     call_group:'GRUPO',call_p2p_s:'P2P-S',call_p2p_d:'P2P-D',
     confirm_kick:'¿Expulsar ISSI {issi}?\nEl terminal será desregistrado y forzado a reconectarse.',
@@ -2318,7 +2322,8 @@ const LANGS={
     th_dest:'Cél',th_speaker:'Beszélő',th_duration:'Időtartam',
     th_time:'Idő',th_activity:'Tevékenység',
     last_heard_title:'Utoljára hallott',no_activity:'Még nincs tevékenység',
-    act_call_group:'Csoportos hívás',act_call_individual:'P2P hívás',act_sds:'SDS',
+    act_call_group:'Group voice',act_call_individual:'P2P simplex',
+    act_call_p2p_simplex:'P2P simplex',act_call_p2p_duplex:'P2P duplex',act_sds:'SDS',
     online_badge:'ONLINE',kick:'Kizárás',sds:'SDS',wap:'WAP',
     call_group:'CSOPORT',call_p2p_s:'P2P-S',call_p2p_d:'P2P-D',
     confirm_kick:'ISSI {issi} kizárása?\nA terminál törlésre kerül és újra kell csatlakoznia.',
@@ -2384,7 +2389,8 @@ const LANGS={
     th_dest:'被叫',th_speaker:'讲话者',th_duration:'时长',
     th_time:'时间',th_activity:'活动',
     last_heard_title:'最近通话记录',no_activity:'暂无活动记录',
-    act_call_group:'组呼',act_call_individual:'点对点',act_sds:'SDS',
+    act_call_group:'Group voice',act_call_individual:'P2P simplex',
+    act_call_p2p_simplex:'P2P simplex',act_call_p2p_duplex:'P2P duplex',act_sds:'SDS',
     online_badge:'在线',kick:'踢下线',sds:'SDS',wap:'WAP',
     call_group:'组呼',call_p2p_s:'P2P-S',call_p2p_d:'P2P-D',
     confirm_kick:'确定踢下 ISSI {issi}？\n终端将被注销并强制重新注册。',
@@ -2943,7 +2949,8 @@ function pushLastHeard(entry){
 }
 function activityBadge(activity){
   if(activity==='call_group')return`<span class="badge badge-blue">${t('act_call_group')}</span>`;
-  if(activity==='call_individual')return`<span class="badge badge-yellow">${t('act_call_individual')}</span>`;
+  if(activity==='call_individual'||activity==='call_p2p_simplex')return`<span class="badge badge-green">${t('act_call_p2p_simplex')}</span>`;
+  if(activity==='call_p2p_duplex')return`<span class="badge badge-yellow">${t('act_call_p2p_duplex')}</span>`;
   if(activity==='sds')return`<span class="badge" style="background:rgba(180,100,255,0.15);color:#c87aff;border-color:rgba(180,100,255,0.4)">${t('act_sds')}</span>`;
   return`<span class="badge badge-dim">${activity}</span>`;
 }

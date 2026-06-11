@@ -4198,7 +4198,7 @@ fn test_local_origin_brew_private_call_updates_dashboard_last_heard() {
         .front()
         .expect("local-origin Brew P2P call should be visible in dashboard Last Heard");
     assert_eq!(last_heard.issi, TEST_ISSI);
-    assert_eq!(last_heard.activity, "call_individual");
+    assert_eq!(last_heard.activity, "call_p2p_simplex");
     assert_eq!(last_heard.dest, remote_issi);
 }
 
@@ -4686,6 +4686,82 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
 }
 
 #[test]
+fn test_local_origin_brew_private_duplex_disconnect_while_alerting_releases_network_peer() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let remote_issi = 7_000_204;
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(remote_issi as u64);
+    u_setup.simplex_duplex_selection = true;
+    u_setup.hook_method_selection = true;
+
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let (brew_uuid, network_call) = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid, call }) => Some((*brew_uuid, call.clone())),
+            _ => None,
+        })
+        .expect("local private duplex U-SETUP should be forwarded to Brew");
+    assert_eq!(network_call.duplex, 1);
+    let call_id = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .expect("local caller should receive D-CALL PROCEEDING");
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitAlert { brew_uuid }),
+    });
+    test.run_stack(Some(1));
+    let alert_msgs = test.dump_sinks();
+    assert!(
+        alert_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::LcmcMleUnitdataReq(prim)
+                if prim.main_address.ssi == TEST_ISSI && parse_d_alert(prim).is_some()
+        )),
+        "Brew alert should ring the local caller while the network peer is still alerting"
+    );
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let release_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_network_circuit_release(&release_msgs, brew_uuid),
+        1,
+        "caller hangup during Brew duplex alerting must cancel the still-ringing network peer"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&release_msgs, brew_uuid),
+        0,
+        "alerting cancel must not open Brew media"
+    );
+}
+
+#[test]
 fn test_network_origin_brew_private_simplex_connect_confirm_grants_external_caller_first() {
     debug::setup_logging_verbose();
 
@@ -4863,7 +4939,7 @@ fn test_network_origin_brew_private_call_updates_dashboard_last_heard() {
         .front()
         .expect("network-origin Brew P2P call should be visible in dashboard Last Heard");
     assert_eq!(last_heard.issi, TEST_ISSI);
-    assert_eq!(last_heard.activity, "call_individual");
+    assert_eq!(last_heard.activity, "call_p2p_duplex");
     assert_eq!(last_heard.dest, TEST_CALLED_ISSI);
 }
 
@@ -10904,7 +10980,7 @@ fn test_p2p_setup_to_parrot_99999_opens_separate_local_simplex_service() {
         .front()
         .expect("parrot call should be visible in dashboard Last Heard");
     assert_eq!(last_heard.issi, TEST_ISSI);
-    assert_eq!(last_heard.activity, "call_individual");
+    assert_eq!(last_heard.activity, "call_p2p_simplex");
     assert_eq!(last_heard.dest, 99_999);
 }
 

@@ -1594,7 +1594,10 @@ function activityMeta(activity) {
     case "call_group":
       return { label: "Group voice", className: "blue" };
     case "call_individual":
-      return { label: "Private voice", className: "green" };
+    case "call_p2p_simplex":
+      return { label: "P2P simplex", className: "green" };
+    case "call_p2p_duplex":
+      return { label: "P2P duplex", className: "amber" };
     case "sds":
       return { label: "SDS", className: "amber" };
     default:

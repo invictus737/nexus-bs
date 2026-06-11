@@ -1534,7 +1534,14 @@ impl TetraEntityTrait for BrewEntity {
             }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid, cause }) => {
                 let was_active = self.drop_network_circuit(brew_uuid);
-                if was_active && self.connected {
+                if !was_active {
+                    tracing::info!(
+                        "BrewEntity: forwarding circuit release for setup/ringing uuid={} cause={}",
+                        brew_uuid,
+                        cause
+                    );
+                }
+                if self.connected {
                     self.send_or_queue_brew_command(BrewCommand::SendCallRelease { uuid: brew_uuid, cause });
                 }
             }
@@ -2087,7 +2094,7 @@ mod tests {
 
     use crossbeam_channel::{Receiver, Sender, bounded};
     use tetra_config::bluestation::{SharedConfig, from_toml_str};
-    use tetra_core::{TdmaTime, TxReporter};
+    use tetra_core::{TdmaTime, TxReporter, tetra_entities::TetraEntity};
     use tetra_saps::SapMsgInner;
     use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
     use tetra_saps::control::call_control::CallControl;
@@ -2247,6 +2254,34 @@ mod tests {
                 SapMsgInner::CmceCallControl(CallControl::NetworkCallEnd { brew_uuid }) if *brew_uuid == uuid
             )
         }));
+    }
+
+    #[test]
+    fn circuit_release_before_media_ready_is_forwarded_to_brew() {
+        let (mut entity, rx) = brew_entity_without_worker();
+        let uuid = Uuid::new_v4();
+        let cause = 1;
+        let mut queue = MessageQueue::new();
+
+        entity.rx_prim(
+            &mut queue,
+            tetra_saps::SapMsg {
+                sap: tetra_core::Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid: uuid, cause }),
+            },
+        );
+
+        let command = rx.try_recv().expect("setup-phase circuit release must be sent to Brew");
+        assert!(matches!(
+            command,
+            BrewCommand::SendCallRelease {
+                uuid: got_uuid,
+                cause: got_cause,
+            } if got_uuid == uuid && got_cause == cause
+        ));
+        assert!(rx.try_recv().is_err(), "only one call release should be sent");
     }
 
     #[test]

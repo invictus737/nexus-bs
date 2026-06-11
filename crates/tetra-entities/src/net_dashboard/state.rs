@@ -43,7 +43,7 @@ pub struct LogEntry {
 pub struct LastHeardEntry {
     pub ts: String,       // HH:MM:SS timestamp
     pub issi: u32,        // source ISSI
-    pub activity: String, // "call_group", "call_individual", "sds"
+    pub activity: String, // "call_group", "call_p2p_simplex", "call_p2p_duplex", "sds"
     pub dest: u32,        // destination GSSI or ISSI (0 if unknown)
 }
 
