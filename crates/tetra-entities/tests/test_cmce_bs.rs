@@ -5073,6 +5073,12 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
         .expect("network-origin private duplex setup should emit D-SETUP");
     assert!(setup.1.simplex_duplex_selection);
     let call_id = setup.1.call_identifier;
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+    assert_eq!(
+        test.config.state_read().timeslot_alloc.owner(3),
+        Some(TimeslotOwner::Cmce),
+        "network-origin private duplex must reserve the external/network bearer timeslot"
+    );
 
     test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, true, true));
     test.run_stack(Some(1));
@@ -5122,22 +5128,14 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
         .collect();
     assert_eq!(
         open_circuits.len(),
-        2,
-        "network-origin private duplex must open one local called bearer and one network/calling bearer"
+        1,
+        "network-origin private duplex must open only the local RF bearer; the external Brew bearer is reserved but not RF-scheduled"
     );
-    assert_ne!(
-        open_circuits[0].ts, open_circuits[1].ts,
-        "network-origin private duplex bearers must use distinct traffic timeslots"
-    );
+    assert_eq!(open_circuits[0].ts, 2);
+    assert_eq!(open_circuits[0].peer_ts, None);
     assert_eq!(
-        open_circuits[0].peer_ts,
-        Some(open_circuits[1].ts),
-        "called bearer must cross-route to the calling/network bearer"
-    );
-    assert_eq!(
-        open_circuits[1].peer_ts,
-        Some(open_circuits[0].ts),
-        "calling/network bearer must cross-route to the called bearer"
+        open_circuits[0].active_addr,
+        Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi))
     );
     assert_eq!(
         count_network_circuit_media_ready(&confirm_msgs, brew_uuid),

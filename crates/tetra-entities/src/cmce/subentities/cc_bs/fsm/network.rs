@@ -834,32 +834,15 @@ impl CcBsSubentity {
             speech_service,
             etee_encrypted,
         };
-        let called_peer_ts = if call.simplex_duplex && call.calling_ts != call.called_ts {
-            Some(call.calling_ts)
-        } else {
-            None
-        };
-        Self::signal_umac_circuit_open(queue, &circuit, called_peer_ts, CircuitDlMediaSource::SwMI, Some(call.called_addr));
+        Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.called_addr));
 
         if call.simplex_duplex && call.calling_ts != call.called_ts {
-            let calling_circuit = CmceCircuit {
-                ts_created: self.dltime,
-                direction: Direction::Both,
-                ts: call.calling_ts,
+            tracing::info!(
+                "CMCE: network-origin duplex call_id={} reserved external bearer ts={} usage={} without RF UMAC open; Brew media bridges on local ts={}",
                 call_id,
-                usage: call.calling_usage,
-                circuit_mode,
-                comm_type,
-                simplex_duplex: call.simplex_duplex,
-                speech_service,
-                etee_encrypted,
-            };
-            Self::signal_umac_circuit_open(
-                queue,
-                &calling_circuit,
-                Some(call.called_ts),
-                CircuitDlMediaSource::SwMI,
-                Some(call.calling_addr),
+                call.calling_ts,
+                call.calling_usage,
+                call.called_ts
             );
         }
 
