@@ -22,6 +22,8 @@ const TX_CAL_FALLBACK_BLOCK_SAMPLES: usize = 4096;
 const TX_CAL_PREFILL_BLOCKS: usize = 8;
 const TX_CAL_SETTLE_BLOCKS: usize = 3;
 const TX_CAL_CAPTURE_BLOCKS: usize = 3;
+const TX_CAL_STREAM_WARMUP_BLOCKS: usize = 32;
+const TX_CAL_MAX_STATUS_DRAIN_EVENTS: usize = 16;
 const TX_CAL_MIN_SNR_DB: f64 = 25.0;
 const TX_CAL_ACCEPT_MIN_SNR_DB: f64 = 35.0;
 const TX_CAL_ACCEPT_CARRIER_DBC: f64 = -30.0;
@@ -449,11 +451,21 @@ impl SoapyIo {
             let tone_hz = quantized_tone_hz(TX_CAL_TONE_HZ, self.tx_fs, block_len);
             let tone = calibration_tone(self.tx_fs, tone_hz, TX_CAL_TONE_AMPLITUDE, block_len);
             let limits = TxCalibrationLimits::default();
+            let mut timing = CalibrationTiming::default();
 
-            let rx_baseline = self.capture_rx_only_calibration_baseline(&mut rx_stream, &mut tx_stream, block_len)?;
+            warm_tx_calibration_streams(&mut rx_stream, &mut tx_stream, block_len, &mut timing)?;
+            let rx_baseline = self.capture_rx_only_calibration_baseline(&mut rx_stream, &mut tx_stream, block_len, &mut timing)?;
             let neutral = TxCalibrationCoefficients::default();
-            let reference_meas =
-                self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, rx_baseline, &tone, tone_hz, neutral)?;
+            let reference_meas = self.capture_calibration_measurement(
+                &mut rx_stream,
+                &mut tx_stream,
+                rx_baseline,
+                &tone,
+                tone_hz,
+                neutral,
+                &mut timing,
+                false,
+            )?;
             if reference_meas.snr_db < TX_CAL_MIN_SNR_DB {
                 return Err(format!(
                     "RF loopback signal too weak for calibration: SNR {:.1} dB < {:.1} dB source={} tone {:.1} Hz signal {:.1} dBFS measured_floor {:.1} dBFS rx_baseline {:.1} dBFS calibration_freq {:.0} Hz live_rx {:.0} Hz live_tx {:.0} Hz",
@@ -479,8 +491,16 @@ impl SoapyIo {
                     let mut axis_meas = best_meas;
                     for direction in [-1.0, 1.0] {
                         let candidate = with_axis_delta(best, axis, step * direction, &limits);
-                        let meas =
-                            self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, rx_baseline, &tone, tone_hz, candidate)?;
+                        let meas = self.capture_calibration_measurement(
+                            &mut rx_stream,
+                            &mut tx_stream,
+                            rx_baseline,
+                            &tone,
+                            tone_hz,
+                            candidate,
+                            &mut timing,
+                            false,
+                        )?;
                         if meas.carrier_leakage_dbc < axis_meas.carrier_leakage_dbc {
                             axis_best = candidate;
                             axis_meas = meas;
@@ -501,8 +521,16 @@ impl SoapyIo {
                     let mut axis_score = iq_calibration_score(&axis_meas);
                     for direction in [-1.0, 1.0] {
                         let candidate = with_axis_delta(best, axis, step * direction, &limits);
-                        let meas =
-                            self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, rx_baseline, &tone, tone_hz, candidate)?;
+                        let meas = self.capture_calibration_measurement(
+                            &mut rx_stream,
+                            &mut tx_stream,
+                            rx_baseline,
+                            &tone,
+                            tone_hz,
+                            candidate,
+                            &mut timing,
+                            false,
+                        )?;
                         let score = iq_calibration_score(&meas);
                         if score < axis_score {
                             axis_best = candidate;
@@ -540,9 +568,19 @@ impl SoapyIo {
                     neutral,
                     applied,
                     &reference_meas,
+                    &mut timing,
                 )?
             } else {
-                let meas = self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, rx_baseline, &tone, tone_hz, neutral)?;
+                let meas = self.capture_calibration_measurement(
+                    &mut rx_stream,
+                    &mut tx_stream,
+                    rx_baseline,
+                    &tone,
+                    tone_hz,
+                    neutral,
+                    &mut timing,
+                    false,
+                )?;
                 (CalibrationConfirmation::default(), meas)
             };
             let carrier_improvement = reference_meas.carrier_leakage_dbc - final_meas.carrier_leakage_dbc;
@@ -553,6 +591,7 @@ impl SoapyIo {
             let accepted = applied != TxCalibrationCoefficients::default()
                 && dc_preaccepted
                 && confirmation.confirmed
+                && timing.confirmation_ok()
                 && final_quality_ok
                 && (!candidate_has_iq || image_quality_ok);
             let accepted_dc = accepted;
@@ -612,9 +651,25 @@ impl SoapyIo {
                     confirmation_passes: confirmation.passes,
                     confirmation_carrier_spread_db: confirmation.carrier_spread_db,
                     confirmation_signal_spread_db: confirmation.signal_spread_db,
+                    timing_warning: timing.warning(),
+                    timing_status_events: timing.status_events,
+                    timing_confirmation_status_events: timing.confirmation_status_events,
+                    timing_underflows: timing.underflows,
+                    timing_overflows: timing.overflows,
+                    timing_time_errors: timing.time_errors,
+                    timing_other_errors: timing.other_errors,
+                    timing_last_status: timing.last_status.clone(),
                     summary: if accepted {
+                        let timing_suffix = if timing.warning() {
+                            format!(
+                                ", timing warning events={} confirmation_events={} last={}",
+                                timing.status_events, timing.confirmation_status_events, timing.last_status
+                            )
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB",
+                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB{}",
                             accepted_mode,
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
@@ -626,11 +681,20 @@ impl SoapyIo {
                             reference_meas.snr_db,
                             final_meas.snr_db,
                             confirmation.carrier_spread_db,
-                            confirmation.signal_spread_db
+                            confirmation.signal_spread_db,
+                            timing_suffix
                         )
                     } else {
+                        let timing_suffix = if timing.warning() {
+                            format!(
+                                ", timing warning events={} confirmation_events={} last={}",
+                                timing.status_events, timing.confirmation_status_events, timing.last_status
+                            )
+                        } else {
+                            String::new()
+                        };
                         format!(
-                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} confirm spread carrier {:.1} dB signal {:.1} dB",
+                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} confirm spread carrier {:.1} dB signal {:.1} dB{}",
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
                             final_meas.carrier_leakage_dbc,
@@ -645,7 +709,8 @@ impl SoapyIo {
                             final_quality_ok,
                             image_quality_ok,
                             confirmation.carrier_spread_db,
-                            confirmation.signal_spread_db
+                            confirmation.signal_spread_db,
+                            timing_suffix
                         )
                     },
                 },
@@ -808,11 +873,12 @@ impl SoapyIo {
         neutral: TxCalibrationCoefficients,
         candidate: TxCalibrationCoefficients,
         reference: &CalibrationMeasurement,
+        timing: &mut CalibrationTiming,
     ) -> Result<(CalibrationConfirmation, CalibrationMeasurement), String> {
-        let neutral_a = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, neutral)?;
-        let candidate_a = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate)?;
-        let neutral_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, neutral)?;
-        let candidate_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate)?;
+        let neutral_a = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, neutral, timing, true)?;
+        let candidate_a = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate, timing, true)?;
+        let neutral_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, neutral, timing, true)?;
+        let candidate_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate, timing, true)?;
         let confirmation = calibration_confirmation(reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
         Ok((confirmation, candidate_b))
     }
@@ -825,14 +891,17 @@ impl SoapyIo {
         tone: &[StreamType],
         tone_hz: f64,
         coeffs: TxCalibrationCoefficients,
+        timing: &mut CalibrationTiming,
+        confirmation: bool,
     ) -> Result<CalibrationMeasurement, String> {
         self.apply_tx_calibration_coefficients(coeffs, true, true)?;
         std::thread::sleep(std::time::Duration::from_millis(25));
+        drain_tx_stream_status(tx, timing, confirmation);
 
         let zero = vec![ComplexSample::ZERO; tone.len()];
-        let floor_before = capture_calibration_samples(rx, tx, &zero)?;
-        let capture = capture_calibration_samples(rx, tx, tone)?;
-        let floor_after = capture_calibration_samples(rx, tx, &zero)?;
+        let floor_before = capture_calibration_samples(rx, tx, &zero, timing, confirmation)?;
+        let capture = capture_calibration_samples(rx, tx, tone, timing, confirmation)?;
+        let floor_after = capture_calibration_samples(rx, tx, &zero, timing, confirmation)?;
         Ok(measure_calibration_capture(
             &capture,
             &floor_before,
@@ -848,10 +917,12 @@ impl SoapyIo {
         rx: &mut soapysdr::RxStream<StreamType>,
         tx: &mut soapysdr::TxStream<StreamType>,
         block_len: usize,
+        timing: &mut CalibrationTiming,
     ) -> Result<CalibrationRxBaseline, String> {
         self.apply_tx_calibration_coefficients(TxCalibrationCoefficients::default(), true, true)?;
         std::thread::sleep(std::time::Duration::from_millis(25));
-        capture_rx_only_calibration_samples(rx, tx, block_len).map(|capture| CalibrationRxBaseline::from_samples(&capture))
+        drain_tx_stream_status(tx, timing, false);
+        capture_rx_only_calibration_samples(rx, tx, block_len, timing).map(|capture| CalibrationRxBaseline::from_samples(&capture))
     }
 
     fn apply_tx_calibration_coefficients(&self, coeffs: TxCalibrationCoefficients, apply_dc: bool, apply_iq: bool) -> Result<(), String> {
@@ -1221,6 +1292,42 @@ impl Default for CalibrationConfirmation {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+struct CalibrationTiming {
+    status_events: u32,
+    confirmation_status_events: u32,
+    underflows: u32,
+    overflows: u32,
+    time_errors: u32,
+    other_errors: u32,
+    last_status: String,
+}
+
+impl CalibrationTiming {
+    fn record(&mut self, label: String, code: Option<soapysdr::ErrorCode>, confirmation: bool) {
+        self.status_events = self.status_events.saturating_add(1);
+        if confirmation {
+            self.confirmation_status_events = self.confirmation_status_events.saturating_add(1);
+        }
+        match code {
+            Some(soapysdr::ErrorCode::Underflow) => self.underflows = self.underflows.saturating_add(1),
+            Some(soapysdr::ErrorCode::Overflow) => self.overflows = self.overflows.saturating_add(1),
+            Some(soapysdr::ErrorCode::TimeError) => self.time_errors = self.time_errors.saturating_add(1),
+            Some(soapysdr::ErrorCode::Timeout | soapysdr::ErrorCode::NotSupported) | None => {}
+            Some(_) => self.other_errors = self.other_errors.saturating_add(1),
+        }
+        self.last_status = label;
+    }
+
+    fn warning(&self) -> bool {
+        self.status_events > 0
+    }
+
+    fn confirmation_ok(&self) -> bool {
+        self.confirmation_status_events == 0
+    }
+}
+
 fn apply_configured_tx_calibration(
     dev: &soapysdr::Device,
     tx_ch: usize,
@@ -1545,15 +1652,19 @@ fn capture_calibration_samples(
     rx: &mut soapysdr::RxStream<StreamType>,
     tx: &mut soapysdr::TxStream<StreamType>,
     tx_block: &[StreamType],
+    timing: &mut CalibrationTiming,
+    confirmation: bool,
 ) -> Result<Vec<StreamType>, String> {
     let mut rx_block = vec![ComplexSample::ZERO; tx_block.len()];
     let mut capture = Vec::with_capacity(tx_block.len() * TX_CAL_CAPTURE_BLOCKS);
+    drain_tx_stream_status(tx, timing, confirmation);
 
     for _ in 0..TX_CAL_PREFILL_BLOCKS {
         tx.write_all(&[tx_block], None, false, 250_000)
             .map_err(|e| format!("write calibration prefill block: {}", e))?;
         read_calibration_block(rx, &mut rx_block, 250_000)?;
     }
+    drain_tx_stream_status(tx, timing, confirmation);
 
     for block_idx in 0..(TX_CAL_SETTLE_BLOCKS + TX_CAL_CAPTURE_BLOCKS) {
         tx.write_all(&[tx_block], None, false, 250_000)
@@ -1566,6 +1677,7 @@ fn capture_calibration_samples(
     if capture.len() < tx_block.len() {
         return Err(format!("short calibration capture: {} samples", capture.len()));
     }
+    drain_tx_stream_status(tx, timing, confirmation);
     Ok(capture)
 }
 
@@ -1573,7 +1685,9 @@ fn capture_rx_only_calibration_samples(
     rx: &mut soapysdr::RxStream<StreamType>,
     tx: &mut soapysdr::TxStream<StreamType>,
     block_len: usize,
+    timing: &mut CalibrationTiming,
 ) -> Result<Vec<StreamType>, String> {
+    drain_tx_stream_status(tx, timing, false);
     tx.deactivate(None)
         .map_err(|e| format!("deactivate TX stream for RX-only calibration baseline: {}", e))?;
     let result = (|| {
@@ -1597,6 +1711,9 @@ fn capture_rx_only_calibration_samples(
     })();
 
     let activate_result = tx.activate(None);
+    if activate_result.is_ok() {
+        drain_tx_stream_status(tx, timing, false);
+    }
     match (result, activate_result) {
         (Ok(capture), Ok(())) => Ok(capture),
         (Err(err), Ok(())) => Err(err),
@@ -1605,6 +1722,55 @@ fn capture_rx_only_calibration_samples(
             "{}; additionally failed to reactivate TX stream after RX-only calibration baseline: {}",
             err, activate_err
         )),
+    }
+}
+
+fn warm_tx_calibration_streams(
+    rx: &mut soapysdr::RxStream<StreamType>,
+    tx: &mut soapysdr::TxStream<StreamType>,
+    block_len: usize,
+    timing: &mut CalibrationTiming,
+) -> Result<(), String> {
+    let zero = vec![ComplexSample::ZERO; block_len];
+    let mut rx_block = vec![ComplexSample::ZERO; block_len];
+    drain_tx_stream_status(tx, timing, false);
+    for _ in 0..TX_CAL_STREAM_WARMUP_BLOCKS {
+        tx.write_all(&[&zero], None, false, 250_000)
+            .map_err(|e| format!("write calibration warmup block: {}", e))?;
+        read_calibration_block(rx, &mut rx_block, 250_000)?;
+    }
+    drain_tx_stream_status(tx, timing, false);
+    Ok(())
+}
+
+fn drain_tx_stream_status(tx: &mut soapysdr::TxStream<StreamType>, timing: &mut CalibrationTiming, confirmation: bool) {
+    for _ in 0..TX_CAL_MAX_STATUS_DRAIN_EVENTS {
+        let mut chan_mask = 0usize;
+        let mut flags = 0i32;
+        let mut time_ns = 0i64;
+        match tx.read_status(&mut chan_mask, &mut flags, &mut time_ns, 0) {
+            Ok(status) => {
+                timing.record(
+                    format!(
+                        "ok status={} chan_mask=0x{:x} flags=0x{:x} time_ns={}",
+                        status, chan_mask, flags, time_ns
+                    ),
+                    None,
+                    confirmation,
+                );
+            }
+            Err(err) if matches!(err.code, soapysdr::ErrorCode::Timeout | soapysdr::ErrorCode::NotSupported) => break,
+            Err(err) => {
+                timing.record(
+                    format!(
+                        "{:?}: {} chan_mask=0x{:x} flags=0x{:x} time_ns={}",
+                        err.code, err.message, chan_mask, flags, time_ns
+                    ),
+                    Some(err.code),
+                    confirmation,
+                );
+            }
+        }
     }
 }
 
