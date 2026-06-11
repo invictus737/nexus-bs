@@ -4945,7 +4945,7 @@ fn test_large_group_repeated_u_setup_floor_alias_is_bounded_without_setup_fanout
 }
 
 #[test]
-fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
+fn test_repeated_group_u_setup_from_current_speaker_answers_setup_reentry() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -4960,19 +4960,38 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
     register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
     let (active_call_id, active_ts, active_usage) = start_group_call_with_circuit(&mut test);
 
-    // Some terminals repeat U-SETUP when the user presses PTT again even
-    // though the SwMI still has that MS as current speaker. Clause 14.5.2.2.1
-    // floor control needs an explicit D-TX GRANTED response for transmit
-    // permission, and UMAC must keep the current speaker mapped.
+    // Some Motorola-class terminals repeat U-SETUP when the user presses PTT
+    // again, even though the SwMI still has that MS as current speaker. Treat
+    // that as setup re-entry on the maintained call so the MS receives the
+    // D-CONNECT setup response it expects; listener floor state still uses
+    // normal maintenance signalling.
     test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
     test.run_stack(Some(1));
     let repeated_msgs = test.dump_sinks();
 
     assert_eq!(count_d_releases(&repeated_msgs), 0);
     assert_eq!(count_d_setups(&repeated_msgs), 0);
-    assert_eq!(count_d_call_proceedings(&repeated_msgs), 0);
-    assert_eq!(count_d_connects(&repeated_msgs), 0);
+    assert_eq!(count_d_call_proceedings(&repeated_msgs), 1);
+    assert_eq!(count_d_connects(&repeated_msgs), 1);
     assert_eq!(count_umac_open(&repeated_msgs), 0);
+
+    let connects: Vec<_> = repeated_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let (connect_prim, connect) = &connects[0];
+    assert_eq!(connect.call_identifier, active_call_id);
+    assert_eq!(connect.transmission_grant, TransmissionGrant::Granted);
+    assert_eq!(connect_prim.main_address, TetraAddress::issi(TEST_ISSI));
+    let connect_alloc = connect_prim
+        .chan_alloc
+        .as_ref()
+        .expect("current-speaker setup re-entry D-CONNECT should carry channel allocation");
+    assert_chan_alloc_matches_circuit(connect_alloc, active_ts, active_usage, "current-speaker setup re-entry D-CONNECT");
+    assert_eq!(connect_alloc.ul_dl_assigned, UlDlAssignment::Both);
 
     let grants: Vec<_> = repeated_msgs
         .iter()
@@ -4983,55 +5002,37 @@ fn test_repeated_group_u_setup_from_current_speaker_reasserts_existing_floor() {
         .collect();
     assert_eq!(
         grants.len(),
-        2,
-        "current-speaker repeated setup must explicitly reassert floor to the MS and local listeners"
+        1,
+        "D-CONNECT grants the current speaker; only local listeners need D-TX GRANTED"
     );
-    assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address.ssi == TEST_ISSI
-            && prim.main_address.ssi_type == SsiType::Issi
-            && grant.call_identifier == active_call_id
-            && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
-    }));
-    assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI)
-            && grant.call_identifier == active_call_id
-            && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
-    }));
+    let (listener_prim, listener_grant) = &grants[0];
+    assert_eq!(listener_prim.main_address, TetraAddress::issi(TEST_CALLED_ISSI));
+    assert_eq!(listener_grant.call_identifier, active_call_id);
+    assert_eq!(
+        listener_grant.transmission_grant,
+        TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    );
     for (prim, grant) in &grants {
-        let expected_dir = if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 {
-            UlDlAssignment::Both
-        } else {
-            UlDlAssignment::Dl
-        };
         assert_d_tx_granted_facch_allocation(
             prim,
             grant,
             active_ts,
             active_usage,
-            expected_dir,
-            "current-speaker repeated U-SETUP floor reassert",
+            UlDlAssignment::Dl,
+            "current-speaker setup re-entry listener floor update",
         );
     }
 
     assert_eq!(
         count_umac_floor_granted(&repeated_msgs),
-        0,
-        "current-speaker repeated setup must wait for positive D-TX GRANTED transmission before refreshing UMAC"
-    );
-    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
-        &mut test,
-        &repeated_msgs,
-        TetraAddress::issi(TEST_ISSI),
-        active_call_id,
-        TEST_ISSI,
-        TEST_GSSI,
-        active_ts,
+        1,
+        "current-speaker setup re-entry refreshes the existing UMAC floor"
     );
     assert_eq!(count_umac_call_ended_or_close(&repeated_msgs), 0);
 }
 
 #[test]
-fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_floor() {
+fn test_repeated_group_u_setup_same_gssi_during_hangtime_answers_setup_reentry() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -5052,10 +5053,12 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
     drain_group_tx_ceased_tail(&mut test, dltime);
     let _tail_msgs = test.dump_sinks();
 
-    // Nexus-BS hangtime is local call-retention between transmissions. While
-    // the call is still maintained, EN 300 392-2 clause 14.5.2.2.1 floor
-    // control applies on the existing call id instead of starting or rejecting
-    // a parallel same-GSSI call.
+    // Nexus-BS hangtime is local call-retention between transmissions. A
+    // terminal that sends U-TX DEMAND is handled as in-call floor control, but
+    // a Motorola-class terminal may send a fresh U-SETUP after leaving the
+    // maintained context. EN 300 392-2 clauses 14.5.2.1.2 and 14.7.2.10 make
+    // that a setup primitive, so answer with setup-phase PDUs while reusing the
+    // existing call id/circuit.
     test.submit_message(build_u_setup_msg(TEST_CALLED_ISSI, TEST_GSSI));
     test.run_stack(Some(1));
     let repeated_msgs = test.dump_sinks();
@@ -5067,10 +5070,42 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
     );
     assert_eq!(
         count_d_call_proceedings(&repeated_msgs),
-        0,
-        "hangtime retake must not restart setup with D-CALL PROCEEDING"
+        1,
+        "hangtime U-SETUP re-entry must answer the setup primitive"
     );
-    assert_eq!(count_d_connects(&repeated_msgs), 0, "hangtime retake must not resend D-CONNECT");
+    assert_eq!(count_d_connects(&repeated_msgs), 1, "hangtime U-SETUP re-entry must send D-CONNECT");
+
+    let proceedings: Vec<_> = repeated_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let (proceeding_prim, proceeding) = &proceedings[0];
+    assert_eq!(proceeding.call_identifier, active_call_id);
+    assert_eq!(proceeding_prim.main_address, TetraAddress::issi(TEST_CALLED_ISSI));
+    assert!(proceeding_prim.chan_alloc.is_none());
+
+    let connects: Vec<_> = repeated_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .collect();
+    let (connect_prim, connect) = &connects[0];
+    assert_eq!(connect.call_identifier, active_call_id);
+    assert_eq!(connect.transmission_grant, TransmissionGrant::Granted);
+    assert!(!connect.transmission_request_permission);
+    assert_eq!(connect_prim.main_address, TetraAddress::issi(TEST_CALLED_ISSI));
+    assert_eq!(connect_prim.layer2service, Layer2Service::Unacknowledged);
+    let connect_alloc = connect_prim
+        .chan_alloc
+        .as_ref()
+        .expect("maintained group D-CONNECT should carry the existing channel allocation");
+    assert_chan_alloc_matches_circuit(connect_alloc, active_ts, active_usage, "hangtime U-SETUP re-entry D-CONNECT");
+    assert_eq!(connect_alloc.ul_dl_assigned, UlDlAssignment::Both);
 
     let grants: Vec<_> = repeated_msgs
         .iter()
@@ -5081,33 +5116,24 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
         .collect();
     assert_eq!(
         grants.len(),
-        2,
-        "hangtime retake should grant the requester and inform group listeners"
+        1,
+        "D-CONNECT grants the requester; only listeners need maintenance floor signalling"
     );
-    assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address.ssi == TEST_CALLED_ISSI
-            && prim.main_address.ssi_type == SsiType::Issi
-            && grant.call_identifier == active_call_id
-            && grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8
-    }));
-    assert!(grants.iter().any(|(prim, grant)| {
-        prim.main_address == TetraAddress::issi(TEST_ISSI)
-            && grant.call_identifier == active_call_id
-            && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
-    }));
+    let (listener_prim, listener_grant) = &grants[0];
+    assert_eq!(listener_prim.main_address, TetraAddress::issi(TEST_ISSI));
+    assert_eq!(listener_grant.call_identifier, active_call_id);
+    assert_eq!(
+        listener_grant.transmission_grant,
+        TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+    );
     for (prim, grant) in &grants {
-        let expected_dir = if grant.transmission_grant == TransmissionGrant::Granted.into_raw() as u8 {
-            UlDlAssignment::Both
-        } else {
-            UlDlAssignment::Dl
-        };
         assert_d_tx_granted_facch_allocation(
             prim,
             grant,
             active_ts,
             active_usage,
-            expected_dir,
-            "hangtime repeated U-SETUP floor retake",
+            UlDlAssignment::Dl,
+            "hangtime U-SETUP re-entry listener floor update",
         );
     }
 
@@ -5124,18 +5150,22 @@ fn test_repeated_group_u_setup_same_gssi_during_hangtime_grants_existing_call_fl
     );
     assert_eq!(
         count_umac_floor_granted(&repeated_msgs),
-        0,
-        "hangtime retake must wait for positive D-TX GRANTED transmission before UMAC floor activation"
+        1,
+        "D-CONNECT setup re-entry grants the requester and reopens the existing U-plane floor"
     );
-    let _activation_msgs = transmit_positive_group_grant_and_assert_floor(
-        &mut test,
-        &repeated_msgs,
-        TetraAddress::issi(TEST_CALLED_ISSI),
-        active_call_id,
-        TEST_CALLED_ISSI,
-        TEST_GSSI,
-        active_ts,
-    );
+    let floor_grants_to_umac: Vec<_> = repeated_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id,
+                source_issi,
+                dest_gssi,
+                ts,
+            }) if msg.dest == TetraEntity::Umac => Some((*call_id, *source_issi, *dest_gssi, *ts)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(floor_grants_to_umac, vec![(active_call_id, TEST_CALLED_ISSI, TEST_GSSI, active_ts)]);
 
     run_group_late_entry_resend_tick(&mut test, dltime);
     let backup_msgs = test.dump_sinks();

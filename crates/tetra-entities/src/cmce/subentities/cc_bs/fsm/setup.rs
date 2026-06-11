@@ -1,3 +1,4 @@
+use super::group::GroupEvent;
 use super::*;
 
 impl CcBsSubentity {
@@ -163,21 +164,50 @@ impl CcBsSubentity {
 
             let active_state = active_call.state();
             let current_speaker = active_call.source_issi;
+            // If the previous U-TX CEASED is still tail-draining, do not let a
+            // fresh setup-style response race the old lower-layer cease. Keep
+            // that narrow case on the queued floor-control path.
+            let same_speaker_tail_pending = current_speaker == calling_party.ssi
+                && self
+                    .pending_group_tx_ceased_tail_drains
+                    .get(&active_call_id)
+                    .is_some_and(|pending| pending.sender.ssi == calling_party.ssi);
+
+            if !same_speaker_tail_pending
+                && (matches!(active_state, GroupCallState::NoActiveSpeaker { .. }) || current_speaker == calling_party.ssi)
+            {
+                tracing::info!(
+                    "CMCE: answering repeated U-SETUP from issi={} to maintained gssi={} call_id={} state={:?} as setup re-entry",
+                    calling_party.ssi,
+                    dest_gssi,
+                    active_call_id,
+                    active_state
+                );
+                if let Err(err) = self.fsm_group_on_u_setup_maintained_reentry(queue, message, pdu, active_call_id, calling_party) {
+                    tracing::warn!(
+                        "CMCE: repeated U-SETUP setup re-entry failed call_id={} issi={} gssi={} err={:?}",
+                        active_call_id,
+                        calling_party.ssi,
+                        dest_gssi,
+                        err
+                    );
+                }
+                return;
+            }
 
             tracing::info!(
-                "CMCE: mapping repeated U-SETUP from issi={} to active gssi={} call_id={} state={:?} as floor request",
+                "CMCE: mapping repeated U-SETUP from issi={} to active transmitting gssi={} call_id={} state={:?} as floor request",
                 calling_party.ssi,
                 dest_gssi,
                 active_call_id,
                 active_state
             );
 
-            // EN 300 392-2 clause 14.5.2.1 covers group-call setup. Once the
-            // same GSSI call is already maintained, clause 14.5.2.2.1 makes
-            // transmit permission a floor-control procedure using
-            // D-TX GRANTED. Treat a compatible repeated U-SETUP from field
-            // radios as that floor request instead of mixing setup-phase
-            // D-CALL PROCEEDING/D-CONNECT with active-call floor signalling.
+            // EN 300 392-2 clause 14.5.2.2.1 makes U-TX DEMAND the normal
+            // in-call floor request. A compatible U-SETUP received while another
+            // same-GSSI over is still actively transmitting is bounded as a
+            // floor-request alias, avoiding a parallel setup transaction during
+            // the current speech item.
             let floor_result = if matches!(active_state, GroupCallState::Transmitting) && current_speaker == calling_party.ssi {
                 self.fsm_group_reassert_current_speaker_floor(queue, active_call_id, calling_party)
             } else {
@@ -419,6 +449,146 @@ impl CcBsSubentity {
             };
             queue.push_back(msg);
         }
+    }
+
+    fn fsm_group_on_u_setup_maintained_reentry(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: &SapMsg,
+        pdu: &USetup,
+        call_id: u16,
+        calling_party: TetraAddress,
+    ) -> Result<(), GroupTransitionError> {
+        let Some(call_snapshot) = self.active_calls.get(&call_id).cloned() else {
+            return Err(GroupTransitionError::UnknownCall(call_id));
+        };
+        let state = call_snapshot.state();
+        if !matches!(state, GroupCallState::NoActiveSpeaker { .. }) && call_snapshot.source_issi != calling_party.ssi {
+            return Err(GroupTransitionError::InvalidTransition {
+                call_id,
+                state,
+                event: GroupEvent::TxDemand,
+            });
+        }
+
+        let Some(cached) = self.cached_setups.get(&call_id) else {
+            return Err(GroupTransitionError::MissingCachedSetup(call_id));
+        };
+        let dest_addr = cached.dest_addr;
+        let ts = call_snapshot.ts;
+        let usage = call_snapshot.usage;
+        let dest_gssi = call_snapshot.dest_gssi;
+
+        if let Some(call) = self.active_calls.get_mut(&call_id) {
+            call.grant_floor(calling_party.ssi, Some(calling_party));
+        }
+        self.cancel_matching_group_tx_ceased_tail_drain(call_id, calling_party.ssi, "group setup re-entry");
+
+        // EN 300 392-2 clause 14.5.2.1.2 and table 14.30 define U-SETUP as a
+        // setup request expecting D-CALL PROCEEDING/D-CONNECT. If a Motorola MS
+        // has already left the maintained group-call context during hangtime or
+        // after a silent current-speaker regrant, a bare D-TX GRANTED can be
+        // interpreted as unsolicited maintenance signalling. Reuse the existing
+        // call id/circuit but answer the setup primitive with setup-phase PDUs,
+        // then use normal maintenance signalling only for the remaining
+        // listeners.
+        self.send_d_call_proceeding(queue, message, pdu, call_id, CallTimeoutSetupPhase::T10s, pdu.hook_method_selection);
+
+        let d_connect = DConnect {
+            call_identifier: call_id,
+            call_time_out: if pdu.simplex_duplex_selection {
+                CallTimeout::Infinite
+            } else {
+                self.config_call_timeout()
+            },
+            hook_method_selection: pdu.hook_method_selection,
+            simplex_duplex_selection: pdu.simplex_duplex_selection,
+            transmission_grant: TransmissionGrant::Granted,
+            transmission_request_permission: false,
+            call_ownership: true,
+            call_priority: None,
+            basic_service_information: None,
+            temporary_address: None,
+            notification_indicator: None,
+            facility: None,
+            proprietary: None,
+        };
+
+        tracing::info!("-> {:?} (maintained group setup re-entry)", d_connect);
+        let mut connect_sdu = BitBuffer::new_autoexpand(30);
+        d_connect.to_bitbuf(&mut connect_sdu).expect("Failed to serialize DConnect");
+        connect_sdu.seek(0);
+
+        let SapMsgInner::LcmcMleUnitdataInd(prim) = &message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return Ok(());
+        };
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+        queue.push_back(SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                sdu: connect_sdu,
+                handle: prim.handle,
+                endpoint_id: prim.endpoint_id,
+                link_id: prim.link_id,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
+                chan_alloc: Some(CmceChanAllocReq {
+                    usage: Some(usage),
+                    alloc_type: ChanAllocType::Replace,
+                    carrier: None,
+                    timeslots,
+                    ul_dl_assigned: UlDlAssignment::Both,
+                }),
+                main_address: calling_party,
+                tx_reporter: None,
+            }),
+        });
+
+        self.send_group_listener_d_tx_granted_facch(queue, call_id, calling_party.ssi, dest_addr.ssi, ts, usage);
+        self.reset_group_t310_after_floor_grant(call_id);
+        self.refresh_group_cached_d_setup_speaker(call_id, calling_party.ssi);
+
+        self.emit(crate::net_telemetry::TelemetryEvent::GroupCallSpeakerChanged {
+            call_id,
+            gssi: dest_gssi,
+            speaker_issi: calling_party.ssi,
+        });
+
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                call_id,
+                source_issi: calling_party.ssi,
+                dest_gssi,
+                ts,
+            }),
+        });
+
+        if net_brew::is_brew_gssi_routable(&self.config, dest_gssi) {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: calling_party.ssi,
+                    dest_gssi,
+                    ts,
+                }),
+            });
+        }
+
+        Ok(())
     }
 
     /// Handle U-SETUP for point-to-point (individual) duplex calls.
