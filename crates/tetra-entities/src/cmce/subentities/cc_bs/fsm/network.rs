@@ -105,9 +105,12 @@ impl CcBsSubentity {
 
         // EN 300 392-2 clauses 14.5.1.1.1/14.5.1.1.2 define the local MS
         // state change on D-CONNECT ACKNOWLEDGE/D-CONNECT. Annex D.4's
-        // conservative direct-setup example waits for the local L2 ACK before
-        // authorizing the opposite side to send first traffic. For Brew-bridged
-        // private calls, Brew is that opposite side.
+        // conservative direct-setup example waits for local acknowledgement
+        // before authorizing the opposite side. For Brew-origin simplex where
+        // the external caller already owns the initial floor, field terminals
+        // may not BL-ACK D-CONNECT ACK quickly enough; once RF transmission is
+        // confirmed, keep the call alive and let Brew floor control drive
+        // subsequent speech permission.
         if let Err(err) = self.fsm_individual_transition_to_active(pending.call_id) {
             match err {
                 IndividualTransitionError::UnknownCall(_) => {
@@ -152,8 +155,14 @@ impl CcBsSubentity {
 
         Self::push_network_circuit_media_ready(queue, pending.brew_uuid, pending.call_id, pending.ts);
 
+        let completion_basis = if pending.reporter.is_acknowledged() {
+            "local L2 ACK"
+        } else {
+            "local RF transmission"
+        };
         tracing::info!(
-            "CMCE: Brew private connect media-ready after local L2 ACK call_id={} uuid={} local_issi={} peer_issi={} kind={:?}",
+            "CMCE: Brew private connect media-ready after {} call_id={} uuid={} local_issi={} peer_issi={} kind={:?}",
+            completion_basis,
             pending.call_id,
             pending.brew_uuid,
             pending.local_addr.ssi,
@@ -164,12 +173,20 @@ impl CcBsSubentity {
         let _ = call_snapshot;
     }
 
+    fn pending_network_individual_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
+        pending.kind == PendingNetworkIndividualConnectKind::LocalCalledDConnectAck
+            && !pending.simplex_duplex
+            && pending.grant == TransmissionGrant::GrantedToOtherUser
+    }
+
     pub(in crate::cmce::subentities::cc_bs) fn drain_pending_network_individual_connects(&mut self, queue: &mut MessageQueue) {
         let ready: Vec<(u16, PendingNetworkConnectAction)> = self
             .pending_network_individual_connects
             .iter()
             .filter_map(|(&call_id, pending)| {
-                if pending.reporter.is_acknowledged() {
+                if pending.reporter.is_acknowledged()
+                    || (Self::pending_network_individual_connect_can_complete_on_tx(pending) && pending.reporter.is_transmitted())
+                {
                     Some((call_id, PendingNetworkConnectAction::Complete))
                 } else if pending.reporter.is_in_final_state()
                     || pending.started_at.age(self.dltime) >= NETWORK_INDIVIDUAL_CONNECT_PENDING_TIMEOUT_TIMESLOTS

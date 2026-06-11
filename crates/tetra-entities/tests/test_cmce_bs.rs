@@ -3918,12 +3918,12 @@ fn test_network_origin_private_call_preserves_method_and_timeout_fields() {
     assert_eq!(
         count_umac_floor_granted(&confirm_msgs),
         0,
-        "Brew-origin private floor waits until the called D-CONNECT ACK is L2-acknowledged"
+        "Brew-origin private floor waits until the called D-CONNECT ACK is delivered"
     );
     assert_eq!(
         count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
         0,
-        "Brew media must wait for local D-CONNECT ACK L2 ACK"
+        "Brew media must wait for local D-CONNECT ACK delivery"
     );
 
     acknowledge_called_d_connect_ack(&confirm_msgs, TEST_CALLED_ISSI);
@@ -4592,24 +4592,29 @@ fn test_network_origin_brew_private_simplex_connect_confirm_grants_external_call
     assert_eq!(
         count_umac_floor_granted(&confirm_msgs),
         0,
-        "Annex D.4-compatible Brew private setup must wait for local D-CONNECT ACK L2 ACK before initial floor"
+        "Annex D.4-compatible Brew private setup must wait for local D-CONNECT ACK delivery before initial floor"
     );
     assert_eq!(
         count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
         0,
-        "Brew media must wait for local D-CONNECT ACK L2 ACK"
+        "Brew media must wait for local D-CONNECT ACK delivery"
     );
 
-    acknowledge_called_d_connect_ack(&confirm_msgs, TEST_CALLED_ISSI);
+    let connect_ack_reporter = called_d_connect_ack_reporter(&confirm_msgs, TEST_CALLED_ISSI);
+    connect_ack_reporter.mark_transmitted();
     test.run_stack(Some(1));
-    let after_ack_msgs = test.dump_sinks();
+    let after_transmit_msgs = test.dump_sinks();
 
     assert_eq!(
-        count_umac_floor_granted(&after_ack_msgs),
+        count_umac_floor_granted(&after_transmit_msgs),
         0,
         "external caller-first grant must not seed local UL floor"
     );
-    assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
+    assert_eq!(
+        count_network_circuit_media_ready(&after_transmit_msgs, brew_uuid),
+        1,
+        "external caller-first Brew simplex may open media after local RF D-CONNECT ACK transmission"
+    );
 
     test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
@@ -4624,7 +4629,7 @@ fn test_network_origin_brew_private_simplex_connect_confirm_grants_external_call
 }
 
 #[test]
-fn test_network_origin_brew_private_d_connect_ack_transmitted_without_l2_ack_does_not_open_media() {
+fn test_network_origin_brew_private_d_connect_ack_transmitted_without_l2_ack_opens_external_caller_media() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -4690,8 +4695,8 @@ fn test_network_origin_brew_private_d_connect_ack_transmitted_without_l2_ack_doe
     );
     assert_eq!(
         count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
-        0,
-        "Brew media waits for local D-CONNECT ACK L2 ACK, not only MAC transmission"
+        1,
+        "external caller-first Brew simplex opens media after local RF D-CONNECT ACK transmission"
     );
 }
 
