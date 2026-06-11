@@ -15065,3 +15065,30 @@ RF Calibration Fine Estimate Step Guard - 2026-06-11 18:30 EEST:
     passed.
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+Private Duplex P2P Hangup Peer Release - 2026-06-11 19:39 EEST:
+
+- Field regression: full-duplex private P2P hangup could send the non-requesting
+  Motorola peer an assigned-channel `D-DISCONNECT`, and the peer could reboot
+  on call clear.
+- ETSI scope: EN 300 392-2 clause 14.5.1.3.1 covers MS-originated individual
+  call disconnection and permits the SwMI to inform the other MS by
+  `D-DISCONNECT` or `D-RELEASE`. For local RF private calls, Nexus-BS now uses
+  the `D-RELEASE` peer-clear alternative for duplex as well as simplex.
+- Fix:
+  - kept the requester `D-RELEASE` prompt path;
+  - kept simplex peer `D-RELEASE` after bearer-tail drain;
+  - changed local full-duplex peer clear to immediate reporter-tracked
+    assigned-channel `D-RELEASE` instead of `D-DISCONNECT`/peer `U-RELEASE`
+    handshake;
+  - updated CMCE tests to assert zero local RF peer `D-DISCONNECT`, no duplicate
+    release on stale `U-DISCONNECT`/`U-RELEASE`/PTT, no late `D-SETUP`, and
+    circuit cleanup only after reporters or bounded guard.
+- Verification:
+  - `cargo test -p tetra-entities --test test_cmce_bs duplex_p2p --locked`
+    passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs p2p --locked` passed.
+  - `cargo test -p tetra-entities --test test_cmce_bs --locked` passed.
+  - `cargo check -p tetra-entities --locked` passed.
+  - `rustfmt --edition 2024 --check` on touched Rust files passed.
+  - `git diff --check` passed.

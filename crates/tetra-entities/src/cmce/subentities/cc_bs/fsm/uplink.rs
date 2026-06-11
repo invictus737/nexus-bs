@@ -1032,11 +1032,11 @@ impl CcBsSubentity {
                     self.begin_individual_disconnect_tail_drain(call_id, sender, peer_issi, disconnect_cause);
                     return;
                 }
-                if let Some(reporter) = self.send_d_disconnect_individual(queue, call_id, &call_snapshot, sender, disconnect_cause) {
-                    self.begin_individual_disconnect_delivery(call_id, peer_issi, sender.ssi, reporter, disconnect_cause);
-                } else if let Some(call) = self.individual_calls.get_mut(&call_id) {
-                    call.begin_disconnect_pending(peer_issi, sender.ssi, self.dltime, disconnect_cause);
-                }
+                // EN 300 392-2 clause 14.5.1.3.1 also permits peer clear by
+                // D-RELEASE. Use that option for local full-duplex private RF
+                // calls too: it expects no U-RELEASE response and avoids the
+                // Motorola peer D-DISCONNECT reboot path.
+                self.send_individual_disconnect_peer_release(queue, call_id, &call_snapshot, disconnect_cause, peer_issi);
                 return;
             }
 
