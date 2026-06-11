@@ -14888,3 +14888,26 @@ TETRA Polyphase TX and Known-Symbol RF EVM Calibration - 2026-06-11 17:17 EEST:
   - `cargo test -p tetra-entities --test test_phy_bs --locked` passed.
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+RF Calibration Watchdog Guard - 2026-06-11 17:30 EEST:
+
+- Field run after deploying `e4af707` showed the destructive TX calibration
+  path can legitimately block the PHY/router tick longer than the 30s systemd
+  watchdog window while SDR streams are retuned and RF loopback measurements
+  are running.
+- Failure observed:
+  - RF carrier inhibit correctly notified and deregistered the three registered
+    MS units;
+  - PHY started `/home/chris/nexus-bs/calibration.toml` calibration;
+  - service watchdog withheld `WATCHDOG=1` because the stack tick was stalled;
+  - systemd aborted `nexus-bs@chris.service` before the new calibration report
+    could be written.
+- Fix:
+  - `CalibrationPhase` now explicitly marks `Calibrating`, `Calibrated`, and
+    `Restarting` as phases where a stack-tick stall is expected;
+  - systemd watchdog continues sending `WATCHDOG=1` with RF-calibration status
+    only in those phases;
+  - normal idle/inhibiting/failed stack stalls remain watchdog failures.
+- Verification:
+  - `cargo test -p tetra-entities --lib rf_calibration --locked` passed.
+  - `cargo check -p tetra-entities --locked` passed.

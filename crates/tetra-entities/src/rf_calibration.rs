@@ -32,6 +32,13 @@ impl CalibrationPhase {
             CalibrationPhase::Inhibiting | CalibrationPhase::Calibrating | CalibrationPhase::Restarting
         )
     }
+
+    pub fn allows_service_watchdog_stall(self) -> bool {
+        matches!(
+            self,
+            CalibrationPhase::Calibrating | CalibrationPhase::Calibrated | CalibrationPhase::Restarting
+        )
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -161,4 +168,19 @@ fn unix_secs_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CalibrationPhase;
+
+    #[test]
+    fn calibration_phase_allows_watchdog_stall_only_while_phy_is_blocked_or_restarting() {
+        assert!(!CalibrationPhase::Idle.allows_service_watchdog_stall());
+        assert!(!CalibrationPhase::Inhibiting.allows_service_watchdog_stall());
+        assert!(CalibrationPhase::Calibrating.allows_service_watchdog_stall());
+        assert!(CalibrationPhase::Calibrated.allows_service_watchdog_stall());
+        assert!(CalibrationPhase::Restarting.allows_service_watchdog_stall());
+        assert!(!CalibrationPhase::Failed.allows_service_watchdog_stall());
+    }
 }

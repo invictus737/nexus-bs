@@ -102,6 +102,14 @@ pub fn spawn_systemd_watchdog(running: Arc<AtomicBool>) -> Option<std::thread::J
 
                 let current_tick = stack_tick_count();
                 if current_tick == last_tick {
+                    let calibration_phase = crate::rf_calibration::current_phase();
+                    if calibration_phase.allows_service_watchdog_stall() {
+                        notify_systemd(&format!(
+                            "WATCHDOG=1\nSTATUS=Nexus-BS RF calibration {}",
+                            calibration_phase.as_str()
+                        ));
+                        continue;
+                    }
                     tracing::error!(
                         "Service watchdog: stack tick counter stalled at {}, withholding WATCHDOG=1",
                         current_tick
