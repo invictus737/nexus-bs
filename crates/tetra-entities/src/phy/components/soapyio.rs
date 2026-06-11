@@ -27,6 +27,7 @@ const TX_CAL_TETRA_AMPLITUDE: f32 = 0.20;
 const TX_CAL_TETRA_PATTERN_SYMBOLS: usize = 24;
 const TX_CAL_TETRA_REFERENCE_SYMBOLS: usize = 384;
 const TX_CAL_TETRA_ANALYSIS_BANDWIDTH_HZ: f64 = 25_000.0;
+const TX_CAL_TETRA_EVM_ATTEMPTS: usize = 3;
 const TX_CAL_FALLBACK_BLOCK_SAMPLES: usize = 4096;
 const TX_CAL_PREFILL_BLOCKS: usize = 8;
 const TX_CAL_SETTLE_BLOCKS: usize = 3;
@@ -683,8 +684,8 @@ impl SoapyIo {
             let tetra_known_rms_improvement = tetra_known_rms_evm_improvement(reference_meas.tetra_known, final_meas.tetra_known);
             let tetra_known_peak_improvement = tetra_known_peak_evm_improvement(reference_meas.tetra_known, final_meas.tetra_known);
             let tetra_known_quality_ok = tetra_known_evm_quality_ok(final_meas.tetra_known);
-            let known_evm_acceptance_ok =
-                tetra_known_evm_candidate_safe(reference_meas.tetra_known, final_meas.tetra_known, candidate_has_iq);
+            let known_evm_acceptance_ok = tetra_known_evm_quality_ok(final_meas.tetra_known)
+                && tetra_known_evm_candidate_safe(reference_meas.tetra_known, final_meas.tetra_known, candidate_has_iq);
             let image_quality_ok = calibration_image_quality_ok(&final_meas);
             let final_quality_ok = calibration_final_quality_ok(&final_meas, &confirmation);
             let rf_limiting = rf_limiting_factor_with_dc_actuator(&final_meas, tetra_known_quality_ok, Some(dc_actuator));
@@ -1063,11 +1064,11 @@ impl SoapyIo {
         let carrier_span_db = max_carrier_dbc - min_carrier_dbc;
         let effective = readback_ok && carrier_span_db >= TX_CAL_DC_ACTUATOR_MIN_RESPONSE_DB;
         let estimated = estimate_tx_dc_correction_from_probes(
-            reference.dc,
-            measurements[0].dc,
-            measurements[1].dc,
-            measurements[2].dc,
-            measurements[3].dc,
+            reference,
+            measurements[0],
+            measurements[1],
+            measurements[2],
+            measurements[3],
             step,
             limits,
         );
@@ -1137,9 +1138,9 @@ impl SoapyIo {
         }
 
         let search_steps: &[f64] = if initial_candidate.is_some() {
-            &[0.004, 0.002, 0.001, 0.0005, 0.00025, 0.0001]
+            &[0.004, 0.002, 0.001, 0.0005, 0.00025, 0.0001, 0.00005]
         } else {
-            &[0.08, 0.04, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005]
+            &[0.08, 0.04, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005, 0.00025, 0.0001, 0.00005]
         };
 
         for step in search_steps {
@@ -1248,18 +1249,48 @@ impl SoapyIo {
             .checked_mul(total_blocks)
             .ok_or_else(|| "TETRA known-EVM calibration sequence length overflow".to_string())?;
         let tx_sequence = synthesize_tetra_calibration_tx_sequence(self.tx_fs, calibration_center_hz, tx_sequence_len)?;
-        let capture = capture_calibration_sequence_samples(rx, tx, &tx_sequence, block_len, timing, confirmation)?;
-        let modem_samples = downconvert_tetra_calibration_capture(&capture, self.rx_fs, calibration_center_hz)?;
         let reference_symbols = tetra_calibration_reference_symbols(TX_CAL_TETRA_REFERENCE_SYMBOLS)?;
-        let report = evm::evaluate_modulation_accuracy(&modem_samples, &reference_symbols, evm::TETRA_MODEM_SPS).ok_or_else(|| {
-            format!(
-                "TETRA known-symbol EVM could not lock: modem_samples={} reference_symbols={}",
-                modem_samples.len(),
-                reference_symbols.len()
-            )
-        })?;
+        let attempts = TX_CAL_TETRA_EVM_ATTEMPTS.max(1);
+        let mut best: Option<(usize, TetraKnownEvmMeasurement)> = None;
+        let mut last_modem_samples = 0usize;
 
-        Ok(report.into())
+        for attempt_idx in 0..attempts {
+            let capture = capture_calibration_sequence_samples(rx, tx, &tx_sequence, block_len, timing, confirmation)?;
+            let modem_samples = downconvert_tetra_calibration_capture(&capture, self.rx_fs, calibration_center_hz)?;
+            last_modem_samples = modem_samples.len();
+            let Some(report) = evm::evaluate_modulation_accuracy(&modem_samples, &reference_symbols, evm::TETRA_MODEM_SPS) else {
+                continue;
+            };
+            let known = TetraKnownEvmMeasurement::from(report);
+            match best {
+                Some((_, current)) if tetra_known_evm_score(known) >= tetra_known_evm_score(current) => {}
+                _ => best = Some((attempt_idx + 1, known)),
+            }
+        }
+
+        match best {
+            Some((attempt, known)) => {
+                if attempts > 1 {
+                    tracing::warn!(
+                        "SoapySDR: TETRA known-symbol EVM selected attempt {}/{} rms={:.2}% peak={:.2}% diff={:.2}deg symbols={} timing={:.2}",
+                        attempt,
+                        attempts,
+                        known.rms_evm_pct,
+                        known.peak_evm_pct,
+                        known.differential_rms_deg,
+                        known.symbols_used,
+                        known.timing_sample
+                    );
+                }
+                Ok(known)
+            }
+            None => Err(format!(
+                "TETRA known-symbol EVM could not lock after {} attempt(s): modem_samples={} reference_symbols={}",
+                attempts,
+                last_modem_samples,
+                reference_symbols.len()
+            )),
+        }
     }
 
     fn capture_rx_only_calibration_baseline(
@@ -2523,6 +2554,10 @@ fn tetra_known_evm_quality_ok(candidate: Option<TetraKnownEvmMeasurement>) -> bo
     })
 }
 
+fn tetra_known_evm_score(candidate: TetraKnownEvmMeasurement) -> f64 {
+    candidate.rms_evm_pct + candidate.peak_evm_pct * 0.05 + candidate.differential_rms_deg * 0.02
+}
+
 fn tetra_known_evm_candidate_safe(
     reference: Option<TetraKnownEvmMeasurement>,
     candidate: Option<TetraKnownEvmMeasurement>,
@@ -2692,6 +2727,19 @@ fn with_axis_delta(
 }
 
 fn estimate_tx_dc_correction_from_probes(
+    reference: CalibrationMeasurement,
+    plus_i: CalibrationMeasurement,
+    minus_i: CalibrationMeasurement,
+    plus_q: CalibrationMeasurement,
+    minus_q: CalibrationMeasurement,
+    step: f64,
+    limits: &TxCalibrationLimits,
+) -> Option<TxCalibrationCoefficients> {
+    estimate_tx_dc_correction_from_probe_vectors(reference.dc, plus_i.dc, minus_i.dc, plus_q.dc, minus_q.dc, step, limits)
+        .or_else(|| estimate_tx_dc_correction_from_probe_power(&reference, &plus_i, &minus_i, &plus_q, &minus_q, step, limits))
+}
+
+fn estimate_tx_dc_correction_from_probe_vectors(
     reference_dc: ComplexF64,
     plus_i_dc: ComplexF64,
     minus_i_dc: ComplexF64,
@@ -2730,6 +2778,63 @@ fn estimate_tx_dc_correction_from_probes(
         dc_q: dc_q.clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
         ..Default::default()
     })
+}
+
+fn estimate_tx_dc_correction_from_probe_power(
+    reference: &CalibrationMeasurement,
+    plus_i: &CalibrationMeasurement,
+    minus_i: &CalibrationMeasurement,
+    plus_q: &CalibrationMeasurement,
+    minus_q: &CalibrationMeasurement,
+    step: f64,
+    limits: &TxCalibrationLimits,
+) -> Option<TxCalibrationCoefficients> {
+    if step <= 0.0 || !step.is_finite() {
+        return None;
+    }
+
+    let reference_power = power_from_dbfs_amp(reference.carrier_leakage_dbfs)?;
+    let plus_i_power = power_from_dbfs_amp(plus_i.carrier_leakage_dbfs)?;
+    let minus_i_power = power_from_dbfs_amp(minus_i.carrier_leakage_dbfs)?;
+    let plus_q_power = power_from_dbfs_amp(plus_q.carrier_leakage_dbfs)?;
+    let minus_q_power = power_from_dbfs_amp(minus_q.carrier_leakage_dbfs)?;
+
+    let dc_i = estimate_axis_minimum_from_probe_power(reference_power, plus_i_power, minus_i_power, step).unwrap_or(0.0);
+    let dc_q = estimate_axis_minimum_from_probe_power(reference_power, plus_q_power, minus_q_power, step).unwrap_or(0.0);
+    if !dc_i.is_finite() || !dc_q.is_finite() {
+        return None;
+    }
+    if dc_i.abs() <= 1.0e-9 && dc_q.abs() <= 1.0e-9 {
+        return None;
+    }
+
+    Some(TxCalibrationCoefficients {
+        dc_i: dc_i.clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
+        dc_q: dc_q.clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
+        ..Default::default()
+    })
+}
+
+fn estimate_axis_minimum_from_probe_power(reference_power: f64, plus_power: f64, minus_power: f64, step: f64) -> Option<f64> {
+    if !reference_power.is_finite() || !plus_power.is_finite() || !minus_power.is_finite() || step <= 0.0 || !step.is_finite() {
+        return None;
+    }
+
+    let gradient = (plus_power - minus_power) / (2.0 * step);
+    let curvature = (plus_power + minus_power - 2.0 * reference_power) / (2.0 * step * step);
+    if !gradient.is_finite() || !curvature.is_finite() || curvature <= 1.0e-18 {
+        return None;
+    }
+
+    let estimate = -gradient / (2.0 * curvature);
+    estimate.is_finite().then_some(estimate)
+}
+
+fn power_from_dbfs_amp(dbfs: f64) -> Option<f64> {
+    if !dbfs.is_finite() {
+        return None;
+    }
+    Some(10.0_f64.powf(dbfs / 10.0))
 }
 
 fn dc_calibration_search_score(meas: &CalibrationMeasurement) -> f64 {
@@ -2816,6 +2921,11 @@ mod tests {
             clipped_fraction: 0.0,
             snr_db: 87.0,
         }
+    }
+
+    fn calibration_measurement_with_carrier_amp(carrier_amp: f64) -> CalibrationMeasurement {
+        let carrier_db = 20.0 * carrier_amp.max(1.0e-12).log10();
+        calibration_measurement(carrier_db, 43.0, carrier_amp * 100.0, 0.0)
     }
 
     fn runtime_calibration_config() -> TxCalibrationRuntimeConfig {
@@ -2949,10 +3059,31 @@ mod tests {
         };
 
         let estimated =
-            estimate_tx_dc_correction_from_probes(reference_dc, plus_i, minus_i, plus_q, minus_q, step, &limits).expect("estimate");
+            estimate_tx_dc_correction_from_probe_vectors(reference_dc, plus_i, minus_i, plus_q, minus_q, step, &limits).expect("estimate");
 
         assert!((estimated.dc_i + 0.0015).abs() < 1.0e-9);
         assert!((estimated.dc_q - 0.0020).abs() < 1.0e-9);
+    }
+
+    #[test]
+    fn tx_dc_probe_power_fallback_estimates_tiny_correction_when_vector_phase_is_singular() {
+        let limits = TxCalibrationLimits::default();
+        let step = 0.04;
+        let residual_i = 0.0008;
+        let residual_q = -0.0003;
+        let carrier_amp_for = |dc_i: f64, dc_q: f64| ((residual_i + dc_i).powi(2) + (residual_q + dc_q).powi(2)).sqrt();
+
+        let reference = calibration_measurement_with_carrier_amp(carrier_amp_for(0.0, 0.0));
+        let plus_i = calibration_measurement_with_carrier_amp(carrier_amp_for(step, 0.0));
+        let minus_i = calibration_measurement_with_carrier_amp(carrier_amp_for(-step, 0.0));
+        let plus_q = calibration_measurement_with_carrier_amp(carrier_amp_for(0.0, step));
+        let minus_q = calibration_measurement_with_carrier_amp(carrier_amp_for(0.0, -step));
+
+        let estimated =
+            estimate_tx_dc_correction_from_probes(reference, plus_i, minus_i, plus_q, minus_q, step, &limits).expect("estimate");
+
+        assert!((estimated.dc_i + residual_i).abs() < 1.0e-9);
+        assert!((estimated.dc_q + residual_q).abs() < 1.0e-9);
     }
 
     #[test]
@@ -2993,6 +3124,29 @@ mod tests {
             report.peak_evm * 100.0
         );
         assert!(report.symbols_used >= 96);
+    }
+
+    #[test]
+    fn tetra_known_evm_score_keeps_absurdly_good_lock() {
+        let good = TetraKnownEvmMeasurement {
+            rms_evm_pct: 0.08,
+            peak_evm_pct: 0.30,
+            differential_rms_deg: 0.05,
+            timing_sample: 77.0,
+            frequency_rotation_rad_per_symbol: 0.0,
+            symbols_used: 192,
+        };
+        let ordinary = TetraKnownEvmMeasurement {
+            rms_evm_pct: 1.8,
+            peak_evm_pct: 3.3,
+            differential_rms_deg: 0.8,
+            timing_sample: 77.0,
+            frequency_rotation_rad_per_symbol: 0.0,
+            symbols_used: 192,
+        };
+
+        assert!(tetra_known_evm_score(good) < tetra_known_evm_score(ordinary));
+        assert!(tetra_known_evm_quality_ok(Some(good)));
     }
 
     #[test]

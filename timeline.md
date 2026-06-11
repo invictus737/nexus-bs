@@ -15017,3 +15017,29 @@ RF Calibration Fine TX DC Estimation - 2026-06-11 18:50 EEST:
     passed.
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+RF Calibration Carrier-Power Estimate and Known EVM Guard - 2026-06-11 18:20 EEST:
+
+- Field run on `261c050` kept the service safe but exposed two measurement
+  gaps:
+  - TX DC actuator readback/effect remained valid, but the vector estimate was
+    unavailable because the ±I/±Q carrier-leak vectors were not invertible;
+  - one known-symbol TETRA EVM capture locked badly at about 93.7% RMS even
+    though earlier RF loopback captures were around 1.7% RMS.
+- Fix:
+  - added a scalar carrier-power fallback estimate from the same ±I/±Q actuator
+    probes, so sub-mill DC corrections can still be seeded when vector phase is
+    singular;
+  - extended the no-estimate DC search below 0.0005 down to 0.00005;
+  - changed known-symbol EVM capture to best-of-3 and kept the lowest measured
+    EVM lock, including very good values instead of treating them as suspect;
+  - made final calibration acceptance require a valid known-symbol TETRA EVM
+    quality gate, so a bad lock cannot be reported as safe just because it is
+    not worse than itself.
+- Verification:
+  - `cargo test -p tetra-config --lib bluestation::sec_phy_soapy --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked`
+    passed.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `git diff --check` passed.
