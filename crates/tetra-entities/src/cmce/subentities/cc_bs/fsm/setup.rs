@@ -1217,7 +1217,7 @@ impl CcBsSubentity {
             }),
         });
 
-        if let Err(err) = self.fsm_individual_create_setup_call(
+        let create_result = self.fsm_individual_create_setup_call(
             call_id,
             IndividualCall {
                 calling_addr: calling_party,
@@ -1248,7 +1248,17 @@ impl CcBsSubentity {
                 last_floor_holder: None,
                 queued_tx_demand: None,
             },
-        ) {
+        );
+        if create_result.is_ok() {
+            self.emit(crate::net_telemetry::TelemetryEvent::IndividualCallStarted {
+                call_id,
+                calling_issi: calling_party.ssi,
+                called_issi: called_addr.ssi,
+                simplex: !pdu.simplex_duplex_selection,
+                ts,
+                secondary_ts: None,
+            });
+        } else if let Err(err) = create_result {
             match err {
                 IndividualTransitionError::DuplicateCall(_) => {
                     tracing::warn!("CMCE: duplicate call_id={} while creating Brew P2P setup", call_id);

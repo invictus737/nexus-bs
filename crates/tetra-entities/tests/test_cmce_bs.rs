@@ -4135,6 +4135,74 @@ fn test_local_origin_brew_private_connect_preserves_method_and_timeout_fields() 
 }
 
 #[test]
+fn test_local_origin_brew_private_call_updates_dashboard_last_heard() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let (telemetry_sink, telemetry_source) = telemetry_channel();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.register_entity(CmceBs::new(test.config.clone(), Some(telemetry_sink), None));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew]);
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    let _ = drain_telemetry(&telemetry_source);
+
+    let remote_issi = 7_000_201;
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(remote_issi as u64);
+    u_setup.simplex_duplex_selection = false;
+
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let call_id = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_call_proceeding(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .expect("local Brew private setup should emit D-CALL PROCEEDING");
+
+    let events = drain_telemetry(&telemetry_source);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::IndividualCallStarted {
+                call_id: got_call_id,
+                calling_issi,
+                called_issi,
+                simplex,
+                ts: _,
+                secondary_ts,
+            } if *got_call_id == call_id
+                && *calling_issi == TEST_ISSI
+                && *called_issi == remote_issi
+                && *simplex
+                && secondary_ts.is_none()
+        )),
+        "local-origin Brew P2P setup must publish individual-call dashboard telemetry"
+    );
+
+    let dashboard = DashboardServer::new("test.toml".to_string());
+    for event in events {
+        dashboard.handle_telemetry(event);
+    }
+    let state = dashboard.state.read().unwrap();
+    let last_heard = state
+        .last_heard
+        .front()
+        .expect("local-origin Brew P2P call should be visible in dashboard Last Heard");
+    assert_eq!(last_heard.issi, TEST_ISSI);
+    assert_eq!(last_heard.activity, "call_individual");
+    assert_eq!(last_heard.dest, remote_issi);
+}
+
+#[test]
 fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
     debug::setup_logging_verbose();
 
@@ -4721,6 +4789,82 @@ fn test_network_origin_brew_private_simplex_connect_confirm_grants_external_call
         TransmissionGrant::RequestQueued.into_raw() as u8,
         "local PTT while the Brew caller owns the initial floor must queue, not steal floor"
     );
+}
+
+#[test]
+fn test_network_origin_brew_private_call_updates_dashboard_last_heard() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let (telemetry_sink, telemetry_source) = telemetry_channel();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.register_entity(CmceBs::new(test.config.clone(), Some(telemetry_sink), None));
+    test.populate_entities(vec![], vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew]);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_CALLED_GSSI);
+    let _ = drain_telemetry(&telemetry_source);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    let mut call = default_network_circuit_call(TEST_ISSI, TEST_CALLED_ISSI);
+    call.priority = 11;
+    call.duplex = 1;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest {
+            brew_uuid,
+            call: call.clone(),
+        }),
+    });
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let call_id = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| pdu.call_identifier),
+            _ => None,
+        })
+        .expect("network-origin Brew private setup should emit D-SETUP");
+
+    let events = drain_telemetry(&telemetry_source);
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            TelemetryEvent::IndividualCallStarted {
+                call_id: got_call_id,
+                calling_issi,
+                called_issi,
+                simplex,
+                ts: _,
+                secondary_ts,
+            } if *got_call_id == call_id
+                && *calling_issi == TEST_ISSI
+                && *called_issi == TEST_CALLED_ISSI
+                && !*simplex
+                && secondary_ts.is_none()
+        )),
+        "network-origin Brew P2P setup must publish individual-call dashboard telemetry"
+    );
+
+    let dashboard = DashboardServer::new("test.toml".to_string());
+    for event in events {
+        dashboard.handle_telemetry(event);
+    }
+    let state = dashboard.state.read().unwrap();
+    let last_heard = state
+        .last_heard
+        .front()
+        .expect("network-origin Brew P2P call should be visible in dashboard Last Heard");
+    assert_eq!(last_heard.issi, TEST_ISSI);
+    assert_eq!(last_heard.activity, "call_individual");
+    assert_eq!(last_heard.dest, TEST_CALLED_ISSI);
 }
 
 #[test]

@@ -384,6 +384,7 @@ impl CcBsSubentity {
         let hook_method_selection = Self::network_circuit_hook_method(call.method);
         let circuit_mode = CircuitModeType::try_from(call.mode as u64).unwrap_or(CircuitModeType::TchS);
         let external_subscriber_number = Self::encode_external_subscriber_number(&call.number);
+        let calling_issi = call.source_issi;
 
         tracing::info!(
             "CMCE: accepting Brew setup request uuid={} call_id={} src={} dst={} ts={} duplex={} number='{}'",
@@ -448,10 +449,10 @@ impl CcBsSubentity {
         let setup_msg = Self::build_sapmsg(setup_sdu, None, called_addr, Layer2Service::Unacknowledged, None);
         queue.push_back(setup_msg);
 
-        if let Err(err) = self.fsm_individual_create_setup_call(
+        let create_result = self.fsm_individual_create_setup_call(
             call_id,
             IndividualCall {
-                calling_addr: TetraAddress::new(call.source_issi, SsiType::Issi),
+                calling_addr: TetraAddress::new(calling_issi, SsiType::Issi),
                 called_addr,
                 calling_handle: 0,
                 calling_link_id: 0,
@@ -479,7 +480,17 @@ impl CcBsSubentity {
                 last_floor_holder: None,
                 queued_tx_demand: None,
             },
-        ) {
+        );
+        if create_result.is_ok() {
+            self.emit(crate::net_telemetry::TelemetryEvent::IndividualCallStarted {
+                call_id,
+                calling_issi,
+                called_issi: called_addr.ssi,
+                simplex: !simplex_duplex,
+                ts,
+                secondary_ts: None,
+            });
+        } else if let Err(err) = create_result {
             match err {
                 IndividualTransitionError::DuplicateCall(_) => {
                     tracing::warn!("CMCE: duplicate call_id={} while creating inbound Brew setup", call_id);
