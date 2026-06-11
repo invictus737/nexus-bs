@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use toml::Value;
 
 pub const TX_CALIBRATION_DEFAULT_FILE: &str = "calibration.toml";
@@ -233,6 +233,29 @@ pub fn write_tx_calibration_file_atomic(path: impl AsRef<Path>, file: &TxCalibra
     std::fs::write(&tmp_path, text).map_err(|e| format!("write {}: {}", tmp_path.display(), e))?;
     std::fs::rename(&tmp_path, path).map_err(|e| format!("rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
     Ok(())
+}
+
+pub fn tx_calibration_run_report_path(path: impl AsRef<Path>) -> PathBuf {
+    path.as_ref().with_extension("run.toml")
+}
+
+pub fn tx_calibration_rejected_report_path(path: impl AsRef<Path>) -> PathBuf {
+    path.as_ref().with_extension("rejected.toml")
+}
+
+pub fn write_tx_calibration_result_file_atomic(path: impl AsRef<Path>, file: &TxCalibrationFile) -> Result<PathBuf, String> {
+    let path = path.as_ref();
+    let run_path = tx_calibration_run_report_path(path);
+    write_tx_calibration_file_atomic(&run_path, file)?;
+
+    if file.report.accepted {
+        write_tx_calibration_file_atomic(path, file)?;
+        Ok(path.to_path_buf())
+    } else {
+        let rejected_path = tx_calibration_rejected_report_path(path);
+        write_tx_calibration_file_atomic(&rejected_path, file)?;
+        Ok(run_path)
+    }
 }
 
 pub fn validate_tx_calibration_file(file: &TxCalibrationFile) -> Result<(), String> {
@@ -489,5 +512,42 @@ mod tests {
         file.applied.dc_i = 0.50;
         let err = validate_tx_calibration_file(&file).expect_err("must reject unsafe DC coefficient");
         assert!(err.contains("applied.dc_i"));
+    }
+
+    #[test]
+    fn tx_calibration_result_preserves_primary_file_when_run_is_rejected() {
+        let accepted = valid_calibration();
+        let mut rejected = valid_calibration();
+        rejected.status = "rejected".to_string();
+        rejected.applied = TxCalibrationCoefficients::default();
+        rejected.report.accepted = false;
+        rejected.report.accepted_dc = false;
+        rejected.report.accepted_iq = false;
+        rejected.report.accepted_mode = "rejected".to_string();
+        rejected.report.summary = "rejected test run".to_string();
+
+        let path = std::env::temp_dir().join(format!("nexus-bs-calibration-result-test-{}.toml", std::process::id()));
+        let run_path = tx_calibration_run_report_path(&path);
+        let rejected_path = tx_calibration_rejected_report_path(&path);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&run_path);
+        let _ = std::fs::remove_file(&rejected_path);
+
+        write_tx_calibration_file_atomic(&path, &accepted).expect("write accepted primary");
+        let written_path = write_tx_calibration_result_file_atomic(&path, &rejected).expect("write rejected run");
+
+        assert_eq!(written_path, run_path);
+        let primary = read_tx_calibration_file(&path).expect("primary calibration remains readable");
+        let run = read_tx_calibration_file(&run_path).expect("run report is readable");
+        let rejected_copy = read_tx_calibration_file(&rejected_path).expect("rejected report is readable");
+
+        assert!(primary.report.accepted);
+        assert_eq!(primary.applied.dc_i, accepted.applied.dc_i);
+        assert!(!run.report.accepted);
+        assert!(!rejected_copy.report.accepted);
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&run_path);
+        let _ = std::fs::remove_file(&rejected_path);
     }
 }

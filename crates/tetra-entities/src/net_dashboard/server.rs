@@ -1377,10 +1377,16 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         }
     }
 
-    let report = match tetra_config::bluestation::read_tx_calibration_file(&calibration_path) {
+    let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
+    let report_path = if run_report_path.exists() {
+        &run_report_path
+    } else {
+        Path::new(&calibration_path)
+    };
+    let report = match tetra_config::bluestation::read_tx_calibration_file(report_path) {
         Ok(report) => report,
         Err(err) => {
-            crate::rf_calibration::mark_failed(format!("calibration file was not readable after PHY finished: {}", err));
+            crate::rf_calibration::mark_failed(format!("calibration run report was not readable after PHY finished: {}", err));
             schedule_restart_after_rf_calibration("unreadable calibration file");
             return;
         }

@@ -3,7 +3,7 @@ use tetra_config::bluestation::{
     SharedConfig, StackMode,
     sec_phy_soapy::{
         CfgSoapySdr, TxCalibrationCoefficients, TxCalibrationDevice, TxCalibrationFile, TxCalibrationLimits, TxCalibrationPoint,
-        TxCalibrationReport, read_tx_calibration_file, write_tx_calibration_file_atomic,
+        TxCalibrationReport, read_tx_calibration_file, write_tx_calibration_result_file_atomic,
     },
 };
 
@@ -638,40 +638,35 @@ impl SoapyIo {
                     &mut timing,
                 )?
             } else {
-                let meas = self.capture_calibration_measurement(
+                tracing::warn!("SoapySDR: TX calibration found no safe candidate; preserving neutral reference as final report");
+                (CalibrationConfirmation::default(), reference_meas)
+            };
+
+            if applied != TxCalibrationCoefficients::default() {
+                warm_tx_calibration_streams(&mut rx_stream, &mut tx_stream, block_len, &mut timing)?;
+                match self.capture_tetra_known_evm_measurement(
                     &mut rx_stream,
                     &mut tx_stream,
-                    rx_baseline,
-                    &tone,
-                    tone_hz,
-                    neutral,
+                    applied,
+                    block_len,
+                    session.calibration_center_hz,
                     &mut timing,
                     false,
-                )?;
-                (CalibrationConfirmation::default(), meas)
-            };
-            match self.capture_tetra_known_evm_measurement(
-                &mut rx_stream,
-                &mut tx_stream,
-                applied,
-                block_len,
-                session.calibration_center_hz,
-                &mut timing,
-                false,
-            ) {
-                Ok(known) => {
-                    tracing::warn!(
-                        "SoapySDR: TETRA known-symbol EVM final rms={:.2}% peak={:.2}% diff={:.2}deg symbols={} timing={:.2}",
-                        known.rms_evm_pct,
-                        known.peak_evm_pct,
-                        known.differential_rms_deg,
-                        known.symbols_used,
-                        known.timing_sample
-                    );
-                    final_meas.tetra_known = Some(known);
-                }
-                Err(err) => {
-                    tracing::warn!("SoapySDR: TETRA known-symbol EVM final unavailable: {}", err);
+                ) {
+                    Ok(known) => {
+                        tracing::warn!(
+                            "SoapySDR: TETRA known-symbol EVM final rms={:.2}% peak={:.2}% diff={:.2}deg symbols={} timing={:.2}",
+                            known.rms_evm_pct,
+                            known.peak_evm_pct,
+                            known.differential_rms_deg,
+                            known.symbols_used,
+                            known.timing_sample
+                        );
+                        final_meas.tetra_known = Some(known);
+                    }
+                    Err(err) => {
+                        tracing::warn!("SoapySDR: TETRA known-symbol EVM final unavailable: {}", err);
+                    }
                 }
             }
             let carrier_improvement = reference_meas.carrier_leakage_dbc - final_meas.carrier_leakage_dbc;
@@ -822,11 +817,11 @@ impl SoapyIo {
                 },
             };
 
-            write_tx_calibration_file_atomic(calibration_path, &file)?;
+            let written_path = write_tx_calibration_result_file_atomic(calibration_path, &file)?;
             tracing::warn!(
                 "SoapySDR: TX calibration {} saved to {}: {}",
                 if accepted { "accepted" } else { "rejected" },
-                calibration_path,
+                written_path.display(),
                 file.report.summary
             );
             Ok(file)

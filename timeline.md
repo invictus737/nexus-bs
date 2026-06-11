@@ -14911,3 +14911,38 @@ RF Calibration Watchdog Guard - 2026-06-11 17:30 EEST:
 - Verification:
   - `cargo test -p tetra-entities --lib rf_calibration --locked` passed.
   - `cargo check -p tetra-entities --locked` passed.
+
+RF Calibration Report Preservation - 2026-06-11 18:05 EEST:
+
+- Field follow-up after `5c5c51b` showed a rejected destructive calibration run
+  had overwritten `/home/chris/nexus-bs/calibration.toml`, so startup refused to
+  apply the previous accepted DC correction.
+- Scope:
+  - RF calibration persistence and dashboard status only;
+  - no CMCE, UMAC, MM, SDS, WAP, MAC scheduling, or call-control protocol
+    behavior changed;
+  - TETRA EVM remains clause-scoped engineering evidence against TS 100 392-2
+    clause 6.6.1, not formal certification.
+- Fix:
+  - calibration now writes every run to `calibration.run.toml`;
+  - accepted runs also update the persistent `calibration.toml`;
+  - rejected runs write `calibration.rejected.toml` but preserve any existing
+    persistent `calibration.toml`;
+  - dashboard/orchestrator decisions read the current run report, while status
+    also exposes the active persistent report;
+  - if no safe DC/IQ candidate is selected, the final report preserves the valid
+    neutral reference measurement instead of doing a late post-sweep capture
+    that can be corrupted by stream disruption;
+  - accepted candidates warm calibration streams before the final known-symbol
+    TETRA EVM capture.
+- Verification:
+  - `node --check dashboard/assets/app.js` passed.
+  - `cargo test -p tetra-config --lib bluestation::sec_phy_soapy --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib rf_calibration --locked` passed.
+  - `cargo test -p tetra-entities --test test_dashboard_assets --locked`
+    passed.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `git diff --check` passed.

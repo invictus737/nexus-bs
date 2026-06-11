@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 use serde_json::json;
-use tetra_config::bluestation::read_tx_calibration_file;
+use tetra_config::bluestation::{read_tx_calibration_file, tx_calibration_run_report_path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationPhase {
@@ -80,6 +80,7 @@ pub fn try_start(calibration_path: &str) -> Result<(), String> {
     if s.phase.is_active() {
         return Err(format!("calibration already running: {}", s.phase.as_str()));
     }
+    let _ = std::fs::remove_file(tx_calibration_run_report_path(calibration_path));
     s.phase = CalibrationPhase::Inhibiting;
     s.calibration_path = calibration_path.to_string();
     s.error.clear();
@@ -142,16 +143,36 @@ pub fn status_json(default_calibration_path: &Path) -> serde_json::Value {
     } else {
         PathBuf::from(&snapshot.calibration_path)
     };
-    let file = read_tx_calibration_file(&active_path).ok();
+    let run_path = tx_calibration_run_report_path(&active_path);
+    let active_file = read_tx_calibration_file(&active_path).ok();
+    let run_file = read_tx_calibration_file(&run_path).ok();
+    let active_mtime = file_mtime_unix_secs(&active_path);
+    let run_mtime = file_mtime_unix_secs(&run_path);
+    let prefer_run_report = run_file.is_some()
+        && match (run_mtime, active_mtime) {
+            (Some(run), Some(active)) => run >= active,
+            (Some(_), None) => true,
+            _ => false,
+        };
+    let report = if prefer_run_report {
+        run_file.clone()
+    } else {
+        active_file.clone().or_else(|| run_file.clone())
+    };
+    let report_path = if prefer_run_report { run_path.clone() } else { active_path.clone() };
     json!({
         "ok": true,
         "status": snapshot.phase.as_str(),
         "active": snapshot.phase.is_active(),
         "path": active_path.display().to_string(),
+        "report_path": report_path.display().to_string(),
+        "run_report_path": run_path.display().to_string(),
         "error": if snapshot.error.is_empty() { serde_json::Value::Null } else { json!(snapshot.error) },
         "updated_unix_secs": snapshot.updated_unix_secs,
         "log": snapshot.log,
-        "report": file,
+        "report": report,
+        "active_report": active_file,
+        "run_report": run_file,
     })
 }
 
@@ -168,6 +189,16 @@ fn unix_secs_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn file_mtime_unix_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
 }
 
 #[cfg(test)]

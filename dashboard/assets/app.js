@@ -1053,7 +1053,7 @@ function setCalibrationStatus(message) {
 
 async function requestTxCalibration() {
   if (state.calibrationBusy) return;
-  if (!window.confirm("Run destructive TX DC/IQ calibration?\nTETRA traffic will be stopped, calibration.toml will be written, and Nexus-BS will restart with accepted DC correction. IQ is measured but remains opt-in until RF burst EVM validation passes.")) {
+  if (!window.confirm("Run destructive TX DC/IQ calibration?\nTETRA traffic will be stopped. Accepted runs update calibration.toml and restart with DC correction; rejected runs keep the existing calibration and save only the run report. IQ is measured but remains opt-in until RF burst EVM validation passes.")) {
     return;
   }
   state.calibrationBusy = true;
@@ -1098,17 +1098,20 @@ async function loadCalibrationStatus() {
 function renderCalibration() {
   const status = state.calibration || {};
   const report = status.report || {};
+  const activeReport = status.active_report || {};
   const reference = report.reference || {};
   const calibrated = report.calibrated || {};
   const applied = report.applied || {};
   const summary = report.report || {};
+  const activeSummary = activeReport.report || {};
   const accepted = !!summary.accepted;
+  const activeAccepted = !!activeSummary.accepted;
   const active = !!status.active || !!state.calibrationBusy;
   const phase = status.status || "idle";
   const failed = phase === "failed";
 
   setText("calibrationStatus", active ? phase.toUpperCase() : accepted && !failed ? "APPLIED" : phase.toUpperCase());
-  setText("calibrationPath", status.path || "calibration.toml");
+  setText("calibrationPath", status.report_path || status.path || "calibration.toml");
   setText(
     "calibrationApplied",
     report.status
@@ -1133,7 +1136,7 @@ function renderCalibration() {
       ? "running; accepted DC restarts service; IQ remains opt-in"
       : failed
         ? status.error || summary.summary || "calibration failed"
-        : summary.summary || status.error || "traffic outage required"
+        : summary.summary || (activeAccepted ? "active calibration preserved" : status.error || "traffic outage required")
   );
   setText("calibrationLog", status.log || (summary.summary ? `${summary.summary}\n` : ""));
   const button = $("calibrationRunBtn");
