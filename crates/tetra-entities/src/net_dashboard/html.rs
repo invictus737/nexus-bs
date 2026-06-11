@@ -1494,7 +1494,7 @@ td code{
         </div>
         <div class="rf-quality-grid">
           <div class="rf-qmetric" id="rf-q-evm-wrap">
-            <div class="rf-qmetric-label" data-i18n="rf_evm">EVM</div>
+            <div class="rf-qmetric-label" data-i18n="rf_evm">DSP EVM</div>
             <div class="rf-qmetric-value" id="rf-evm">—</div>
             <div class="rf-qmetric-bar"><div class="rf-qmetric-fill" id="rf-evm-bar"></div></div>
           </div>
@@ -2013,7 +2013,7 @@ const LANGS={
     rf_hint_spectrum:'live · 512-bin FFT',rf_hint_constellation:'π/4-DQPSK',
     rf_waterfall:'TX Spectrum Waterfall',rf_hint_waterfall:'rolling · viridis',
     rf_quality:'Signal Quality',rf_hint_quality:'measured pre-PA · derived from same DSP snapshot',
-    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Carrier leak',rf_obw:'Occupied BW (99%)',
+    rf_evm:'DSP EVM',rf_papr:'PAPR',rf_carrier:'Carrier leak',rf_obw:'Occupied BW (99%)',
     rf_dc:'DC offset (I/Q)',rf_iqa:'IQ amplitude imbalance',rf_iqp:'IQ phase imbalance',
     rf_hw_health:'Hardware Health',rf_hint_health:'polled every 5s',
     rf_temp:'SDR Temperature',rf_tx_gain:'TX Gain Stages (actual)',rf_rx_gain:'RX Gain Stages (actual)',
@@ -2083,7 +2083,7 @@ const LANGS={
     rf_hint_spectrum:'live · FFT 512-bin',rf_hint_constellation:'π/4-DQPSK',
     rf_waterfall:'Cascadă Spectru TX',rf_hint_waterfall:'derulant · viridis',
     rf_quality:'Calitate Semnal',rf_hint_quality:'măsurat pre-PA · din același snapshot DSP',
-    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Scurgere portantă',rf_obw:'Bandă ocupată (99%)',
+    rf_evm:'DSP EVM',rf_papr:'PAPR',rf_carrier:'Scurgere portantă',rf_obw:'Bandă ocupată (99%)',
     rf_dc:'Offset DC (I/Q)',rf_iqa:'Dezechilibru amplitudine IQ',rf_iqp:'Dezechilibru fază IQ',
     rf_hw_health:'Stare Hardware',rf_hint_health:'citit la 5s',
     rf_temp:'Temperatură SDR',rf_tx_gain:'Câștig TX (actual)',rf_rx_gain:'Câștig RX (actual)',
@@ -2152,7 +2152,7 @@ const LANGS={
     rf_hint_spectrum:'live · 512-bin FFT',rf_hint_constellation:'π/4-DQPSK',
     rf_waterfall:'TX-Spektrum-Wasserfall',rf_hint_waterfall:'rollend · viridis',
     rf_quality:'Signalqualität',rf_hint_quality:'gemessen vor PA · aus selbem DSP-Snapshot',
-    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Trägerleckage',rf_obw:'Belegte BW (99%)',
+    rf_evm:'DSP EVM',rf_papr:'PAPR',rf_carrier:'Trägerleckage',rf_obw:'Belegte BW (99%)',
     rf_dc:'DC-Offset (I/Q)',rf_iqa:'IQ-Amplitudenungleichgewicht',rf_iqp:'IQ-Phasenungleichgewicht',
     rf_hw_health:'Hardware-Zustand',rf_hint_health:'alle 5s abgefragt',
     rf_temp:'SDR-Temperatur',rf_tx_gain:'TX-Verstärkung (aktuell)',rf_rx_gain:'RX-Verstärkung (aktuell)',
@@ -2221,7 +2221,7 @@ const LANGS={
     rf_hint_spectrum:'en vivo · FFT 512-bin',rf_hint_constellation:'π/4-DQPSK',
     rf_waterfall:'Cascada Espectro TX',rf_hint_waterfall:'desplazándose · viridis',
     rf_quality:'Calidad de Señal',rf_hint_quality:'medido pre-PA · del mismo snapshot DSP',
-    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Fuga portadora',rf_obw:'BW ocupada (99%)',
+    rf_evm:'DSP EVM',rf_papr:'PAPR',rf_carrier:'Fuga portadora',rf_obw:'BW ocupada (99%)',
     rf_dc:'Offset DC (I/Q)',rf_iqa:'Desequilibrio amplitud IQ',rf_iqp:'Desequilibrio fase IQ',
     rf_hw_health:'Estado Hardware',rf_hint_health:'consultado cada 5s',
     rf_temp:'Temperatura SDR',rf_tx_gain:'Ganancia TX (real)',rf_rx_gain:'Ganancia RX (real)',
@@ -2290,7 +2290,7 @@ const LANGS={
     rf_hint_spectrum:'élő · 512-bin FFT',rf_hint_constellation:'π/4-DQPSK',
     rf_waterfall:'TX Spektrum Vízesés',rf_hint_waterfall:'gördülő · viridis',
     rf_quality:'Jelminőség',rf_hint_quality:'PA előtt mérve · ugyanazon DSP pillanatképből',
-    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'Vivőszivárgás',rf_obw:'Foglalt sávszélesség (99%)',
+    rf_evm:'DSP EVM',rf_papr:'PAPR',rf_carrier:'Vivőszivárgás',rf_obw:'Foglalt sávszélesség (99%)',
     rf_dc:'DC eltolás (I/Q)',rf_iqa:'IQ amplitúdó egyensúlytalanság',rf_iqp:'IQ fázis egyensúlytalanság',
     rf_hw_health:'Hardver állapot',rf_hint_health:'5 másodpercenként',
     rf_temp:'SDR hőmérséklet',rf_tx_gain:'TX erősítés (aktuális)',rf_rx_gain:'RX erősítés (aktuális)',
@@ -2351,7 +2351,7 @@ const LANGS={
     rf_hint_spectrum:'实时 · 512 点 FFT',rf_hint_constellation:'π/4-DQPSK',
     rf_waterfall:'TX 频谱瀑布图',rf_hint_waterfall:'滚动 · viridis 配色',
     rf_quality:'信号质量',rf_hint_quality:'功放前测量 · 来自同一 DSP 快照',
-    rf_evm:'EVM',rf_papr:'PAPR',rf_carrier:'载波泄漏',rf_obw:'占用带宽 (99%)',
+    rf_evm:'DSP EVM',rf_papr:'PAPR',rf_carrier:'载波泄漏',rf_obw:'占用带宽 (99%)',
     rf_dc:'直流偏置 (I/Q)',rf_iqa:'IQ 幅度不平衡',rf_iqp:'IQ 相位不平衡',
     rf_hw_health:'硬件状态',rf_hint_health:'每 5 秒轮询',
     rf_temp:'SDR 温度',rf_tx_gain:'TX 增益（实际）',rf_rx_gain:'RX 增益（实际）',
@@ -3599,7 +3599,7 @@ if(document.cookie.split(';').some(c=>c.trim().startsWith('fs_auth='))){
 // ── RF live monitor rendering ──────────────────────────────────────────────
 // We receive tx_visual + tx_quality messages: visual carries a 512-bin spectrum
 // (i16 dB-tenths, fftshift'd) and up to 192 IQ samples for the constellation.
-// Plus a richer set of derived metrics (EVM, PAPR, etc) we paint as health bars.
+// Plus a richer set of derived metrics (DSP EVM estimate, PAPR, etc) we paint as health bars.
 // All drawing is done on Canvas 2D — no external libs.
 
 const rfState = {
@@ -3651,7 +3651,7 @@ function rfResizeCanvas(id){
 //     the spectrum trace, constellation, waterfall and the top-row RMS/Peak
 //     readout.  Fast cadence so the animation feels live.
 //
-//   * tx_quality — once per second.  Carries the derived metrics (EVM, PAPR,
+//   * tx_quality — once per second.  Carries the derived metrics (DSP EVM estimate, PAPR,
 //     carrier leak, OBW, DC offset, IQ imbalance).  Slow cadence so the
 //     numeric cards don't flicker.  We additionally smooth across 3 messages
 //     (≈3 s window) so they sit still.

@@ -385,7 +385,7 @@ tx_gain_vga = 12.5
         assert!(!soapy.tx_calibration_enabled);
         assert_eq!(soapy.tx_calibration_file, "calibration.toml");
         assert!(soapy.tx_calibration_apply_dc);
-        assert!(soapy.tx_calibration_apply_iq);
+        assert!(!soapy.tx_calibration_apply_iq);
     }
 
     #[test]

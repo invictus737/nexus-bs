@@ -21,6 +21,30 @@ pub enum Mode {
     Dl,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn phase_index(symbol: ComplexSample) -> i8 {
+        ((symbol.im.atan2(symbol.re) / sample_consts::FRAC_PI_4).round() as i8).rem_euclid(8)
+    }
+
+    #[test]
+    fn dqpsk_mapper_phase_transitions_match_tetra_table_5_1() {
+        let mut mapper = DqpskMapper::new();
+
+        let symbols = [
+            mapper.symbol(true, true),
+            mapper.symbol(true, false),
+            mapper.symbol(false, false),
+            mapper.symbol(false, true),
+        ];
+        let phases: Vec<i8> = symbols.into_iter().map(phase_index).collect();
+
+        assert_eq!(phases, vec![5, 4, 5, 0]);
+    }
+}
+
 pub struct Modulator {
     mode: Mode,
     /// Sample counter value at the beginning of hyperframe number 0

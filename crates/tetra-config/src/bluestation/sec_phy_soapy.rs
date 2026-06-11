@@ -40,7 +40,9 @@ pub struct CfgSoapySdr {
     pub tx_calibration_file: String,
     /// Apply persisted TX DC offset correction.
     pub tx_calibration_apply_dc: bool,
-    /// Apply persisted TX IQ balance correction.
+    /// Apply persisted TX IQ balance correction. This is intentionally opt-in:
+    /// CW tone image improvement alone is not enough evidence for live TETRA
+    /// burst EVM improvement.
     pub tx_calibration_apply_iq: bool,
 }
 

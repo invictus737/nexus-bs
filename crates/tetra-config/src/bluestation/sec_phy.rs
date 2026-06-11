@@ -93,7 +93,7 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> Result<CfgPhyIo, String> {
                     .tx_calibration_file
                     .unwrap_or_else(|| crate::bluestation::TX_CALIBRATION_DEFAULT_FILE.to_string()),
                 tx_calibration_apply_dc: soapy_dto.tx_calibration_apply_dc.unwrap_or(true),
-                tx_calibration_apply_iq: soapy_dto.tx_calibration_apply_iq.unwrap_or(true),
+                tx_calibration_apply_iq: soapy_dto.tx_calibration_apply_iq.unwrap_or(false),
             })
         })
         .transpose()?;

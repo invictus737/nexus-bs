@@ -3,6 +3,7 @@ pub mod train_consts;
 
 pub mod demodulator;
 pub mod dsp_types;
+pub mod evm;
 pub mod fcfb;
 pub mod fir;
 pub mod history;

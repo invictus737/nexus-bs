@@ -86,8 +86,8 @@ pub struct TxVisualSnapshot {
     pub constellation_iq: Vec<i16>,
 }
 
-/// Slow-path quality snapshot — derived metrics shown on the RF page as stable
-/// readouts. Refreshed once per second.
+/// Slow-path quality snapshot. `evm_pct` is a pre-SDR DSP estimate, not
+/// transmitted RF EVM.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct TxQualitySnapshot {
     pub papr_db: f32,

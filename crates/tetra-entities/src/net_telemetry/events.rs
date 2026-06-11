@@ -85,9 +85,9 @@ pub enum TelemetryEvent {
         /// Peak-to-Average Power Ratio in dB. Typical π/4-DQPSK target ≈ 3.5-4 dB.
         /// Higher values indicate clipping or modulation problems.
         papr_db: f32,
-        /// RMS-normalized Error Vector Magnitude as a percentage. Per 3GPP TS 36.104
-        /// methodology: compare measured IQ to ideal constellation, normalize by RMS
-        /// of ideal symbols. Lower is better (≤5% professional, ≤12% acceptable).
+        /// Pre-SDR DSP Error Vector Magnitude estimate as a percentage. This is
+        /// useful for visual health, but it is not transmitted RF EVM and must
+        /// not be used as TETRA modulation-accuracy evidence.
         evm_pct: f32,
         /// Mean of the I component across captured samples (DC offset on I).
         /// Should be ~0; non-zero indicates DC bias from the SDR front-end.

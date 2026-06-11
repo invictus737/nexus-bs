@@ -1053,7 +1053,7 @@ function setCalibrationStatus(message) {
 
 async function requestTxCalibration() {
   if (state.calibrationBusy) return;
-  if (!window.confirm("Run destructive TX DC/IQ calibration?\nTETRA traffic will be stopped, calibration.toml will be written, and Nexus-BS will restart if the result is accepted.")) {
+  if (!window.confirm("Run destructive TX DC/IQ calibration?\nTETRA traffic will be stopped, calibration.toml will be written, and Nexus-BS will restart with accepted DC correction. IQ is measured but remains opt-in until RF burst EVM validation passes.")) {
     return;
   }
   state.calibrationBusy = true;
@@ -1129,7 +1129,11 @@ function renderCalibration() {
   );
   setText(
     "calibrationActionStatus",
-    active ? "running; service restart follows accepted result" : failed ? status.error || summary.summary || "calibration failed" : summary.summary || status.error || "traffic outage required"
+    active
+      ? "running; accepted DC restarts service; IQ remains opt-in"
+      : failed
+        ? status.error || summary.summary || "calibration failed"
+        : summary.summary || status.error || "traffic outage required"
   );
   setText("calibrationLog", status.log || (summary.summary ? `${summary.summary}\n` : ""));
   const button = $("calibrationRunBtn");
@@ -1757,7 +1761,7 @@ function renderSite() {
     carrierInhibited
       ? "TX inhibited, RX monitor"
       : txQuality.evm_pct !== undefined
-        ? `pi/4-DQPSK, EVM ${fmtPct(txQuality.evm_pct)}`
+        ? `pi/4-DQPSK, DSP EVM est. ${fmtPct(txQuality.evm_pct)}`
         : "pi/4-DQPSK, waiting TX"
   );
   setText(
@@ -1781,7 +1785,7 @@ function renderSite() {
 
   setText("rfRms", fmtDb(txVisual.rms_dbfs, "dBFS"));
   setText("rfPeak", fmtDb(txVisual.peak_dbfs, "dBFS"));
-  setText("rfEvm", fmtPct(txQuality.evm_pct));
+  setText("rfEvm", txQuality.evm_pct !== undefined ? `${fmtPct(txQuality.evm_pct)} DSP` : "--");
   setText("rfPapr", fmtDb(txQuality.papr_db));
   setText("rfObw", fmtHz(txQuality.occupied_bandwidth_hz, "kHz"));
   setText("rfCarrierLeak", fmtDb(txQuality.carrier_leakage_db));

@@ -1447,7 +1447,7 @@ fn upsert_soapy_calibration_keys(input: &str) -> Result<String, String> {
         ("tx_calibration_enabled", "true"),
         ("tx_calibration_file", "\"calibration.toml\""),
         ("tx_calibration_apply_dc", "true"),
-        ("tx_calibration_apply_iq", "true"),
+        ("tx_calibration_apply_iq", "false"),
     ];
     let mut present = [false; 4];
     for idx in (section_start + 1)..section_end {
@@ -4714,6 +4714,26 @@ model name	: Intel(R) Core(TM) i7-8650U CPU @ 1.90GHz
                 repeat_count: 0,
             }
         );
+    }
+
+    #[test]
+    fn calibration_config_upsert_enables_dc_but_keeps_iq_opt_in() {
+        let input = r#"[phy_io.soapysdr]
+rx_freq = 431362500.0
+tx_freq = 438362500.0
+tx_calibration_apply_iq = true
+
+[cell]
+main_carrier = 1
+"#;
+
+        let updated = upsert_soapy_calibration_keys(input).expect("upsert calibration keys");
+
+        assert!(updated.contains("tx_calibration_enabled = true"));
+        assert!(updated.contains("tx_calibration_file = \"calibration.toml\""));
+        assert!(updated.contains("tx_calibration_apply_dc = true"));
+        assert!(updated.contains("tx_calibration_apply_iq = false"));
+        assert!(!updated.contains("tx_calibration_apply_iq = true"));
     }
 
     #[test]
