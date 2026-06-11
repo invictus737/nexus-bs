@@ -14995,3 +14995,25 @@ RF Calibration TX DC Actuator Diagnostic - 2026-06-11 18:35 EEST:
     passed.
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+RF Calibration Fine TX DC Estimation - 2026-06-11 18:50 EEST:
+
+- Field diagnostic showed the TX DC actuator is effective and readback works:
+  a 0.04 DC step caused about 17.7 dB carrier-leak span. That means the
+  previous 0.005 minimum grid step was too coarse for the required correction,
+  not that the actuator was dead.
+- Fix:
+  - derive a vector TX DC estimate from central-difference ±I/±Q actuator
+    probes and the measured neutral DC carrier vector;
+  - verify the estimated DC point by RF capture before accepting it as search
+    anchor;
+  - run fine I/Q grid refinement around the estimate down to 0.0001;
+  - record estimated DC I/Q and estimate-valid status in the calibration
+    report.
+- Verification:
+  - `cargo test -p tetra-config --lib bluestation::sec_phy_soapy --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked`
+    passed.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `git diff --check` passed.

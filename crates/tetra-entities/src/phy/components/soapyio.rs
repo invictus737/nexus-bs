@@ -525,6 +525,7 @@ impl SoapyIo {
                 &tone,
                 tone_hz,
                 neutral,
+                reference_meas,
                 &limits,
                 &mut timing,
             )?;
@@ -538,6 +539,7 @@ impl SoapyIo {
                 neutral,
                 reference_meas,
                 &limits,
+                dc_actuator.estimated,
                 &mut timing,
             )?;
             tracing::warn!(
@@ -747,6 +749,9 @@ impl SoapyIo {
                     tx_dc_actuator_carrier_span_db: Some(dc_actuator.carrier_span_db),
                     tx_dc_actuator_min_carrier_dbc: Some(dc_actuator.min_carrier_dbc),
                     tx_dc_actuator_max_carrier_dbc: Some(dc_actuator.max_carrier_dbc),
+                    tx_dc_actuator_estimated_dc_i: dc_actuator.estimated.map(|coeffs| coeffs.dc_i),
+                    tx_dc_actuator_estimated_dc_q: dc_actuator.estimated.map(|coeffs| coeffs.dc_q),
+                    tx_dc_actuator_estimate_valid: dc_actuator.estimated.is_some(),
                     tx_dc_actuator_readback_ok: dc_actuator.readback_ok,
                     tx_dc_actuator_effective: dc_actuator.effective,
                     rf_limiting_factor: rf_limiting.to_string(),
@@ -1009,6 +1014,7 @@ impl SoapyIo {
         tone: &[StreamType],
         tone_hz: f64,
         neutral: TxCalibrationCoefficients,
+        reference: CalibrationMeasurement,
         limits: &TxCalibrationLimits,
         timing: &mut CalibrationTiming,
     ) -> Result<TxDcActuatorDiagnostic, String> {
@@ -1017,20 +1023,21 @@ impl SoapyIo {
             return Ok(TxDcActuatorDiagnostic::default());
         }
 
-        let probes = [
-            TxCalibrationCoefficients { dc_i: step, ..neutral },
-            TxCalibrationCoefficients { dc_i: -step, ..neutral },
-            TxCalibrationCoefficients { dc_q: step, ..neutral },
-            TxCalibrationCoefficients { dc_q: -step, ..neutral },
-        ];
+        let plus_i = TxCalibrationCoefficients { dc_i: step, ..neutral };
+        let minus_i = TxCalibrationCoefficients { dc_i: -step, ..neutral };
+        let plus_q = TxCalibrationCoefficients { dc_q: step, ..neutral };
+        let minus_q = TxCalibrationCoefficients { dc_q: -step, ..neutral };
+        let probes = [plus_i, minus_i, plus_q, minus_q];
 
         let mut min_carrier_dbc = f64::INFINITY;
         let mut max_carrier_dbc = f64::NEG_INFINITY;
         let mut readback_ok = true;
+        let mut measurements = Vec::with_capacity(probes.len());
         for coeffs in probes {
             let meas = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, coeffs, timing, false)?;
             min_carrier_dbc = min_carrier_dbc.min(meas.carrier_leakage_dbc);
             max_carrier_dbc = max_carrier_dbc.max(meas.carrier_leakage_dbc);
+            measurements.push(meas);
             match self.dev.dc_offset(soapysdr::Direction::Tx, self.tx_ch) {
                 Ok((read_i, read_q)) => {
                     let i_ok = (read_i - coeffs.dc_i).abs() <= 1.0e-6;
@@ -1055,14 +1062,26 @@ impl SoapyIo {
 
         let carrier_span_db = max_carrier_dbc - min_carrier_dbc;
         let effective = readback_ok && carrier_span_db >= TX_CAL_DC_ACTUATOR_MIN_RESPONSE_DB;
+        let estimated = estimate_tx_dc_correction_from_probes(
+            reference.dc,
+            measurements[0].dc,
+            measurements[1].dc,
+            measurements[2].dc,
+            measurements[3].dc,
+            step,
+            limits,
+        );
         tracing::warn!(
-            "SoapySDR: TX DC actuator probe step={:.5} carrier span={:.1} dB min={:.1} max={:.1} dBc readback_ok={} effective={}",
+            "SoapySDR: TX DC actuator probe step={:.5} carrier span={:.1} dB min={:.1} max={:.1} dBc readback_ok={} effective={} estimated={}",
             step,
             carrier_span_db,
             min_carrier_dbc,
             max_carrier_dbc,
             readback_ok,
-            effective
+            effective,
+            estimated
+                .map(|coeffs| format!("({:+.6},{:+.6})", coeffs.dc_i, coeffs.dc_q))
+                .unwrap_or_else(|| "unavailable".to_string())
         );
 
         Ok(TxDcActuatorDiagnostic {
@@ -1070,6 +1089,7 @@ impl SoapyIo {
             carrier_span_db,
             min_carrier_dbc,
             max_carrier_dbc,
+            estimated,
             readback_ok,
             effective,
         })
@@ -1085,6 +1105,7 @@ impl SoapyIo {
         neutral: TxCalibrationCoefficients,
         reference: CalibrationMeasurement,
         limits: &TxCalibrationLimits,
+        initial_candidate: Option<TxCalibrationCoefficients>,
         timing: &mut CalibrationTiming,
     ) -> Result<(TxCalibrationCoefficients, CalibrationMeasurement), String> {
         let mut best = neutral;
@@ -1093,10 +1114,38 @@ impl SoapyIo {
         let mut raw_best = neutral;
         let mut raw_best_meas = reference;
 
-        for step in [0.08, 0.04, 0.02, 0.01, 0.005] {
+        if let Some(candidate) = initial_candidate {
+            let meas = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate, timing, false)?;
+            let score = dc_calibration_search_score(&meas);
+            tracing::warn!(
+                "SoapySDR: TX DC estimated probe dc=({:+.6},{:+.6}) carrier {:.1}->{:.1} dBc score {:.2}",
+                candidate.dc_i,
+                candidate.dc_q,
+                reference.carrier_leakage_dbc,
+                meas.carrier_leakage_dbc,
+                score
+            );
+            if meas.carrier_leakage_dbc < raw_best_meas.carrier_leakage_dbc {
+                raw_best = candidate;
+                raw_best_meas = meas;
+            }
+            if score < best_score {
+                best = candidate;
+                best_meas = meas;
+                best_score = score;
+            }
+        }
+
+        let search_steps: &[f64] = if initial_candidate.is_some() {
+            &[0.004, 0.002, 0.001, 0.0005, 0.00025, 0.0001]
+        } else {
+            &[0.08, 0.04, 0.02, 0.01, 0.005, 0.002, 0.001, 0.0005]
+        };
+
+        for step in search_steps {
             let anchor = best;
-            for delta_i in [-step, 0.0, step] {
-                for delta_q in [-step, 0.0, step] {
+            for delta_i in [-*step, 0.0, *step] {
+                for delta_q in [-*step, 0.0, *step] {
                     if delta_i == 0.0 && delta_q == 0.0 {
                         continue;
                     }
@@ -1597,6 +1646,7 @@ struct TxDcActuatorDiagnostic {
     carrier_span_db: f64,
     min_carrier_dbc: f64,
     max_carrier_dbc: f64,
+    estimated: Option<TxCalibrationCoefficients>,
     readback_ok: bool,
     effective: bool,
 }
@@ -2516,10 +2566,16 @@ fn tetra_known_summary_suffix(reference: &CalibrationMeasurement, candidate: &Ca
 
 fn tx_dc_actuator_summary_suffix(diagnostic: Option<TxDcActuatorDiagnostic>) -> String {
     match diagnostic {
-        Some(diagnostic) => format!(
-            ", TX DC actuator step {:.3} span {:.1} dB readback_ok={} effective={}",
-            diagnostic.step, diagnostic.carrier_span_db, diagnostic.readback_ok, diagnostic.effective
-        ),
+        Some(diagnostic) => {
+            let estimated = diagnostic
+                .estimated
+                .map(|coeffs| format!(" estimated_dc=({:+.5},{:+.5})", coeffs.dc_i, coeffs.dc_q))
+                .unwrap_or_default();
+            format!(
+                ", TX DC actuator step {:.3} span {:.1} dB readback_ok={} effective={}{}",
+                diagnostic.step, diagnostic.carrier_span_db, diagnostic.readback_ok, diagnostic.effective, estimated
+            )
+        }
         None => String::new(),
     }
 }
@@ -2633,6 +2689,47 @@ fn with_axis_delta(
         CalibrationAxis::IqQ => coeffs.iq_q = (coeffs.iq_q + delta).clamp(-limits.tx_iq_abs_max, limits.tx_iq_abs_max),
     }
     coeffs
+}
+
+fn estimate_tx_dc_correction_from_probes(
+    reference_dc: ComplexF64,
+    plus_i_dc: ComplexF64,
+    minus_i_dc: ComplexF64,
+    plus_q_dc: ComplexF64,
+    minus_q_dc: ComplexF64,
+    step: f64,
+    limits: &TxCalibrationLimits,
+) -> Option<TxCalibrationCoefficients> {
+    if step <= 0.0 || !step.is_finite() {
+        return None;
+    }
+    let scale = 1.0 / (2.0 * step);
+    let resp_i = ComplexF64 {
+        re: (plus_i_dc.re - minus_i_dc.re) * scale,
+        im: (plus_i_dc.im - minus_i_dc.im) * scale,
+    };
+    let resp_q = ComplexF64 {
+        re: (plus_q_dc.re - minus_q_dc.re) * scale,
+        im: (plus_q_dc.im - minus_q_dc.im) * scale,
+    };
+    let det = resp_i.re * resp_q.im - resp_q.re * resp_i.im;
+    if !det.is_finite() || det.abs() < 1.0e-9 {
+        return None;
+    }
+
+    let target_re = -reference_dc.re;
+    let target_im = -reference_dc.im;
+    let dc_i = (target_re * resp_q.im - resp_q.re * target_im) / det;
+    let dc_q = (resp_i.re * target_im - target_re * resp_i.im) / det;
+    if !dc_i.is_finite() || !dc_q.is_finite() {
+        return None;
+    }
+
+    Some(TxCalibrationCoefficients {
+        dc_i: dc_i.clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
+        dc_q: dc_q.clamp(-limits.tx_dc_abs_max, limits.tx_dc_abs_max),
+        ..Default::default()
+    })
 }
 
 fn dc_calibration_search_score(meas: &CalibrationMeasurement) -> f64 {
@@ -2818,6 +2915,7 @@ mod tests {
             carrier_span_db: 0.2,
             min_carrier_dbc: -20.1,
             max_carrier_dbc: -19.9,
+            estimated: None,
             readback_ok: true,
             effective: false,
         };
@@ -2826,6 +2924,35 @@ mod tests {
             rf_limiting_factor_with_dc_actuator(&meas, true, Some(diagnostic)),
             "tx_dc_actuator_no_effect"
         );
+    }
+
+    #[test]
+    fn tx_dc_probe_solver_estimates_sub_mill_correction() {
+        let limits = TxCalibrationLimits::default();
+        let reference_dc = ComplexF64 { re: 0.0015, im: -0.0020 };
+        let step = 0.04;
+        let plus_i = ComplexF64 {
+            re: reference_dc.re + step,
+            im: reference_dc.im,
+        };
+        let minus_i = ComplexF64 {
+            re: reference_dc.re - step,
+            im: reference_dc.im,
+        };
+        let plus_q = ComplexF64 {
+            re: reference_dc.re,
+            im: reference_dc.im + step,
+        };
+        let minus_q = ComplexF64 {
+            re: reference_dc.re,
+            im: reference_dc.im - step,
+        };
+
+        let estimated =
+            estimate_tx_dc_correction_from_probes(reference_dc, plus_i, minus_i, plus_q, minus_q, step, &limits).expect("estimate");
+
+        assert!((estimated.dc_i + 0.0015).abs() < 1.0e-9);
+        assert!((estimated.dc_q - 0.0020).abs() < 1.0e-9);
     }
 
     #[test]
