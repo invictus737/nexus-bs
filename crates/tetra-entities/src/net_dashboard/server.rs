@@ -1297,15 +1297,17 @@ fn serve_rf_calibration_run(
     let phy_sender = phy_cmd_tx.lock().ok().and_then(|guard| guard.clone());
     let Some(phy_sender) = phy_sender else {
         crate::rf_calibration::mark_failed("PHY control channel unavailable");
+        let _ = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: false });
         http_json_response(stream, 503, r#"{"ok":false,"error":"PHY control channel unavailable"}"#);
         return;
     };
+    let rf_sender = rf_cmd_tx.lock().ok().and_then(|guard| guard.clone());
 
     let config_path_string = config_path.to_string();
     std::thread::Builder::new()
         .name("rf-calibration".into())
         .spawn(move || {
-            run_rf_calibration_orchestrator(config_path_string, calibration_path_string, phy_sender);
+            run_rf_calibration_orchestrator(config_path_string, calibration_path_string, rf_sender, phy_sender);
         })
         .ok();
 
@@ -1319,7 +1321,7 @@ fn serve_rf_calibration_run(
     http_json_response(stream, 202, &body);
 }
 
-fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String, phy_sender: CmdSender) {
+fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String, rf_sender: Option<CmdSender>, phy_sender: CmdSender) {
     crate::rf_calibration::append_log("RF carrier inhibit queued; waiting notification guard before PHY calibration");
     std::thread::sleep(std::time::Duration::from_secs(3));
     if phy_sender
@@ -1329,6 +1331,7 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         .is_err()
     {
         crate::rf_calibration::mark_failed("failed to queue PHY calibration command");
+        restore_rf_carrier_after_calibration(&rf_sender, "failed PHY queue");
         return;
     }
 
@@ -1336,9 +1339,13 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
     loop {
         match crate::rf_calibration::current_phase() {
             crate::rf_calibration::CalibrationPhase::Calibrated => break,
-            crate::rf_calibration::CalibrationPhase::Failed => return,
+            crate::rf_calibration::CalibrationPhase::Failed => {
+                restore_rf_carrier_after_calibration(&rf_sender, "failed calibration");
+                return;
+            }
             _ if std::time::Instant::now() >= deadline => {
                 crate::rf_calibration::mark_failed("timeout waiting for PHY calibration");
+                restore_rf_carrier_after_calibration(&rf_sender, "calibration timeout");
                 return;
             }
             _ => std::thread::sleep(std::time::Duration::from_millis(250)),
@@ -1349,11 +1356,13 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         Ok(report) => report,
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration file was not readable after PHY finished: {}", err));
+            restore_rf_carrier_after_calibration(&rf_sender, "unreadable calibration file");
             return;
         }
     };
     if !report.report.accepted {
         crate::rf_calibration::mark_failed(format!("calibration rejected; config not changed: {}", report.report.summary));
+        restore_rf_carrier_after_calibration(&rf_sender, "rejected calibration");
         return;
     }
 
@@ -1367,7 +1376,19 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         }
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration accepted but config update failed: {}", err));
+            restore_rf_carrier_after_calibration(&rf_sender, "config update failure");
         }
+    }
+}
+
+fn restore_rf_carrier_after_calibration(rf_sender: &Option<CmdSender>, reason: &str) {
+    let Some(sender) = rf_sender else {
+        crate::rf_calibration::append_log(format!("ERROR: RF carrier enable unavailable after {}", reason));
+        return;
+    };
+    match sender.try_send(ControlCommand::SetRfCarrierInhibit { inhibited: false }) {
+        Ok(()) => crate::rf_calibration::append_log(format!("RF carrier enable queued after {}", reason)),
+        Err(_) => crate::rf_calibration::append_log(format!("ERROR: RF carrier enable queue failed after {}", reason)),
     }
 }
 

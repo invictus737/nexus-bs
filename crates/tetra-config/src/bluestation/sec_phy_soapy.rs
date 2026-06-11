@@ -105,12 +105,18 @@ pub struct TxCalibrationDevice {
     pub name: String,
     pub tx_frequency_hz: f64,
     pub rx_frequency_hz: f64,
+    pub tx_center_frequency_hz: f64,
+    pub rx_center_frequency_hz: f64,
+    pub calibration_frequency_hz: f64,
+    pub duplex_shift_hz: f64,
     pub sample_rate_hz: f64,
     pub tx_channel: usize,
     pub rx_channel: usize,
     pub tx_antenna: String,
     pub rx_antenna: String,
+    pub loopback_source: String,
     pub tx_gains_fingerprint: String,
+    pub rx_gains_fingerprint: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -239,6 +245,21 @@ mod tests {
         TxCalibrationFile {
             schema_version: 1,
             status: "calibrated".to_string(),
+            device: TxCalibrationDevice {
+                name: "SXceiver".to_string(),
+                tx_frequency_hz: 438_362_500.0,
+                rx_frequency_hz: 431_362_500.0,
+                tx_center_frequency_hz: 438_362_500.0,
+                rx_center_frequency_hz: 431_342_500.0,
+                calibration_frequency_hz: 438_362_500.0,
+                duplex_shift_hz: 7_000_000.0,
+                tx_antenna: "TX".to_string(),
+                rx_antenna: "RX".to_string(),
+                loopback_source: "rx_internal_lb".to_string(),
+                tx_gains_fingerprint: "DAC=9.00,MIXER=30.00".to_string(),
+                rx_gains_fingerprint: "LNA=42.00,PGA=16.00".to_string(),
+                ..Default::default()
+            },
             limits: TxCalibrationLimits::default(),
             reference: TxCalibrationPoint {
                 label: "neutral".to_string(),
@@ -295,6 +316,9 @@ mod tests {
         assert_eq!(parsed.schema_version, 1);
         assert_eq!(parsed.reference.label, "neutral");
         assert_eq!(parsed.applied.dc_i, 0.01);
+        assert_eq!(parsed.device.duplex_shift_hz, 7_000_000.0);
+        assert_eq!(parsed.device.loopback_source, "rx_internal_lb");
+        assert_eq!(parsed.device.rx_gains_fingerprint, "LNA=42.00,PGA=16.00");
         assert!(parsed.report.accepted);
     }
 

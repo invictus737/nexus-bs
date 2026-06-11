@@ -18,8 +18,13 @@ type StreamType = ComplexSample;
 const SOAPY_FREQ_OFFSET: f64 = 20000.0;
 const TX_CAL_TONE_HZ: f64 = 24_000.0;
 const TX_CAL_TONE_AMPLITUDE: f32 = 0.20;
-const TX_CAL_CAPTURE_SAMPLES: usize = 4096;
+const TX_CAL_FALLBACK_BLOCK_SAMPLES: usize = 4096;
+const TX_CAL_PREFILL_BLOCKS: usize = 8;
+const TX_CAL_SETTLE_BLOCKS: usize = 3;
+const TX_CAL_CAPTURE_BLOCKS: usize = 3;
 const TX_CAL_MIN_SNR_DB: f64 = 25.0;
+const SOAPY_SX_LOOPBACK_ANTENNA: &str = "LB";
+const SOAPY_SX_PA_SETTING: &str = "PA";
 
 pub struct RxResult {
     /// Number of samples read
@@ -54,7 +59,12 @@ pub struct SoapyIo {
     sdr_name: String,
     rx_ant: Option<String>,
     tx_ant: Option<String>,
+    rx_gain: Vec<(String, f64)>,
     tx_gain: Vec<(String, f64)>,
+    rx_args: Vec<(String, String)>,
+    tx_args: Vec<(String, String)>,
+    live_rx_carrier_hz: Option<f64>,
+    live_tx_carrier_hz: Option<f64>,
 }
 
 /// Soapy/Lime timestamps can occasionally jitter by a single sample.
@@ -73,6 +83,22 @@ macro_rules! soapycheck {
             }
         }
     };
+}
+
+#[derive(Clone, Debug)]
+struct TxCalibrationSession {
+    live_rx_carrier_hz: f64,
+    live_tx_carrier_hz: f64,
+    live_rx_center_hz: f64,
+    live_tx_center_hz: f64,
+    calibration_center_hz: f64,
+    rx_stream_existed_before: bool,
+    tx_stream_existed_before: bool,
+    rx_active_before: bool,
+    tx_active_before: bool,
+    original_rx_antenna: Option<String>,
+    original_pa_setting: Option<String>,
+    loopback_source: String,
 }
 
 impl SoapyIo {
@@ -94,11 +120,22 @@ impl SoapyIo {
         let sdr_name = sdr_settings.name.clone();
         let rx_ant_configured = sdr_settings.rx_ant.clone();
         let tx_ant_configured = sdr_settings.tx_ant.clone();
+        let rx_gain_configured = sdr_settings.rx_gain.clone();
         let tx_gain_configured = sdr_settings.tx_gain.clone();
+        let rx_args_configured = sdr_settings.rx_args.clone();
+        let tx_args_configured = sdr_settings.tx_args.clone();
 
         // Get PPM corrected freqs
         let (dl_corrected, _) = soapy_cfg.dl_freq_corrected();
         let (ul_corrected, _) = soapy_cfg.ul_freq_corrected();
+
+        let (live_rx_carrier_hz, live_tx_carrier_hz) = match mode {
+            StackMode::Bs => (Some(ul_corrected), Some(dl_corrected)),
+            StackMode::Ms => (Some(dl_corrected), Some(ul_corrected)),
+            StackMode::Mon => {
+                unimplemented!("Monitor mode not implemented yet");
+            }
+        };
 
         let (rx_freq, tx_freq) = match mode {
             StackMode::Bs => (
@@ -176,15 +213,8 @@ impl SoapyIo {
             apply_configured_tx_calibration(&dev, tx_ch, soapy_cfg);
         }
 
-        let mut rx_args = soapysdr::Args::new();
-        for (key, value) in sdr_settings.rx_args {
-            rx_args.set(key, value);
-        }
-
-        let mut tx_args = soapysdr::Args::new();
-        for (key, value) in sdr_settings.tx_args {
-            tx_args.set(key, value);
-        }
+        let rx_args = args_from_pairs(&rx_args_configured);
+        let tx_args = args_from_pairs(&tx_args_configured);
 
         let mut rx = if rx_enabled {
             Some(soapycheck!("setup RX stream", dev.rx_stream_args(&[rx_ch], rx_args)))
@@ -218,7 +248,12 @@ impl SoapyIo {
             sdr_name,
             rx_ant: rx_ant_configured,
             tx_ant: tx_ant_configured,
+            rx_gain: rx_gain_configured,
             tx_gain: tx_gain_configured,
+            rx_args: rx_args_configured,
+            tx_args: tx_args_configured,
+            live_rx_carrier_hz,
+            live_tx_carrier_hz,
         })
     }
 
@@ -226,11 +261,6 @@ impl SoapyIo {
         if !self.tx_enabled() || !self.rx_enabled() {
             return Err("TX calibration requires both RX and TX streams".to_string());
         }
-
-        tracing::warn!(
-            "SoapySDR: starting destructive TX DC/IQ calibration using RF loopback capture; path={}",
-            calibration_path
-        );
 
         let original_rx_freq = self
             .dev
@@ -243,14 +273,37 @@ impl SoapyIo {
         let tx_active_before = self.tx.as_ref().is_some_and(|tx| tx.active());
         let rx_active_before = self.rx.as_ref().is_some_and(|rx| rx.active());
 
-        self.deactivate_streams_for_calibration()?;
-        self.dev
-            .set_frequency(soapysdr::Direction::Rx, self.rx_ch, tx_freq, soapysdr::Args::new())
-            .map_err(|e| format!("retune RX to TX frequency {:.0} Hz: {}", tx_freq, e))?;
+        let mut session = TxCalibrationSession {
+            live_rx_carrier_hz: self.live_rx_carrier_hz.unwrap_or(original_rx_freq),
+            live_tx_carrier_hz: self.live_tx_carrier_hz.unwrap_or(tx_freq),
+            live_rx_center_hz: original_rx_freq,
+            live_tx_center_hz: tx_freq,
+            calibration_center_hz: tx_freq,
+            rx_stream_existed_before: self.rx.is_some(),
+            tx_stream_existed_before: self.tx.is_some(),
+            rx_active_before,
+            tx_active_before,
+            original_rx_antenna: None,
+            original_pa_setting: None,
+            loopback_source: "external_rf_coupling".to_string(),
+        };
 
-        let result = self.run_tx_calibration_inner(calibration_path, tx_freq);
+        tracing::warn!(
+            "SoapySDR: starting destructive TX DC/IQ calibration path={} live_rx_carrier={:.0}Hz live_tx_carrier={:.0}Hz duplex_shift={:+.0}Hz rx_center={:.0}Hz tx_center={:.0}Hz",
+            calibration_path,
+            session.live_rx_carrier_hz,
+            session.live_tx_carrier_hz,
+            session.live_tx_carrier_hz - session.live_rx_carrier_hz,
+            session.live_rx_center_hz,
+            session.live_tx_center_hz
+        );
 
-        let restore_result = self.restore_after_tx_calibration(original_rx_freq, rx_active_before, tx_active_before);
+        let result = match self.prepare_tx_calibration_session(&mut session) {
+            Ok(()) => self.run_tx_calibration_inner(calibration_path, &session),
+            Err(err) => Err(err),
+        };
+
+        let restore_result = self.restore_after_tx_calibration(&session);
         if let Err(restore_err) = restore_result {
             tracing::error!("SoapySDR: TX calibration restore failed: {}", restore_err);
             if result.is_ok() {
@@ -261,124 +314,227 @@ impl SoapyIo {
         result
     }
 
-    fn run_tx_calibration_inner(&mut self, calibration_path: &str, tx_freq: f64) -> Result<TxCalibrationFile, String> {
-        self.activate_streams_for_calibration()?;
+    fn prepare_tx_calibration_session(&mut self, session: &mut TxCalibrationSession) -> Result<(), String> {
+        self.drop_streams_for_calibration()?;
 
-        let tone = calibration_tone(self.tx_fs, TX_CAL_TONE_HZ, TX_CAL_TONE_AMPLITUDE, TX_CAL_CAPTURE_SAMPLES);
-        let limits = TxCalibrationLimits::default();
+        session.original_rx_antenna = self.dev.antenna(soapysdr::Direction::Rx, self.rx_ch).ok();
+        let rx_antennas = self
+            .dev
+            .antennas(soapysdr::Direction::Rx, self.rx_ch)
+            .map_err(|e| format!("list RX antennas before calibration: {}", e))?;
+        let has_internal_loopback = rx_antennas.iter().any(|ant| ant == SOAPY_SX_LOOPBACK_ANTENNA);
 
-        let baseline_dc = self.capture_calibration_baseline_dc()?;
-        let neutral = TxCalibrationCoefficients::default();
-        let reference_meas = self.capture_calibration_measurement(Some(baseline_dc), &tone, neutral)?;
-        if reference_meas.snr_db < TX_CAL_MIN_SNR_DB {
-            return Err(format!(
-                "RF loopback signal too weak for calibration: SNR {:.1} dB < {:.1} dB",
-                reference_meas.snr_db, TX_CAL_MIN_SNR_DB
-            ));
+        if has_internal_loopback {
+            session.original_pa_setting = self.dev.read_setting(SOAPY_SX_PA_SETTING).ok();
+            self.dev
+                .set_antenna(soapysdr::Direction::Rx, self.rx_ch, SOAPY_SX_LOOPBACK_ANTENNA)
+                .map_err(|e| format!("select RX internal loopback antenna {}: {}", SOAPY_SX_LOOPBACK_ANTENNA, e))?;
+            session.loopback_source = "rx_internal_lb".to_string();
+            tracing::warn!(
+                "SoapySDR: TX calibration leaves {}={} while RX uses internal LB",
+                SOAPY_SX_PA_SETTING,
+                session.original_pa_setting.as_deref().unwrap_or("unknown")
+            );
+        } else if self.sdr_name == "SXceiver" {
+            return Err(
+                "SXceiver internal RF loopback antenna LB is not available; external RF coupling is too weak for reliable calibration"
+                    .to_string(),
+            );
         }
 
-        let mut best = neutral;
-        let mut best_meas = reference_meas;
+        self.dev
+            .set_frequency(
+                soapysdr::Direction::Tx,
+                self.tx_ch,
+                session.calibration_center_hz,
+                soapysdr::Args::new(),
+            )
+            .map_err(|e| format!("set TX calibration frequency {:.0} Hz: {}", session.calibration_center_hz, e))?;
+        self.dev
+            .set_frequency(
+                soapysdr::Direction::Rx,
+                self.rx_ch,
+                session.calibration_center_hz,
+                soapysdr::Args::new(),
+            )
+            .map_err(|e| {
+                format!(
+                    "retune RX to TX calibration frequency {:.0} Hz: {}",
+                    session.calibration_center_hz, e
+                )
+            })?;
 
-        for step in [0.04, 0.02, 0.01, 0.005] {
-            for axis in [CalibrationAxis::DcI, CalibrationAxis::DcQ] {
-                let mut axis_best = best;
-                let mut axis_meas = best_meas;
-                for direction in [-1.0, 1.0] {
-                    let candidate = with_axis_delta(best, axis, step * direction, &limits);
-                    let meas = self.capture_calibration_measurement(Some(baseline_dc), &tone, candidate)?;
-                    if meas.carrier_leakage_dbc < axis_meas.carrier_leakage_dbc {
-                        axis_best = candidate;
-                        axis_meas = meas;
-                    }
-                }
-                best = axis_best;
-                best_meas = axis_meas;
-            }
-        }
-
-        for step in [0.12, 0.06, 0.03, 0.015] {
-            for axis in [CalibrationAxis::IqI, CalibrationAxis::IqQ] {
-                let mut axis_best = best;
-                let mut axis_meas = best_meas;
-                let mut axis_score = iq_calibration_score(&axis_meas);
-                for direction in [-1.0, 1.0] {
-                    let candidate = with_axis_delta(best, axis, step * direction, &limits);
-                    let meas = self.capture_calibration_measurement(Some(baseline_dc), &tone, candidate)?;
-                    let score = iq_calibration_score(&meas);
-                    if score < axis_score {
-                        axis_best = candidate;
-                        axis_meas = meas;
-                        axis_score = score;
-                    }
-                }
-                best = axis_best;
-                best_meas = axis_meas;
-            }
-        }
-
-        // Re-measure final coefficients after all changes have settled.
-        let final_meas = self.capture_calibration_measurement(Some(baseline_dc), &tone, best)?;
-        let carrier_improvement = reference_meas.carrier_leakage_dbc - final_meas.carrier_leakage_dbc;
-        let image_improvement = final_meas.image_rejection_db - reference_meas.image_rejection_db;
-        let evm_improvement = reference_meas.evm_proxy_pct - final_meas.evm_proxy_pct;
-        let accepted = carrier_improvement >= limits.min_carrier_improvement_db || image_improvement >= limits.min_image_improvement_db;
-        let applied = if accepted { best } else { TxCalibrationCoefficients::default() };
-
-        self.apply_tx_calibration_coefficients(applied, true, true)?;
-
-        let now = unix_secs_now();
-        let file = TxCalibrationFile {
-            schema_version: 1,
-            status: if accepted {
-                "calibrated".to_string()
-            } else {
-                "rejected".to_string()
-            },
-            created_unix_secs: now,
-            updated_unix_secs: now,
-            device: TxCalibrationDevice {
-                name: self.sdr_name.clone(),
-                tx_frequency_hz: tx_freq,
-                rx_frequency_hz: self.rx_center_frequency().unwrap_or(0.0),
-                sample_rate_hz: self.tx_fs,
-                tx_channel: self.tx_ch,
-                rx_channel: self.rx_ch,
-                tx_antenna: self.tx_ant.clone().unwrap_or_else(|| "auto".to_string()),
-                rx_antenna: self.rx_ant.clone().unwrap_or_else(|| "auto".to_string()),
-                tx_gains_fingerprint: gains_fingerprint(&self.tx_gain),
-            },
-            limits,
-            reference: reference_meas.into_point("neutral_no_calibration", neutral),
-            calibrated: final_meas.into_point("calibrated_candidate", best),
-            applied,
-            report: TxCalibrationReport {
-                carrier_leakage_improvement_db: carrier_improvement,
-                image_rejection_improvement_db: image_improvement,
-                evm_proxy_improvement_pct: evm_improvement,
-                accepted,
-                summary: if accepted {
-                    format!(
-                        "accepted: carrier leak {:+.1} dB, image rejection {:+.1} dB, EVM proxy {:+.2} pp",
-                        carrier_improvement, image_improvement, evm_improvement
-                    )
-                } else {
-                    format!(
-                        "rejected: improvement below thresholds; carrier {:+.1} dB, image {:+.1} dB",
-                        carrier_improvement, image_improvement
-                    )
-                },
-            },
-        };
-
-        write_tx_calibration_file_atomic(calibration_path, &file)?;
         tracing::warn!(
-            "SoapySDR: TX calibration {} saved to {}: {}",
-            if accepted { "accepted" } else { "rejected" },
-            calibration_path,
-            file.report.summary
+            "SoapySDR: TX calibration using {} at {:.0}Hz; live duplex RX/TX remains {:.0}/{:.0}Hz in calibration.toml",
+            session.loopback_source,
+            session.calibration_center_hz,
+            session.live_rx_carrier_hz,
+            session.live_tx_carrier_hz
         );
-        Ok(file)
+        Ok(())
+    }
+
+    fn run_tx_calibration_inner(&mut self, calibration_path: &str, session: &TxCalibrationSession) -> Result<TxCalibrationFile, String> {
+        let (mut rx_stream, mut tx_stream) = self.setup_tx_calibration_streams()?;
+
+        let result = (|| {
+            let block_len = self.calibration_block_len();
+            let tone_hz = quantized_tone_hz(TX_CAL_TONE_HZ, self.tx_fs, block_len);
+            let tone = calibration_tone(self.tx_fs, tone_hz, TX_CAL_TONE_AMPLITUDE, block_len);
+            let limits = TxCalibrationLimits::default();
+
+            let baseline_dc = self.capture_calibration_baseline_dc(&mut rx_stream, &mut tx_stream, block_len)?;
+            let neutral = TxCalibrationCoefficients::default();
+            let reference_meas =
+                self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, Some(baseline_dc), &tone, tone_hz, neutral)?;
+            if reference_meas.snr_db < TX_CAL_MIN_SNR_DB {
+                return Err(format!(
+                    "RF loopback signal too weak for calibration: SNR {:.1} dB < {:.1} dB source={} tone {:.1} Hz signal {:.1} dBFS noise {:.1} dBFS calibration_freq {:.0} Hz live_rx {:.0} Hz live_tx {:.0} Hz",
+                    reference_meas.snr_db,
+                    TX_CAL_MIN_SNR_DB,
+                    session.loopback_source,
+                    tone_hz,
+                    reference_meas.signal_dbfs,
+                    reference_meas.noise_floor_dbfs,
+                    session.calibration_center_hz,
+                    session.live_rx_carrier_hz,
+                    session.live_tx_carrier_hz
+                ));
+            }
+
+            let mut best = neutral;
+            let mut best_meas = reference_meas;
+
+            for step in [0.04, 0.02, 0.01, 0.005] {
+                for axis in [CalibrationAxis::DcI, CalibrationAxis::DcQ] {
+                    let mut axis_best = best;
+                    let mut axis_meas = best_meas;
+                    for direction in [-1.0, 1.0] {
+                        let candidate = with_axis_delta(best, axis, step * direction, &limits);
+                        let meas = self.capture_calibration_measurement(
+                            &mut rx_stream,
+                            &mut tx_stream,
+                            Some(baseline_dc),
+                            &tone,
+                            tone_hz,
+                            candidate,
+                        )?;
+                        if meas.carrier_leakage_dbc < axis_meas.carrier_leakage_dbc {
+                            axis_best = candidate;
+                            axis_meas = meas;
+                        }
+                    }
+                    best = axis_best;
+                    best_meas = axis_meas;
+                }
+            }
+
+            for step in [0.12, 0.06, 0.03, 0.015] {
+                for axis in [CalibrationAxis::IqI, CalibrationAxis::IqQ] {
+                    let mut axis_best = best;
+                    let mut axis_meas = best_meas;
+                    let mut axis_score = iq_calibration_score(&axis_meas);
+                    for direction in [-1.0, 1.0] {
+                        let candidate = with_axis_delta(best, axis, step * direction, &limits);
+                        let meas = self.capture_calibration_measurement(
+                            &mut rx_stream,
+                            &mut tx_stream,
+                            Some(baseline_dc),
+                            &tone,
+                            tone_hz,
+                            candidate,
+                        )?;
+                        let score = iq_calibration_score(&meas);
+                        if score < axis_score {
+                            axis_best = candidate;
+                            axis_meas = meas;
+                            axis_score = score;
+                        }
+                    }
+                    best = axis_best;
+                    best_meas = axis_meas;
+                }
+            }
+
+            // Re-measure final coefficients after all changes have settled.
+            let final_meas =
+                self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, Some(baseline_dc), &tone, tone_hz, best)?;
+            let carrier_improvement = reference_meas.carrier_leakage_dbc - final_meas.carrier_leakage_dbc;
+            let image_improvement = final_meas.image_rejection_db - reference_meas.image_rejection_db;
+            let evm_improvement = reference_meas.evm_proxy_pct - final_meas.evm_proxy_pct;
+            let accepted = carrier_improvement >= limits.min_carrier_improvement_db || image_improvement >= limits.min_image_improvement_db;
+            let applied = if accepted { best } else { TxCalibrationCoefficients::default() };
+
+            self.apply_tx_calibration_coefficients(applied, true, true)?;
+
+            let now = unix_secs_now();
+            let file = TxCalibrationFile {
+                schema_version: 1,
+                status: if accepted {
+                    "calibrated".to_string()
+                } else {
+                    "rejected".to_string()
+                },
+                created_unix_secs: now,
+                updated_unix_secs: now,
+                device: TxCalibrationDevice {
+                    name: self.sdr_name.clone(),
+                    tx_frequency_hz: session.live_tx_carrier_hz,
+                    rx_frequency_hz: session.live_rx_carrier_hz,
+                    tx_center_frequency_hz: session.live_tx_center_hz,
+                    rx_center_frequency_hz: session.live_rx_center_hz,
+                    calibration_frequency_hz: session.calibration_center_hz,
+                    duplex_shift_hz: session.live_tx_carrier_hz - session.live_rx_carrier_hz,
+                    sample_rate_hz: self.tx_fs,
+                    tx_channel: self.tx_ch,
+                    rx_channel: self.rx_ch,
+                    tx_antenna: self.tx_ant.clone().unwrap_or_else(|| "auto".to_string()),
+                    rx_antenna: self
+                        .rx_ant
+                        .clone()
+                        .unwrap_or_else(|| session.original_rx_antenna.clone().unwrap_or_else(|| "auto".to_string())),
+                    loopback_source: session.loopback_source.clone(),
+                    tx_gains_fingerprint: gains_fingerprint(&self.tx_gain),
+                    rx_gains_fingerprint: gains_fingerprint(&self.rx_gain),
+                },
+                limits,
+                reference: reference_meas.into_point("neutral_no_calibration", neutral),
+                calibrated: final_meas.into_point("calibrated_candidate", best),
+                applied,
+                report: TxCalibrationReport {
+                    carrier_leakage_improvement_db: carrier_improvement,
+                    image_rejection_improvement_db: image_improvement,
+                    evm_proxy_improvement_pct: evm_improvement,
+                    accepted,
+                    summary: if accepted {
+                        format!(
+                            "accepted: carrier leak {:+.1} dB, image rejection {:+.1} dB, EVM proxy {:+.2} pp",
+                            carrier_improvement, image_improvement, evm_improvement
+                        )
+                    } else {
+                        format!(
+                            "rejected: improvement below thresholds; carrier {:+.1} dB, image {:+.1} dB",
+                            carrier_improvement, image_improvement
+                        )
+                    },
+                },
+            };
+
+            write_tx_calibration_file_atomic(calibration_path, &file)?;
+            tracing::warn!(
+                "SoapySDR: TX calibration {} saved to {}: {}",
+                if accepted { "accepted" } else { "rejected" },
+                calibration_path,
+                file.report.summary
+            );
+            Ok(file)
+        })();
+
+        let zero = vec![ComplexSample::ZERO; self.calibration_block_len()];
+        tx_stream.write_all(&[&zero], None, false, 250_000).ok();
+        tx_stream.deactivate(None).ok();
+        rx_stream.deactivate(None).ok();
+        result
     }
 
     fn deactivate_streams_for_calibration(&mut self) -> Result<(), String> {
@@ -395,37 +551,116 @@ impl SoapyIo {
         Ok(())
     }
 
-    fn activate_streams_for_calibration(&mut self) -> Result<(), String> {
-        if let Some(rx) = &mut self.rx {
-            if !rx.active() {
-                rx.activate(None)
-                    .map_err(|e| format!("activate RX stream for calibration: {}", e))?;
+    fn drop_streams_for_calibration(&mut self) -> Result<(), String> {
+        self.deactivate_streams_for_calibration()?;
+        self.tx = None;
+        self.rx = None;
+        Ok(())
+    }
+
+    fn setup_tx_calibration_streams(&self) -> Result<(soapysdr::RxStream<StreamType>, soapysdr::TxStream<StreamType>), String> {
+        let rx_args = args_from_pairs(&self.rx_args);
+        let tx_args = args_from_pairs(&self.tx_args);
+        let mut rx = self
+            .dev
+            .rx_stream_args::<StreamType, _>(&[self.rx_ch], rx_args)
+            .map_err(|e| format!("setup RX calibration stream: {}", e))?;
+        let mut tx = self
+            .dev
+            .tx_stream_args::<StreamType, _>(&[self.tx_ch], tx_args)
+            .map_err(|e| format!("setup TX calibration stream: {}", e))?;
+        rx.activate(None).map_err(|e| format!("activate RX calibration stream: {}", e))?;
+        tx.activate(None).map_err(|e| format!("activate TX calibration stream: {}", e))?;
+        Ok((rx, tx))
+    }
+
+    fn calibration_block_len(&self) -> usize {
+        stream_period_samples(&self.tx_args)
+            .or_else(|| stream_period_samples(&self.rx_args))
+            .map(|period| period.saturating_mul(4))
+            .unwrap_or(TX_CAL_FALLBACK_BLOCK_SAMPLES)
+            .max(64)
+    }
+
+    fn setup_live_streams_after_tx_calibration(&mut self, session: &TxCalibrationSession) -> Result<(), String> {
+        let rx = if session.rx_stream_existed_before {
+            let rx_args = args_from_pairs(&self.rx_args);
+            Some(
+                self.dev
+                    .rx_stream_args::<StreamType, _>(&[self.rx_ch], rx_args)
+                    .map_err(|e| format!("setup RX live stream after calibration: {}", e))?,
+            )
+        } else {
+            None
+        };
+        let tx = if session.tx_stream_existed_before {
+            let tx_args = args_from_pairs(&self.tx_args);
+            Some(
+                self.dev
+                    .tx_stream_args::<StreamType, _>(&[self.tx_ch], tx_args)
+                    .map_err(|e| format!("setup TX live stream after calibration: {}", e))?,
+            )
+        } else {
+            None
+        };
+
+        self.rx = rx;
+        self.tx = tx;
+
+        if session.rx_active_before {
+            if let Some(rx) = &mut self.rx {
+                rx.activate(None).map_err(|e| format!("reactivate RX live stream: {}", e))?;
             }
         }
-        if let Some(tx) = &mut self.tx {
-            if !tx.active() {
-                tx.activate(None)
-                    .map_err(|e| format!("activate TX stream for calibration: {}", e))?;
+        if session.tx_active_before {
+            if let Some(tx) = &mut self.tx {
+                tx.activate(None).map_err(|e| format!("reactivate TX live stream: {}", e))?;
             }
         }
         Ok(())
     }
 
-    fn restore_after_tx_calibration(&mut self, original_rx_freq: f64, rx_active: bool, tx_active: bool) -> Result<(), String> {
-        self.deactivate_streams_for_calibration()?;
+    fn restore_after_tx_calibration(&mut self, session: &TxCalibrationSession) -> Result<(), String> {
+        self.drop_streams_for_calibration()?;
+        if let Some(original_pa) = &session.original_pa_setting {
+            if let Err(err) = self.dev.write_setting(SOAPY_SX_PA_SETTING, original_pa.as_str()) {
+                tracing::warn!(
+                    "SoapySDR: failed to restore {}={} after calibration: {}",
+                    SOAPY_SX_PA_SETTING,
+                    original_pa,
+                    err
+                );
+            }
+        }
+        if let Some(original_rx_antenna) = &session.original_rx_antenna {
+            if let Err(err) = self
+                .dev
+                .set_antenna(soapysdr::Direction::Rx, self.rx_ch, original_rx_antenna.as_str())
+            {
+                tracing::warn!(
+                    "SoapySDR: failed to restore RX antenna {} after calibration: {}",
+                    original_rx_antenna,
+                    err
+                );
+            }
+        }
         self.dev
-            .set_frequency(soapysdr::Direction::Rx, self.rx_ch, original_rx_freq, soapysdr::Args::new())
-            .map_err(|e| format!("restore RX frequency {:.0} Hz: {}", original_rx_freq, e))?;
-        if rx_active {
-            if let Some(rx) = &mut self.rx {
-                rx.activate(None).map_err(|e| format!("reactivate RX stream: {}", e))?;
-            }
-        }
-        if tx_active {
-            if let Some(tx) = &mut self.tx {
-                tx.activate(None).map_err(|e| format!("reactivate TX stream: {}", e))?;
-            }
-        }
+            .set_frequency(
+                soapysdr::Direction::Tx,
+                self.tx_ch,
+                session.live_tx_center_hz,
+                soapysdr::Args::new(),
+            )
+            .map_err(|e| format!("restore TX frequency {:.0} Hz: {}", session.live_tx_center_hz, e))?;
+        self.dev
+            .set_frequency(
+                soapysdr::Direction::Rx,
+                self.rx_ch,
+                session.live_rx_center_hz,
+                soapysdr::Args::new(),
+            )
+            .map_err(|e| format!("restore RX frequency {:.0} Hz: {}", session.live_rx_center_hz, e))?;
+        self.setup_live_streams_after_tx_calibration(session)?;
         self.initial_time = None;
         self.rx_next_count = 0;
         self.prev_time_ns = -1;
@@ -434,41 +669,30 @@ impl SoapyIo {
 
     fn capture_calibration_measurement(
         &mut self,
+        rx: &mut soapysdr::RxStream<StreamType>,
+        tx: &mut soapysdr::TxStream<StreamType>,
         baseline_dc: Option<ComplexF64>,
         tone: &[StreamType],
+        tone_hz: f64,
         coeffs: TxCalibrationCoefficients,
     ) -> Result<CalibrationMeasurement, String> {
         self.apply_tx_calibration_coefficients(coeffs, true, true)?;
         std::thread::sleep(std::time::Duration::from_millis(25));
 
-        let tx = self.tx.as_mut().ok_or_else(|| "TX stream unavailable".to_string())?;
-        tx.write_all(&[tone], None, false, 250_000)
-            .map_err(|e| format!("write calibration tone: {}", e))?;
-
-        let mut capture = vec![ComplexSample::ZERO; TX_CAL_CAPTURE_SAMPLES];
-        let rx = self.rx.as_mut().ok_or_else(|| "RX stream unavailable".to_string())?;
-        let len = rx
-            .read(&mut [&mut capture[..]], 250_000)
-            .map_err(|e| format!("read calibration capture: {}", e))?;
-        if len < TX_CAL_CAPTURE_SAMPLES / 2 {
-            return Err(format!("short calibration capture: {} samples", len));
-        }
-        capture.truncate(len);
-        Ok(measure_calibration_capture(&capture, self.rx_fs, TX_CAL_TONE_HZ, baseline_dc))
+        let capture = capture_calibration_samples(rx, tx, tone)?;
+        Ok(measure_calibration_capture(&capture, self.rx_fs, tone_hz, baseline_dc))
     }
 
-    fn capture_calibration_baseline_dc(&mut self) -> Result<ComplexF64, String> {
+    fn capture_calibration_baseline_dc(
+        &mut self,
+        rx: &mut soapysdr::RxStream<StreamType>,
+        tx: &mut soapysdr::TxStream<StreamType>,
+        block_len: usize,
+    ) -> Result<ComplexF64, String> {
         self.apply_tx_calibration_coefficients(TxCalibrationCoefficients::default(), true, true)?;
         std::thread::sleep(std::time::Duration::from_millis(25));
-        let mut capture = vec![ComplexSample::ZERO; TX_CAL_CAPTURE_SAMPLES];
-        let rx = self.rx.as_mut().ok_or_else(|| "RX stream unavailable".to_string())?;
-        let len = rx
-            .read(&mut [&mut capture[..]], 250_000)
-            .map_err(|e| format!("read calibration baseline capture: {}", e))?;
-        if len < TX_CAL_CAPTURE_SAMPLES / 2 {
-            return Err(format!("short calibration baseline capture: {} samples", len));
-        }
-        capture.truncate(len);
+        let zero = vec![ComplexSample::ZERO; block_len];
+        let capture = capture_calibration_samples(rx, tx, &zero)?;
         Ok(mean_complex(&capture))
     }
 
@@ -890,6 +1114,72 @@ fn mean_complex(samples: &[StreamType]) -> ComplexF64 {
     }
     let n = samples.len() as f64;
     ComplexF64 { re: re / n, im: im / n }
+}
+
+fn capture_calibration_samples(
+    rx: &mut soapysdr::RxStream<StreamType>,
+    tx: &mut soapysdr::TxStream<StreamType>,
+    tx_block: &[StreamType],
+) -> Result<Vec<StreamType>, String> {
+    let mut rx_block = vec![ComplexSample::ZERO; tx_block.len()];
+    let mut capture = Vec::with_capacity(tx_block.len() * TX_CAL_CAPTURE_BLOCKS);
+
+    for _ in 0..TX_CAL_PREFILL_BLOCKS {
+        tx.write_all(&[tx_block], None, false, 250_000)
+            .map_err(|e| format!("write calibration prefill block: {}", e))?;
+        read_calibration_block(rx, &mut rx_block, 250_000)?;
+    }
+
+    for block_idx in 0..(TX_CAL_SETTLE_BLOCKS + TX_CAL_CAPTURE_BLOCKS) {
+        tx.write_all(&[tx_block], None, false, 250_000)
+            .map_err(|e| format!("write calibration block: {}", e))?;
+        read_calibration_block(rx, &mut rx_block, 250_000)?;
+        if block_idx >= TX_CAL_SETTLE_BLOCKS {
+            capture.extend_from_slice(&rx_block);
+        }
+    }
+    if capture.len() < tx_block.len() {
+        return Err(format!("short calibration capture: {} samples", capture.len()));
+    }
+    Ok(capture)
+}
+
+fn read_calibration_block(rx: &mut soapysdr::RxStream<StreamType>, out: &mut [StreamType], timeout_us: i64) -> Result<(), String> {
+    let mut offset = 0;
+    while offset < out.len() {
+        let len = rx
+            .read(&mut [&mut out[offset..]], timeout_us)
+            .map_err(|e| format!("read calibration block: {}", e))?;
+        if len == 0 {
+            return Err("read calibration block: no samples".to_string());
+        }
+        offset += len;
+    }
+    Ok(())
+}
+
+fn args_from_pairs(pairs: &[(String, String)]) -> soapysdr::Args {
+    let mut args = soapysdr::Args::new();
+    for (key, value) in pairs {
+        args.set(key.as_str(), value.as_str());
+    }
+    args
+}
+
+fn stream_period_samples(args: &[(String, String)]) -> Option<usize> {
+    args.iter()
+        .find(|(key, _)| key == "period")
+        .and_then(|(_, value)| value.parse::<usize>().ok())
+        .filter(|period| *period > 0)
+}
+
+fn quantized_tone_hz(target_hz: f64, sample_rate: f64, block_len: usize) -> f64 {
+    if !target_hz.is_finite() || !sample_rate.is_finite() || sample_rate <= 0.0 || block_len < 4 {
+        return target_hz;
+    }
+    let max_bin = (block_len / 2).saturating_sub(1).max(1) as f64;
+    let bin = (target_hz * block_len as f64 / sample_rate).round().clamp(1.0, max_bin);
+    bin * sample_rate / block_len as f64
 }
 
 fn dft_at(samples: &[StreamType], sample_rate: f64, freq_hz: f64) -> ComplexF64 {
