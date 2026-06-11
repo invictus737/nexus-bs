@@ -1252,11 +1252,15 @@ fn serve_rf_carrier_post(stream: TcpStream, rf_cmd_tx: &Arc<Mutex<Option<CmdSend
     }
 
     tracing::warn!("Dashboard: RF carrier {} requested", if inhibited { "inhibit" } else { "enable" });
+    if !inhibited {
+        tracing::warn!("Dashboard: scheduling service restart after RF carrier enable to reinitialize SDR TX/RX state");
+        crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
+    }
     let body = serde_json::to_string(&serde_json::json!({
         "ok": true,
         "inhibited": inhibited,
-        "state": if inhibited { "carrier_inhibit_queued" } else { "carrier_enable_queued" },
-        "message": if inhibited { "RF carrier inhibit queued" } else { "RF carrier enable queued" },
+        "state": if inhibited { "carrier_inhibit_queued" } else { "carrier_enable_restart_queued" },
+        "message": if inhibited { "RF carrier inhibit queued" } else { "RF carrier enable queued; service restart follows for SDR reinit" },
     }))
     .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
     http_json_response(stream, 200, &body);
@@ -1361,12 +1365,12 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         match crate::rf_calibration::current_phase() {
             crate::rf_calibration::CalibrationPhase::Calibrated => break,
             crate::rf_calibration::CalibrationPhase::Failed => {
-                restore_rf_carrier_after_calibration(&rf_sender, "failed calibration");
+                schedule_restart_after_rf_calibration("failed calibration");
                 return;
             }
             _ if std::time::Instant::now() >= deadline => {
                 crate::rf_calibration::mark_failed("timeout waiting for PHY calibration");
-                restore_rf_carrier_after_calibration(&rf_sender, "calibration timeout");
+                schedule_restart_after_rf_calibration("calibration timeout");
                 return;
             }
             _ => std::thread::sleep(std::time::Duration::from_millis(250)),
@@ -1377,13 +1381,13 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         Ok(report) => report,
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration file was not readable after PHY finished: {}", err));
-            restore_rf_carrier_after_calibration(&rf_sender, "unreadable calibration file");
+            schedule_restart_after_rf_calibration("unreadable calibration file");
             return;
         }
     };
     if !report.report.accepted {
         crate::rf_calibration::mark_failed(format!("calibration rejected; config not changed: {}", report.report.summary));
-        restore_rf_carrier_after_calibration(&rf_sender, "rejected calibration");
+        schedule_restart_after_rf_calibration("rejected calibration");
         return;
     }
 
@@ -1397,9 +1401,17 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         }
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration accepted but config update failed: {}", err));
-            restore_rf_carrier_after_calibration(&rf_sender, "config update failure");
+            schedule_restart_after_rf_calibration("config update failure");
         }
     }
+}
+
+fn schedule_restart_after_rf_calibration(reason: &str) {
+    crate::rf_calibration::mark_restarting(format!(
+        "service restart scheduled after {}; full SDR reinit required after destructive calibration",
+        reason
+    ));
+    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
 }
 
 fn restore_rf_carrier_after_calibration(rf_sender: &Option<CmdSender>, reason: &str) {

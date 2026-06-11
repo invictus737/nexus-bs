@@ -789,6 +789,7 @@ impl TxSignalMonitor {
     const FFT_LEN: usize = 512;
     const CONSTELLATION_POINTS: usize = 192;
     const CONSTELLATION_ENCODE_SCALE: RealSample = 32767.0 / 1.5;
+    const MIN_OBSERVABLE_TX_RMS: RealSample = 1.0e-6;
 
     fn new(fft_planner: &mut FftPlanner, sink: TelemetrySink, sample_rate: RealSample, center_frequency: f64) -> Self {
         let fft = fft_planner.plan_fft_forward(Self::FFT_LEN);
@@ -856,6 +857,15 @@ impl TxSignalMonitor {
             }
         }
         let rms = (sum2 / n).sqrt();
+        if !tx_monitor_signal_present(rms) {
+            if need_visual {
+                self.next_visual_emit = now + self.visual_interval;
+            }
+            if need_quality {
+                self.next_quality_emit = now + self.quality_interval;
+            }
+            return;
+        }
         let rms_dbfs = 20.0 * rms.max(1.0e-12).log10();
         let peak_dbfs = 20.0 * peak2.sqrt().max(1.0e-12).log10();
 
@@ -1029,6 +1039,10 @@ impl TxSignalMonitor {
         }
         (points, evm_pct)
     }
+}
+
+fn tx_monitor_signal_present(rms: RealSample) -> bool {
+    rms.is_finite() && rms >= TxSignalMonitor::MIN_OBSERVABLE_TX_RMS
 }
 
 /// Find the smallest contiguous band around the centre bin that contains the
@@ -1277,5 +1291,13 @@ mod tests {
         assert_eq!(nonnegative_count(-1200), 0);
         assert_eq!(nonnegative_count(0), 0);
         assert_eq!(nonnegative_count(13), 13);
+    }
+
+    #[test]
+    fn tx_monitor_rejects_silence_as_signal_quality() {
+        assert!(!tx_monitor_signal_present(0.0));
+        assert!(!tx_monitor_signal_present(TxSignalMonitor::MIN_OBSERVABLE_TX_RMS * 0.5));
+        assert!(tx_monitor_signal_present(TxSignalMonitor::MIN_OBSERVABLE_TX_RMS));
+        assert!(tx_monitor_signal_present(0.05));
     }
 }
