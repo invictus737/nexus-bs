@@ -3388,7 +3388,7 @@ fn test_u_itsi_detach_deaffiliates_deregisters_and_clears_energy_saving() {
 }
 
 #[test]
-fn test_hard_roaming_reregistration_resets_shared_groups_and_energy_saving() {
+fn test_explicit_empty_roaming_reregistration_resets_shared_groups_and_energy_saving() {
     debug::setup_logging_verbose();
     let issi = 2040814;
     let gssi = 3000;
@@ -3419,11 +3419,11 @@ fn test_hard_roaming_reregistration_resets_shared_groups_and_energy_saving() {
 
     backdate_mm_registration(&mut test, issi, 121);
 
-    // EN 300 392-2 clauses 16.4.1.1 and 16.7.1: once the old MS is treated
-    // as a hard roaming re-registration, accepted group and energy-economy
-    // state must be rebuilt from the new procedure rather than inherited from
-    // the stale local registration.
-    submit_location_update_with_type(&mut test, issi, LocationUpdateType::RoamingLocationUpdating, None);
+    // EN 300 392-2 clauses 16.4.1.1, 16.8.3/16.8.4 and 16.10.27a: an
+    // explicit complete empty group report carries authoritative group state.
+    // In that case accepted group and energy-economy state must be rebuilt
+    // from the new procedure rather than inherited from stale local state.
+    submit_location_update_with_group_report_response(&mut test, issi, LocationUpdateType::RoamingLocationUpdating, 1, 0);
     test.run_stack(Some(1));
     let sink_msgs = test.dump_sinks();
 
@@ -3446,7 +3446,7 @@ fn test_hard_roaming_reregistration_resets_shared_groups_and_energy_saving() {
     assert!(state.subscribers.is_registered(issi));
     assert!(
         state.subscribers.group_members(gssi).is_empty(),
-        "hard roaming re-registration without group list must clear stale shared GSSI membership"
+        "explicit empty roaming group report must clear stale shared GSSI membership"
     );
     assert!(
         !state.energy_saving.contains_key(&issi),
@@ -6287,11 +6287,11 @@ fn test_restart_recovery_complete_group_report_abandons_pending_swmi_refresh() {
 }
 
 #[test]
-fn test_hard_roaming_location_update_abandons_pending_restart_group_refresh() {
+fn test_group_less_roaming_location_update_preserves_restart_group_affiliation() {
     debug::setup_logging_verbose();
     let issi = 2260616;
     let gssi = 226333;
-    let path = unique_restart_recovery_path("hard-roaming-abandons-cached-swmi-refresh");
+    let path = unique_restart_recovery_path("group-less-roaming-preserves-cached-affiliation");
     std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
@@ -6321,25 +6321,27 @@ fn test_hard_roaming_location_update_abandons_pending_restart_group_refresh() {
         accept.location_update_accept_type,
         LocationUpdateAcceptType::RoamingLocationUpdating
     );
-    assert!(!debug_mm_swmi_group_transaction_pending(&mut test, issi));
+    assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
     assert!(
         subscriber_updates(&roaming_msgs)
             .iter()
-            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups == vec![gssi]),
-        "hard group-less roaming re-registration must clear the old restart group"
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate && update.action != BrewSubscriberAction::Deregister),
+        "group-less roaming LU must not imply group de-affiliation, got {:?}",
+        subscriber_updates(&roaming_msgs)
     );
-    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 
     submit_swmi_group_ack(&mut test, issi, 123_456, false, vec![]);
     test.run_stack(Some(1));
-    let stale_ack_msgs = test.dump_sinks();
+    let ack_msgs = test.dump_sinks();
     assert!(
-        subscriber_updates(&stale_ack_msgs)
+        subscriber_updates(&ack_msgs)
             .iter()
-            .all(|update| update.action != BrewSubscriberAction::Affiliate),
-        "late ACK from the abandoned restart refresh must not re-affiliate after hard roaming re-registration"
+            .all(|update| update.action != BrewSubscriberAction::Deaffiliate && update.action != BrewSubscriberAction::Deregister),
+        "ACK after preserved group-less roaming must not clear the still-valid group, got {:?}",
+        subscriber_updates(&ack_msgs)
     );
-    assert!(test.config.state_read().subscribers.group_members(gssi).is_empty());
+    assert_eq!(test.config.state_read().subscribers.group_members(gssi), vec![issi]);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));

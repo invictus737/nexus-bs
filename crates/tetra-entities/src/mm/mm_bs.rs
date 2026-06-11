@@ -2095,30 +2095,37 @@ impl MmBs {
             let needs_cleanup = if pdu.location_update_type == LocationUpdateType::RoamingLocationUpdating
                 || pdu.location_update_type == LocationUpdateType::ServiceRestorationRoamingLocationUpdating
             {
-                // Some terminals (e.g. Sepura) send RoamingLocationUpdating after every PTT
-                // release, not just on power-cycle or RF loss. If we treat this as a full reboot
-                // and do deregister→register, CMCE has a brief window where it doesn't know the
-                // terminal — a PTT press in that window gets "no listeners" and the terminal
-                // interprets it as a network error and fully disconnects.
-                //
-                // Heuristic: treat RoamingLocationUpdating as a soft re-attach (no cleanup) if
-                // the terminal registered less than 120 seconds ago.
+                // ETSI EN 300 392-2 clauses 16.4.1.1/16.9.3.4 allow a roaming
+                // location update to omit group state. Group attachment is a
+                // separate MM procedure (clauses 16.8.0/16.8.2), and detach-all
+                // requires explicit group identity state (16.10.17) or an
+                // explicit complete empty group report (16.10.27a). A bare
+                // group-less roaming LU from a known MS therefore must not be
+                // interpreted as group de-affiliation.
+                let group_less_roaming_update = !location_update_carries_group_state;
                 let recently_registered = self
                     .client_mgr
                     .get_client_by_issi(issi)
                     .map(|c| c.last_registration_time.elapsed().as_secs() < 120)
                     .unwrap_or(false);
-                if recently_registered {
-                    tracing::debug!(
-                        "MM: ISSI {} RoamingLocationUpdating within 120s of last register — treating as soft re-attach (Sepura post-PTT)",
-                        issi
-                    );
+                if group_less_roaming_update || recently_registered {
+                    if group_less_roaming_update {
+                        tracing::info!(
+                            "MM: ISSI {} {:?} without group state - treating as soft re-attach and preserving persistent group affiliation",
+                            issi,
+                            pdu.location_update_type
+                        );
+                    } else {
+                        tracing::debug!(
+                            "MM: ISSI {} RoamingLocationUpdating within 120s of last register - treating as soft re-attach (post-PTT)",
+                            issi
+                        );
+                    }
                     // Even on soft re-attach, force CMCE to release any individual P2P calls
                     // involving this ISSI. Terminals (e.g. Motorola MTP3550) that drop RF for
-                    // 2s and re-attach lose call state but BS keeps the call alive — next PTT
-                    // is rejected ("PTT denied") because the terminal doesn't recognize the call_id
-                    // in our D-TX-GRANTED. Releasing the individual call here forces a clean U-SETUP
-                    // on the next PTT.
+                    // 2s and re-attach lose call state but BS keeps the call alive; the next PTT
+                    // can be rejected because the terminal does not recognize the old call_id.
+                    // Releasing the individual call here forces a clean U-SETUP on the next PTT.
                     self.emit_individual_call_release_for_issi(queue, issi);
                     soft_reattach_cmce_reset = true;
                     false
