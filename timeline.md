@@ -14851,3 +14851,40 @@ TETRA Phase Modulation SRRC Pulse Shaping Upgrade - 2026-06-11:
   - worst symbol-spaced TX/RX cascade ISI: 1.073% -> 0.064%;
   - 12.5 kHz to 25 kHz adjacent-band energy proxy: -42.8 dB -> -56.2 dB;
   - >25 kHz energy proxy: -63.1 dB -> -70.4 dB.
+
+TETRA Polyphase TX and Known-Symbol RF EVM Calibration - 2026-06-11 17:17 EEST:
+
+- User requested the next PHY/RF steps:
+  - TX polyphase SRRC implementation;
+  - real EVM measured on known TETRA sequences captured through RF
+    loopback/receiver, not blind dashboard constellation snapping;
+  - tighter DC/IQ/PA calibration evidence for commercial-grade constellation
+    work.
+- Clause scope:
+  - TS 100 392-2 clauses 5.4 to 5.6 cover pi/4-DQPSK mapping and SRRC
+    phase-modulation pulse shaping;
+  - clause 6.6.1 is the scoped EVM reference: symbol-time modulation
+    accuracy after RX filtering with gain/DC/frequency rotation estimated;
+  - this is engineering evidence only, not formal ETSI/TETRA certification.
+- Fix:
+  - replaced runtime TX zero-stuffed symmetric FIR evaluation with a polyphase
+    SRRC pulse shaper that is bit-exact against the previous full-rate FIR
+    output;
+  - added `calibration.toml` fields for real known-symbol TETRA EVM before
+    and after calibration, kept separate from the older CW `evm_proxy_pct`;
+  - added destructive calibration capture of a deterministic pi/4-DQPSK known
+    sequence through the same 72 kHz <-> SDR FCFB path used by runtime TX/RX;
+  - IQ acceptance now requires known-symbol TETRA EVM not to degrade, while
+    DC-only carrier-leak correction can still be accepted and reported
+    separately;
+  - report now records an RF limiting-factor hint such as carrier leak,
+    IQ/image rejection, loopback SNR/noise floor, PA/gain compression, or
+    TETRA modulation EVM.
+- Verification:
+  - `cargo test -p tetra-entities --lib phy::components::modulator --locked` passed.
+  - `cargo test -p tetra-entities --lib phy::components::evm --locked` passed.
+  - `cargo test -p tetra-config --lib bluestation::sec_phy_soapy --locked` passed.
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked` passed, including clean FCFB known-symbol EVM loopback.
+  - `cargo test -p tetra-entities --test test_phy_bs --locked` passed.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `git diff --check` passed.

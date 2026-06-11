@@ -151,6 +151,12 @@ pub struct TxCalibrationPoint {
     pub carrier_leakage_dbfs: f64,
     pub image_rejection_db: f64,
     pub evm_proxy_pct: f64,
+    pub tetra_known_rms_evm_pct: Option<f64>,
+    pub tetra_known_peak_evm_pct: Option<f64>,
+    pub tetra_known_differential_rms_deg: Option<f64>,
+    pub tetra_known_symbols_used: Option<usize>,
+    pub tetra_known_timing_sample: Option<f64>,
+    pub tetra_known_frequency_rotation_rad_per_symbol: Option<f64>,
     pub signal_dbfs: f64,
     pub noise_floor_dbfs: f64,
     pub floor_before_dbfs: f64,
@@ -179,6 +185,10 @@ pub struct TxCalibrationReport {
     pub carrier_leakage_improvement_db: f64,
     pub image_rejection_improvement_db: f64,
     pub evm_proxy_improvement_pct: f64,
+    pub tetra_known_rms_evm_improvement_pct: Option<f64>,
+    pub tetra_known_peak_evm_improvement_pct: Option<f64>,
+    pub tetra_known_evm_quality_ok: bool,
+    pub rf_limiting_factor: String,
     pub accepted: bool,
     pub accepted_dc: bool,
     pub accepted_iq: bool,
@@ -273,6 +283,44 @@ pub fn validate_tx_calibration_file(file: &TxCalibrationFile) -> Result<(), Stri
             return Err(format!("{name} must be finite"));
         }
     }
+    for (name, value) in [
+        ("reference.tetra_known_rms_evm_pct", file.reference.tetra_known_rms_evm_pct),
+        ("reference.tetra_known_peak_evm_pct", file.reference.tetra_known_peak_evm_pct),
+        (
+            "reference.tetra_known_differential_rms_deg",
+            file.reference.tetra_known_differential_rms_deg,
+        ),
+        ("reference.tetra_known_timing_sample", file.reference.tetra_known_timing_sample),
+        (
+            "reference.tetra_known_frequency_rotation_rad_per_symbol",
+            file.reference.tetra_known_frequency_rotation_rad_per_symbol,
+        ),
+        ("calibrated.tetra_known_rms_evm_pct", file.calibrated.tetra_known_rms_evm_pct),
+        ("calibrated.tetra_known_peak_evm_pct", file.calibrated.tetra_known_peak_evm_pct),
+        (
+            "calibrated.tetra_known_differential_rms_deg",
+            file.calibrated.tetra_known_differential_rms_deg,
+        ),
+        ("calibrated.tetra_known_timing_sample", file.calibrated.tetra_known_timing_sample),
+        (
+            "calibrated.tetra_known_frequency_rotation_rad_per_symbol",
+            file.calibrated.tetra_known_frequency_rotation_rad_per_symbol,
+        ),
+        (
+            "report.tetra_known_rms_evm_improvement_pct",
+            file.report.tetra_known_rms_evm_improvement_pct,
+        ),
+        (
+            "report.tetra_known_peak_evm_improvement_pct",
+            file.report.tetra_known_peak_evm_improvement_pct,
+        ),
+    ] {
+        if let Some(value) = value {
+            if !value.is_finite() {
+                return Err(format!("{name} must be finite"));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -327,6 +375,12 @@ mod tests {
                 carrier_leakage_dbfs: -50.0,
                 image_rejection_db: 25.0,
                 evm_proxy_pct: 4.5,
+                tetra_known_rms_evm_pct: Some(8.2),
+                tetra_known_peak_evm_pct: Some(22.0),
+                tetra_known_differential_rms_deg: Some(3.4),
+                tetra_known_symbols_used: Some(192),
+                tetra_known_timing_sample: Some(47.5),
+                tetra_known_frequency_rotation_rad_per_symbol: Some(0.002),
                 signal_dbfs: -20.0,
                 noise_floor_dbfs: -75.0,
                 floor_before_dbfs: -81.0,
@@ -351,6 +405,12 @@ mod tests {
                 carrier_leakage_dbfs: -68.0,
                 image_rejection_db: 41.0,
                 evm_proxy_pct: 1.2,
+                tetra_known_rms_evm_pct: Some(4.8),
+                tetra_known_peak_evm_pct: Some(15.5),
+                tetra_known_differential_rms_deg: Some(1.6),
+                tetra_known_symbols_used: Some(192),
+                tetra_known_timing_sample: Some(48.0),
+                tetra_known_frequency_rotation_rad_per_symbol: Some(0.001),
                 signal_dbfs: -20.0,
                 noise_floor_dbfs: -76.0,
                 floor_before_dbfs: -80.9,
@@ -373,6 +433,10 @@ mod tests {
                 carrier_leakage_improvement_db: 18.0,
                 image_rejection_improvement_db: 16.0,
                 evm_proxy_improvement_pct: 3.3,
+                tetra_known_rms_evm_improvement_pct: Some(3.4),
+                tetra_known_peak_evm_improvement_pct: Some(6.5),
+                tetra_known_evm_quality_ok: true,
+                rf_limiting_factor: "within_known_evm_gate".to_string(),
                 accepted: true,
                 accepted_dc: true,
                 accepted_iq: true,
@@ -413,6 +477,9 @@ mod tests {
         assert_eq!(parsed.device.duplex_shift_hz, 7_000_000.0);
         assert_eq!(parsed.device.loopback_source, "rx_internal_lb");
         assert_eq!(parsed.device.rx_gains_fingerprint, "LNA=42.00,PGA=16.00");
+        assert_eq!(parsed.reference.tetra_known_symbols_used, Some(192));
+        assert_eq!(parsed.report.tetra_known_rms_evm_improvement_pct, Some(3.4));
+        assert_eq!(parsed.report.rf_limiting_factor, "within_known_evm_gate");
         assert!(parsed.report.accepted);
     }
 

@@ -3,7 +3,6 @@ use tetra_core::TdmaTime;
 use tetra_pdus::phy::traits::rxtx_dev::TxSlotBits;
 
 use crate::phy::components::dsp_types::*;
-use crate::phy::components::fir;
 use crate::phy::components::modem_common::*;
 
 /// Samples per symbol
@@ -11,6 +10,9 @@ const SPS: SampleCount = 4;
 
 /// Samples per slot
 const SAMPLES_SLOT: SampleCount = SPS * 255;
+
+const FULL_CHANNEL_FILTER_TAPS: usize = CHANNEL_FILTER_TAPS.len() * 2;
+const POLYPHASE_SYMBOL_HISTORY: usize = FULL_CHANNEL_FILTER_TAPS / SPS as usize;
 
 /// Output sample rate
 pub const SAMPLE_RATE: f64 = 18000.0 * SPS as f64;
@@ -24,6 +26,7 @@ pub enum Mode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::phy::components::fir;
 
     fn phase_index(symbol: ComplexSample) -> i8 {
         ((symbol.im.atan2(symbol.re) / sample_consts::FRAC_PI_4).round() as i8).rem_euclid(8)
@@ -43,14 +46,41 @@ mod tests {
 
         assert_eq!(phases, vec![5, 4, 5, 0]);
     }
+
+    #[test]
+    fn polyphase_pulse_shaper_matches_zero_stuffed_symmetric_fir() {
+        let mut legacy = fir::FirComplexSym::new(CHANNEL_FILTER_TAPS.len());
+        let mut polyphase = PolyphasePulseShaper::new();
+        let mut mapper = DqpskMapper::new();
+
+        for sample_idx in 0..520 {
+            let phase = sample_idx % SPS as usize;
+            let input = if phase == 0 {
+                let symbol_idx = sample_idx / SPS as usize;
+                mapper.symbol((symbol_idx & 1) != 0, (symbol_idx & 2) != 0)
+            } else {
+                ComplexSample::ZERO
+            };
+
+            let legacy_sample = legacy.sample(&CHANNEL_FILTER_TAPS, input);
+            let polyphase_sample = polyphase.sample(phase, input);
+            assert!(
+                (legacy_sample - polyphase_sample).norm() < 1.0e-6,
+                "sample {} legacy={} polyphase={}",
+                sample_idx,
+                legacy_sample,
+                polyphase_sample
+            );
+        }
+    }
 }
 
 pub struct Modulator {
     mode: Mode,
     /// Sample counter value at the beginning of hyperframe number 0
     reference_time: SampleCount,
-    /// Pulse shaping filter
-    filter: fir::FirComplexSym,
+    /// Polyphase pulse shaping filter.
+    pulse: PolyphasePulseShaper,
     dqpsk: DqpskMapper,
 }
 
@@ -65,7 +95,7 @@ impl Modulator {
         Self {
             mode,
             reference_time: 0,
-            filter: fir::FirComplexSym::new(CHANNEL_FILTER_TAPS.len()),
+            pulse: PolyphasePulseShaper::new(),
             dqpsk: DqpskMapper::new(),
         }
     }
@@ -101,7 +131,59 @@ impl Modulator {
                 }
             }
         }
-        Ok(self.filter.sample(&CHANNEL_FILTER_TAPS, sample))
+
+        Ok(self.pulse.sample(sample_counter.rem_euclid(SPS) as usize, sample))
+    }
+}
+
+struct PolyphasePulseShaper {
+    newest_symbol: usize,
+    symbols: [ComplexSample; POLYPHASE_SYMBOL_HISTORY],
+}
+
+impl PolyphasePulseShaper {
+    fn new() -> Self {
+        Self {
+            newest_symbol: 0,
+            symbols: [ComplexSample::ZERO; POLYPHASE_SYMBOL_HISTORY],
+        }
+    }
+
+    fn sample(&mut self, phase: usize, input: ComplexSample) -> ComplexSample {
+        debug_assert!(phase < SPS as usize);
+
+        if phase == 0 {
+            self.newest_symbol = if self.newest_symbol == 0 {
+                POLYPHASE_SYMBOL_HISTORY - 1
+            } else {
+                self.newest_symbol - 1
+            };
+            self.symbols[self.newest_symbol] = input;
+        }
+
+        let mut out = ComplexSample::ZERO;
+        let mut delay = phase;
+        let mut symbol_delay = 0;
+        while delay < FULL_CHANNEL_FILTER_TAPS {
+            out += self.symbol(symbol_delay) * full_channel_filter_tap(delay);
+            delay += SPS as usize;
+            symbol_delay += 1;
+        }
+        out
+    }
+
+    fn symbol(&self, delay_symbols: usize) -> ComplexSample {
+        self.symbols[(self.newest_symbol + delay_symbols) % POLYPHASE_SYMBOL_HISTORY]
+    }
+}
+
+fn full_channel_filter_tap(delay_samples: usize) -> RealSample {
+    debug_assert!(delay_samples < FULL_CHANNEL_FILTER_TAPS);
+    let half_len = CHANNEL_FILTER_TAPS.len();
+    if delay_samples < half_len {
+        CHANNEL_FILTER_TAPS[half_len - 1 - delay_samples]
+    } else {
+        CHANNEL_FILTER_TAPS[delay_samples - half_len]
     }
 }
 

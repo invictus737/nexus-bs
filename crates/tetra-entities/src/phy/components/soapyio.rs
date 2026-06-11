@@ -10,6 +10,11 @@ use tetra_config::bluestation::{
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 
 use super::dsp_types::*;
+use super::evm;
+use super::fcfb;
+use super::fir;
+use super::modem_common::CHANNEL_FILTER_TAPS;
+use super::modulator;
 use super::soapy_settings;
 use super::soapy_settings::{SdrSettings, SupportedDevice};
 use super::soapy_time::{ticks_to_time_ns, time_ns_to_ticks};
@@ -18,6 +23,10 @@ type StreamType = ComplexSample;
 const SOAPY_FREQ_OFFSET: f64 = 20000.0;
 const TX_CAL_TONE_HZ: f64 = 24_000.0;
 const TX_CAL_TONE_AMPLITUDE: f32 = 0.20;
+const TX_CAL_TETRA_AMPLITUDE: f32 = 0.20;
+const TX_CAL_TETRA_PATTERN_SYMBOLS: usize = 24;
+const TX_CAL_TETRA_REFERENCE_SYMBOLS: usize = 384;
+const TX_CAL_TETRA_ANALYSIS_BANDWIDTH_HZ: f64 = 25_000.0;
 const TX_CAL_FALLBACK_BLOCK_SAMPLES: usize = 4096;
 const TX_CAL_PREFILL_BLOCKS: usize = 8;
 const TX_CAL_SETTLE_BLOCKS: usize = 3;
@@ -43,6 +52,7 @@ const TX_CAL_CONFIRM_MAX_CARRIER_SPREAD_DB: f64 = 2.0;
 const TX_CAL_CONFIRM_MAX_SIGNAL_SPREAD_DB: f64 = 1.0;
 const TX_CAL_CONFIRM_MAX_IMAGE_WORSEN_DB: f64 = 1.0;
 const TX_CAL_CONFIRM_MAX_EVM_WORSEN_PCT: f64 = 1.0;
+const TX_CAL_CONFIRM_MAX_KNOWN_EVM_WORSEN_PCT: f64 = 1.0;
 const TX_CAL_MAX_COMPONENT_ABS: f64 = 0.85;
 const TX_CAL_CLIP_LEVEL: f32 = 0.98;
 const TX_CAL_MAX_CLIPPED_FRACTION: f64 = 0.001;
@@ -456,7 +466,7 @@ impl SoapyIo {
             warm_tx_calibration_streams(&mut rx_stream, &mut tx_stream, block_len, &mut timing)?;
             let rx_baseline = self.capture_rx_only_calibration_baseline(&mut rx_stream, &mut tx_stream, block_len, &mut timing)?;
             let neutral = TxCalibrationCoefficients::default();
-            let reference_meas = self.capture_calibration_measurement(
+            let mut reference_meas = self.capture_calibration_measurement(
                 &mut rx_stream,
                 &mut tx_stream,
                 rx_baseline,
@@ -480,6 +490,30 @@ impl SoapyIo {
                     session.live_rx_carrier_hz,
                     session.live_tx_carrier_hz
                 ));
+            }
+            match self.capture_tetra_known_evm_measurement(
+                &mut rx_stream,
+                &mut tx_stream,
+                neutral,
+                block_len,
+                session.calibration_center_hz,
+                &mut timing,
+                false,
+            ) {
+                Ok(known) => {
+                    tracing::warn!(
+                        "SoapySDR: TETRA known-symbol EVM reference rms={:.2}% peak={:.2}% diff={:.2}deg symbols={} timing={:.2}",
+                        known.rms_evm_pct,
+                        known.peak_evm_pct,
+                        known.differential_rms_deg,
+                        known.symbols_used,
+                        known.timing_sample
+                    );
+                    reference_meas.tetra_known = Some(known);
+                }
+                Err(err) => {
+                    tracing::warn!("SoapySDR: TETRA known-symbol EVM reference unavailable: {}", err);
+                }
             }
 
             let mut best = neutral;
@@ -554,11 +588,44 @@ impl SoapyIo {
                 applied.dc_q = dc_best.dc_q;
             }
             if iq_preaccepted {
-                applied = iq_best;
-                candidate_has_iq = true;
+                match self.capture_tetra_known_evm_measurement(
+                    &mut rx_stream,
+                    &mut tx_stream,
+                    iq_best,
+                    block_len,
+                    session.calibration_center_hz,
+                    &mut timing,
+                    false,
+                ) {
+                    Ok(known) => {
+                        let safe = tetra_known_evm_candidate_safe(reference_meas.tetra_known, Some(known), true);
+                        tracing::warn!(
+                            "SoapySDR: TETRA known-symbol EVM IQ probe rms={:.2}% peak={:.2}% safe={} symbols={} timing={:.2}",
+                            known.rms_evm_pct,
+                            known.peak_evm_pct,
+                            safe,
+                            known.symbols_used,
+                            known.timing_sample
+                        );
+                        if safe {
+                            applied = iq_best;
+                            candidate_has_iq = true;
+                        } else {
+                            tracing::warn!(
+                                "SoapySDR: TX IQ candidate improves CW image but is not safe on known-symbol TETRA EVM; falling back to DC-only"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "SoapySDR: TX IQ candidate improves CW image but known-symbol TETRA EVM probe failed: {}; falling back to DC-only",
+                            err
+                        );
+                    }
+                }
             }
 
-            let (confirmation, final_meas) = if applied != TxCalibrationCoefficients::default() {
+            let (confirmation, mut final_meas) = if applied != TxCalibrationCoefficients::default() {
                 self.confirm_calibration_candidate(
                     &mut rx_stream,
                     &mut tx_stream,
@@ -583,9 +650,38 @@ impl SoapyIo {
                 )?;
                 (CalibrationConfirmation::default(), meas)
             };
+            match self.capture_tetra_known_evm_measurement(
+                &mut rx_stream,
+                &mut tx_stream,
+                applied,
+                block_len,
+                session.calibration_center_hz,
+                &mut timing,
+                false,
+            ) {
+                Ok(known) => {
+                    tracing::warn!(
+                        "SoapySDR: TETRA known-symbol EVM final rms={:.2}% peak={:.2}% diff={:.2}deg symbols={} timing={:.2}",
+                        known.rms_evm_pct,
+                        known.peak_evm_pct,
+                        known.differential_rms_deg,
+                        known.symbols_used,
+                        known.timing_sample
+                    );
+                    final_meas.tetra_known = Some(known);
+                }
+                Err(err) => {
+                    tracing::warn!("SoapySDR: TETRA known-symbol EVM final unavailable: {}", err);
+                }
+            }
             let carrier_improvement = reference_meas.carrier_leakage_dbc - final_meas.carrier_leakage_dbc;
             let image_improvement = final_meas.image_rejection_db - reference_meas.image_rejection_db;
             let evm_improvement = reference_meas.evm_proxy_pct - final_meas.evm_proxy_pct;
+            let tetra_known_rms_improvement = tetra_known_rms_evm_improvement(reference_meas.tetra_known, final_meas.tetra_known);
+            let tetra_known_peak_improvement = tetra_known_peak_evm_improvement(reference_meas.tetra_known, final_meas.tetra_known);
+            let tetra_known_quality_ok = tetra_known_evm_quality_ok(final_meas.tetra_known);
+            let known_evm_acceptance_ok =
+                tetra_known_evm_candidate_safe(reference_meas.tetra_known, final_meas.tetra_known, candidate_has_iq);
             let image_quality_ok = calibration_image_quality_ok(&final_meas);
             let final_quality_ok = calibration_final_quality_ok(&final_meas, &confirmation);
             let accepted = applied != TxCalibrationCoefficients::default()
@@ -593,6 +689,7 @@ impl SoapyIo {
                 && confirmation.confirmed
                 && timing.confirmation_ok()
                 && final_quality_ok
+                && known_evm_acceptance_ok
                 && (!candidate_has_iq || image_quality_ok);
             let accepted_dc = accepted;
             let accepted_iq = accepted && candidate_has_iq;
@@ -641,6 +738,10 @@ impl SoapyIo {
                     carrier_leakage_improvement_db: carrier_improvement,
                     image_rejection_improvement_db: image_improvement,
                     evm_proxy_improvement_pct: evm_improvement,
+                    tetra_known_rms_evm_improvement_pct: tetra_known_rms_improvement,
+                    tetra_known_peak_evm_improvement_pct: tetra_known_peak_improvement,
+                    tetra_known_evm_quality_ok: tetra_known_quality_ok,
+                    rf_limiting_factor: rf_limiting_factor(&final_meas, tetra_known_quality_ok).to_string(),
                     accepted,
                     accepted_dc,
                     accepted_iq,
@@ -668,8 +769,9 @@ impl SoapyIo {
                         } else {
                             String::new()
                         };
+                        let known_suffix = tetra_known_summary_suffix(&reference_meas, &final_meas);
                         format!(
-                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB{}",
+                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB{}{}",
                             accepted_mode,
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
@@ -682,6 +784,7 @@ impl SoapyIo {
                             final_meas.snr_db,
                             confirmation.carrier_spread_db,
                             confirmation.signal_spread_db,
+                            known_suffix,
                             timing_suffix
                         )
                     } else {
@@ -693,8 +796,9 @@ impl SoapyIo {
                         } else {
                             String::new()
                         };
+                        let known_suffix = tetra_known_summary_suffix(&reference_meas, &final_meas);
                         format!(
-                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} confirm spread carrier {:.1} dB signal {:.1} dB{}",
+                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} known_evm_safe={} confirm spread carrier {:.1} dB signal {:.1} dB{}{}",
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
                             final_meas.carrier_leakage_dbc,
@@ -708,8 +812,10 @@ impl SoapyIo {
                             confirmation.confirmed,
                             final_quality_ok,
                             image_quality_ok,
+                            known_evm_acceptance_ok,
                             confirmation.carrier_spread_db,
                             confirmation.signal_spread_db,
+                            known_suffix,
                             timing_suffix
                         )
                     },
@@ -910,6 +1016,39 @@ impl SoapyIo {
             tone_hz,
             rx_baseline,
         ))
+    }
+
+    fn capture_tetra_known_evm_measurement(
+        &mut self,
+        rx: &mut soapysdr::RxStream<StreamType>,
+        tx: &mut soapysdr::TxStream<StreamType>,
+        coeffs: TxCalibrationCoefficients,
+        block_len: usize,
+        calibration_center_hz: f64,
+        timing: &mut CalibrationTiming,
+        confirmation: bool,
+    ) -> Result<TetraKnownEvmMeasurement, String> {
+        self.apply_tx_calibration_coefficients(coeffs, true, true)?;
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        drain_tx_stream_status(tx, timing, confirmation);
+
+        let total_blocks = TX_CAL_PREFILL_BLOCKS + TX_CAL_SETTLE_BLOCKS + TX_CAL_CAPTURE_BLOCKS;
+        let tx_sequence_len = block_len
+            .checked_mul(total_blocks)
+            .ok_or_else(|| "TETRA known-EVM calibration sequence length overflow".to_string())?;
+        let tx_sequence = synthesize_tetra_calibration_tx_sequence(self.tx_fs, calibration_center_hz, tx_sequence_len)?;
+        let capture = capture_calibration_sequence_samples(rx, tx, &tx_sequence, block_len, timing, confirmation)?;
+        let modem_samples = downconvert_tetra_calibration_capture(&capture, self.rx_fs, calibration_center_hz)?;
+        let reference_symbols = tetra_calibration_reference_symbols(TX_CAL_TETRA_REFERENCE_SYMBOLS)?;
+        let report = evm::evaluate_modulation_accuracy(&modem_samples, &reference_symbols, evm::TETRA_MODEM_SPS).ok_or_else(|| {
+            format!(
+                "TETRA known-symbol EVM could not lock: modem_samples={} reference_symbols={}",
+                modem_samples.len(),
+                reference_symbols.len()
+            )
+        })?;
+
+        Ok(report.into())
     }
 
     fn capture_rx_only_calibration_baseline(
@@ -1236,6 +1375,7 @@ struct CalibrationMeasurement {
     carrier_leakage_dbfs: f64,
     image_rejection_db: f64,
     evm_proxy_pct: f64,
+    tetra_known: Option<TetraKnownEvmMeasurement>,
     signal_dbfs: f64,
     noise_floor_dbfs: f64,
     floor_before_dbfs: f64,
@@ -1258,6 +1398,12 @@ impl CalibrationMeasurement {
             carrier_leakage_dbfs: self.carrier_leakage_dbfs,
             image_rejection_db: self.image_rejection_db,
             evm_proxy_pct: self.evm_proxy_pct,
+            tetra_known_rms_evm_pct: self.tetra_known.map(|evm| evm.rms_evm_pct),
+            tetra_known_peak_evm_pct: self.tetra_known.map(|evm| evm.peak_evm_pct),
+            tetra_known_differential_rms_deg: self.tetra_known.map(|evm| evm.differential_rms_deg),
+            tetra_known_symbols_used: self.tetra_known.map(|evm| evm.symbols_used),
+            tetra_known_timing_sample: self.tetra_known.map(|evm| evm.timing_sample),
+            tetra_known_frequency_rotation_rad_per_symbol: self.tetra_known.map(|evm| evm.frequency_rotation_rad_per_symbol),
             signal_dbfs: self.signal_dbfs,
             noise_floor_dbfs: self.noise_floor_dbfs,
             floor_before_dbfs: self.floor_before_dbfs,
@@ -1269,6 +1415,29 @@ impl CalibrationMeasurement {
             max_component_abs: self.max_component_abs,
             clipped_fraction: self.clipped_fraction,
             snr_db: self.snr_db,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TetraKnownEvmMeasurement {
+    rms_evm_pct: f64,
+    peak_evm_pct: f64,
+    differential_rms_deg: f64,
+    timing_sample: f64,
+    frequency_rotation_rad_per_symbol: f64,
+    symbols_used: usize,
+}
+
+impl From<evm::ModulationAccuracy> for TetraKnownEvmMeasurement {
+    fn from(report: evm::ModulationAccuracy) -> Self {
+        Self {
+            rms_evm_pct: report.rms_evm as f64 * 100.0,
+            peak_evm_pct: report.peak_evm as f64 * 100.0,
+            differential_rms_deg: report.differential_rms_deg as f64,
+            timing_sample: report.timing_sample as f64,
+            frequency_rotation_rad_per_symbol: report.frequency_rotation_rad_per_symbol as f64,
+            symbols_used: report.symbols_used,
         }
     }
 }
@@ -1530,6 +1699,207 @@ fn calibration_tone(sample_rate: f64, tone_hz: f64, amplitude: f32, len: usize) 
         .collect()
 }
 
+fn synthesize_tetra_calibration_tx_sequence(
+    sample_rate: f64,
+    center_frequency: f64,
+    output_samples: usize,
+) -> Result<Vec<StreamType>, String> {
+    if output_samples == 0 {
+        return Ok(Vec::new());
+    }
+
+    let ifft_size = calibration_fcfb_fft_size(sample_rate)?;
+    let mut fft_planner = rustfft::FftPlanner::<RealSample>::new();
+    let output_params = fcfb::SynthesisOutputParameters {
+        ifft_size,
+        sample_rate,
+        center_frequency,
+        overlap: fcfb::Overlap::O1_4,
+    };
+    let mut fcfb = fcfb::SynthesisOutputProcessor::new(&mut fft_planner, output_params);
+    let mut upconverter = fcfb::SynthesisInputProcessor::new_with_frequency(
+        &mut fft_planner,
+        output_params,
+        modulator::SAMPLE_RATE,
+        center_frequency,
+        Some(TX_CAL_TETRA_ANALYSIS_BANDWIDTH_HZ),
+    );
+    let input_block = upconverter.input_block_size();
+    let output_block_samples = fcfb.output_block_size();
+    let blocks_needed = output_samples.div_ceil(output_block_samples).max(1);
+    let modem_samples_needed = blocks_needed
+        .checked_mul(input_block.new)
+        .and_then(|samples| samples.checked_add(input_block.overlap))
+        .and_then(|samples| samples.checked_add(CHANNEL_FILTER_TAPS.len() * 4))
+        .ok_or_else(|| "TETRA known-EVM modem sequence length overflow".to_string())?;
+    let symbols_needed = modem_samples_needed.div_ceil(evm::TETRA_MODEM_SPS) + TX_CAL_TETRA_PATTERN_SYMBOLS * 2;
+    let reference_symbols = tetra_calibration_reference_symbols(symbols_needed)?;
+    let modem_samples = pulse_shape_tetra_symbols(&reference_symbols, evm::TETRA_MODEM_SPS, modem_samples_needed);
+
+    let mut input = upconverter.make_input_buffer();
+    let mut modem_pos = 0usize;
+    let mut out = Vec::with_capacity(output_samples + output_block_samples);
+
+    for block_count in 0..blocks_needed {
+        {
+            let input_samples = input.buffer_in();
+            for sample in input_samples {
+                *sample = modem_samples.get(modem_pos).copied().unwrap_or(ComplexSample::ZERO);
+                modem_pos += 1;
+            }
+        }
+        fcfb.add(upconverter.process(input.buffer(), block_count as fcfb::BlockCount));
+        out.extend_from_slice(fcfb.process());
+        let _ = input.prepare_for_new_samples();
+    }
+
+    out.truncate(output_samples);
+    scale_samples_to_peak(&mut out, TX_CAL_TETRA_AMPLITUDE as f64);
+    Ok(out)
+}
+
+fn downconvert_tetra_calibration_capture(
+    samples: &[StreamType],
+    sample_rate: f64,
+    center_frequency: f64,
+) -> Result<Vec<ComplexSample>, String> {
+    if samples.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let fft_size = calibration_fcfb_fft_size(sample_rate)?;
+    let mut fft_planner = rustfft::FftPlanner::<RealSample>::new();
+    let input_params = fcfb::AnalysisInputParameters {
+        fft_size,
+        sample_rate,
+        center_frequency,
+        overlap: fcfb::Overlap::O1_4,
+    };
+    let mut input = fcfb::AnalysisInputProcessor::new(&mut fft_planner, input_params);
+    let mut output = fcfb::AnalysisOutputProcessor::new_with_frequency(
+        &mut fft_planner,
+        input_params,
+        modulator::SAMPLE_RATE,
+        center_frequency,
+        Some(TX_CAL_TETRA_ANALYSIS_BANDWIDTH_HZ),
+    );
+    let mut buffer = input.make_input_buffer();
+    let mut modem = Vec::new();
+    let mut pos = 0usize;
+    let mut block_count = 0i64;
+
+    while pos < samples.len() {
+        {
+            let input_samples = buffer.prepare_for_new_samples();
+            for sample in input_samples {
+                *sample = samples.get(pos).copied().unwrap_or(ComplexSample::ZERO);
+                pos += 1;
+            }
+        }
+        let fcfb_result = input.process(buffer.buffer(), block_count);
+        modem.extend_from_slice(output.process(fcfb_result));
+        block_count += 1;
+    }
+
+    Ok(modem)
+}
+
+fn calibration_fcfb_fft_size(sample_rate: f64) -> Result<usize, String> {
+    if !sample_rate.is_finite() || sample_rate <= 0.0 {
+        return Err(format!("invalid calibration sample rate {}", sample_rate));
+    }
+
+    let target = (sample_rate / 500.0).round().max(4.0) as isize;
+    for delta in 0..=128isize {
+        for candidate in [target - delta, target + delta] {
+            if candidate < 4 {
+                continue;
+            }
+            let candidate = candidate as usize;
+            if candidate % 4 != 0 {
+                continue;
+            }
+            let modem_fft_size = (modulator::SAMPLE_RATE * candidate as f64 / sample_rate).round() as usize;
+            if modem_fft_size >= 4 && modem_fft_size % 4 == 0 {
+                return Ok(candidate);
+            }
+        }
+    }
+
+    Err(format!(
+        "cannot choose O1/4 FCFB FFT size for calibration sample rate {:.3} Hz",
+        sample_rate
+    ))
+}
+
+fn tetra_calibration_reference_symbols(symbols: usize) -> Result<Vec<ComplexSample>, String> {
+    let pattern = tetra_calibration_pattern_bits();
+    let mut bits = Vec::with_capacity(symbols * 2);
+    for bit_idx in 0..symbols * 2 {
+        bits.push(pattern[bit_idx % pattern.len()]);
+    }
+    evm::pi4_dqpsk_symbols_from_bits(&bits)
+}
+
+fn tetra_calibration_pattern_bits() -> Vec<u8> {
+    let deltas = [-3, -1, 1, 3];
+    let mut state = 0x5eed_cafe_u32;
+    let mut phase_delta_sum = 0i32;
+    let mut bits = Vec::with_capacity(TX_CAL_TETRA_PATTERN_SYMBOLS * 2);
+
+    for _ in 0..TX_CAL_TETRA_PATTERN_SYMBOLS - 1 {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let delta = deltas[((state >> 30) & 0x03) as usize];
+        push_dibit_for_phase_delta(&mut bits, delta);
+        phase_delta_sum += delta;
+    }
+
+    let closing_delta = match (-phase_delta_sum).rem_euclid(8) {
+        1 => 1,
+        3 => 3,
+        5 => -3,
+        7 => -1,
+        residue => unreachable!("odd number of pi/4-DQPSK deltas cannot require even closing residue {residue}"),
+    };
+    push_dibit_for_phase_delta(&mut bits, closing_delta);
+    bits
+}
+
+fn push_dibit_for_phase_delta(bits: &mut Vec<u8>, delta: i32) {
+    match delta {
+        -3 => bits.extend_from_slice(&[1, 1]),
+        -1 => bits.extend_from_slice(&[1, 0]),
+        1 => bits.extend_from_slice(&[0, 0]),
+        3 => bits.extend_from_slice(&[0, 1]),
+        _ => unreachable!("unsupported pi/4-DQPSK phase delta {delta}"),
+    }
+}
+
+fn pulse_shape_tetra_symbols(symbols: &[ComplexSample], samples_per_symbol: usize, total_samples: usize) -> Vec<ComplexSample> {
+    let mut filter = fir::FirComplexSym::new(CHANNEL_FILTER_TAPS.len());
+    let mut out = Vec::with_capacity(total_samples);
+    for sample_idx in 0..total_samples {
+        let input = if sample_idx % samples_per_symbol == 0 {
+            symbols.get(sample_idx / samples_per_symbol).copied().unwrap_or(ComplexSample::ZERO)
+        } else {
+            ComplexSample::ZERO
+        };
+        out.push(filter.sample(&CHANNEL_FILTER_TAPS, input));
+    }
+    out
+}
+
+fn scale_samples_to_peak(samples: &mut [StreamType], target_peak: f64) {
+    let peak = max_component_abs(samples);
+    if peak <= 1.0e-12 || !target_peak.is_finite() || target_peak <= 0.0 {
+        return;
+    }
+    let scale = (target_peak / peak) as f32;
+    for sample in samples {
+        *sample *= scale;
+    }
+}
+
 fn measure_calibration_capture(
     samples: &[StreamType],
     floor_before: &[StreamType],
@@ -1571,6 +1941,7 @@ fn measure_calibration_capture(
         carrier_leakage_dbfs: dbfs_amp(dc_amp),
         image_rejection_db: 20.0 * (signal_amp / image_amp).max(1.0e-12).log10(),
         evm_proxy_pct: ((dc_amp / signal_amp).powi(2) + (image_amp / signal_amp).powi(2)).sqrt() * 100.0,
+        tetra_known: None,
         signal_dbfs: dbfs_amp(signal_amp),
         noise_floor_dbfs: dbfs_amp(noise_rms),
         floor_before_dbfs,
@@ -1676,6 +2047,48 @@ fn capture_calibration_samples(
     }
     if capture.len() < tx_block.len() {
         return Err(format!("short calibration capture: {} samples", capture.len()));
+    }
+    drain_tx_stream_status(tx, timing, confirmation);
+    Ok(capture)
+}
+
+fn capture_calibration_sequence_samples(
+    rx: &mut soapysdr::RxStream<StreamType>,
+    tx: &mut soapysdr::TxStream<StreamType>,
+    tx_sequence: &[StreamType],
+    block_len: usize,
+    timing: &mut CalibrationTiming,
+    confirmation: bool,
+) -> Result<Vec<StreamType>, String> {
+    let total_blocks = TX_CAL_PREFILL_BLOCKS + TX_CAL_SETTLE_BLOCKS + TX_CAL_CAPTURE_BLOCKS;
+    let required_len = block_len
+        .checked_mul(total_blocks)
+        .ok_or_else(|| "calibration sequence length overflow".to_string())?;
+    if tx_sequence.len() < required_len {
+        return Err(format!(
+            "short calibration sequence: {} samples, need {}",
+            tx_sequence.len(),
+            required_len
+        ));
+    }
+
+    let mut rx_block = vec![ComplexSample::ZERO; block_len];
+    let mut capture = Vec::with_capacity(block_len * TX_CAL_CAPTURE_BLOCKS);
+    drain_tx_stream_status(tx, timing, confirmation);
+
+    for block_idx in 0..total_blocks {
+        let offset = block_idx * block_len;
+        let tx_block = &tx_sequence[offset..offset + block_len];
+        tx.write_all(&[tx_block], None, false, 250_000)
+            .map_err(|e| format!("write known-EVM calibration block: {}", e))?;
+        read_calibration_block(rx, &mut rx_block, 250_000)?;
+        if block_idx >= TX_CAL_PREFILL_BLOCKS + TX_CAL_SETTLE_BLOCKS {
+            capture.extend_from_slice(&rx_block);
+        }
+    }
+
+    if capture.len() < block_len {
+        return Err(format!("short known-EVM calibration capture: {} samples", capture.len()));
     }
     drain_tx_stream_status(tx, timing, confirmation);
     Ok(capture)
@@ -1864,6 +2277,83 @@ fn calibration_image_quality_ok(meas: &CalibrationMeasurement) -> bool {
     meas.image_rejection_db >= TX_CAL_GOOD_IMAGE_REJECTION_DB && meas.evm_proxy_pct <= TX_CAL_ACCEPT_MAX_EVM_PROXY_PCT
 }
 
+fn tetra_known_rms_evm_improvement(
+    reference: Option<TetraKnownEvmMeasurement>,
+    candidate: Option<TetraKnownEvmMeasurement>,
+) -> Option<f64> {
+    Some(reference?.rms_evm_pct - candidate?.rms_evm_pct)
+}
+
+fn tetra_known_peak_evm_improvement(
+    reference: Option<TetraKnownEvmMeasurement>,
+    candidate: Option<TetraKnownEvmMeasurement>,
+) -> Option<f64> {
+    Some(reference?.peak_evm_pct - candidate?.peak_evm_pct)
+}
+
+fn tetra_known_evm_quality_ok(candidate: Option<TetraKnownEvmMeasurement>) -> bool {
+    candidate.is_some_and(|evm| {
+        evm.rms_evm_pct <= evm::TETRA_RMS_EVM_LIMIT as f64 * 100.0 && evm.peak_evm_pct <= evm::TETRA_PEAK_EVM_LIMIT as f64 * 100.0
+    })
+}
+
+fn tetra_known_evm_candidate_safe(
+    reference: Option<TetraKnownEvmMeasurement>,
+    candidate: Option<TetraKnownEvmMeasurement>,
+    require_commercial_grade_gate: bool,
+) -> bool {
+    let Some(candidate) = candidate else {
+        return !require_commercial_grade_gate;
+    };
+    let not_worse = match reference {
+        Some(reference) => {
+            candidate.rms_evm_pct <= reference.rms_evm_pct + TX_CAL_CONFIRM_MAX_KNOWN_EVM_WORSEN_PCT
+                && candidate.peak_evm_pct <= reference.peak_evm_pct + TX_CAL_CONFIRM_MAX_KNOWN_EVM_WORSEN_PCT * 3.0
+        }
+        None => true,
+    };
+    if require_commercial_grade_gate {
+        not_worse && tetra_known_evm_quality_ok(Some(candidate))
+    } else {
+        not_worse
+    }
+}
+
+fn tetra_known_summary_suffix(reference: &CalibrationMeasurement, candidate: &CalibrationMeasurement) -> String {
+    match (reference.tetra_known, candidate.tetra_known) {
+        (Some(reference), Some(candidate)) => format!(
+            ", known TETRA EVM rms {:.2}->{:.2}% peak {:.2}->{:.2}% diff {:.2}->{:.2}deg",
+            reference.rms_evm_pct,
+            candidate.rms_evm_pct,
+            reference.peak_evm_pct,
+            candidate.peak_evm_pct,
+            reference.differential_rms_deg,
+            candidate.differential_rms_deg
+        ),
+        (None, Some(candidate)) => format!(
+            ", known TETRA EVM final rms {:.2}% peak {:.2}% diff {:.2}deg",
+            candidate.rms_evm_pct, candidate.peak_evm_pct, candidate.differential_rms_deg
+        ),
+        _ => ", known TETRA EVM unavailable".to_string(),
+    }
+}
+
+fn rf_limiting_factor(meas: &CalibrationMeasurement, tetra_known_quality_ok: bool) -> &'static str {
+    if meas.snr_db < TX_CAL_ACCEPT_MIN_SNR_DB {
+        "loopback_snr_or_noise_floor"
+    } else if meas.max_component_abs > TX_CAL_MAX_COMPONENT_ABS * 0.90 || meas.clipped_fraction > 0.0 {
+        "pa_or_gain_compression"
+    } else if meas.carrier_leakage_dbc > TX_CAL_GOOD_CARRIER_DBC {
+        "tx_dc_carrier_leak"
+    } else if meas.image_rejection_db < TX_CAL_GOOD_IMAGE_REJECTION_DB {
+        "tx_iq_image_rejection"
+    } else if !tetra_known_quality_ok {
+        "tetra_modulation_evm"
+    } else {
+        "within_known_evm_gate"
+    }
+}
+
 fn dc_calibration_accepted(reference: &CalibrationMeasurement, candidate: &CalibrationMeasurement) -> bool {
     let improvement = reference.carrier_leakage_dbc - candidate.carrier_leakage_dbc;
     calibration_capture_quality_ok(candidate)
@@ -2000,6 +2490,7 @@ mod tests {
             carrier_leakage_dbfs: signal_dbfs + carrier_leakage_dbc,
             image_rejection_db,
             evm_proxy_pct,
+            tetra_known: None,
             signal_dbfs,
             noise_floor_dbfs: -80.0,
             floor_before_dbfs: -121.0,
@@ -2090,6 +2581,78 @@ mod tests {
 
         let real_image_gain = calibration_measurement(-42.1, 46.2, 1.0, -34.0);
         assert!(iq_calibration_accepted(&reference, &real_image_gain, dc_only, iq_candidate));
+    }
+
+    #[test]
+    fn tetra_calibration_pattern_is_symbol_periodic() {
+        let symbols = tetra_calibration_reference_symbols(TX_CAL_TETRA_PATTERN_SYMBOLS * 2).expect("reference symbols");
+
+        for idx in 0..TX_CAL_TETRA_PATTERN_SYMBOLS {
+            assert!(
+                (symbols[idx] - symbols[idx + TX_CAL_TETRA_PATTERN_SYMBOLS]).norm() < 1.0e-6,
+                "symbol {} is not periodic",
+                idx
+            );
+        }
+    }
+
+    #[test]
+    fn tetra_known_evm_clean_fcfb_loopback_locks() {
+        let block_len = TX_CAL_FALLBACK_BLOCK_SAMPLES;
+        let total_blocks = TX_CAL_PREFILL_BLOCKS + TX_CAL_SETTLE_BLOCKS + TX_CAL_CAPTURE_BLOCKS;
+        let sequence = synthesize_tetra_calibration_tx_sequence(600_000.0, 438_362_500.0, block_len * total_blocks)
+            .expect("synthesize known TETRA calibration waveform");
+        let capture_start = block_len * (TX_CAL_PREFILL_BLOCKS + TX_CAL_SETTLE_BLOCKS);
+        let capture_end = capture_start + block_len * TX_CAL_CAPTURE_BLOCKS;
+        let modem_samples = downconvert_tetra_calibration_capture(&sequence[capture_start..capture_end], 600_000.0, 438_362_500.0)
+            .expect("downconvert known TETRA calibration capture");
+        let reference_symbols = tetra_calibration_reference_symbols(TX_CAL_TETRA_REFERENCE_SYMBOLS).expect("reference symbols");
+        let report =
+            evm::evaluate_modulation_accuracy(&modem_samples, &reference_symbols, evm::TETRA_MODEM_SPS).expect("known-symbol EVM report");
+
+        assert!(
+            report.rms_evm < evm::TETRA_RMS_EVM_LIMIT,
+            "clean FCFB loopback RMS EVM {:.2}%",
+            report.rms_evm * 100.0
+        );
+        assert!(
+            report.peak_evm < evm::TETRA_PEAK_EVM_LIMIT,
+            "clean FCFB loopback peak EVM {:.2}%",
+            report.peak_evm * 100.0
+        );
+        assert!(report.symbols_used >= 96);
+    }
+
+    #[test]
+    fn tx_calibration_iq_gate_requires_known_tetra_evm_not_worse() {
+        let reference = Some(TetraKnownEvmMeasurement {
+            rms_evm_pct: 4.0,
+            peak_evm_pct: 12.0,
+            differential_rms_deg: 1.0,
+            timing_sample: 0.0,
+            frequency_rotation_rad_per_symbol: 0.0,
+            symbols_used: 192,
+        });
+        let worse = Some(TetraKnownEvmMeasurement {
+            rms_evm_pct: 6.5,
+            peak_evm_pct: 16.0,
+            differential_rms_deg: 1.5,
+            timing_sample: 0.0,
+            frequency_rotation_rad_per_symbol: 0.0,
+            symbols_used: 192,
+        });
+        let better = Some(TetraKnownEvmMeasurement {
+            rms_evm_pct: 3.8,
+            peak_evm_pct: 11.5,
+            differential_rms_deg: 0.9,
+            timing_sample: 0.0,
+            frequency_rotation_rad_per_symbol: 0.0,
+            symbols_used: 192,
+        });
+
+        assert!(!tetra_known_evm_candidate_safe(reference, worse, true));
+        assert!(tetra_known_evm_candidate_safe(reference, better, true));
+        assert!(!tetra_known_evm_candidate_safe(reference, None, true));
     }
 
     #[test]
