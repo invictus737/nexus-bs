@@ -601,6 +601,7 @@ impl BrewEntity {
                 }
                 BrewEvent::CircuitCallRelease { uuid, cause } => {
                     tracing::info!("BrewEntity: CIRCUIT CALL RELEASE uuid={} cause={}", uuid, cause);
+                    self.drop_network_circuit(uuid);
                     queue.push_back(SapMsg {
                         sap: tetra_core::Sap::Control,
                         src: TetraEntity::Brew,
@@ -1613,39 +1614,45 @@ impl BrewEntity {
             return;
         }
 
-        if let Some(uuid) = {
-            let fwd = self.ul_forwarded.get_mut(&ts);
-            fwd.and_then(|fwd| {
-                if fwd.kind != UlForwardKind::Circuit {
-                    return None;
+        if let Some((uuid, circuit_call_id)) = self.ul_forwarded.get(&ts).and_then(|fwd| {
+            if fwd.kind == UlForwardKind::Circuit {
+                Some((fwd.uuid, fwd.call_id))
+            } else {
+                None
+            }
+        }) {
+            if circuit_call_id == call_id {
+                if let Some(fwd) = self.ul_forwarded.get_mut(&ts) {
+                    fwd.source_issi = source_issi;
+                    fwd.dest_gssi = dest_gssi;
                 }
-                if fwd.call_id != call_id {
-                    tracing::warn!(
-                        "BrewEntity: circuit floor grant call_id mismatch on ts={}: expected {} got {}",
-                        ts,
-                        fwd.call_id,
-                        call_id
-                    );
-                }
-                fwd.call_id = call_id;
-                fwd.source_issi = source_issi;
-                fwd.dest_gssi = dest_gssi;
                 tracing::debug!(
                     "BrewEntity: circuit floor grant on ts={} uuid={} src={} dst={}, preserving circuit media session",
                     ts,
-                    fwd.uuid,
+                    uuid,
                     source_issi,
                     dest_gssi
                 );
-                Some(fwd.uuid)
-            })
-        } {
-            self.send_or_queue_brew_command(BrewCommand::SendSimplexGranted {
-                uuid,
-                grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
-                permission: 0,
-            });
-            return;
+                self.send_or_queue_brew_command(BrewCommand::SendSimplexGranted {
+                    uuid,
+                    grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+                    permission: 0,
+                });
+                return;
+            } else {
+                // EN 300 392-2 clause 14.5.2 keeps group-call floor control tied
+                // to the current group call. A stale individual circuit forwarder
+                // from the same RF timeslot must not consume the new group call's
+                // floor grant or send circuit SIMPLEX_GRANTED to Brew.
+                tracing::warn!(
+                    "BrewEntity: stale circuit floor state on ts={}: expected call_id {} got group call_id {}; clearing uuid={} before GROUP_TX",
+                    ts,
+                    circuit_call_id,
+                    call_id,
+                    uuid
+                );
+                self.drop_network_circuit(uuid);
+            }
         }
 
         if !super::is_brew_gssi_routable(&self.config, dest_gssi) {
@@ -2095,6 +2102,7 @@ mod tests {
     use crossbeam_channel::{Receiver, Sender, bounded};
     use tetra_config::bluestation::{SharedConfig, from_toml_str};
     use tetra_core::{TdmaTime, TxReporter, tetra_entities::TetraEntity};
+    use tetra_pdus::cmce::enums::transmission_grant::TransmissionGrant;
     use tetra_saps::SapMsgInner;
     use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
     use tetra_saps::control::call_control::CallControl;
@@ -2117,8 +2125,22 @@ mod tests {
         SharedConfig::from_parts(cfg, None)
     }
 
+    fn brew_test_config_with_routable_gssi_226333() -> SharedConfig {
+        let base = include_str!("../../../../example_config/config.toml").replace("    [226333, 226333],\n", "");
+        let toml = format!(
+            "{}\n\n[brew]\nhost = \"core.tetrapack.online\"\nport = 443\ntls = true\nusername = 226008230\npassword = \"test\"\n",
+            base
+        );
+        let cfg = from_toml_str(&toml).expect("brew test config parses");
+        SharedConfig::from_parts(cfg, None)
+    }
+
     fn brew_entity_with_event_sender() -> (BrewEntity, Receiver<BrewCommand>, Sender<BrewEvent>) {
         let config = brew_test_config();
+        brew_entity_with_config(config)
+    }
+
+    fn brew_entity_with_config(config: SharedConfig) -> (BrewEntity, Receiver<BrewCommand>, Sender<BrewEvent>) {
         let (event_sender, event_receiver) = bounded::<BrewEvent>(BREW_EVENT_CHANNEL_CAPACITY);
         let (command_sender, command_receiver) = bounded::<BrewCommand>(BREW_COMMAND_CHANNEL_CAPACITY);
         let brew_config = config.config().brew.clone().expect("brew config");
@@ -2151,6 +2173,11 @@ mod tests {
 
     fn brew_entity_without_worker() -> (BrewEntity, Receiver<BrewCommand>) {
         let (entity, command_receiver, _event_sender) = brew_entity_with_event_sender();
+        (entity, command_receiver)
+    }
+
+    fn brew_entity_without_worker_with_config(config: SharedConfig) -> (BrewEntity, Receiver<BrewCommand>) {
+        let (entity, command_receiver, _event_sender) = brew_entity_with_config(config);
         (entity, command_receiver)
     }
 
@@ -2282,6 +2309,41 @@ mod tests {
             } if got_uuid == uuid && got_cause == cause
         ));
         assert!(rx.try_recv().is_err(), "only one call release should be sent");
+    }
+
+    #[test]
+    fn network_circuit_release_event_clears_ul_forwarder() {
+        let (mut entity, _rx, event_sender) = brew_entity_with_event_sender();
+        let uuid = Uuid::new_v4();
+        let mut queue = MessageQueue::new();
+
+        entity.ul_forwarded.insert(
+            2,
+            UlForwardedCall {
+                uuid,
+                call_id: 11,
+                source_issi: 2260616,
+                dest_gssi: 2260618,
+                frame_count: 0,
+                kind: UlForwardKind::Circuit,
+            },
+        );
+
+        event_sender
+            .send(BrewEvent::CircuitCallRelease { uuid, cause: 1 })
+            .expect("test event can be queued");
+        entity.process_events(&mut queue);
+
+        assert!(
+            !entity.ul_forwarded.contains_key(&2),
+            "network circuit release must clear the TS forwarder before the next local group floor grant"
+        );
+        assert!(drain_queue(&mut queue).iter().any(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::CmceCallControl(CallControl::NetworkCircuitRelease { brew_uuid, cause: 1 }) if *brew_uuid == uuid
+            )
+        }));
     }
 
     #[test]
@@ -2642,6 +2704,95 @@ mod tests {
             }
             other => panic!("expected SendGroupTx, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn matching_circuit_floor_grant_preserves_private_media_session() {
+        let (mut entity, rx) = brew_entity_without_worker();
+        let uuid = Uuid::new_v4();
+
+        entity.ul_forwarded.insert(
+            2,
+            UlForwardedCall {
+                uuid,
+                call_id: 11,
+                source_issi: 0,
+                dest_gssi: 0,
+                frame_count: 0,
+                kind: UlForwardKind::Circuit,
+            },
+        );
+
+        entity.handle_local_call_start(11, 2260616, 2260618, 2);
+
+        match rx
+            .try_recv()
+            .expect("matched circuit floor grant must be forwarded as SIMPLEX_GRANTED")
+        {
+            BrewCommand::SendSimplexGranted {
+                uuid: got_uuid,
+                grant,
+                permission,
+            } => {
+                assert_eq!(got_uuid, uuid);
+                assert_eq!(grant, TransmissionGrant::GrantedToOtherUser.into_raw() as u8);
+                assert_eq!(permission, 0);
+            }
+            other => panic!("expected SendSimplexGranted, got {other:?}"),
+        }
+        let fwd = entity.ul_forwarded.get(&2).expect("circuit forwarder must remain active");
+        assert_eq!(fwd.kind, UlForwardKind::Circuit);
+        assert_eq!(fwd.call_id, 11);
+        assert_eq!(fwd.source_issi, 2260616);
+        assert_eq!(fwd.dest_gssi, 2260618);
+    }
+
+    #[test]
+    fn stale_circuit_forwarder_does_not_steal_local_group_tx() {
+        let (mut entity, rx) = brew_entity_without_worker_with_config(brew_test_config_with_routable_gssi_226333());
+        let stale_uuid = Uuid::new_v4();
+
+        entity.ul_forwarded.insert(
+            2,
+            UlForwardedCall {
+                uuid: stale_uuid,
+                call_id: 11,
+                source_issi: 2260616,
+                dest_gssi: 2260618,
+                frame_count: 0,
+                kind: UlForwardKind::Circuit,
+            },
+        );
+
+        entity.handle_local_call_start(14, 2260616, 226333, 2);
+
+        let group_uuid = match rx.try_recv().expect("fresh local GSSI 226333 must be forwarded as GROUP_TX") {
+            BrewCommand::SendGroupTx {
+                uuid,
+                source_issi,
+                dest_gssi,
+                priority,
+                service,
+            } => {
+                assert_eq!(source_issi, 2260616);
+                assert_eq!(dest_gssi, 226333);
+                assert_eq!(priority, 0);
+                assert_eq!(service, 0);
+                uuid
+            }
+            other => panic!("expected SendGroupTx, got {other:?}"),
+        };
+
+        assert_ne!(
+            group_uuid, stale_uuid,
+            "stale private circuit UUID must not be reused for a group call"
+        );
+        let fwd = entity.ul_forwarded.get(&2).expect("group forwarder must replace stale circuit");
+        assert_eq!(fwd.kind, UlForwardKind::Group);
+        assert_eq!(fwd.uuid, group_uuid);
+        assert_eq!(fwd.call_id, 14);
+        assert_eq!(fwd.source_issi, 2260616);
+        assert_eq!(fwd.dest_gssi, 226333);
     }
 
     #[test]
