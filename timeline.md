@@ -15043,3 +15043,25 @@ RF Calibration Carrier-Power Estimate and Known EVM Guard - 2026-06-11 18:20 EES
     passed.
   - `cargo check -p tetra-config -p tetra-entities --locked` passed.
   - `git diff --check` passed.
+
+RF Calibration Fine Estimate Step Guard - 2026-06-11 18:30 EEST:
+
+- Field run on `1fc0c1c6` proved the known-symbol EVM best-of-3 path works:
+  the run selected a usable RF loopback lock at about 2.29% RMS / 4.21% peak.
+- The same run exposed that estimating DC from the coarse 0.04 actuator probes
+  can overfit nonlinear carrier-power data and clamp the estimate to the
+  configured ±0.08 limit; the measured estimated probe was immediately bad, so
+  zero DC remained the best safe point.
+- Fix:
+  - keep the coarse 0.04 probe only for actuator readback/effect evidence;
+  - derive the actual DC estimate from finer ±0.001 probes near neutral;
+  - reject formula estimates outside configured DC limits instead of clamping
+    them and reporting them as valid;
+  - record the estimate probe step separately in the calibration report.
+- Verification:
+  - `cargo test -p tetra-config --lib bluestation::sec_phy_soapy --locked`
+    passed.
+  - `cargo test -p tetra-entities --lib phy::components::soapyio --locked`
+    passed.
+  - `cargo check -p tetra-config -p tetra-entities --locked` passed.
+  - `git diff --check` passed.

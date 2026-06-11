@@ -192,6 +192,7 @@ pub struct TxCalibrationReport {
     pub tx_dc_actuator_carrier_span_db: Option<f64>,
     pub tx_dc_actuator_min_carrier_dbc: Option<f64>,
     pub tx_dc_actuator_max_carrier_dbc: Option<f64>,
+    pub tx_dc_actuator_estimate_step: Option<f64>,
     pub tx_dc_actuator_estimated_dc_i: Option<f64>,
     pub tx_dc_actuator_estimated_dc_q: Option<f64>,
     pub tx_dc_actuator_estimate_valid: bool,
@@ -350,6 +351,7 @@ pub fn validate_tx_calibration_file(file: &TxCalibrationFile) -> Result<(), Stri
         ("report.tx_dc_actuator_carrier_span_db", file.report.tx_dc_actuator_carrier_span_db),
         ("report.tx_dc_actuator_min_carrier_dbc", file.report.tx_dc_actuator_min_carrier_dbc),
         ("report.tx_dc_actuator_max_carrier_dbc", file.report.tx_dc_actuator_max_carrier_dbc),
+        ("report.tx_dc_actuator_estimate_step", file.report.tx_dc_actuator_estimate_step),
         ("report.tx_dc_actuator_estimated_dc_i", file.report.tx_dc_actuator_estimated_dc_i),
         ("report.tx_dc_actuator_estimated_dc_q", file.report.tx_dc_actuator_estimated_dc_q),
     ] {
@@ -478,6 +480,7 @@ mod tests {
                 tx_dc_actuator_carrier_span_db: Some(20.0),
                 tx_dc_actuator_min_carrier_dbc: Some(-48.0),
                 tx_dc_actuator_max_carrier_dbc: Some(-28.0),
+                tx_dc_actuator_estimate_step: Some(0.001),
                 tx_dc_actuator_estimated_dc_i: Some(0.001),
                 tx_dc_actuator_estimated_dc_q: Some(-0.002),
                 tx_dc_actuator_estimate_valid: true,
@@ -527,6 +530,7 @@ mod tests {
         assert_eq!(parsed.reference.tetra_known_symbols_used, Some(192));
         assert_eq!(parsed.report.tetra_known_rms_evm_improvement_pct, Some(3.4));
         assert_eq!(parsed.report.tx_dc_actuator_carrier_span_db, Some(20.0));
+        assert_eq!(parsed.report.tx_dc_actuator_estimate_step, Some(0.001));
         assert_eq!(parsed.report.tx_dc_actuator_estimated_dc_i, Some(0.001));
         assert!(parsed.report.tx_dc_actuator_estimate_valid);
         assert!(parsed.report.tx_dc_actuator_readback_ok);
