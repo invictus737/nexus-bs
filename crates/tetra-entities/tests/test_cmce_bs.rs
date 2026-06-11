@@ -4523,6 +4523,101 @@ fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_opens_loc
 }
 
 #[test]
+fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_opens_media_without_floor() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let remote_issi = 7_000_103;
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(remote_issi as u64);
+    u_setup.simplex_duplex_selection = true;
+    u_setup.hook_method_selection = true;
+
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let (brew_uuid, mut network_call) = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid, call }) => Some((*brew_uuid, call.clone())),
+            _ => None,
+        })
+        .expect("local private duplex U-SETUP should be forwarded to Brew");
+    assert_eq!(network_call.duplex, 1);
+    network_call.grant = TransmissionGrant::Granted.into_raw() as u8;
+    network_call.permission = 0;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+            brew_uuid,
+            call: network_call,
+        }),
+    });
+    test.run_stack(Some(1));
+    let connect_msgs = test.dump_sinks();
+
+    let connect = connect_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_connect(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .expect("Brew duplex connect request should emit D-CONNECT to the local caller");
+    assert_eq!(connect.0.main_address.ssi, TEST_ISSI);
+    assert_eq!(connect.0.layer2service, Layer2Service::Acknowledged);
+    assert!(connect.0.tx_reporter.is_some());
+    assert!(connect.1.simplex_duplex_selection);
+    assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
+    assert_eq!(
+        count_network_circuit_connect_confirm(&connect_msgs, brew_uuid),
+        0,
+        "duplex Brew connect confirm waits until local D-CONNECT has at least reached RF"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&connect_msgs, brew_uuid),
+        0,
+        "duplex Brew media waits until local D-CONNECT has at least reached RF"
+    );
+
+    let connect_reporter = d_connect_reporter(&connect_msgs, TEST_ISSI);
+    connect_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let after_transmit_only_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_umac_floor_granted(&after_transmit_only_msgs),
+        0,
+        "duplex private calls must not use the simplex floor-control path"
+    );
+    assert_eq!(
+        count_network_circuit_connect_confirm(&after_transmit_only_msgs, brew_uuid),
+        1,
+        "local caller duplex Brew connect confirms after local RF D-CONNECT transmission"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
+        1,
+        "local caller duplex Brew media opens after local RF D-CONNECT transmission"
+    );
+}
+
+#[test]
 fn test_network_origin_brew_private_simplex_connect_confirm_grants_external_caller_first() {
     debug::setup_logging_verbose();
 

@@ -173,7 +173,10 @@ impl CcBsSubentity {
         let _ = call_snapshot;
     }
 
-    fn pending_network_individual_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
+    fn pending_network_simplex_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
+        // Keep Brew private simplex independent from duplex: simplex has
+        // explicit floor ownership and may complete once the initial owner is
+        // unambiguous and the local connect PDU reached RF.
         !pending.simplex_duplex
             && matches!(
                 (pending.kind, pending.grant),
@@ -182,6 +185,21 @@ impl CcBsSubentity {
                     TransmissionGrant::GrantedToOtherUser
                 ) | (PendingNetworkIndividualConnectKind::LocalCallerDConnect, TransmissionGrant::Granted)
             )
+    }
+
+    fn pending_network_duplex_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
+        // Duplex does not use simplex floor-control; only the local-caller
+        // Brew bridge path may complete after RF D-CONNECT transmission.
+        pending.simplex_duplex
+            && matches!(
+                (pending.kind, pending.grant),
+                (PendingNetworkIndividualConnectKind::LocalCallerDConnect, TransmissionGrant::Granted)
+            )
+    }
+
+    fn pending_network_individual_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
+        Self::pending_network_simplex_connect_can_complete_on_tx(pending)
+            || Self::pending_network_duplex_connect_can_complete_on_tx(pending)
     }
 
     pub(in crate::cmce::subentities::cc_bs) fn drain_pending_network_individual_connects(&mut self, queue: &mut MessageQueue) {
