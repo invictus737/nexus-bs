@@ -32,7 +32,7 @@ use tetra_pdus::umac::pdus::mac_sync::MacSync;
 use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 use tetra_pdus::umac::pdus::mac_u_blck::MacUBlck;
 use tetra_pdus::umac::pdus::mac_u_signal::MacUSignal;
-use tetra_saps::control::call_control::{CallControl, Circuit};
+use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -3376,7 +3376,11 @@ impl UmacBs {
                 if (1..=4).contains(&ts) {
                     let source_addr = TetraAddress::issi(source_issi);
                     let private_participant_scoped = self.channel_scheduler.ul_circuit_is_private_participant_scoped(ts);
-                    if private_participant_scoped && !self.channel_scheduler.circuit_is_active_for_addr(Direction::Ul, ts, source_addr) {
+                    let source_is_local_participant = self.channel_scheduler.circuit_is_active_for_addr(Direction::Ul, ts, source_addr);
+                    let swmi_downlink_floor = private_participant_scoped
+                        && !source_is_local_participant
+                        && self.channel_scheduler.ul_circuit_dl_media_source(ts) == CircuitDlMediaSource::SwMI;
+                    if private_participant_scoped && !source_is_local_participant && !swmi_downlink_floor {
                         tracing::warn!(
                             "UMAC: ignoring FloorGranted for non-participant ISSI {} on private UL ts {}",
                             source_issi,
@@ -3384,21 +3388,32 @@ impl UmacBs {
                         );
                         return;
                     }
-                    self.set_current_ul_speaker(ts, source_addr);
+                    if !swmi_downlink_floor {
+                        self.set_current_ul_speaker(ts, source_addr);
+                    }
                     for floor_ts in self.floor_media_timeslots(ts).into_iter().flatten() {
                         if private_participant_scoped {
-                            self.discard_pending_private_ul_media_except_source(
-                                floor_ts,
-                                ts,
-                                source_addr,
-                                "new private floor grant; discard previous speaker media",
-                            );
-                            self.channel_scheduler.clear_dl_media_queue_except_source(
-                                floor_ts,
-                                ts,
-                                source_addr,
-                                "new private floor grant; discard previous speaker media",
-                            );
+                            if swmi_downlink_floor {
+                                self.discard_pending_private_ul_media_involving(
+                                    floor_ts,
+                                    "new external SwMI private floor grant; discard local stale media",
+                                );
+                                self.channel_scheduler
+                                    .clear_dl_media_queue(floor_ts, "new external SwMI private floor grant");
+                            } else {
+                                self.discard_pending_private_ul_media_except_source(
+                                    floor_ts,
+                                    ts,
+                                    source_addr,
+                                    "new private floor grant; discard previous speaker media",
+                                );
+                                self.channel_scheduler.clear_dl_media_queue_except_source(
+                                    floor_ts,
+                                    ts,
+                                    source_addr,
+                                    "new private floor grant; discard previous speaker media",
+                                );
+                            }
                         } else {
                             self.discard_pending_group_ul_media_except_hangtime_source(
                                 floor_ts,
@@ -3427,7 +3442,7 @@ impl UmacBs {
                             );
                         }
                     }
-                    self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
+                    self.last_ul_voice[ts as usize - 1] = if swmi_downlink_floor { None } else { Some(self.dltime) };
                     self.reset_ul_media_diagnostic(ts);
                     tracing::info!(
                         "UMAC floor granted: call_id={} source_issi={} dest_gssi={} ul_ts={} peer_ts={:?} media_source={:?} private_participant_scoped={}",
@@ -3465,6 +3480,8 @@ impl UmacBs {
             | CallControl::NetworkCircuitAlert { .. }
             | CallControl::NetworkCircuitConnectRequest { .. }
             | CallControl::NetworkCircuitConnectConfirm { .. }
+            | CallControl::NetworkCircuitSimplexGranted { .. }
+            | CallControl::NetworkCircuitSimplexIdle { .. }
             | CallControl::NetworkCircuitMediaReady { .. }
             | CallControl::NetworkCircuitDtmf { .. }
             | CallControl::NetworkCircuitRelease { .. } => {

@@ -162,6 +162,10 @@ pub enum CallControl {
     NetworkCircuitConnectRequest { brew_uuid: uuid::Uuid, call: NetworkCircuitCall },
     /// Brew -> CMCE: TetraPack confirmed the circuit connect.
     NetworkCircuitConnectConfirm { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
+    /// Brew -> CMCE / CMCE -> Brew: simplex floor granted on an active individual circuit.
+    NetworkCircuitSimplexGranted { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
+    /// Brew -> CMCE / CMCE -> Brew: simplex floor idle on an active individual circuit.
+    NetworkCircuitSimplexIdle { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
     /// CMCE -> Brew: traffic channel is open, bridge can start media.
     NetworkCircuitMediaReady { brew_uuid: uuid::Uuid, call_id: u16, ts: u8 },
     /// CMCE -> Brew: DTMF/U-INFO payload forwarded from local MS.

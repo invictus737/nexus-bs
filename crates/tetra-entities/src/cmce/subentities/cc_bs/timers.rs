@@ -444,6 +444,9 @@ impl CcBsSubentity {
                 return;
             }
 
+            let Some(call_snapshot) = self.individual_calls.get(&call_id).cloned() else {
+                return;
+            };
             let (
                 holder_ssi,
                 holder_addr,
@@ -526,8 +529,9 @@ impl CcBsSubentity {
                 // D-TX GRANTED to both MSs and without a separate D-TX CEASED.
                 // Keep channel allocation Both (clause 21.5.2); the grant IE
                 // and UMAC FloorGranted state decide who is allowed to talk.
-                Self::push_individual_d_tx_granted(
+                Self::push_individual_d_tx_granted_if_local_rf(
                     queue,
+                    &call_snapshot,
                     call_id,
                     requester_addr,
                     requester_ts,
@@ -536,8 +540,9 @@ impl CcBsSubentity {
                     TransmissionGrant::Granted,
                     requester_addr.ssi,
                 );
-                Self::push_individual_d_tx_granted(
+                Self::push_individual_d_tx_granted_if_local_rf(
                     queue,
+                    &call_snapshot,
                     call_id,
                     listener_addr,
                     listener_ts,
@@ -589,8 +594,8 @@ impl CcBsSubentity {
             // D-TX-CEASED confirms the floor is idle to both MSs. The peer is
             // allowed to request transmission, but is not granted without a
             // queued U-TX DEMAND.
-            Self::push_individual_d_tx_ceased(queue, call_id, holder_addr, holder_ts, holder_usage);
-            Self::push_individual_d_tx_ceased(queue, call_id, peer_addr, peer_ts, peer_usage);
+            Self::push_individual_d_tx_ceased_if_local_rf(queue, &call_snapshot, call_id, holder_addr, holder_ts, holder_usage);
+            Self::push_individual_d_tx_ceased_if_local_rf(queue, &call_snapshot, call_id, peer_addr, peer_ts, peer_usage);
 
             queue.push_back(SapMsg {
                 sap: Sap::Control,

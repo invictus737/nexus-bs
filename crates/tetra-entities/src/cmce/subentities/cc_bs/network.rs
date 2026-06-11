@@ -77,6 +77,20 @@ impl CcBsSubentity {
         self.fsm_on_network_circuit_connect_confirm(queue, brew_uuid, grant, permission);
     }
 
+    pub(super) fn rx_network_circuit_simplex_granted(
+        &mut self,
+        queue: &mut MessageQueue,
+        brew_uuid: uuid::Uuid,
+        grant: u8,
+        permission: u8,
+    ) {
+        self.fsm_on_network_circuit_simplex_granted(queue, brew_uuid, grant, permission);
+    }
+
+    pub(super) fn rx_network_circuit_simplex_idle(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, grant: u8, permission: u8) {
+        self.fsm_on_network_circuit_simplex_idle(queue, brew_uuid, grant, permission);
+    }
+
     pub(super) fn rx_network_circuit_release(&mut self, queue: &mut MessageQueue, brew_uuid: uuid::Uuid, cause: u8) {
         let Some((call_id, _)) = self.find_brew_individual_call(brew_uuid) else {
             tracing::debug!("CMCE: Brew release for unknown uuid={} cause={}", brew_uuid, cause);

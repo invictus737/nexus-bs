@@ -2068,6 +2068,9 @@ impl CcBsSubentity {
     }
 
     fn complete_individual_tx_ceased_tail_drain(&mut self, queue: &mut MessageQueue, pending: PendingIndividualTxCeasedTailDrain) {
+        let Some(call_snapshot) = self.individual_calls.get(&pending.call_id).cloned() else {
+            return;
+        };
         let queued_requester = {
             let Some(call) = self.individual_calls.get_mut(&pending.call_id) else {
                 return;
@@ -2106,8 +2109,9 @@ impl CcBsSubentity {
                 call.set_floor_holder(requester_leg.addr.ssi);
             }
 
-            Self::push_individual_d_tx_granted(
+            Self::push_individual_d_tx_granted_if_local_rf(
                 queue,
+                &call_snapshot,
                 pending.call_id,
                 requester_leg.addr,
                 requester_leg.ts,
@@ -2116,8 +2120,9 @@ impl CcBsSubentity {
                 TransmissionGrant::Granted,
                 requester_leg.addr.ssi,
             );
-            Self::push_individual_d_tx_granted(
+            Self::push_individual_d_tx_granted_if_local_rf(
                 queue,
+                &call_snapshot,
                 pending.call_id,
                 listener_leg.addr,
                 listener_leg.ts,
@@ -2161,8 +2166,22 @@ impl CcBsSubentity {
             pending.sender.addr.ssi,
             pending.peer.addr.ssi
         );
-        Self::push_individual_d_tx_ceased(queue, pending.call_id, pending.sender.addr, pending.sender.ts, pending.sender.usage);
-        Self::push_individual_d_tx_ceased(queue, pending.call_id, pending.peer.addr, pending.peer.ts, pending.peer.usage);
+        Self::push_individual_d_tx_ceased_if_local_rf(
+            queue,
+            &call_snapshot,
+            pending.call_id,
+            pending.sender.addr,
+            pending.sender.ts,
+            pending.sender.usage,
+        );
+        Self::push_individual_d_tx_ceased_if_local_rf(
+            queue,
+            &call_snapshot,
+            pending.call_id,
+            pending.peer.addr,
+            pending.peer.ts,
+            pending.peer.usage,
+        );
 
         queue.push_back(SapMsg {
             sap: Sap::Control,

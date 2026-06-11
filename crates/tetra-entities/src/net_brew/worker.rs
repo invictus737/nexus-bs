@@ -85,6 +85,12 @@ pub enum BrewEvent {
     /// TetraPack confirmed connect (CONNECT_CONFIRM)
     CircuitConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
 
+    /// TetraPack granted simplex floor on an active circuit call.
+    CircuitSimplexGranted { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// TetraPack reports simplex floor idle on an active circuit call.
+    CircuitSimplexIdle { uuid: Uuid, grant: u8, permission: u8 },
+
     /// Circuit call released (CALL_RELEASE, inbound)
     CircuitCallRelease { uuid: Uuid, cause: u8 },
 
@@ -113,6 +119,8 @@ impl BrewEvent {
             BrewEvent::CircuitCallAlert { .. } => "circuit_call_alert",
             BrewEvent::CircuitConnectRequest { .. } => "circuit_connect_request",
             BrewEvent::CircuitConnectConfirm { .. } => "circuit_connect_confirm",
+            BrewEvent::CircuitSimplexGranted { .. } => "circuit_simplex_granted",
+            BrewEvent::CircuitSimplexIdle { .. } => "circuit_simplex_idle",
             BrewEvent::CircuitCallRelease { .. } => "circuit_call_release",
             BrewEvent::CircuitDtmf { .. } => "circuit_dtmf",
             BrewEvent::ServerError { .. } => "server_error",
@@ -133,6 +141,8 @@ impl BrewEvent {
                 | BrewEvent::CircuitCallAlert { .. }
                 | BrewEvent::CircuitConnectRequest { .. }
                 | BrewEvent::CircuitConnectConfirm { .. }
+                | BrewEvent::CircuitSimplexGranted { .. }
+                | BrewEvent::CircuitSimplexIdle { .. }
                 | BrewEvent::CircuitCallRelease { .. }
         )
     }
@@ -205,6 +215,12 @@ pub enum BrewCommand {
     /// CMCE → Brew: call confirmed and connected
     SendConnectConfirm { uuid: Uuid, grant: u8, permission: u8 },
 
+    /// CMCE → Brew: simplex floor granted on an active circuit
+    SendSimplexGranted { uuid: Uuid, grant: u8, permission: u8 },
+
+    /// CMCE → Brew: simplex floor idle on an active circuit
+    SendSimplexIdle { uuid: Uuid, grant: u8, permission: u8 },
+
     /// CMCE → Brew: release/terminate a circuit call
     SendCallRelease { uuid: Uuid, cause: u8 },
 
@@ -236,6 +252,8 @@ impl BrewCommand {
             BrewCommand::SendCallAlert { .. } => "send_call_alert",
             BrewCommand::SendConnectRequest { .. } => "send_connect_request",
             BrewCommand::SendConnectConfirm { .. } => "send_connect_confirm",
+            BrewCommand::SendSimplexGranted { .. } => "send_simplex_granted",
+            BrewCommand::SendSimplexIdle { .. } => "send_simplex_idle",
             BrewCommand::SendCallRelease { .. } => "send_call_release",
             BrewCommand::SendDtmf { .. } => "send_dtmf",
             BrewCommand::SendRssiUpdate { .. } => "send_rssi_update",
@@ -642,6 +660,22 @@ impl<T: NetworkTransport> BrewWorker<T> {
                             tracing::debug!("Brew: sent CONNECT_CONFIRM uuid={} grant={} perm={}", uuid, grant, permission);
                         }
                     }
+                    BrewCommand::SendSimplexGranted { uuid, grant, permission } => {
+                        let data = build_simplex_granted(&uuid, grant, permission);
+                        if let Err(e) = self.transport.send_reliable(&data) {
+                            tracing::error!("BrewWorker: failed to send SIMPLEX_GRANTED: {}", e);
+                        } else {
+                            tracing::debug!("Brew: sent SIMPLEX_GRANTED uuid={} grant={} perm={}", uuid, grant, permission);
+                        }
+                    }
+                    BrewCommand::SendSimplexIdle { uuid, grant, permission } => {
+                        let data = build_simplex_idle(&uuid, grant, permission);
+                        if let Err(e) = self.transport.send_reliable(&data) {
+                            tracing::error!("BrewWorker: failed to send SIMPLEX_IDLE: {}", e);
+                        } else {
+                            tracing::debug!("Brew: sent SIMPLEX_IDLE uuid={} grant={} perm={}", uuid, grant, permission);
+                        }
+                    }
                     BrewCommand::SendCallRelease { uuid, cause } => {
                         let data = build_call_release(&uuid, cause);
                         if let Err(e) = self.transport.send_reliable(&data) {
@@ -803,6 +837,42 @@ impl<T: NetworkTransport> BrewWorker<T> {
                     permission
                 );
                 self.enqueue_event(BrewEvent::CircuitConnectConfirm {
+                    uuid: cc.identifier,
+                    grant,
+                    permission,
+                });
+            }
+            CALL_STATE_SIMPLEX_GRANTED => {
+                let (grant, permission) = if let BrewCallPayload::CircularGrant(g) = cc.payload {
+                    (g.grant, g.permission)
+                } else {
+                    (0, 0)
+                };
+                tracing::info!(
+                    "BrewWorker: SIMPLEX_GRANTED uuid={} grant={} perm={}",
+                    cc.identifier,
+                    grant,
+                    permission
+                );
+                self.enqueue_event(BrewEvent::CircuitSimplexGranted {
+                    uuid: cc.identifier,
+                    grant,
+                    permission,
+                });
+            }
+            CALL_STATE_SIMPLEX_IDLE => {
+                let (grant, permission) = if let BrewCallPayload::CircularGrant(g) = cc.payload {
+                    (g.grant, g.permission)
+                } else {
+                    (1, 0)
+                };
+                tracing::info!(
+                    "BrewWorker: SIMPLEX_IDLE uuid={} grant={} perm={}",
+                    cc.identifier,
+                    grant,
+                    permission
+                );
+                self.enqueue_event(BrewEvent::CircuitSimplexIdle {
                     uuid: cc.identifier,
                     grant,
                     permission,

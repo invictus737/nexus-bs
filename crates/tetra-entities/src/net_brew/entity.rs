@@ -19,6 +19,7 @@ use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::{CfgBrew, SharedConfig};
 use tetra_core::{Sap, TdmaTime, tetra_entities::TetraEntity};
 use tetra_core::{TxReporter, TxState};
+use tetra_pdus::cmce::enums::transmission_grant::TransmissionGrant;
 use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::{
     SapMsg, SapMsgInner,
@@ -556,6 +557,42 @@ impl BrewEntity {
                         src: TetraEntity::Brew,
                         dest: TetraEntity::Cmce,
                         msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
+                BrewEvent::CircuitSimplexGranted { uuid, grant, permission } => {
+                    tracing::info!(
+                        "BrewEntity: CIRCUIT SIMPLEX_GRANTED uuid={} grant={} permission={}",
+                        uuid,
+                        grant,
+                        permission
+                    );
+                    queue.push_back(SapMsg {
+                        sap: tetra_core::Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                            brew_uuid: uuid,
+                            grant,
+                            permission,
+                        }),
+                    });
+                }
+                BrewEvent::CircuitSimplexIdle { uuid, grant, permission } => {
+                    tracing::info!(
+                        "BrewEntity: CIRCUIT SIMPLEX_IDLE uuid={} grant={} permission={}",
+                        uuid,
+                        grant,
+                        permission
+                    );
+                    queue.push_back(SapMsg {
+                        sap: tetra_core::Sap::Control,
+                        src: TetraEntity::Brew,
+                        dest: TetraEntity::Cmce,
+                        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
                             brew_uuid: uuid,
                             grant,
                             permission,
@@ -1423,6 +1460,32 @@ impl TetraEntityTrait for BrewEntity {
                     });
                 }
             }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                brew_uuid,
+                grant,
+                permission,
+            }) => {
+                if self.connected {
+                    self.send_or_queue_brew_command(BrewCommand::SendSimplexGranted {
+                        uuid: brew_uuid,
+                        grant,
+                        permission,
+                    });
+                }
+            }
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
+                brew_uuid,
+                grant,
+                permission,
+            }) => {
+                if self.connected {
+                    self.send_or_queue_brew_command(BrewCommand::SendSimplexIdle {
+                        uuid: brew_uuid,
+                        grant,
+                        permission,
+                    });
+                }
+            }
             SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady { brew_uuid, call_id, ts }) => {
                 tracing::info!("BrewEntity: circuit media ready uuid={} call_id={} ts={}", brew_uuid, call_id, ts);
                 // Register UL forwarding: voice on `ts` gets sent to TetraPack.
@@ -1543,8 +1606,12 @@ impl BrewEntity {
             return;
         }
 
-        if let Some(fwd) = self.ul_forwarded.get_mut(&ts) {
-            if fwd.kind == UlForwardKind::Circuit {
+        if let Some(uuid) = {
+            let fwd = self.ul_forwarded.get_mut(&ts);
+            fwd.and_then(|fwd| {
+                if fwd.kind != UlForwardKind::Circuit {
+                    return None;
+                }
                 if fwd.call_id != call_id {
                     tracing::warn!(
                         "BrewEntity: circuit floor grant call_id mismatch on ts={}: expected {} got {}",
@@ -1563,8 +1630,15 @@ impl BrewEntity {
                     source_issi,
                     dest_gssi
                 );
-                return;
-            }
+                Some(fwd.uuid)
+            })
+        } {
+            self.send_or_queue_brew_command(BrewCommand::SendSimplexGranted {
+                uuid,
+                grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+                permission: 0,
+            });
+            return;
         }
 
         if !super::is_brew_gssi_routable(&self.config, dest_gssi) {
@@ -1641,24 +1715,32 @@ impl BrewEntity {
 
     /// Handle notification that a local UL call has ended.
     fn handle_local_call_tx_stopped(&mut self, call_id: u16, ts: u8) {
-        if let Some(fwd) = self.ul_forwarded.get(&ts) {
-            if fwd.kind == UlForwardKind::Circuit {
-                if fwd.call_id != call_id {
-                    tracing::warn!(
-                        "BrewEntity: circuit floor release call_id mismatch on ts={}: expected {} got {}",
-                        ts,
-                        fwd.call_id,
-                        call_id
-                    );
-                }
-                tracing::debug!(
-                    "BrewEntity: circuit floor release on ts={} uuid={} frames={}, preserving circuit media session",
-                    ts,
-                    fwd.uuid,
-                    fwd.frame_count
-                );
-                return;
+        if let Some(uuid) = self.ul_forwarded.get(&ts).and_then(|fwd| {
+            if fwd.kind != UlForwardKind::Circuit {
+                return None;
             }
+            if fwd.call_id != call_id {
+                tracing::warn!(
+                    "BrewEntity: circuit floor release call_id mismatch on ts={}: expected {} got {}",
+                    ts,
+                    fwd.call_id,
+                    call_id
+                );
+            }
+            tracing::debug!(
+                "BrewEntity: circuit floor release on ts={} uuid={} frames={}, preserving circuit media session",
+                ts,
+                fwd.uuid,
+                fwd.frame_count
+            );
+            Some(fwd.uuid)
+        }) {
+            self.send_or_queue_brew_command(BrewCommand::SendSimplexIdle {
+                uuid,
+                grant: TransmissionGrant::NotGranted.into_raw() as u8,
+                permission: 0,
+            });
+            return;
         }
 
         if let Some(fwd) = self.ul_forwarded.remove(&ts) {

@@ -519,15 +519,29 @@ pub fn build_setup_reject(session_uuid: &Uuid, cause: u8) -> Vec<u8> {
     buf
 }
 
-/// Build CONNECT_CONFIRM with grant/permission (ETSI 14.7.6 BS→TetraPack).
-pub fn build_connect_confirm(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+fn build_circular_grant(call_state: u8, session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
     let mut buf = Vec::with_capacity(20);
     buf.push(BREW_CLASS_CALL_CONTROL);
-    buf.push(CALL_STATE_CONNECT_CONFIRM);
+    buf.push(call_state);
     buf.extend_from_slice(session_uuid.as_bytes());
     buf.push(grant);
     buf.push(permission);
     buf
+}
+
+/// Build CONNECT_CONFIRM with grant/permission (ETSI 14.7.6 BS->TetraPack).
+pub fn build_connect_confirm(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    build_circular_grant(CALL_STATE_CONNECT_CONFIRM, session_uuid, grant, permission)
+}
+
+/// Build SIMPLEX_GRANTED with BrewCircularGrant (Brew v1 call-control state 12).
+pub fn build_simplex_granted(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    build_circular_grant(CALL_STATE_SIMPLEX_GRANTED, session_uuid, grant, permission)
+}
+
+/// Build SIMPLEX_IDLE with BrewCircularGrant (Brew v1 call-control state 13).
+pub fn build_simplex_idle(session_uuid: &Uuid, grant: u8, permission: u8) -> Vec<u8> {
+    build_circular_grant(CALL_STATE_SIMPLEX_IDLE, session_uuid, grant, permission)
 }
 
 /// Build CALL_RELEASE with disconnect cause (ETSI 14.7.x both directions).
@@ -927,6 +941,41 @@ mod tests {
                 assert_eq!(parsed.mnemonic, Some(EMPTY_BREW_MNEMONIC));
             } else {
                 panic!("Expected CircularCall");
+            }
+        } else {
+            panic!("Expected CallControl");
+        }
+    }
+
+    #[test]
+    fn test_build_simplex_grant_states_roundtrip() {
+        let uuid = Uuid::new_v4();
+
+        let granted = build_simplex_granted(&uuid, 3, 0);
+        assert_eq!(granted.len(), 20, "SIMPLEX_GRANTED carries a 2-byte BrewCircularGrant payload");
+        let msg = parse_brew_message(&granted).unwrap();
+        if let BrewMessage::CallControl(cc) = msg {
+            assert_eq!(cc.call_state, CALL_STATE_SIMPLEX_GRANTED);
+            if let BrewCallPayload::CircularGrant(grant) = cc.payload {
+                assert_eq!(grant.grant, 3);
+                assert_eq!(grant.permission, 0);
+            } else {
+                panic!("Expected CircularGrant");
+            }
+        } else {
+            panic!("Expected CallControl");
+        }
+
+        let idle = build_simplex_idle(&uuid, 1, 0);
+        assert_eq!(idle.len(), 20, "SIMPLEX_IDLE carries a 2-byte BrewCircularGrant payload");
+        let msg = parse_brew_message(&idle).unwrap();
+        if let BrewMessage::CallControl(cc) = msg {
+            assert_eq!(cc.call_state, CALL_STATE_SIMPLEX_IDLE);
+            if let BrewCallPayload::CircularGrant(grant) = cc.payload {
+                assert_eq!(grant.grant, 1);
+                assert_eq!(grant.permission, 0);
+            } else {
+                panic!("Expected CircularGrant");
             }
         } else {
             panic!("Expected CallControl");

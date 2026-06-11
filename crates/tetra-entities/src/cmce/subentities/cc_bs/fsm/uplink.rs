@@ -133,6 +133,67 @@ impl CcBsSubentity {
         ));
     }
 
+    pub(in crate::cmce::subentities::cc_bs) fn individual_leg_is_local_rf(call: &IndividualCall, addr: TetraAddress) -> bool {
+        if call.called_over_brew && addr == call.called_addr {
+            return false;
+        }
+        if call.calling_over_brew && addr == call.calling_addr {
+            return false;
+        }
+        true
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn push_individual_d_tx_granted_if_local_rf(
+        queue: &mut MessageQueue,
+        call: &IndividualCall,
+        call_id: u16,
+        target_addr: TetraAddress,
+        target_ts: u8,
+        target_usage: u8,
+        ul_dl_assigned: UlDlAssignment,
+        transmission_grant: TransmissionGrant,
+        transmitting_issi: u32,
+    ) {
+        if Self::individual_leg_is_local_rf(call, target_addr) {
+            Self::push_individual_d_tx_granted(
+                queue,
+                call_id,
+                target_addr,
+                target_ts,
+                target_usage,
+                ul_dl_assigned,
+                transmission_grant,
+                transmitting_issi,
+            );
+        } else {
+            tracing::debug!(
+                "CMCE: suppressing RF D-TX GRANTED call_id={} to Brew external ISSI {} grant={:?}",
+                call_id,
+                target_addr.ssi,
+                transmission_grant
+            );
+        }
+    }
+
+    pub(in crate::cmce::subentities::cc_bs) fn push_individual_d_tx_ceased_if_local_rf(
+        queue: &mut MessageQueue,
+        call: &IndividualCall,
+        call_id: u16,
+        target_addr: TetraAddress,
+        target_ts: u8,
+        target_usage: u8,
+    ) {
+        if Self::individual_leg_is_local_rf(call, target_addr) {
+            Self::push_individual_d_tx_ceased(queue, call_id, target_addr, target_ts, target_usage);
+        } else {
+            tracing::debug!(
+                "CMCE: suppressing RF D-TX CEASED call_id={} to Brew external ISSI {}",
+                call_id,
+                target_addr.ssi
+            );
+        }
+    }
+
     /// Handle parsed U-SETUP and dispatch into group/individual FSM paths.
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_u_setup(
         &mut self,
@@ -340,8 +401,9 @@ impl CcBsSubentity {
                 // decides who may transmit; keep the traffic-channel allocation
                 // bidirectional per clause 21.5.2 so FACCH and receive audio
                 // stay coherent on radios that reject UL-only reallocation.
-                Self::push_individual_d_tx_granted(
+                Self::push_individual_d_tx_granted_if_local_rf(
                     queue,
+                    &call,
                     call_id,
                     requester_addr,
                     requester_ts,
@@ -350,8 +412,9 @@ impl CcBsSubentity {
                     TransmissionGrant::Granted,
                     requester_addr.ssi,
                 );
-                Self::push_individual_d_tx_granted(
+                Self::push_individual_d_tx_granted_if_local_rf(
                     queue,
+                    &call,
                     call_id,
                     listener_addr,
                     listener_ts,
@@ -547,17 +610,26 @@ impl CcBsSubentity {
                     // when SwMI supports interruption, a pre-emptive U-TX
                     // DEMAND withdraws the current simplex private speaker by
                     // D-TX INTERRUPT, then grants the requester.
-                    self.send_d_tx_interrupt_facch(
+                    if Self::individual_leg_is_local_rf(&call, peer_addr) {
+                        self.send_d_tx_interrupt_facch(
+                            queue,
+                            call_id,
+                            peer_addr,
+                            requesting_party.ssi,
+                            peer_ts,
+                            peer_usage,
+                            TransmissionGrant::GrantedToOtherUser,
+                        );
+                    } else {
+                        tracing::debug!(
+                            "CMCE: suppressing RF D-TX INTERRUPT call_id={} to Brew external ISSI {}",
+                            call_id,
+                            peer_addr.ssi
+                        );
+                    }
+                    Self::push_individual_d_tx_granted_if_local_rf(
                         queue,
-                        call_id,
-                        peer_addr,
-                        requesting_party.ssi,
-                        peer_ts,
-                        peer_usage,
-                        TransmissionGrant::GrantedToOtherUser,
-                    );
-                    Self::push_individual_d_tx_granted(
-                        queue,
+                        &call,
                         call_id,
                         requesting_party,
                         req_ts,
@@ -651,8 +723,9 @@ impl CcBsSubentity {
             if let Some(c) = self.individual_calls.get_mut(&call_id) {
                 c.set_floor_holder(requesting_party.ssi);
             }
-            Self::push_individual_d_tx_granted(
+            Self::push_individual_d_tx_granted_if_local_rf(
                 queue,
+                &call,
                 call_id,
                 requesting_party,
                 req_ts,
@@ -664,8 +737,9 @@ impl CcBsSubentity {
             // Peer is now the listener; the grant IE says GrantedToOtherUser,
             // while the channel allocation remains bidirectional for channel
             // continuity.
-            Self::push_individual_d_tx_granted(
+            Self::push_individual_d_tx_granted_if_local_rf(
                 queue,
+                &call,
                 call_id,
                 peer_addr,
                 peer_ts,

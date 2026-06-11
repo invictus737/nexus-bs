@@ -743,6 +743,257 @@ impl CcBsSubentity {
         );
     }
 
+    /// Handle Brew simplex floor grant on an active private circuit.
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_simplex_granted(
+        &mut self,
+        queue: &mut MessageQueue,
+        brew_uuid: uuid::Uuid,
+        grant: u8,
+        permission: u8,
+    ) {
+        let Some((call_id, call)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_GRANTED for unknown uuid={} grant={} permission={}",
+                brew_uuid,
+                grant,
+                permission
+            );
+            return;
+        };
+
+        if call.simplex_duplex {
+            tracing::debug!(
+                "CMCE: ignoring Brew SIMPLEX_GRANTED for duplex call_id={} uuid={}",
+                call_id,
+                brew_uuid
+            );
+            return;
+        }
+        if !call.is_active() {
+            tracing::debug!(
+                "CMCE: ignoring Brew SIMPLEX_GRANTED for inactive call_id={} uuid={} state={:?}",
+                call_id,
+                brew_uuid,
+                call.state
+            );
+            return;
+        }
+
+        let Some((local_addr, local_ts, local_usage, peer_addr)) = Self::brew_private_local_and_peer_legs(&call) else {
+            tracing::warn!(
+                "CMCE: Brew SIMPLEX_GRANTED call_id={} uuid={} has no external private leg",
+                call_id,
+                brew_uuid
+            );
+            return;
+        };
+
+        let grant_enum = Self::network_circuit_grant(grant);
+        tracing::info!(
+            "CMCE: Brew SIMPLEX_GRANTED uuid={} call_id={} local_issi={} peer_issi={} grant={:?} permission={}",
+            brew_uuid,
+            call_id,
+            local_addr.ssi,
+            peer_addr.ssi,
+            grant_enum,
+            permission
+        );
+
+        match grant_enum {
+            TransmissionGrant::Granted => {
+                if let Some(active) = self.individual_calls.get_mut(&call_id) {
+                    active.set_floor_holder(local_addr.ssi);
+                }
+                Self::push_individual_d_tx_granted(
+                    queue,
+                    call_id,
+                    local_addr,
+                    local_ts,
+                    local_usage,
+                    UlDlAssignment::Both,
+                    TransmissionGrant::Granted,
+                    local_addr.ssi,
+                );
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi: local_addr.ssi,
+                        dest_gssi: peer_addr.ssi,
+                        ts: local_ts,
+                    }),
+                });
+            }
+            TransmissionGrant::GrantedToOtherUser => {
+                if let Some(active) = self.individual_calls.get_mut(&call_id) {
+                    active.set_floor_holder(peer_addr.ssi);
+                }
+                Self::push_individual_d_tx_granted(
+                    queue,
+                    call_id,
+                    local_addr,
+                    local_ts,
+                    local_usage,
+                    UlDlAssignment::Both,
+                    TransmissionGrant::GrantedToOtherUser,
+                    peer_addr.ssi,
+                );
+                queue.push_back(SapMsg {
+                    sap: Sap::Control,
+                    src: TetraEntity::Cmce,
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                        call_id,
+                        source_issi: peer_addr.ssi,
+                        dest_gssi: local_addr.ssi,
+                        ts: local_ts,
+                    }),
+                });
+            }
+            TransmissionGrant::RequestQueued | TransmissionGrant::NotGranted => {
+                let current_speaker = call.floor_holder.unwrap_or(peer_addr.ssi);
+                Self::push_individual_d_tx_granted(
+                    queue,
+                    call_id,
+                    local_addr,
+                    local_ts,
+                    local_usage,
+                    UlDlAssignment::Dl,
+                    grant_enum,
+                    current_speaker,
+                );
+            }
+        }
+    }
+
+    /// Handle Brew simplex idle on an active private circuit.
+    pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_circuit_simplex_idle(
+        &mut self,
+        queue: &mut MessageQueue,
+        brew_uuid: uuid::Uuid,
+        grant: u8,
+        permission: u8,
+    ) {
+        let Some((call_id, call)) = self.find_brew_individual_call(brew_uuid) else {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_IDLE for unknown uuid={} grant={} permission={}",
+                brew_uuid,
+                grant,
+                permission
+            );
+            return;
+        };
+
+        if call.simplex_duplex || !call.is_active() {
+            tracing::debug!(
+                "CMCE: ignoring Brew SIMPLEX_IDLE for call_id={} uuid={} duplex={} state={:?}",
+                call_id,
+                brew_uuid,
+                call.simplex_duplex,
+                call.state
+            );
+            return;
+        }
+
+        let Some((local_addr, local_ts, local_usage, peer_addr)) = Self::brew_private_local_and_peer_legs(&call) else {
+            tracing::warn!(
+                "CMCE: Brew SIMPLEX_IDLE call_id={} uuid={} has no external private leg",
+                call_id,
+                brew_uuid
+            );
+            return;
+        };
+
+        tracing::info!(
+            "CMCE: Brew SIMPLEX_IDLE uuid={} call_id={} local_issi={} peer_issi={} grant={} permission={}",
+            brew_uuid,
+            call_id,
+            local_addr.ssi,
+            peer_addr.ssi,
+            grant,
+            permission
+        );
+
+        if call.floor_holder.is_some_and(|holder| holder != peer_addr.ssi) {
+            tracing::debug!(
+                "CMCE: Brew SIMPLEX_IDLE call_id={} ignored because current floor holder is {:?}",
+                call_id,
+                call.floor_holder
+            );
+            return;
+        }
+
+        if let Some(requester) = call.queued_tx_demand {
+            if let Some(active) = self.individual_calls.get_mut(&call_id) {
+                active.set_floor_holder(requester.ssi);
+                active.queued_tx_demand = None;
+            }
+
+            tracing::info!(
+                "CMCE: Brew SIMPLEX_IDLE uuid={} call_id={} -> granting queued local requester ISSI {}",
+                brew_uuid,
+                call_id,
+                requester.ssi
+            );
+
+            Self::push_individual_d_tx_granted(
+                queue,
+                call_id,
+                local_addr,
+                local_ts,
+                local_usage,
+                UlDlAssignment::Both,
+                TransmissionGrant::Granted,
+                local_addr.ssi,
+            );
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Umac,
+                msg: SapMsgInner::CmceCallControl(CallControl::FloorGranted {
+                    call_id,
+                    source_issi: local_addr.ssi,
+                    dest_gssi: peer_addr.ssi,
+                    ts: local_ts,
+                }),
+            });
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Cmce,
+                dest: TetraEntity::Brew,
+                msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexGranted {
+                    brew_uuid,
+                    grant: TransmissionGrant::GrantedToOtherUser.into_raw() as u8,
+                    permission: 0,
+                }),
+            });
+            return;
+        }
+
+        if let Some(active) = self.individual_calls.get_mut(&call_id) {
+            active.clear_floor_holder();
+        }
+        Self::push_individual_d_tx_ceased(queue, call_id, local_addr, local_ts, local_usage);
+        queue.push_back(SapMsg {
+            sap: Sap::Control,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::CmceCallControl(CallControl::FloorReleased { call_id, ts: local_ts }),
+        });
+    }
+
+    fn brew_private_local_and_peer_legs(call: &IndividualCall) -> Option<(TetraAddress, u8, u8, TetraAddress)> {
+        if call.called_over_brew && !call.calling_over_brew {
+            Some((call.calling_addr, call.calling_ts, call.calling_usage, call.called_addr))
+        } else if call.calling_over_brew && !call.called_over_brew {
+            Some((call.called_addr, call.called_ts, call.called_usage, call.calling_addr))
+        } else {
+            None
+        }
+    }
+
     /// Handle network-initiated group call start.
     pub(in crate::cmce::subentities::cc_bs) fn fsm_on_network_call_start(
         &mut self,

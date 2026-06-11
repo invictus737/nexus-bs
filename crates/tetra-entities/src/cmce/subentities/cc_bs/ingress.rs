@@ -88,6 +88,20 @@ impl CcBsSubentity {
             } => {
                 self.rx_network_circuit_connect_confirm(queue, brew_uuid, grant, permission);
             }
+            CallControl::NetworkCircuitSimplexGranted {
+                brew_uuid,
+                grant,
+                permission,
+            } => {
+                self.rx_network_circuit_simplex_granted(queue, brew_uuid, grant, permission);
+            }
+            CallControl::NetworkCircuitSimplexIdle {
+                brew_uuid,
+                grant,
+                permission,
+            } => {
+                self.rx_network_circuit_simplex_idle(queue, brew_uuid, grant, permission);
+            }
             CallControl::NetworkCircuitMediaReady { brew_uuid, .. } => {
                 tracing::trace!("CMCE: ignoring unexpected NetworkCircuitMediaReady uuid={}", brew_uuid);
             }
