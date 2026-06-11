@@ -289,6 +289,26 @@
           </section>
         </div>
 
+        <section class="panel calibration-panel" id="rfCalibrationPanel">
+          <div class="panel-head"><h2>RF Calibration</h2><span id="calibrationStatus">idle</span></div>
+          <div class="calibration-grid">
+            <div class="calibration-copy">
+              <dl class="facts compact-facts">
+                <dt>File</dt><dd id="calibrationPath">calibration.toml</dd>
+                <dt>Applied</dt><dd id="calibrationApplied">--</dd>
+                <dt>Carrier Leak</dt><dd id="calibrationCarrier">--</dd>
+                <dt>Image Rejection</dt><dd id="calibrationImage">--</dd>
+                <dt>EVM Proxy</dt><dd id="calibrationEvm">--</dd>
+              </dl>
+            </div>
+            <div class="calibration-actions">
+              <button class="action-btn danger" id="calibrationRunBtn" type="button">Calibrate TX DC/IQ</button>
+              <span id="calibrationActionStatus">traffic outage required</span>
+              <pre id="calibrationLog" class="calibration-log"></pre>
+            </div>
+          </div>
+        </section>
+
         <section class="panel config-manager" id="configManager">
           <div class="panel-head"><h2>Config Manager</h2><span id="configProfileStatus">loading</span></div>
           <div class="config-controls">

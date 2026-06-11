@@ -59,6 +59,13 @@ sample_rate = 600000
 # Adjust if your SDR has a non-negligible tuning error.
 ppm_err = 0.0
 
+# TX DC/IQ calibration. Keep disabled until Dashboard Settings -> RF Calibration
+# has generated calibration.toml and accepted a before/after improvement report.
+tx_calibration_enabled = false
+tx_calibration_file = "calibration.toml"
+tx_calibration_apply_dc = true
+tx_calibration_apply_iq = true
+
 ################################################################################################
 ## OPTIONAL: specific device, antenna, gain selection                                        ##
 ## Check your device with SoapySDRUtil --probe                                               ##

@@ -185,6 +185,17 @@ impl RxTxDev for RxTxDevSoapySdr {
         Ok(())
     }
 
+    fn run_tx_calibration(&mut self, calibration_path: &str) -> Result<(), String> {
+        if let Some(tx_dsp) = &mut self.tx_dsp {
+            tx_dsp.clear_after_inhibit();
+        }
+        self.sdr
+            .set_tx_stream_active(false)
+            .map_err(|err| format!("deactivate TX stream before calibration: {:?}", err))?;
+        self.tx_inhibited = true;
+        self.sdr.run_tx_calibration(calibration_path).map(|_| ())
+    }
+
     fn rxtx_timeslot<'a>(
         &'a mut self,
         tx_slot: &[TxSlotBits],

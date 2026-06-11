@@ -568,6 +568,7 @@ pub struct DashboardServer {
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     cmd_tx: Option<CmdSender>,
     rf_cmd_tx: Option<CmdSender>,
+    phy_cmd_tx: Option<CmdSender>,
     update_state: SharedUpdateState,
     /// Optional override for the OTA update source directory.
     /// If None, the update routine auto-detects.
@@ -598,6 +599,7 @@ impl DashboardServer {
             shared_config: None,
             cmd_tx: None,
             rf_cmd_tx: None,
+            phy_cmd_tx: None,
             update_state: Arc::new(Mutex::new(UpdateState::new())),
             source_dir_override: None,
             static_dir: None,
@@ -615,6 +617,10 @@ impl DashboardServer {
 
     pub fn set_rf_cmd_sender(&mut self, tx: CmdSender) {
         self.rf_cmd_tx = Some(tx);
+    }
+
+    pub fn set_phy_cmd_sender(&mut self, tx: CmdSender) {
+        self.phy_cmd_tx = Some(tx);
     }
 
     /// Provide the SharedConfig so the dashboard can read live SDS queue state.
@@ -659,6 +665,7 @@ impl DashboardServer {
         let runtime_config_path = self.runtime_config_path.clone();
         let cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.cmd_tx.take()));
         let rf_cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.rf_cmd_tx.take()));
+        let phy_cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.phy_cmd_tx.take()));
         let update_state = Arc::clone(&self.update_state);
         let source_dir_override = self.source_dir_override.clone();
         let static_dir = self.static_dir.clone();
@@ -700,6 +707,7 @@ impl DashboardServer {
                     let runtime_config_path = runtime_config_path.clone();
                     let cmd_tx = Arc::clone(&cmd_tx);
                     let rf_cmd_tx = Arc::clone(&rf_cmd_tx);
+                    let phy_cmd_tx = Arc::clone(&phy_cmd_tx);
                     let update_state = Arc::clone(&update_state);
                     let source_dir_override = source_dir_override.clone();
                     let static_dir = static_dir.clone();
@@ -719,6 +727,7 @@ impl DashboardServer {
                             runtime_config_path,
                             cmd_tx,
                             rf_cmd_tx,
+                            phy_cmd_tx,
                             update_state,
                             source_dir_override,
                             static_dir,
@@ -1253,6 +1262,178 @@ fn serve_rf_carrier_post(stream: TcpStream, rf_cmd_tx: &Arc<Mutex<Option<CmdSend
     http_json_response(stream, 200, &body);
 }
 
+fn serve_rf_calibration_status(stream: TcpStream, config_path: &str) {
+    let path = crate::rf_calibration::calibration_path_for_config(config_path);
+    let body = serde_json::to_string(&crate::rf_calibration::status_json(&path)).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+    http_json_response(stream, 200, &body);
+}
+
+fn serve_rf_calibration_run(
+    stream: TcpStream,
+    config_path: &str,
+    rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+) {
+    let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path);
+    let calibration_path_string = calibration_path.display().to_string();
+    if let Err(err) = crate::rf_calibration::try_start(&calibration_path_string) {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": err,
+            "status": crate::rf_calibration::current_phase().as_str(),
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 409, &body);
+        return;
+    }
+
+    let rf_accepted = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: true });
+    if !rf_accepted {
+        crate::rf_calibration::mark_failed("RF carrier control channel unavailable");
+        http_json_response(stream, 503, r#"{"ok":false,"error":"RF carrier control channel unavailable"}"#);
+        return;
+    }
+
+    let phy_sender = phy_cmd_tx.lock().ok().and_then(|guard| guard.clone());
+    let Some(phy_sender) = phy_sender else {
+        crate::rf_calibration::mark_failed("PHY control channel unavailable");
+        http_json_response(stream, 503, r#"{"ok":false,"error":"PHY control channel unavailable"}"#);
+        return;
+    };
+
+    let config_path_string = config_path.to_string();
+    std::thread::Builder::new()
+        .name("rf-calibration".into())
+        .spawn(move || {
+            run_rf_calibration_orchestrator(config_path_string, calibration_path_string, phy_sender);
+        })
+        .ok();
+
+    let body = serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "status": "inhibiting",
+        "path": calibration_path.display().to_string(),
+        "message": "RF calibration started",
+    }))
+    .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+    http_json_response(stream, 202, &body);
+}
+
+fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String, phy_sender: CmdSender) {
+    crate::rf_calibration::append_log("RF carrier inhibit queued; waiting notification guard before PHY calibration");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    if phy_sender
+        .try_send(ControlCommand::RunTxCalibration {
+            calibration_path: calibration_path.clone(),
+        })
+        .is_err()
+    {
+        crate::rf_calibration::mark_failed("failed to queue PHY calibration command");
+        return;
+    }
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    loop {
+        match crate::rf_calibration::current_phase() {
+            crate::rf_calibration::CalibrationPhase::Calibrated => break,
+            crate::rf_calibration::CalibrationPhase::Failed => return,
+            _ if std::time::Instant::now() >= deadline => {
+                crate::rf_calibration::mark_failed("timeout waiting for PHY calibration");
+                return;
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(250)),
+        }
+    }
+
+    let report = match tetra_config::bluestation::read_tx_calibration_file(&calibration_path) {
+        Ok(report) => report,
+        Err(err) => {
+            crate::rf_calibration::mark_failed(format!("calibration file was not readable after PHY finished: {}", err));
+            return;
+        }
+    };
+    if !report.report.accepted {
+        crate::rf_calibration::mark_failed(format!("calibration rejected; config not changed: {}", report.report.summary));
+        return;
+    }
+
+    match enable_tx_calibration_in_config(&config_path) {
+        Ok(()) => {
+            crate::rf_calibration::mark_restarting("calibration accepted; config.toml updated; restarting service");
+            crate::service_control::schedule_service_action(
+                crate::service_control::ServiceAction::Restart,
+                std::time::Duration::from_secs(2),
+            );
+        }
+        Err(err) => {
+            crate::rf_calibration::mark_failed(format!("calibration accepted but config update failed: {}", err));
+        }
+    }
+}
+
+fn enable_tx_calibration_in_config(config_path: &str) -> Result<(), String> {
+    let path = Path::new(config_path);
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let updated = upsert_soapy_calibration_keys(&text)?;
+    let backup_path = format!("{}.bak", config_path);
+    let _ = std::fs::copy(path, &backup_path);
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, updated).map_err(|e| format!("write {}: {}", tmp_path.display(), e))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| format!("rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
+    Ok(())
+}
+
+fn upsert_soapy_calibration_keys(input: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = input.lines().map(|line| line.to_string()).collect();
+    let had_trailing_newline = input.ends_with('\n');
+    let section_start = lines
+        .iter()
+        .position(|line| line.trim() == "[phy_io.soapysdr]")
+        .ok_or_else(|| "missing [phy_io.soapysdr] section".to_string())?;
+    let section_end = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']')
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+
+    let desired = [
+        ("tx_calibration_enabled", "true"),
+        ("tx_calibration_file", "\"calibration.toml\""),
+        ("tx_calibration_apply_dc", "true"),
+        ("tx_calibration_apply_iq", "true"),
+    ];
+    let mut present = [false; 4];
+    for idx in (section_start + 1)..section_end {
+        let matched = {
+            let trimmed = lines[idx].trim_start();
+            desired.iter().enumerate().find_map(|(key_idx, (key, value))| {
+                (trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=')).then_some((key_idx, *key, *value))
+            })
+        };
+        if let Some((key_idx, key, value)) = matched {
+            lines[idx] = format!("{key} = {value}");
+            present[key_idx] = true;
+        }
+    }
+    let mut insert_at = section_end;
+    for (key_idx, (key, value)) in desired.iter().enumerate() {
+        if !present[key_idx] {
+            lines.insert(insert_at, format!("{key} = {value}"));
+            insert_at += 1;
+        }
+    }
+    let mut out = lines.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn serve_clear_dashboard_logs(stream: TcpStream, state: &DashboardState) {
     if let Ok(mut s) = state.write() {
         s.clear_logs();
@@ -1299,6 +1480,7 @@ fn handle_connection(
     runtime_config_path: Option<String>,
     cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     rf_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
+    phy_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     update_state: SharedUpdateState,
     source_dir_override: Option<String>,
     static_dir: Option<String>,
@@ -1537,6 +1719,12 @@ fn handle_connection(
             Ok(value) => serve_rf_carrier_post(buf.into_inner(), &rf_cmd_tx, &value),
             Err(e) => http_response(buf.into_inner(), 400, &format!("invalid JSON: {}", e)),
         }
+    } else if request_matches(&req_line, "POST", "/api/rf/calibration/run") {
+        drain_http_headers(&mut stream);
+        serve_rf_calibration_run(stream, &config_path, &rf_cmd_tx, &phy_cmd_tx);
+    } else if request_matches(&req_line, "GET", "/api/rf/calibration/status") {
+        drain_http_headers(&mut stream);
+        serve_rf_calibration_status(stream, &config_path);
     } else if request_matches(&req_line, "POST", "/api/logs/clear") {
         drain_http_headers(&mut stream);
         serve_clear_dashboard_logs(stream, &state);

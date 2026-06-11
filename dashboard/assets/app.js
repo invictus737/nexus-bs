@@ -35,6 +35,8 @@ const state = {
   configEditorStatus: "idle",
   configBusy: false,
   rfCarrierBusy: false,
+  calibration: null,
+  calibrationBusy: false,
   serviceBusy: false,
   serviceStatus: "idle",
   logAutoScroll: true,
@@ -1045,6 +1047,106 @@ async function requestRfCarrierToggle() {
   }
 }
 
+function setCalibrationStatus(message) {
+  setText("calibrationActionStatus", message || "idle");
+}
+
+async function requestTxCalibration() {
+  if (state.calibrationBusy) return;
+  if (!window.confirm("Run destructive TX DC/IQ calibration?\nTETRA traffic will be stopped, calibration.toml will be written, and Nexus-BS will restart if the result is accepted.")) {
+    return;
+  }
+  state.calibrationBusy = true;
+  renderCalibration();
+  setCalibrationStatus("starting calibration");
+  try {
+    const res = await fetch("/api/rf/calibration/run", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    state.calibration = body;
+    setCalibrationStatus(body.message || "calibration running");
+    await loadCalibrationStatus();
+  } catch (error) {
+    setCalibrationStatus(`calibration failed: ${String(error.message || error).slice(0, 110)}`);
+  } finally {
+    window.setTimeout(() => {
+      state.calibrationBusy = false;
+      renderCalibration();
+    }, 2500);
+  }
+}
+
+async function loadCalibrationStatus() {
+  try {
+    const res = await fetch("/api/rf/calibration/status", {
+      credentials: "same-origin",
+      cache: "no-store",
+    });
+    if (!res.ok) return;
+    state.calibration = await res.json();
+    state.calibrationBusy = !!state.calibration?.active;
+    renderCalibration();
+  } catch {
+    // Keep the last report visible.
+  }
+}
+
+function renderCalibration() {
+  const status = state.calibration || {};
+  const report = status.report || {};
+  const reference = report.reference || {};
+  const calibrated = report.calibrated || {};
+  const applied = report.applied || {};
+  const summary = report.report || {};
+  const accepted = !!summary.accepted;
+  const active = !!status.active || !!state.calibrationBusy;
+  const phase = status.status || "idle";
+
+  setText("calibrationStatus", active ? phase.toUpperCase() : accepted ? "APPLIED" : phase.toUpperCase());
+  setText("calibrationPath", status.path || "calibration.toml");
+  setText(
+    "calibrationApplied",
+    report.status
+      ? `${report.status} dc(${fmtSignedFixed(applied.dc_i, 4)}, ${fmtSignedFixed(applied.dc_q, 4)}) iq(${fmtSignedFixed(applied.iq_i, 4)}, ${fmtSignedFixed(applied.iq_q, 4)})`
+      : "--"
+  );
+  setText(
+    "calibrationCarrier",
+    metricBeforeAfter(reference.carrier_leakage_dbc, calibrated.carrier_leakage_dbc, "dBc", summary.carrier_leakage_improvement_db)
+  );
+  setText(
+    "calibrationImage",
+    metricBeforeAfter(reference.image_rejection_db, calibrated.image_rejection_db, "dB", summary.image_rejection_improvement_db)
+  );
+  setText(
+    "calibrationEvm",
+    metricBeforeAfter(reference.evm_proxy_pct, calibrated.evm_proxy_pct, "%", summary.evm_proxy_improvement_pct)
+  );
+  setText("calibrationActionStatus", active ? "running; service restart follows accepted result" : summary.summary || status.error || "traffic outage required");
+  setText("calibrationLog", status.log || (summary.summary ? `${summary.summary}\n` : ""));
+  const button = $("calibrationRunBtn");
+  if (button) button.disabled = active || state.calibrationBusy || !state.site?.config?.available;
+}
+
+function metricBeforeAfter(before, after, unit, improvement) {
+  const b = Number(before);
+  const a = Number(after);
+  if (!Number.isFinite(b) || !Number.isFinite(a)) return "--";
+  const imp = Number(improvement);
+  const suffix = Number.isFinite(imp) ? ` / Δ ${fmtSignedFixed(imp, 1)} ${unit === "%" ? "pp" : "dB"}` : "";
+  return `${b.toFixed(1)} ${unit} -> ${a.toFixed(1)} ${unit}${suffix}`;
+}
+
+function fmtSignedFixed(value, digits = 1) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return "--";
+  return `${n >= 0 ? "+" : ""}${n.toFixed(digits)}`;
+}
+
 function liveSystemSeconds(field, fallbackField) {
   const sys = state.system || {};
   const raw = sys[field] ?? (fallbackField ? sys[fallbackField] : undefined);
@@ -1695,6 +1797,7 @@ function renderSite() {
   setText("adminCoreProcess", "nexus-bs core service");
   setText("adminDashboardProcess", "nexus-bs-dashboard service");
   renderServiceControls();
+  renderCalibration();
   setText("slotSummary", "TS1 control, TS2-TS4 traffic");
   setText("diagramSlotState", "TS1 control, TS2-TS4 traffic");
 }
@@ -2025,6 +2128,7 @@ function refreshDashboardData() {
   loadSite();
   loadSnapshot();
   loadCallsSnapshot();
+  loadCalibrationStatus();
   loadConfigProfiles();
 }
 
@@ -2117,6 +2221,7 @@ function initNav() {
   $("serviceRestartBtn")?.addEventListener("click", () => requestServiceAction("restart"));
   $("serviceShutdownBtn")?.addEventListener("click", () => requestServiceAction("shutdown"));
   $("serviceStopGoBtn")?.addEventListener("click", () => requestServiceAction("stopgo"));
+  $("calibrationRunBtn")?.addEventListener("click", requestTxCalibration);
   $("diagramPathToggle")?.addEventListener("click", requestRfCarrierToggle);
   $("logAutoScrollBtn")?.addEventListener("click", () => {
     state.logAutoScroll = !state.logAutoScroll;
@@ -2146,4 +2251,8 @@ setInterval(loadSystem, 15000);
 setInterval(loadSite, SITE_REFRESH_MS);
 setInterval(loadSnapshot, SNAPSHOT_REFRESH_MS);
 setInterval(loadCallsSnapshot, CALLS_REFRESH_MS);
+setInterval(() => {
+  if (state.calibrationBusy || state.calibration?.active) loadCalibrationStatus();
+}, 1000);
+setInterval(loadCalibrationStatus, 30000);
 setInterval(renderLiveTick, 1000);

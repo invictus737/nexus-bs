@@ -9,6 +9,7 @@ pub mod messagerouter;
 pub mod mle;
 pub mod mm;
 pub mod phy;
+pub mod rf_calibration;
 pub mod sndcp;
 pub mod umac;
 

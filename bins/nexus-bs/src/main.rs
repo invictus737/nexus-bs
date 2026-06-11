@@ -193,11 +193,15 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
         (None, None)
     };
 
+    // Always build control links — dashboard needs them even without external control server.
+    // PHY also uses its link for local RF calibration commands.
+    let (mut c_d, mut c_e) = build_all_control_links();
+
     // Add suitable Phy component based on PhyIo type
     match cfg.config().phy_io.backend {
         PhyBackend::SoapySdr => {
             let rxdev = RxTxDevSoapySdr::with_telemetry(cfg, tsink.clone());
-            let phy = PhyBs::new(cfg.clone(), rxdev);
+            let phy = PhyBs::new(cfg.clone(), rxdev, c_e.remove(&TetraEntity::Phy));
             router.register_entity(Box::new(phy));
         }
         _ => {
@@ -230,9 +234,6 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
             );
         }
     }
-
-    // Always build control links — dashboard needs them even without external control server
-    let (mut c_d, mut c_e) = build_all_control_links();
 
     // Add remaining components
     let lmac = LmacBs::new(cfg.clone());
@@ -397,12 +398,19 @@ fn main() {
                 use tetra_core::tetra_entities::TetraEntity;
                 cdispatchers.get(&TetraEntity::Mm).map(|d| d.clone_sender())
             };
+            let dash_phy_cmd_tx = {
+                use tetra_core::tetra_entities::TetraEntity;
+                cdispatchers.get(&TetraEntity::Phy).map(|d| d.clone_sender())
+            };
 
             if let Some(tx) = dash_cmd_tx {
                 dashboard.set_cmd_sender(tx);
             }
             if let Some(tx) = dash_rf_cmd_tx {
                 dashboard.set_rf_cmd_sender(tx);
+            }
+            if let Some(tx) = dash_phy_cmd_tx {
+                dashboard.set_phy_cmd_sender(tx);
             }
 
             // start() must be called before Arc::new() because it takes &mut self

@@ -379,6 +379,47 @@ tx_gain_vga = 12.5
     }
 
     #[test]
+    fn test_soapy_tx_calibration_defaults_to_disabled() {
+        let cfg = from_toml_str(&minimal_soapy_toml("")).expect("parse failed");
+        let soapy = cfg.phy_io.soapysdr.expect("SoapySdr config expected");
+        assert!(!soapy.tx_calibration_enabled);
+        assert_eq!(soapy.tx_calibration_file, "calibration.toml");
+        assert!(soapy.tx_calibration_apply_dc);
+        assert!(soapy.tx_calibration_apply_iq);
+    }
+
+    #[test]
+    fn test_soapy_tx_calibration_accepts_explicit_settings() {
+        let cfg = from_toml_str(&minimal_soapy_toml(
+            r#"
+tx_calibration_enabled = true
+tx_calibration_file = "calibration.toml"
+tx_calibration_apply_dc = true
+tx_calibration_apply_iq = false
+"#,
+        ))
+        .expect("calibration fields should parse");
+        let soapy = cfg.phy_io.soapysdr.expect("SoapySdr config expected");
+        assert!(soapy.tx_calibration_enabled);
+        assert_eq!(soapy.tx_calibration_file, "calibration.toml");
+        assert!(soapy.tx_calibration_apply_dc);
+        assert!(!soapy.tx_calibration_apply_iq);
+    }
+
+    #[test]
+    fn test_soapy_tx_calibration_rejects_wrong_types() {
+        for input in [
+            "tx_calibration_enabled = \"yes\"",
+            "tx_calibration_file = true",
+            "tx_calibration_apply_dc = 1",
+            "tx_calibration_apply_iq = \"false\"",
+        ] {
+            let toml = minimal_soapy_toml(input);
+            assert!(from_toml_str(&toml).is_err(), "should reject {input}");
+        }
+    }
+
+    #[test]
     fn test_energy_saving_mode_defaults_to_auto() {
         let toml = minimal_toml("");
         let cfg = from_toml_str(&toml).expect("parse failed");

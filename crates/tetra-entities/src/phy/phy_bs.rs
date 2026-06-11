@@ -7,6 +7,7 @@ use tetra_pdus::phy::traits::rxtx_dev::{RxBurstBits, RxSlotBits, RxTxDev, TxSlot
 use tetra_saps::tp::TpUnitdataInd;
 use tetra_saps::{SapMsg, SapMsgInner};
 
+use crate::net_control::{ControlCommand, ControlEndpoint};
 use crate::phy::components::phy_io_file::{FileWriteMsg, PhyIoFileMode};
 use crate::phy::components::{burst_consts::*, slotter, train_consts::*};
 use crate::umac::subcomp::bs_sched::MACSCHED_TX_AHEAD;
@@ -31,12 +32,13 @@ pub struct PhyBs<D: RxTxDev> {
     /// RX/TX device
     rxtxdev: D,
     carrier_inhibited_applied: bool,
+    control: Option<ControlEndpoint>,
 
     tick: u64,
 }
 
 impl<D: RxTxDev> PhyBs<D> {
-    pub fn new(config: SharedConfig, rxtxdev: D) -> Self {
+    pub fn new(config: SharedConfig, rxtxdev: D, control: Option<ControlEndpoint>) -> Self {
         let c = &config.config().phy_io;
         let initial_carrier_inhibited = config.state_read().carrier_inhibited;
         let mut rxtxdev = rxtxdev;
@@ -77,6 +79,7 @@ impl<D: RxTxDev> PhyBs<D> {
             ul_input_file,
             rxtxdev,
             carrier_inhibited_applied: initial_carrier_inhibited,
+            control,
             tick: 0,
         }
     }
@@ -367,6 +370,37 @@ impl<D: RxTxDev> PhyBs<D> {
         // TPC SAP not implemented yet. Log instead of crashing the PHY worker.
         unimplemented_log!("rx_tpc_prim: TPC SAP not implemented");
     }
+
+    fn process_control_commands(&mut self) {
+        let commands: Vec<ControlCommand> = self
+            .control
+            .as_ref()
+            .map(|cep| {
+                let mut commands = Vec::new();
+                while let Some(cmd) = cep.try_recv() {
+                    commands.push(cmd);
+                }
+                commands
+            })
+            .unwrap_or_default();
+
+        for cmd in commands {
+            match cmd {
+                ControlCommand::RunTxCalibration { calibration_path } => {
+                    tracing::warn!("PHY: TX DC/IQ calibration requested path={}", calibration_path);
+                    crate::rf_calibration::mark_calibrating(&calibration_path);
+                    match self.rxtxdev.run_tx_calibration(&calibration_path) {
+                        Ok(()) => crate::rf_calibration::mark_calibrated("PHY calibration finished"),
+                        Err(err) => {
+                            tracing::error!("PHY: TX DC/IQ calibration failed: {}", err);
+                            crate::rf_calibration::mark_failed(err);
+                        }
+                    }
+                }
+                other => tracing::warn!("PHY: ignoring unsupported control command {:?}", other),
+            }
+        }
+    }
 }
 
 impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyBs<D> {
@@ -394,5 +428,6 @@ impl<D: RxTxDev + Send + 'static> TetraEntityTrait for PhyBs<D> {
 
     fn tick_start(&mut self, _queue: &mut MessageQueue, ts: TdmaTime) {
         self.dltime = ts;
+        self.process_control_commands();
     }
 }

@@ -123,6 +123,11 @@ pub enum ControlCommand {
     /// persisted config change: restart returns to carrier active.
     SetRfCarrierInhibit { inhibited: bool },
 
+    /// Run destructive local TX DC/IQ calibration in PHY and write calibration.toml.
+    ///
+    /// This is a local maintenance command, not an air-interface TETRA PDU.
+    RunTxCalibration { calibration_path: String },
+
     /// Add a live SDS message to the broadcast queue.
     /// The message will be transmitted to all MSs on the cell at the next HMD interval,
     /// round-robining with the static Home Mode Display text.

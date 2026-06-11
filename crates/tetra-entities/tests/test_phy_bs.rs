@@ -64,7 +64,7 @@ fn carrier_inhibit_hard_gates_tx_stream_but_keeps_phy_rx_tick() {
         calls: Arc::clone(&calls),
         tx_inhibit_calls: Arc::clone(&tx_inhibit_calls),
     };
-    let mut phy = PhyBs::new(config.clone(), dev);
+    let mut phy = PhyBs::new(config.clone(), dev, None);
     let mut queue = MessageQueue::new();
 
     phy.tick_start(&mut queue, TdmaTime::default());

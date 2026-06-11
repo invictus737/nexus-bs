@@ -931,6 +931,60 @@ td .pill {
   white-space: nowrap;
 }
 
+.calibration-panel {
+  margin-top: 14px;
+}
+
+.calibration-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 42%);
+  gap: 0;
+}
+
+.compact-facts dt,
+.compact-facts dd {
+  min-height: 34px;
+}
+
+.calibration-actions {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
+  gap: 8px;
+  align-content: start;
+  padding: 12px;
+  border-left: 1px solid var(--line-soft);
+}
+
+.calibration-actions > span {
+  min-width: 0;
+  align-self: end;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.calibration-log {
+  grid-column: 1 / -1;
+  min-height: 104px;
+  max-height: 180px;
+  margin: 0;
+  padding: 10px;
+  overflow: auto;
+  border: 1px solid var(--line-soft);
+  border-radius: 6px;
+  background: var(--panel-3);
+  color: #c9d6df;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+}
+
 .config-manager {
   margin-top: 14px;
 }
@@ -1135,10 +1189,17 @@ td .pill {
   .grid.traffic-grid,
   .slot-grid,
   .service-controls,
+  .calibration-grid,
+  .calibration-actions,
   .config-controls,
   .config-editor-bar,
   .config-footer {
     grid-template-columns: 1fr;
+  }
+
+  .calibration-actions {
+    border-left: 0;
+    border-top: 1px solid var(--line-soft);
   }
 
   .action-btn {

@@ -47,5 +47,9 @@ pub trait RxTxDev {
         Ok(())
     }
 
+    fn run_tx_calibration(&mut self, _calibration_path: &str) -> Result<(), String> {
+        Err("TX calibration is not supported by this RX/TX device".to_string())
+    }
+
     fn rxtx_timeslot(&mut self, tx_slot: &[TxSlotBits]) -> Result<Vec<Option<RxSlotBits<'_>>>, RxTxDevError>;
 }
