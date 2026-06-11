@@ -26,7 +26,8 @@ KillSignal=SIGINT
 TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
-CPUAffinity=3
+# Dashboard and local command bridge share the non-RF application CPU.
+CPUAffinity=2
 CPUWeight=50
 Nice=5
 

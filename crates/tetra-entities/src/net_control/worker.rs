@@ -117,6 +117,7 @@ impl<T: NetworkTransport> ControlWorker<T> {
             ControlCommand::KickMs { .. } => TetraEntity::Cmce,
             ControlCommand::RestartService => TetraEntity::Cmce,
             ControlCommand::ShutdownService => TetraEntity::Cmce,
+            ControlCommand::PowerOffHost => TetraEntity::Cmce,
             ControlCommand::StopGoService { .. } => TetraEntity::Cmce,
             ControlCommand::SetRfCarrierInhibit { .. } => TetraEntity::Mm,
             ControlCommand::RunTxCalibration { .. } => TetraEntity::Phy,
@@ -212,6 +213,12 @@ mod tests {
     #[test]
     fn test_route_stop_go_service_to_cmce() {
         let target = ControlWorker::<MockTransport>::route_control_command(&ControlCommand::StopGoService { start_delay_secs: 5 });
+        assert_eq!(target, TetraEntity::Cmce);
+    }
+
+    #[test]
+    fn test_route_power_off_host_to_cmce() {
+        let target = ControlWorker::<MockTransport>::route_control_command(&ControlCommand::PowerOffHost);
         assert_eq!(target, TetraEntity::Cmce);
     }
 

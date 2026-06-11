@@ -130,6 +130,13 @@ impl CmceBs {
                     std::time::Duration::from_millis(500),
                 );
             }
+            ControlCommand::PowerOffHost => {
+                tracing::warn!("CMCE: PowerOffHost requested");
+                crate::service_control::schedule_service_action(
+                    crate::service_control::ServiceAction::PowerOffHost,
+                    std::time::Duration::from_millis(500),
+                );
+            }
             ControlCommand::StopGoService { start_delay_secs } => {
                 tracing::info!(
                     "CMCE: StopGoService requested; core exits now, systemd restart delay should be {}s",

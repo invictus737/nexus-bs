@@ -52,7 +52,9 @@ MemoryMax=512M
 TasksMax=128
 LimitNOFILE=4096
 NoNewPrivileges=yes
-CPUAffinity=0 1 2
+# Keep the RF/TETRA core on its dedicated application CPU. CPU 0 remains
+# available for the OS/kernel work; dashboard/control run on CPU 2.
+CPUAffinity=1
 CPUWeight=900
 
 StandardOutput=journal

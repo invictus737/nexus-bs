@@ -703,11 +703,12 @@ function fmtPct(value) {
   return `${n.toFixed(1)}%`;
 }
 
-function fmtSignedHz(value) {
+function fmtDuplexShift(value, spacingId) {
   const n = Number(value);
   if (!Number.isFinite(n)) return "--";
-  const sign = n > 0 ? "+" : "";
-  return `${sign}${fmtHz(n)}`;
+  const id = Number(spacingId);
+  const suffix = Number.isFinite(id) ? ` (${id})` : "";
+  return `${fmtHz(n)}${suffix}`;
 }
 
 function gainsLabel(gains) {
@@ -977,12 +978,16 @@ async function requestServiceAction(action) {
   };
   const labels = {
     restart: "restart",
-    shutdown: "shutdown",
+    shutdown: "shutdown BS + OS",
     stopgo: "stop & go",
+  };
+  const confirmations = {
+    shutdown: "Shutdown BS and power off the Linux host?\nRF and dashboard will stop until physical power is restored.",
+    stopgo: "Stop & Go BS?",
   };
   const endpoint = endpoints[action];
   if (!endpoint || state.serviceBusy) return;
-  if (action !== "restart" && !window.confirm(`${labels[action]} BS?`)) return;
+  if (action !== "restart" && !window.confirm(confirmations[action] || `${labels[action]} BS?`)) return;
   state.serviceBusy = true;
   renderServiceControls();
   setServiceStatus(`${labels[action]} queued`);
@@ -1746,7 +1751,7 @@ function renderSite() {
 
   setText("rfTxFreq", fmtHz(txHz));
   setText("rfRxFreq", fmtHz(rxHz));
-  setText("rfDuplexShift", shift === null ? "--" : fmtSignedHz(shift));
+  setText("rfDuplexShift", shift === null ? "--" : fmtDuplexShift(shift, cell.duplex_spacing_id));
   setText("rfBandCarrier", cell.freq_band !== undefined ? `band ${cell.freq_band}, carrier ${cell.main_carrier}` : "--");
   setText("rfMccMnc", cfg.network ? `${cfg.network.mcc} / ${cfg.network.mnc}` : "--");
   setText("rfLocationArea", cell.location_area ?? "--");

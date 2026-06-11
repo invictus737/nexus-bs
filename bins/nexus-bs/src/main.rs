@@ -492,9 +492,9 @@ fn main() {
     };
 
     // Set up Ctrl+C handler for graceful shutdown.
-    // Also installs lifecycle control so RestartService / ShutdownService commands
-    // can request shutdown with the correct exit code (75 for restart, signaling
-    // systemd to restart us instead of treating it as a normal exit).
+    // Also installs lifecycle control so RestartService / ShutdownService can
+    // request shutdown with the correct exit code. PowerOffHost stops the loop
+    // only after host poweroff has been queued.
     let is_running = Arc::new(AtomicBool::new(true));
     tetra_entities::service_control::install_lifecycle_control(is_running.clone());
     let _watchdog_handle = tetra_entities::service_control::spawn_systemd_watchdog(is_running.clone());
@@ -510,8 +510,8 @@ fn main() {
     tetra_entities::service_control::notify_stopping("Nexus-BS stack stopped");
 
     // router drops here → entities are dropped, networked entities disconnect.
-    // If RestartService/ShutdownService was triggered, exit with the requested code
-    // so systemd can restart us (exit 75) or stop cleanly (exit 0).
+    // If RestartService/ShutdownService was triggered, exit with the requested
+    // code so systemd can restart us (exit 75) or stop cleanly (exit 0).
     if let Some(code) = tetra_entities::service_control::requested_exit_code() {
         std::process::exit(code);
     }

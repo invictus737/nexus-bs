@@ -16,11 +16,17 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let css_path = root.join("dashboard/assets/styles.css");
     let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
+    let core_unit_path = root.join("contrib/systemd/nexus-bs@.service");
+    let control_unit_path = root.join("contrib/systemd/nexus-bs-control@.service");
+    let dashboard_unit_path = root.join("contrib/systemd/nexus-bs-dashboard@.service");
 
     let index = std::fs::read_to_string(&index_path).expect("dashboard index.html should exist");
     let app = std::fs::read_to_string(&app_path).expect("dashboard app.js should exist");
     let css = std::fs::read_to_string(&css_path).expect("dashboard styles.css should exist");
     let deploy_script = std::fs::read_to_string(&deploy_script_path).expect("deploy script should exist");
+    let core_unit = std::fs::read_to_string(&core_unit_path).expect("core systemd unit should exist");
+    let control_unit = std::fs::read_to_string(&control_unit_path).expect("control systemd unit should exist");
+    let dashboard_unit = std::fs::read_to_string(&dashboard_unit_path).expect("dashboard systemd unit should exist");
 
     assert!(
         index.contains(r#"<link rel="stylesheet" href="/assets/styles.css">"#),
@@ -240,6 +246,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains(r#"stopgo: "/api/service/stop-go""#)
             && app.contains("function requestServiceAction"),
         "dashboard must call the core-owned service lifecycle API"
+    );
+    assert!(
+        core_unit.contains("CPUAffinity=1") && control_unit.contains("CPUAffinity=2") && dashboard_unit.contains("CPUAffinity=2"),
+        "systemd split deployment must pin RF core to CPU 1 and dashboard/control to CPU 2"
     );
     assert!(
         app.contains(r#"fetch("/api/logs/clear""#)

@@ -112,6 +112,9 @@ pub enum ControlCommand {
     /// Stop the Nexus-BS service (systemctl stop nexus-bs)
     ShutdownService,
 
+    /// Power off the Linux host running Nexus-BS.
+    PowerOffHost,
+
     /// Stop the Nexus-BS core now and let systemd bring it back after RestartSec.
     ///
     /// This intentionally exits the process instead of delaying inside the RF

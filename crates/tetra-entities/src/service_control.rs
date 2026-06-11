@@ -37,6 +37,7 @@ pub fn set_configured_service_unit(unit: &str) {
 pub enum ServiceAction {
     Restart,
     Stop,
+    PowerOffHost,
 }
 
 impl ServiceAction {
@@ -44,6 +45,7 @@ impl ServiceAction {
         match self {
             ServiceAction::Restart => "restart",
             ServiceAction::Stop => "stop",
+            ServiceAction::PowerOffHost => "poweroff",
         }
     }
 
@@ -51,6 +53,7 @@ impl ServiceAction {
         match self {
             ServiceAction::Restart => "restart",
             ServiceAction::Stop => "shutdown",
+            ServiceAction::PowerOffHost => "host poweroff",
         }
     }
 }
@@ -194,10 +197,23 @@ pub fn schedule_service_action(action: ServiceAction, delay: Duration) {
         .name("service-control".into())
         .spawn(move || {
             std::thread::sleep(delay);
+            if matches!(action, ServiceAction::PowerOffHost) {
+                match run_host_poweroff() {
+                    Ok(()) => {
+                        tracing::warn!("Service control: host poweroff requested");
+                        if let Some(lifecycle) = LIFECYCLE_CONTROL.get() {
+                            lifecycle.running.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    Err(e) => tracing::error!("Service control: host poweroff failed: {}", e),
+                }
+                return;
+            }
             if let Some(lifecycle) = LIFECYCLE_CONTROL.get() {
                 let exit_code = match action {
                     ServiceAction::Restart => RESTART_EXIT_CODE,
                     ServiceAction::Stop => 0,
+                    ServiceAction::PowerOffHost => unreachable!("poweroff handled before lifecycle stop"),
                 };
                 lifecycle.exit_code.store(exit_code, Ordering::SeqCst);
                 lifecycle.running.store(false, Ordering::SeqCst);
@@ -239,6 +255,16 @@ fn run_service_action(action: ServiceAction, unit: &str) -> Result<(), String> {
     match run_command("systemctl", &[verb, unit]) {
         Ok(()) => Ok(()),
         Err(systemctl_err) => match run_command("sudo", &["-n", "systemctl", verb, unit]) {
+            Ok(()) => Ok(()),
+            Err(sudo_err) => Err(format!("systemctl: {}; sudo -n: {}", systemctl_err, sudo_err)),
+        },
+    }
+}
+
+fn run_host_poweroff() -> Result<(), String> {
+    match run_command("systemctl", &["--no-block", "poweroff"]) {
+        Ok(()) => Ok(()),
+        Err(systemctl_err) => match run_command("sudo", &["-n", "systemctl", "--no-block", "poweroff"]) {
             Ok(()) => Ok(()),
             Err(sudo_err) => Err(format!("systemctl: {}; sudo -n: {}", systemctl_err, sudo_err)),
         },

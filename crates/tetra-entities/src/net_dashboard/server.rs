@@ -1767,7 +1767,7 @@ fn handle_connection(
         serve_service_command(stream, &cmd_tx, "restart", ControlCommand::RestartService);
     } else if request_matches(&req_line, "POST", "/api/service/shutdown") {
         drain_http_headers(&mut stream);
-        serve_service_command(stream, &cmd_tx, "shutdown", ControlCommand::ShutdownService);
+        serve_service_command(stream, &cmd_tx, "host shutdown", ControlCommand::PowerOffHost);
     } else if request_matches(&req_line, "POST", "/api/service/stop-go") {
         drain_http_headers(&mut stream);
         serve_service_command(stream, &cmd_tx, "stop-go", ControlCommand::StopGoService { start_delay_secs: 5 });
@@ -2671,11 +2671,14 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
             }
         }
         Some("shutdown") => {
-            tracing::info!("Dashboard: shutdown service requested");
-            if !send_cmd(ControlCommand::ShutdownService) {
-                tracing::warn!("Dashboard: control dispatcher unavailable for shutdown request");
+            tracing::warn!("Dashboard: host poweroff requested");
+            if !send_cmd(ControlCommand::PowerOffHost) {
+                tracing::warn!("Dashboard: control dispatcher unavailable for host poweroff request");
                 let mut s = state.write().unwrap();
-                s.push_log("WARN", "Shutdown request was not queued; control channel unavailable".to_string());
+                s.push_log(
+                    "WARN",
+                    "Host poweroff request was not queued; control channel unavailable".to_string(),
+                );
             }
         }
         Some("update") => {
