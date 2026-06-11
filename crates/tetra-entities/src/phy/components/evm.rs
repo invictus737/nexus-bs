@@ -262,6 +262,7 @@ fn wrap_pi(angle: RealSample) -> RealSample {
 
 #[cfg(test)]
 mod tests {
+    use super::super::modem_common::{CHANNEL_FILTER_REFERENCE_ENERGY, CHANNEL_FILTER_ROLL_OFF};
     use super::*;
 
     fn phase_index(symbol: ComplexSample) -> i32 {
@@ -293,6 +294,51 @@ mod tests {
         out
     }
 
+    fn ideal_srrc_impulse(t_symbols: f64, alpha: f64) -> f64 {
+        let singular = 1.0 / (4.0 * alpha);
+        if t_symbols.abs() < 1.0e-12 {
+            return 1.0 + alpha * (4.0 / std::f64::consts::PI - 1.0);
+        }
+        if (t_symbols.abs() - singular).abs() < 1.0e-10 {
+            return alpha / 2.0_f64.sqrt()
+                * ((1.0 + 2.0 / std::f64::consts::PI) * (std::f64::consts::PI / (4.0 * alpha)).sin()
+                    + (1.0 - 2.0 / std::f64::consts::PI) * (std::f64::consts::PI / (4.0 * alpha)).cos());
+        }
+
+        let pi_t = std::f64::consts::PI * t_symbols;
+        ((pi_t * (1.0 - alpha)).sin() + 4.0 * alpha * t_symbols * (pi_t * (1.0 + alpha)).cos())
+            / (pi_t * (1.0 - (4.0 * alpha * t_symbols).powi(2)))
+    }
+
+    fn filter_energy(taps: &[RealSample]) -> RealSample {
+        taps.iter().map(|tap| tap * tap).sum()
+    }
+
+    fn spectrum_energy_fraction(taps: &[RealSample], sample_rate_hz: f64, low_hz: f64, high_hz: f64) -> f64 {
+        let bins = 4096usize;
+        let mut selected = 0.0;
+        let mut total = 0.0;
+
+        for bin in 0..bins {
+            let frequency = -sample_rate_hz * 0.5 + sample_rate_hz * (bin as f64 + 0.5) / bins as f64;
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (sample_idx, tap) in taps.iter().enumerate() {
+                let angle = -2.0 * std::f64::consts::PI * frequency * sample_idx as f64 / sample_rate_hz;
+                re += *tap as f64 * angle.cos();
+                im += *tap as f64 * angle.sin();
+            }
+            let power = re * re + im * im;
+            total += power;
+            let abs_frequency = frequency.abs();
+            if abs_frequency >= low_hz && abs_frequency < high_hz {
+                selected += power;
+            }
+        }
+
+        selected / total
+    }
+
     #[test]
     fn pi4_dqpsk_phase_transitions_match_clause_5_4_mapping() {
         let bits = [1, 1, 1, 0, 0, 0, 0, 1];
@@ -303,11 +349,45 @@ mod tests {
     }
 
     #[test]
+    fn channel_filter_taps_match_tetra_alpha_035_srrc_reference() {
+        let alpha = CHANNEL_FILTER_ROLL_OFF as f64;
+        let unscaled: Vec<f64> = (0..CHANNEL_FILTER_TAPS.len())
+            .map(|tap_idx| ideal_srrc_impulse((tap_idx as f64 + 0.5) / TETRA_MODEM_SPS as f64, alpha))
+            .collect();
+        let unscaled_energy = 2.0 * unscaled.iter().map(|tap| tap * tap).sum::<f64>();
+        let scale = (CHANNEL_FILTER_REFERENCE_ENERGY as f64 / unscaled_energy).sqrt();
+
+        for (tap_idx, (actual, expected_unscaled)) in CHANNEL_FILTER_TAPS.iter().zip(unscaled.iter()).enumerate() {
+            let expected = expected_unscaled * scale;
+            assert!(
+                (*actual as f64 - expected).abs() < 2.0e-7,
+                "tap {} actual {} expected {}",
+                tap_idx,
+                actual,
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn channel_filter_preserves_tx_drive_energy() {
+        let taps = reconstructed_rrc_impulse_response();
+        let energy = filter_energy(&taps);
+
+        assert!(
+            (energy - CHANNEL_FILTER_REFERENCE_ENERGY).abs() < 1.0e-6,
+            "filter energy {} expected {}",
+            energy,
+            CHANNEL_FILTER_REFERENCE_ENERGY
+        );
+    }
+
+    #[test]
     fn rrc_cascade_has_low_symbol_spaced_isi() {
         let taps = reconstructed_rrc_impulse_response();
         assert_eq!(taps.len(), CHANNEL_FILTER_TAPS.len() * 2);
         let group_delay = (taps.len() as RealSample - 1.0) / 2.0;
-        assert!((group_delay - 15.5).abs() < 1.0e-6);
+        assert!((group_delay - (CHANNEL_FILTER_TAPS.len() as RealSample - 0.5)).abs() < 1.0e-6);
 
         let mut cascade = vec![0.0; taps.len() * 2 - 1];
         for (i, a) in taps.iter().enumerate() {
@@ -318,7 +398,8 @@ mod tests {
         let center = taps.len() - 1;
         let peak = cascade[center].abs().max(1.0e-12);
         let mut worst_isi = 0.0_f32;
-        for offset_symbols in -7_i32..=7 {
+        let span_symbols = (CHANNEL_FILTER_TAPS.len() / TETRA_MODEM_SPS) as i32;
+        for offset_symbols in -span_symbols..=span_symbols {
             if offset_symbols == 0 {
                 continue;
             }
@@ -329,9 +410,21 @@ mod tests {
         }
 
         assert!(
-            worst_isi < 0.012,
-            "current SRRC cascade deterministic symbol-spaced ISI is {:.3}%",
+            worst_isi < 0.001,
+            "SRRC cascade deterministic symbol-spaced ISI is {:.3}%",
             worst_isi * 100.0
+        );
+    }
+
+    #[test]
+    fn rrc_filter_limits_adjacent_channel_energy_proxy() {
+        let taps = reconstructed_rrc_impulse_response();
+        let adjacent_fraction = spectrum_energy_fraction(&taps, 72_000.0, 12_500.0, 25_000.0);
+
+        assert!(
+            adjacent_fraction < 5.0e-6,
+            "SRRC adjacent-band energy proxy is {:.3} dB relative to total",
+            10.0 * adjacent_fraction.max(1.0e-300).log10()
         );
     }
 

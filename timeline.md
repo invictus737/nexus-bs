@@ -14824,3 +14824,30 @@ Private P2P Peer Clear Without Optional Imminent-Disconnect Notice - 2026-06-10 
   - `cargo check -p tetra-entities --locked` passed.
   - `rustfmt --edition 2024 --check` passed on touched files.
   - `git diff --check` passed.
+
+TETRA Phase Modulation SRRC Pulse Shaping Upgrade - 2026-06-11:
+
+- User requested maximum-effort PHY signal quality improvement focused on the
+  generated TETRA waveform/constellation, not dashboard presentation.
+- Clause scope:
+  - TS 100 392-2 clauses 5.2 to 5.7 define the phase-modulation transmitter
+    baseband chain;
+  - clause 5.4 defines pi/4-DQPSK differential symbol mapping;
+  - clauses 5.5 and 5.6 define the square-root raised cosine pulse with
+    alpha = 0.35 and linear-phase modulation filter;
+  - clause 6.6.1 defines phase-modulation EVM at symbol time after ideal RX
+    filtering and estimation of C0/C1/frequency rotation.
+- Fix:
+  - replaced the old 32-tap effective SRRC pulse with a deterministic
+    96-tap effective SRRC generated from the TS 100 392-2 alpha=0.35 equation
+    on the existing 4 samples/symbol half-sample grid;
+  - preserved legacy TX pulse energy (`0.24992721`) to avoid changing SDR/PA
+    drive level while improving modulation quality;
+  - kept sample-rate, pi/4-DQPSK mapping, slot timing model and call/protocol
+    layers unchanged.
+- Local deterministic DSP comparison:
+  - full taps: 32 -> 96;
+  - group delay: 15.5 -> 47.5 modem samples;
+  - worst symbol-spaced TX/RX cascade ISI: 1.073% -> 0.064%;
+  - 12.5 kHz to 25 kHz adjacent-band energy proxy: -42.8 dB -> -56.2 dB;
+  - >25 kHz energy proxy: -63.1 dB -> -70.4 dB.
