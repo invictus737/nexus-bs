@@ -32,6 +32,15 @@ const TX_CAL_ACCEPT_MAX_EVM_PROXY_PCT: f64 = 10.0;
 const TX_CAL_ACCEPT_MAX_EVM_WORSEN_PCT: f64 = 1.0;
 const TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB: f64 = 3.0;
 const TX_CAL_ACCEPT_MAX_FLOOR_DRIFT_DB: f64 = 3.0;
+const TX_CAL_LOW_FLOOR_DBFS: f64 = -115.0;
+const TX_CAL_LOW_FLOOR_MIN_SNR_DB: f64 = 70.0;
+const TX_CAL_IQ_MIN_COEFF_DELTA: f64 = 0.005;
+const TX_CAL_CONFIRM_MIN_CARRIER_IMPROVEMENT_DB: f64 = 6.0;
+const TX_CAL_CONFIRM_GOOD_CARRIER_DBC: f64 = -40.0;
+const TX_CAL_CONFIRM_MAX_CARRIER_SPREAD_DB: f64 = 2.0;
+const TX_CAL_CONFIRM_MAX_SIGNAL_SPREAD_DB: f64 = 1.0;
+const TX_CAL_CONFIRM_MAX_IMAGE_WORSEN_DB: f64 = 1.0;
+const TX_CAL_CONFIRM_MAX_EVM_WORSEN_PCT: f64 = 1.0;
 const TX_CAL_MAX_COMPONENT_ABS: f64 = 0.85;
 const TX_CAL_CLIP_LEVEL: f32 = 0.98;
 const TX_CAL_MAX_CLIPPED_FRACTION: f64 = 0.001;
@@ -508,25 +517,51 @@ impl SoapyIo {
 
             let iq_best = best;
             let iq_best_meas = best_meas;
-            let dc_accepted = dc_calibration_accepted(&reference_meas, &dc_best_meas);
-            let iq_accepted = iq_calibration_accepted(&reference_meas, &iq_best_meas);
+            let dc_preaccepted = dc_calibration_accepted(&reference_meas, &dc_best_meas);
+            let iq_preaccepted = dc_preaccepted && iq_calibration_accepted(&dc_best_meas, &iq_best_meas, dc_best, iq_best);
             let mut applied = TxCalibrationCoefficients::default();
-            if dc_accepted {
+            let mut candidate_has_iq = false;
+            if dc_preaccepted {
                 applied.dc_i = dc_best.dc_i;
                 applied.dc_q = dc_best.dc_q;
             }
-            if iq_accepted {
+            if iq_preaccepted {
                 applied = iq_best;
+                candidate_has_iq = true;
             }
 
-            self.apply_tx_calibration_coefficients(applied, true, true)?;
-            let final_meas = self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, rx_baseline, &tone, tone_hz, applied)?;
+            let (confirmation, final_meas) = if applied != TxCalibrationCoefficients::default() {
+                self.confirm_calibration_candidate(
+                    &mut rx_stream,
+                    &mut tx_stream,
+                    rx_baseline,
+                    &tone,
+                    tone_hz,
+                    neutral,
+                    applied,
+                    &reference_meas,
+                )?
+            } else {
+                let meas = self.capture_calibration_measurement(&mut rx_stream, &mut tx_stream, rx_baseline, &tone, tone_hz, neutral)?;
+                (CalibrationConfirmation::default(), meas)
+            };
             let carrier_improvement = reference_meas.carrier_leakage_dbc - final_meas.carrier_leakage_dbc;
             let image_improvement = final_meas.image_rejection_db - reference_meas.image_rejection_db;
             let evm_improvement = reference_meas.evm_proxy_pct - final_meas.evm_proxy_pct;
+            let image_quality_ok = calibration_image_quality_ok(&final_meas);
+            let final_quality_ok = calibration_final_quality_ok(&final_meas, &confirmation);
             let accepted = applied != TxCalibrationCoefficients::default()
-                && (dc_accepted || iq_accepted)
-                && calibration_capture_quality_ok(&final_meas);
+                && dc_preaccepted
+                && confirmation.confirmed
+                && final_quality_ok
+                && (!candidate_has_iq || image_quality_ok);
+            let accepted_dc = accepted;
+            let accepted_iq = accepted && candidate_has_iq;
+            let accepted_mode = if accepted {
+                if accepted_iq { "dc_iq" } else { "dc_only" }
+            } else {
+                "rejected"
+            };
 
             let now = unix_secs_now();
             let file = TxCalibrationFile {
@@ -568,31 +603,19 @@ impl SoapyIo {
                     image_rejection_improvement_db: image_improvement,
                     evm_proxy_improvement_pct: evm_improvement,
                     accepted,
-                    accepted_dc: dc_accepted,
-                    accepted_iq: iq_accepted,
+                    accepted_dc,
+                    accepted_iq,
+                    accepted_mode: accepted_mode.to_string(),
+                    dc_confirmed: confirmation.confirmed,
+                    image_quality_ok,
+                    final_quality_ok,
+                    confirmation_passes: confirmation.passes,
+                    confirmation_carrier_spread_db: confirmation.carrier_spread_db,
+                    confirmation_signal_spread_db: confirmation.signal_spread_db,
                     summary: if accepted {
                         format!(
-                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB",
-                            if iq_accepted {
-                                "DC+IQ"
-                            } else if dc_accepted {
-                                "DC-only"
-                            } else {
-                                "neutral"
-                            },
-                            carrier_improvement,
-                            reference_meas.carrier_leakage_dbc,
-                            final_meas.carrier_leakage_dbc,
-                            image_improvement,
-                            reference_meas.image_rejection_db,
-                            final_meas.image_rejection_db,
-                            evm_improvement,
-                            reference_meas.snr_db,
-                            final_meas.snr_db
-                        )
-                    } else {
-                        format!(
-                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB",
+                            "accepted {}: carrier leak {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, confirm spread carrier {:.1} dB signal {:.1} dB",
+                            accepted_mode,
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
                             final_meas.carrier_leakage_dbc,
@@ -602,7 +625,27 @@ impl SoapyIo {
                             evm_improvement,
                             reference_meas.snr_db,
                             final_meas.snr_db,
-                            final_meas.floor_drift_db
+                            confirmation.carrier_spread_db,
+                            confirmation.signal_spread_db
+                        )
+                    } else {
+                        format!(
+                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} confirm spread carrier {:.1} dB signal {:.1} dB",
+                            carrier_improvement,
+                            reference_meas.carrier_leakage_dbc,
+                            final_meas.carrier_leakage_dbc,
+                            image_improvement,
+                            reference_meas.image_rejection_db,
+                            final_meas.image_rejection_db,
+                            evm_improvement,
+                            reference_meas.snr_db,
+                            final_meas.snr_db,
+                            final_meas.floor_drift_db,
+                            confirmation.confirmed,
+                            final_quality_ok,
+                            image_quality_ok,
+                            confirmation.carrier_spread_db,
+                            confirmation.signal_spread_db
                         )
                     },
                 },
@@ -753,6 +796,25 @@ impl SoapyIo {
         self.rx_next_count = 0;
         self.prev_time_ns = -1;
         Ok(())
+    }
+
+    fn confirm_calibration_candidate(
+        &mut self,
+        rx: &mut soapysdr::RxStream<StreamType>,
+        tx: &mut soapysdr::TxStream<StreamType>,
+        rx_baseline: CalibrationRxBaseline,
+        tone: &[StreamType],
+        tone_hz: f64,
+        neutral: TxCalibrationCoefficients,
+        candidate: TxCalibrationCoefficients,
+        reference: &CalibrationMeasurement,
+    ) -> Result<(CalibrationConfirmation, CalibrationMeasurement), String> {
+        let neutral_a = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, neutral)?;
+        let candidate_a = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate)?;
+        let neutral_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, neutral)?;
+        let candidate_b = self.capture_calibration_measurement(rx, tx, rx_baseline, tone, tone_hz, candidate)?;
+        let confirmation = calibration_confirmation(reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
+        Ok((confirmation, candidate_b))
     }
 
     fn capture_calibration_measurement(
@@ -1105,9 +1167,12 @@ struct CalibrationMeasurement {
     evm_proxy_pct: f64,
     signal_dbfs: f64,
     noise_floor_dbfs: f64,
+    floor_before_dbfs: f64,
+    floor_after_dbfs: f64,
     loopback_floor_dbfs: f64,
     rx_baseline_dbfs: f64,
     floor_drift_db: f64,
+    floor_drift_abs_db: f64,
     max_component_abs: f64,
     clipped_fraction: f64,
     snr_db: f64,
@@ -1124,12 +1189,34 @@ impl CalibrationMeasurement {
             evm_proxy_pct: self.evm_proxy_pct,
             signal_dbfs: self.signal_dbfs,
             noise_floor_dbfs: self.noise_floor_dbfs,
+            floor_before_dbfs: self.floor_before_dbfs,
+            floor_after_dbfs: self.floor_after_dbfs,
             loopback_floor_dbfs: self.loopback_floor_dbfs,
             rx_baseline_dbfs: self.rx_baseline_dbfs,
             floor_drift_db: self.floor_drift_db,
+            floor_drift_abs_db: self.floor_drift_abs_db,
             max_component_abs: self.max_component_abs,
             clipped_fraction: self.clipped_fraction,
             snr_db: self.snr_db,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CalibrationConfirmation {
+    passes: u32,
+    confirmed: bool,
+    carrier_spread_db: f64,
+    signal_spread_db: f64,
+}
+
+impl Default for CalibrationConfirmation {
+    fn default() -> Self {
+        Self {
+            passes: 0,
+            confirmed: false,
+            carrier_spread_db: 0.0,
+            signal_spread_db: 0.0,
         }
     }
 }
@@ -1170,7 +1257,16 @@ fn apply_configured_tx_calibration(
     }
 
     let coeffs = calibration.applied;
-    if soapy_cfg.tx_calibration_apply_dc {
+    let apply_dc = soapy_cfg.tx_calibration_apply_dc && calibration.report.accepted_dc;
+    let apply_iq = soapy_cfg.tx_calibration_apply_iq && calibration.report.accepted_iq;
+    if soapy_cfg.tx_calibration_apply_dc && !calibration.report.accepted_dc {
+        tracing::warn!("SoapySDR: TX DC calibration requested but report did not accept DC; skipping DC component");
+    }
+    if soapy_cfg.tx_calibration_apply_iq && !calibration.report.accepted_iq {
+        tracing::warn!("SoapySDR: TX IQ calibration requested but report did not accept IQ; skipping IQ component");
+    }
+
+    if apply_dc {
         match dev.has_dc_offset(soapysdr::Direction::Tx, tx_ch) {
             Ok(true) => {
                 if dev.has_dc_offset_mode(soapysdr::Direction::Tx, tx_ch).unwrap_or(false) {
@@ -1185,7 +1281,7 @@ fn apply_configured_tx_calibration(
         }
     }
 
-    if soapy_cfg.tx_calibration_apply_iq {
+    if apply_iq {
         match dev.has_iq_balance(soapysdr::Direction::Tx, tx_ch) {
             Ok(true) => {
                 if let Err(err) = dev.set_iq_balance(soapysdr::Direction::Tx, tx_ch, coeffs.iq_i, coeffs.iq_q) {
@@ -1198,10 +1294,12 @@ fn apply_configured_tx_calibration(
     }
 
     tracing::warn!(
-        "SoapySDR: TX calibration applied from {} dc=({:+.6},{:+.6}) iq=({:+.6},{:+.6}) report={}",
+        "SoapySDR: TX calibration applied from {} dc={}({:+.6},{:+.6}) iq={}({:+.6},{:+.6}) report={}",
         path,
+        if apply_dc { "on" } else { "off" },
         coeffs.dc_i,
         coeffs.dc_q,
+        if apply_iq { "on" } else { "off" },
         coeffs.iq_i,
         coeffs.iq_q,
         calibration.report.summary
@@ -1357,6 +1455,8 @@ fn measure_calibration_capture(
     let floor_after_amp = floor_bin_magnitude(floor_after, sample_rate, tone_hz);
     let loopback_floor_amp = floor_before_amp.max(floor_after_amp).max(1.0e-12);
     let floor_drift_db = ratio_db(floor_after_amp, floor_before_amp);
+    let floor_before_dbfs = dbfs_amp(floor_before_amp);
+    let floor_after_dbfs = dbfs_amp(floor_after_amp);
 
     CalibrationMeasurement {
         dc,
@@ -1366,9 +1466,12 @@ fn measure_calibration_capture(
         evm_proxy_pct: ((dc_amp / signal_amp).powi(2) + (image_amp / signal_amp).powi(2)).sqrt() * 100.0,
         signal_dbfs: dbfs_amp(signal_amp),
         noise_floor_dbfs: dbfs_amp(noise_rms),
+        floor_before_dbfs,
+        floor_after_dbfs,
         loopback_floor_dbfs: dbfs_amp(loopback_floor_amp),
         rx_baseline_dbfs: dbfs_amp(rx_baseline.rms_amp),
         floor_drift_db,
+        floor_drift_abs_db: floor_drift_db.abs(),
         max_component_abs: max_component_abs(samples),
         clipped_fraction: clipped_fraction(samples),
         snr_db: ratio_db(signal_amp, loopback_floor_amp),
@@ -1568,11 +1671,31 @@ fn dft_at_centered(samples: &[StreamType], dc: ComplexF64, sample_rate: f64, fre
     }
 }
 
-fn calibration_capture_quality_ok(meas: &CalibrationMeasurement) -> bool {
+fn calibration_capture_core_quality_ok(meas: &CalibrationMeasurement) -> bool {
     meas.snr_db >= TX_CAL_ACCEPT_MIN_SNR_DB
-        && meas.floor_drift_db.abs() <= TX_CAL_ACCEPT_MAX_FLOOR_DRIFT_DB
         && meas.max_component_abs <= TX_CAL_MAX_COMPONENT_ABS
         && meas.clipped_fraction <= TX_CAL_MAX_CLIPPED_FRACTION
+}
+
+fn calibration_floor_stable(meas: &CalibrationMeasurement) -> bool {
+    meas.floor_drift_abs_db <= TX_CAL_ACCEPT_MAX_FLOOR_DRIFT_DB
+}
+
+fn calibration_low_floor_warning_ok(meas: &CalibrationMeasurement) -> bool {
+    meas.loopback_floor_dbfs <= TX_CAL_LOW_FLOOR_DBFS && meas.snr_db >= TX_CAL_LOW_FLOOR_MIN_SNR_DB
+}
+
+fn calibration_capture_quality_ok(meas: &CalibrationMeasurement) -> bool {
+    calibration_capture_core_quality_ok(meas) && calibration_floor_stable(meas)
+}
+
+fn calibration_final_quality_ok(meas: &CalibrationMeasurement, confirmation: &CalibrationConfirmation) -> bool {
+    calibration_capture_core_quality_ok(meas)
+        && (calibration_floor_stable(meas) || (confirmation.confirmed && calibration_low_floor_warning_ok(meas)))
+}
+
+fn calibration_image_quality_ok(meas: &CalibrationMeasurement) -> bool {
+    meas.image_rejection_db >= TX_CAL_GOOD_IMAGE_REJECTION_DB && meas.evm_proxy_pct <= TX_CAL_ACCEPT_MAX_EVM_PROXY_PCT
 }
 
 fn dc_calibration_accepted(reference: &CalibrationMeasurement, candidate: &CalibrationMeasurement) -> bool {
@@ -1582,14 +1705,61 @@ fn dc_calibration_accepted(reference: &CalibrationMeasurement, candidate: &Calib
         && (improvement >= TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB || candidate.carrier_leakage_dbc <= TX_CAL_GOOD_CARRIER_DBC)
 }
 
-fn iq_calibration_accepted(reference: &CalibrationMeasurement, candidate: &CalibrationMeasurement) -> bool {
+fn iq_calibration_accepted(
+    reference: &CalibrationMeasurement,
+    candidate: &CalibrationMeasurement,
+    reference_coeffs: TxCalibrationCoefficients,
+    candidate_coeffs: TxCalibrationCoefficients,
+) -> bool {
     let image_improvement = candidate.image_rejection_db - reference.image_rejection_db;
+    let coeff_delta = iq_coeff_delta(reference_coeffs, candidate_coeffs);
     calibration_capture_quality_ok(candidate)
+        && coeff_delta >= TX_CAL_IQ_MIN_COEFF_DELTA
         && candidate.carrier_leakage_dbc <= TX_CAL_ACCEPT_CARRIER_DBC
         && candidate.image_rejection_db >= TX_CAL_ACCEPT_IMAGE_REJECTION_DB
-        && (image_improvement >= TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB || candidate.image_rejection_db >= TX_CAL_GOOD_IMAGE_REJECTION_DB)
+        && image_improvement >= TX_CAL_ACCEPT_MIN_IMPROVEMENT_DB
         && candidate.evm_proxy_pct <= TX_CAL_ACCEPT_MAX_EVM_PROXY_PCT
         && candidate.evm_proxy_pct <= reference.evm_proxy_pct + TX_CAL_ACCEPT_MAX_EVM_WORSEN_PCT
+}
+
+fn iq_coeff_delta(reference: TxCalibrationCoefficients, candidate: TxCalibrationCoefficients) -> f64 {
+    ((candidate.iq_i - reference.iq_i).powi(2) + (candidate.iq_q - reference.iq_q).powi(2)).sqrt()
+}
+
+fn calibration_confirmation(
+    reference: &CalibrationMeasurement,
+    neutral_a: &CalibrationMeasurement,
+    candidate_a: &CalibrationMeasurement,
+    neutral_b: &CalibrationMeasurement,
+    candidate_b: &CalibrationMeasurement,
+) -> CalibrationConfirmation {
+    let carrier_spread_db = (candidate_a.carrier_leakage_dbc - candidate_b.carrier_leakage_dbc).abs();
+    let signal_spread_db = (candidate_a.signal_dbfs - candidate_b.signal_dbfs).abs();
+    let candidate_a_improvement = neutral_a.carrier_leakage_dbc - candidate_a.carrier_leakage_dbc;
+    let candidate_b_improvement = neutral_b.carrier_leakage_dbc - candidate_b.carrier_leakage_dbc;
+    let candidate_a_carrier_ok = candidate_a_improvement >= TX_CAL_CONFIRM_MIN_CARRIER_IMPROVEMENT_DB
+        || candidate_a.carrier_leakage_dbc <= TX_CAL_CONFIRM_GOOD_CARRIER_DBC;
+    let candidate_b_carrier_ok = candidate_b_improvement >= TX_CAL_CONFIRM_MIN_CARRIER_IMPROVEMENT_DB
+        || candidate_b.carrier_leakage_dbc <= TX_CAL_CONFIRM_GOOD_CARRIER_DBC;
+    let image_ok = candidate_a.image_rejection_db >= reference.image_rejection_db - TX_CAL_CONFIRM_MAX_IMAGE_WORSEN_DB
+        && candidate_b.image_rejection_db >= reference.image_rejection_db - TX_CAL_CONFIRM_MAX_IMAGE_WORSEN_DB;
+    let evm_ok = candidate_a.evm_proxy_pct <= reference.evm_proxy_pct + TX_CAL_CONFIRM_MAX_EVM_WORSEN_PCT
+        && candidate_b.evm_proxy_pct <= reference.evm_proxy_pct + TX_CAL_CONFIRM_MAX_EVM_WORSEN_PCT;
+    let confirmed = candidate_a_carrier_ok
+        && candidate_b_carrier_ok
+        && carrier_spread_db <= TX_CAL_CONFIRM_MAX_CARRIER_SPREAD_DB
+        && signal_spread_db <= TX_CAL_CONFIRM_MAX_SIGNAL_SPREAD_DB
+        && image_ok
+        && evm_ok
+        && calibration_capture_core_quality_ok(candidate_a)
+        && calibration_capture_core_quality_ok(candidate_b);
+
+    CalibrationConfirmation {
+        passes: 4,
+        confirmed,
+        carrier_spread_db,
+        signal_spread_db,
+    }
 }
 
 fn with_axis_delta(
@@ -1652,6 +1822,32 @@ fn temperature_sensor_reads_supported(settings_name: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn calibration_measurement(
+        carrier_leakage_dbc: f64,
+        image_rejection_db: f64,
+        evm_proxy_pct: f64,
+        signal_dbfs: f64,
+    ) -> CalibrationMeasurement {
+        CalibrationMeasurement {
+            dc: ComplexF64::ZERO,
+            carrier_leakage_dbc,
+            carrier_leakage_dbfs: signal_dbfs + carrier_leakage_dbc,
+            image_rejection_db,
+            evm_proxy_pct,
+            signal_dbfs,
+            noise_floor_dbfs: -80.0,
+            floor_before_dbfs: -121.0,
+            floor_after_dbfs: -121.2,
+            loopback_floor_dbfs: -121.0,
+            rx_baseline_dbfs: -87.0,
+            floor_drift_db: -0.2,
+            floor_drift_abs_db: 0.2,
+            max_component_abs: 0.02,
+            clipped_fraction: 0.0,
+            snr_db: 87.0,
+        }
+    }
+
     fn runtime_calibration_config() -> TxCalibrationRuntimeConfig {
         TxCalibrationRuntimeConfig {
             name: "SXceiver".to_string(),
@@ -1708,6 +1904,60 @@ mod tests {
         let calibration = calibration_file_for_runtime(&runtime);
 
         validate_tx_calibration_matches_runtime_config(&calibration, &runtime).expect("matching resolved runtime config must be accepted");
+    }
+
+    #[test]
+    fn tx_calibration_iq_requires_nonzero_coeff_and_image_gain() {
+        let reference = calibration_measurement(-42.0, 43.0, 1.1, -34.0);
+        let already_good_image = calibration_measurement(-42.1, 43.3, 1.0, -34.0);
+        let dc_only = TxCalibrationCoefficients {
+            dc_i: 0.005,
+            dc_q: 0.020,
+            ..Default::default()
+        };
+
+        assert!(!iq_calibration_accepted(&reference, &already_good_image, dc_only, dc_only));
+
+        let tiny_image_gain = calibration_measurement(-42.1, 43.4, 1.0, -34.0);
+        let iq_candidate = TxCalibrationCoefficients { iq_i: 0.010, ..dc_only };
+        assert!(!iq_calibration_accepted(&reference, &tiny_image_gain, dc_only, iq_candidate));
+
+        let real_image_gain = calibration_measurement(-42.1, 46.2, 1.0, -34.0);
+        assert!(iq_calibration_accepted(&reference, &real_image_gain, dc_only, iq_candidate));
+    }
+
+    #[test]
+    fn tx_calibration_dc_confirmation_allows_low_floor_warning_after_repeatability() {
+        let reference = calibration_measurement(-20.3, 43.2, 9.7, -33.9);
+        let neutral_a = calibration_measurement(-20.2, 43.2, 9.6, -33.9);
+        let candidate_a = calibration_measurement(-42.1, 43.3, 1.1, -33.9);
+        let neutral_b = calibration_measurement(-20.4, 43.1, 9.7, -34.0);
+        let mut candidate_b = calibration_measurement(-42.4, 43.4, 1.0, -33.95);
+        candidate_b.floor_before_dbfs = -116.8;
+        candidate_b.floor_after_dbfs = -120.9;
+        candidate_b.loopback_floor_dbfs = -120.9;
+        candidate_b.floor_drift_db = -4.1;
+        candidate_b.floor_drift_abs_db = 4.1;
+
+        let confirmation = calibration_confirmation(&reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
+
+        assert!(confirmation.confirmed);
+        assert!(!calibration_capture_quality_ok(&candidate_b));
+        assert!(calibration_final_quality_ok(&candidate_b, &confirmation));
+    }
+
+    #[test]
+    fn tx_calibration_dc_confirmation_rejects_unstable_candidate() {
+        let reference = calibration_measurement(-20.3, 43.2, 9.7, -33.9);
+        let neutral_a = calibration_measurement(-20.2, 43.2, 9.6, -33.9);
+        let candidate_a = calibration_measurement(-42.1, 43.3, 1.1, -33.9);
+        let neutral_b = calibration_measurement(-20.4, 43.1, 9.7, -34.0);
+        let candidate_b = calibration_measurement(-37.5, 43.4, 1.0, -33.95);
+
+        let confirmation = calibration_confirmation(&reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
+
+        assert!(!confirmation.confirmed);
+        assert!(confirmation.carrier_spread_db > TX_CAL_CONFIRM_MAX_CARRIER_SPREAD_DB);
     }
 
     #[test]
