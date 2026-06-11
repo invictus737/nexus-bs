@@ -2827,10 +2827,10 @@ impl CcBsSubentity {
         ts: u8,
         usage: u8,
     ) {
-        self.send_d_tx_granted_facch_inner(queue, call_id, source_issi, dest_gssi, ts, usage, None);
+        self.send_d_tx_granted_facch_inner(queue, call_id, source_issi, dest_gssi, ts, usage, UlDlAssignment::Dl, None);
     }
 
-    pub(super) fn send_d_tx_granted_facch_reported(
+    pub(super) fn send_network_d_tx_granted_facch_reported(
         &mut self,
         queue: &mut MessageQueue,
         call_id: u16,
@@ -2840,7 +2840,16 @@ impl CcBsSubentity {
         usage: u8,
     ) -> TxReporter {
         let reporter = TxReporter::new_unacked();
-        self.send_d_tx_granted_facch_inner(queue, call_id, source_issi, dest_gssi, ts, usage, Some(reporter.clone()));
+        self.send_d_tx_granted_facch_inner(
+            queue,
+            call_id,
+            source_issi,
+            dest_gssi,
+            ts,
+            usage,
+            UlDlAssignment::Both,
+            Some(reporter.clone()),
+        );
         reporter
     }
 
@@ -2852,6 +2861,7 @@ impl CcBsSubentity {
         dest_gssi: u32,
         ts: u8,
         usage: u8,
+        ul_dl_assigned: UlDlAssignment,
         reporter: Option<TxReporter>,
     ) {
         // EN 300 392-2 clause 14.5.2.2.1 b) requires group listeners to be
@@ -2884,16 +2894,13 @@ impl CcBsSubentity {
         sdu.seek(0);
 
         let dest_addr = TetraAddress::new(dest_gssi, SsiType::Gssi);
-        // DL-only on group FACCH: only the current speaker holds UL.
-        let msg = Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(
-            sdu,
-            dest_addr,
-            ts,
-            Some(usage),
-            UlDlAssignment::Dl,
-            reporter,
-            Some(0),
-        );
+        // Local-speaker listener copies are DL-only so the current speaker is
+        // not contradicted by a GSSI GrantedToOtherUser PDU. Network-speaker
+        // copies keep Both: listeners are not authorized for speech, but they
+        // must retain assigned-channel UL signalling so U-TX DEMAND can reach
+        // the SwMI instead of being locally rejected by the terminal.
+        let msg =
+            Self::build_sapmsg_stealing_ul_dl_reported_with_repetitions(sdu, dest_addr, ts, Some(usage), ul_dl_assigned, reporter, Some(0));
         queue.push_back(msg);
     }
 

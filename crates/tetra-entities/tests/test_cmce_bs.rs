@@ -2754,7 +2754,7 @@ fn test_network_group_speaker_change_updates_dashboard_after_rf_grant() {
     register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
 
     let first_uuid = uuid::Uuid::new_v4();
-    let (call_id, _ts, _start_msgs) = start_network_group_call(&mut test, first_uuid, TEST_CALLED_ISSI, TEST_GSSI, 7);
+    let (call_id, active_ts, _start_msgs) = start_network_group_call(&mut test, first_uuid, TEST_CALLED_ISSI, TEST_GSSI, 7);
 
     let dashboard = DashboardServer::new("test.toml".to_string());
     for event in drain_telemetry(&telemetry_source) {
@@ -2784,6 +2784,25 @@ fn test_network_group_speaker_change_updates_dashboard_after_rf_grant() {
         &grant_msgs,
         TetraAddress::new(TEST_GSSI, SsiType::Gssi),
         TransmissionGrant::GrantedToOtherUser,
+    );
+    let network_listener_grant = grant_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_tx_granted(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .find(|(prim, grant)| {
+            prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi)
+                && grant.transmission_grant == TransmissionGrant::GrantedToOtherUser.into_raw() as u8
+        })
+        .expect("network speaker change should send GSSI listener D-TX-GRANTED");
+    assert_d_tx_granted_facch_allocation(
+        network_listener_grant.0,
+        &network_listener_grant.1,
+        active_ts,
+        call_id as u8,
+        UlDlAssignment::Both,
+        "network-origin listener floor notification must preserve UL request signalling",
     );
     grant_reporter.mark_transmitted();
     test.run_stack(Some(1));
@@ -3670,7 +3689,7 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
             .as_ref()
             .expect("FACCH D-TX-GRANTED should carry channel allocation")
             .ul_dl_assigned,
-        UlDlAssignment::Dl
+        UlDlAssignment::Both
     );
 
     assert_eq!(

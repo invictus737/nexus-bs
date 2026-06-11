@@ -777,7 +777,7 @@ impl CcBsSubentity {
             );
         }
 
-        let ready_reporter = self.send_d_tx_granted_facch_reported(queue, call_id, source_issi, dest_gssi, ts, usage);
+        let ready_reporter = self.send_network_d_tx_granted_facch_reported(queue, call_id, source_issi, dest_gssi, ts, usage);
         self.reset_group_t310_after_floor_grant(call_id);
         self.refresh_group_cached_d_setup_speaker(call_id, source_issi);
 
