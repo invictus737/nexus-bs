@@ -1024,8 +1024,16 @@ impl CcBsSubentity {
             });
             call_info.duplex = pdu.simplex_duplex_selection as u8;
             call_info.method = pdu.hook_method_selection as u8;
-            // Update these fields as the call is accepted
-            call_info.grant = 0;
+            let called_ms_transmits_first = Self::private_simplex_called_ms_transmits_first(
+                pdu.simplex_duplex_selection,
+                pdu.hook_method_selection,
+                call_snapshot.request_to_transmit_send_data,
+            );
+            let (_, calling_grant) = Self::private_connect_grants(pdu.simplex_duplex_selection, called_ms_transmits_first);
+            // CONNECT_REQUEST is sent to the Brew/origin side, so its grant is
+            // relative to the external caller. The local D-CONNECT ACK gets
+            // the complementary grant when Brew confirms the connection.
+            call_info.grant = calling_grant.into_raw() as u8;
             call_info.permission = 0;
 
             if let Err(err) = self.fsm_individual_mark_connect_request_sent(call_id, call_info.clone()) {

@@ -659,7 +659,16 @@ impl CcBsSubentity {
             ul_dl_assigned: UlDlAssignment::Both,
         };
 
-        let grant_enum = Self::network_circuit_grant(grant);
+        let grant_enum = if call.calling_over_brew && !call.simplex_duplex {
+            let origin_grant = call
+                .network_call
+                .as_ref()
+                .map(|call_info| Self::network_circuit_grant(call_info.grant))
+                .unwrap_or_else(|| Self::network_circuit_grant(grant));
+            Self::opposite_private_simplex_grant(origin_grant)
+        } else {
+            Self::network_circuit_grant(grant)
+        };
         let d_connect_ack = DConnectAcknowledge {
             call_identifier: call_id,
             call_time_out: call.call_timeout,
@@ -991,6 +1000,15 @@ impl CcBsSubentity {
             Some((call.called_addr, call.called_ts, call.called_usage, call.calling_addr))
         } else {
             None
+        }
+    }
+
+    fn opposite_private_simplex_grant(grant: TransmissionGrant) -> TransmissionGrant {
+        match grant {
+            TransmissionGrant::Granted => TransmissionGrant::GrantedToOtherUser,
+            TransmissionGrant::GrantedToOtherUser => TransmissionGrant::Granted,
+            TransmissionGrant::RequestQueued => TransmissionGrant::RequestQueued,
+            TransmissionGrant::NotGranted => TransmissionGrant::NotGranted,
         }
     }
 

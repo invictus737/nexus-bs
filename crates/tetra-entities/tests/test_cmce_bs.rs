@@ -3886,6 +3886,7 @@ fn test_network_origin_private_call_preserves_method_and_timeout_fields() {
         .expect("called MS U-CONNECT should be forwarded to Brew");
     assert_eq!(connect_request.timeout, CallTimeout::T10m.into_raw() as u8);
     assert_eq!(connect_request.method, 0);
+    assert_eq!(connect_request.grant, TransmissionGrant::Granted.into_raw() as u8);
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -3912,7 +3913,7 @@ fn test_network_origin_private_call_preserves_method_and_timeout_fields() {
     assert!(connect_ack.0.tx_reporter.is_some());
     assert_eq!(connect_ack.1.call_identifier, call_id);
     assert_eq!(connect_ack.1.call_time_out, CallTimeout::T10m);
-    assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
+    assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::GrantedToOtherUser);
     assert!(count_umac_open(&confirm_msgs) >= 1);
     assert_eq!(
         count_umac_floor_granted(&confirm_msgs),
@@ -3928,7 +3929,7 @@ fn test_network_origin_private_call_preserves_method_and_timeout_fields() {
     acknowledge_called_d_connect_ack(&confirm_msgs, TEST_CALLED_ISSI);
     test.run_stack(Some(1));
     let after_ack_msgs = test.dump_sinks();
-    assert_eq!(count_umac_floor_granted(&after_ack_msgs), 1);
+    assert_eq!(count_umac_floor_granted(&after_ack_msgs), 0);
     assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
 }
 
@@ -4522,7 +4523,7 @@ fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_does_not_
 }
 
 #[test]
-fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor() {
+fn test_network_origin_brew_private_simplex_connect_confirm_grants_external_caller_first() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -4586,7 +4587,7 @@ fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor()
     assert_eq!(connect_ack.0.main_address.ssi, TEST_CALLED_ISSI);
     assert_eq!(connect_ack.0.layer2service, Layer2Service::Acknowledged);
     assert!(connect_ack.0.tx_reporter.is_some());
-    assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
+    assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::GrantedToOtherUser);
 
     assert_eq!(
         count_umac_floor_granted(&confirm_msgs),
@@ -4603,32 +4604,22 @@ fn test_network_origin_brew_private_simplex_connect_confirm_sets_initial_floor()
     test.run_stack(Some(1));
     let after_ack_msgs = test.dump_sinks();
 
-    assert_eq!(count_umac_floor_granted(&after_ack_msgs), 1);
-    assert!(
-        after_ack_msgs.iter().any(|msg| matches!(
-            &msg.msg,
-            SapMsgInner::CmceCallControl(CallControl::FloorGranted {
-                call_id: got_call_id,
-                source_issi,
-                dest_gssi,
-                ..
-            }) if *got_call_id == call_id && *source_issi == TEST_CALLED_ISSI && *dest_gssi == TEST_ISSI
-        )),
-        "EN 300 392-2 clause 14.5.1.2.1 plus Annex D.4: Brew-routed simplex D-CONNECT-ACK grant seeds the local floor after L2 ACK"
+    assert_eq!(
+        count_umac_floor_granted(&after_ack_msgs),
+        0,
+        "external caller-first grant must not seed local UL floor"
     );
     assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
 
-    test.submit_message(build_u_tx_ceased_msg(TEST_CALLED_ISSI, call_id));
+    test.submit_message(build_u_tx_demand_msg(TEST_CALLED_ISSI, call_id));
     test.run_stack(Some(1));
-    let _ = test.dump_sinks();
-
-    test.router
-        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
-    test.run_stack(Some(1));
-    let tail_msgs = test.dump_sinks();
-    assert!(
-        count_umac_floor_released(&tail_msgs) >= 1,
-        "U-TX CEASED from the granted network-origin local speaker must not be ignored as floor_holder=None"
+    let queued_msgs = test.dump_sinks();
+    let queued_grants = d_tx_granted_to_issi(&queued_msgs, TEST_CALLED_ISSI);
+    assert_eq!(queued_grants.len(), 1);
+    assert_eq!(
+        queued_grants[0].transmission_grant,
+        TransmissionGrant::RequestQueued.into_raw() as u8,
+        "local PTT while the Brew caller owns the initial floor must queue, not steal floor"
     );
 }
 
