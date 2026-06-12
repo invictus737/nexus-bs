@@ -856,6 +856,15 @@ td .pill {
   overflow-wrap: anywhere;
 }
 
+.facts a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
+.facts a:hover {
+  text-decoration: underline;
+}
+
 #configPath,
 #runtimeConfigPath,
 #soapyInfo {

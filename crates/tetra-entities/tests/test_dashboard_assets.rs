@@ -103,6 +103,19 @@ fn external_dashboard_asset_manifest_is_coherent() {
         index.contains(r#"id="settingsSection""#) && index.contains(r#"id="aboutSection""#),
         "dashboard must keep Settings/Admin and About/Credits sections"
     );
+    for link in [
+        "https://github.com/invictus737/nexus-bs",
+        "https://github.com/misadeks/tetra-bluestation",
+        "https://github.com/MidnightBlueLabs/tetra-bluestation",
+        "https://github.com/razvanzeces/flowstation",
+        "https://github.com/tejeez/sxxcvr",
+    ] {
+        assert!(index.contains(link), "external dashboard About must contain link {link}");
+    }
+    assert!(
+        index.contains("Dennis DB2OE for dashboard theme inspiration"),
+        "external dashboard About must credit Dennis DB2OE for dashboard theme inspiration"
+    );
     assert!(
         index.contains(r#"id="configManager""#) && index.contains(r#"id="configProfileSelect""#) && index.contains(r#"id="configEditor""#),
         "Settings must expose config profile selection and current TOML editing controls"

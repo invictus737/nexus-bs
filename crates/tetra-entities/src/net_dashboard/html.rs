@@ -815,6 +815,10 @@ td code{
   line-height:1.15;margin-bottom:10px;
 }
 .about-copy{font-size:13px;line-height:1.65;color:var(--text2);max-width:780px;}
+.about-link-row{
+  margin-top:12px;font-family:var(--mono);font-size:12px;
+  color:var(--text3);overflow-wrap:anywhere;
+}
 .about-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;}
 .about-credit{
   background:var(--bg3);border:1px solid var(--border);
@@ -825,6 +829,14 @@ td code{
   color:var(--text);margin-bottom:6px;
 }
 .about-credit-desc{font-size:12px;line-height:1.55;color:var(--text2);}
+.about-link,
+.about-credit-name a,
+.about-credit-desc a{
+  color:var(--accent);text-decoration:none;
+}
+.about-link:hover,
+.about-credit-name a:hover,
+.about-credit-desc a:hover{text-decoration:underline;}
 .about-chip-row{display:flex;gap:8px;flex-wrap:wrap;margin-top:14px;}
 .about-chip{
   font-family:var(--mono);font-size:10px;font-weight:700;
@@ -1900,6 +1912,10 @@ td code{
             The dashboard identifies this build as Nexus-BS. Historical credits are listed
             for transparency; they do not describe current Nexus-BS project governance.
           </div>
+          <div class="about-link-row">
+            GitHub:
+            <a class="about-link" href="https://github.com/invictus737/nexus-bs" target="_blank" rel="noopener noreferrer">github.com/invictus737/nexus-bs</a>
+          </div>
           <div class="about-chip-row">
             <span class="about-chip">User-Agent {{PRODUCT_USER_AGENT}}</span>
             <span class="about-chip">TETRA BS</span>
@@ -1924,16 +1940,20 @@ td code{
         <div class="card-body" style="padding:14px 18px">
           <div class="about-grid">
             <div class="about-credit">
-              <div class="about-credit-name">BlueStation Project</div>
-              <div class="about-credit-desc">Historical TETRA base-station foundation, protocol-structure and early SDR-stack contributions.</div>
+              <div class="about-credit-name"><a href="https://github.com/misadeks/tetra-bluestation" target="_blank" rel="noopener noreferrer">BlueStation Project</a></div>
+              <div class="about-credit-desc">Historical TETRA base-station foundation, protocol-structure and early SDR-stack contributions. Also referenced: <a href="https://github.com/MidnightBlueLabs/tetra-bluestation" target="_blank" rel="noopener noreferrer">MidnightBlueLabs/tetra-bluestation</a>.</div>
             </div>
             <div class="about-credit">
-              <div class="about-credit-name">FlowStation Project</div>
+              <div class="about-credit-name"><a href="https://github.com/razvanzeces/flowstation" target="_blank" rel="noopener noreferrer">FlowStation Project</a></div>
               <div class="about-credit-desc">Historical field-feature, dashboard, Brew integration and deployment-hardening contributions.</div>
             </div>
             <div class="about-credit">
-              <div class="about-credit-name">SXCEIVER</div>
+              <div class="about-credit-name"><a href="https://github.com/tejeez/sxxcvr" target="_blank" rel="noopener noreferrer">SXCEIVER</a></div>
               <div class="about-credit-desc">SDR hardware ecosystem context, RF integration work and station-oriented deployment support.</div>
+            </div>
+            <div class="about-credit">
+              <div class="about-credit-name">Dennis DB2OE</div>
+              <div class="about-credit-desc">Dashboard theme inspiration.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name">All Contributors</div>

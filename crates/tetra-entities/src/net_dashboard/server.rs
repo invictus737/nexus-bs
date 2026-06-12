@@ -4492,8 +4492,23 @@ mod tests {
         assert!(dashboard.contains(r#"class="btn disabled""#));
         assert!(dashboard.contains(r#"disabled title="OTA update disabled for now""#));
 
-        for credit in ["BlueStation Project", "FlowStation Project", "SXCEIVER", "All Contributors"] {
+        for credit in [
+            "BlueStation Project",
+            "FlowStation Project",
+            "SXCEIVER",
+            "Dennis DB2OE",
+            "All Contributors",
+        ] {
             assert!(dashboard.contains(credit), "missing About credit {credit}");
+        }
+        for link in [
+            "https://github.com/invictus737/nexus-bs",
+            "https://github.com/misadeks/tetra-bluestation",
+            "https://github.com/MidnightBlueLabs/tetra-bluestation",
+            "https://github.com/razvanzeces/flowstation",
+            "https://github.com/tejeez/sxxcvr",
+        ] {
+            assert!(dashboard.contains(link), "missing About link {link}");
         }
         assert!(dashboard.contains("current Nexus-BS project governance"));
     }
