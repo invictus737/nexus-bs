@@ -4494,6 +4494,8 @@ mod tests {
 
         for credit in [
             "BlueStation Project",
+            "Tatu Peltola",
+            "native Rust Viterbi",
             "Mihajlo YU4MSH",
             "FDX P2P",
             "FlowStation Project",
