@@ -465,13 +465,12 @@ impl CcBsSubentity {
 
         let communication = CommunicationType::try_from(call.communication as u64).unwrap_or(CommunicationType::P2p);
         let simplex_duplex = call.duplex != 0;
-        let called_circuit_direction = if simplex_duplex { Direction::Dl } else { Direction::Both };
 
         let occupied_call_ids = self.occupied_call_ids();
         let (circuit_called, circuit_calling) = {
             let mut state = self.config.state_write();
             let circuit_called = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
-                called_circuit_direction,
+                Direction::Both,
                 communication,
                 simplex_duplex,
                 &mut state.timeslot_alloc,
@@ -500,41 +499,13 @@ impl CcBsSubentity {
                 }
             };
 
-            let circuit_calling = if simplex_duplex {
-                match self.circuits.allocate_circuit_for_call_with_allocator(
-                    circuit_called.call_id,
-                    Direction::Ul,
-                    communication,
-                    simplex_duplex,
-                    &mut state.timeslot_alloc,
-                    TimeslotOwner::Cmce,
-                ) {
-                    Ok(circuit) => Some(circuit.clone()),
-                    Err(e) => {
-                        let _ = self.circuits.close_circuit(Direction::Both, circuit_called.ts);
-                        let _ = state.timeslot_alloc.release(TimeslotOwner::Cmce, circuit_called.ts);
-                        tracing::info!(
-                            "CMCE: rejecting Brew setup request uuid={} src={} dst={} (second duplex allocation failed: {:?})",
-                            brew_uuid,
-                            call.source_issi,
-                            call.destination,
-                            e
-                        );
-                        queue.push_back(SapMsg {
-                            sap: Sap::Control,
-                            src: TetraEntity::Cmce,
-                            dest: TetraEntity::Brew,
-                            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupReject {
-                                brew_uuid,
-                                cause: DisconnectCause::CongestionInInfrastructure.into_raw() as u8,
-                            }),
-                        });
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            // EN 300 392-2 clause 23.1.3.1.1 permits a frequency
+            // half-duplex MS to support a single-slot duplex service only on
+            // the same-numbered DL/UL slot pair. Brew/network interconnect has
+            // one local RF MS leg, so keep requested duplex on one local
+            // `Both` bearer instead of splitting DL and UL onto different
+            // timeslots.
+            let circuit_calling: Option<CmceCircuit> = None;
 
             (circuit_called.clone(), circuit_calling)
         };

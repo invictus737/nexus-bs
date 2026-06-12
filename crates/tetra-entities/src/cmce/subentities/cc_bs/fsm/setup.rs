@@ -1142,19 +1142,16 @@ impl CcBsSubentity {
             }
         }
 
-        // Allocate the local RF bearer(s) for the originating MS. Full-duplex
-        // Brew interconnect uses two standard assigned timeslots on the local
-        // air interface: one UL bearer toward Brew and one DL bearer from Brew.
-        let calling_circuit_direction = if pdu.simplex_duplex_selection {
-            Direction::Ul
-        } else {
-            Direction::Both
-        };
+        // Allocate one local RF bearer for the originating MS. For Brew
+        // interconnect there is only one local MS leg; EN 300 392-2
+        // clause 23.1.3.1.1 permits frequency half-duplex MSs to support
+        // duplex service on the same-numbered DL/UL slot pair, so requested
+        // duplex remains `Both` on a single local timeslot.
         let occupied_call_ids = self.occupied_call_ids();
         let (circuit_calling, circuit_called) = {
             let mut state = self.config.state_write();
             let circuit_calling = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
-                calling_circuit_direction,
+                Direction::Both,
                 pdu.basic_service_information.communication_type,
                 pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
@@ -1181,39 +1178,7 @@ impl CcBsSubentity {
                 }
             };
 
-            let circuit_called = if pdu.simplex_duplex_selection {
-                match self.circuits.allocate_circuit_for_call_with_allocator(
-                    circuit_calling.call_id,
-                    Direction::Dl,
-                    pdu.basic_service_information.communication_type,
-                    pdu.simplex_duplex_selection,
-                    &mut state.timeslot_alloc,
-                    TimeslotOwner::Cmce,
-                ) {
-                    Ok(circuit) => Some(circuit.clone()),
-                    Err(e) => {
-                        let _ = self.circuits.close_circuit(Direction::Both, circuit_calling.ts);
-                        let _ = state.timeslot_alloc.release(TimeslotOwner::Cmce, circuit_calling.ts);
-                        tracing::info!(
-                            "CMCE: rejecting U-SETUP over Brew src={} dst={} (second duplex allocation failed: {:?})",
-                            calling_party.ssi,
-                            called_addr.ssi,
-                            e
-                        );
-                        Self::reject_u_setup_before_call_id(
-                            queue,
-                            calling_party,
-                            prim.handle,
-                            prim.link_id,
-                            prim.endpoint_id,
-                            DisconnectCause::CongestionInInfrastructure,
-                        );
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
+            let circuit_called: Option<CmceCircuit> = None;
 
             (circuit_calling.clone(), circuit_called)
         };
@@ -1222,9 +1187,6 @@ impl CcBsSubentity {
         let calling_ts = circuit_calling.ts;
         let calling_usage = circuit_calling.usage;
         let (called_ts, called_usage) = if let Some(called) = &circuit_called {
-            // Keep one usage marker for the split duplex pair. The second CMCE
-            // reservation owns the second TS for cleanup, while UMAC receives
-            // a coherent DL/UL bearer pair with a shared traffic marker.
             (called.ts, calling_usage)
         } else {
             (calling_ts, calling_usage)

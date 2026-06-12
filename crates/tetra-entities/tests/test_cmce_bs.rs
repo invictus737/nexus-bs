@@ -4727,8 +4727,8 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
     assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
     assert_eq!(
         test.config.state_read().timeslot_alloc.owner(3),
-        Some(TimeslotOwner::Cmce),
-        "local-origin Brew duplex must reserve separate local UL/DL traffic timeslots"
+        None,
+        "local-origin Brew duplex must keep one ETSI single-slot local RF bearer"
     );
     network_call.grant = TransmissionGrant::Granted.into_raw() as u8;
     network_call.permission = 0;
@@ -4762,38 +4762,26 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
         .expect("Brew duplex D-CONNECT must carry channel allocation");
     assert_eq!(
         connect_alloc.timeslots,
-        [false, false, true, false],
-        "local-origin Brew duplex D-CONNECT must carry only the local DL allocation"
+        [false, true, false, false],
+        "local-origin Brew duplex D-CONNECT must carry the single local DL/UL slot"
     );
     assert_eq!(connect_alloc.alloc_type, ChanAllocType::Replace);
-    assert_eq!(connect_alloc.ul_dl_assigned, UlDlAssignment::Dl);
-    let secondary_alloc = connect_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim)
-                if prim.main_address.ssi == TEST_ISSI
-                    && prim.sdu.get_len() == 0
-                    && prim
-                        .chan_alloc
-                        .as_ref()
-                        .is_some_and(|alloc| alloc.ul_dl_assigned == UlDlAssignment::Ul) =>
-            {
-                Some(prim)
-            }
-            _ => None,
-        })
-        .expect("local-origin Brew duplex must send a separate UL-only channel allocation");
-    let secondary_alloc_req = secondary_alloc.chan_alloc.as_ref().expect("secondary allocation should be present");
-    assert_eq!(secondary_alloc_req.timeslots, [false, true, false, false]);
-    assert_eq!(secondary_alloc_req.alloc_type, ChanAllocType::Additional);
-    assert_eq!(secondary_alloc_req.ul_dl_assigned, UlDlAssignment::Ul);
-    assert_eq!(secondary_alloc_req.usage, connect_alloc.usage);
-    assert_eq!(secondary_alloc.layer2service, Layer2Service::Unacknowledged);
-    assert_eq!(secondary_alloc.unacked_bl_repetitions, Some(0));
-    let secondary_reporter = secondary_alloc
-        .tx_reporter
-        .clone()
-        .expect("secondary UL allocation must be reported before Brew media opens");
+    assert_eq!(connect_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert!(
+        connect_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == TEST_ISSI
+                        && prim.sdu.get_len() == 0
+                        && prim
+                            .chan_alloc
+                            .as_ref()
+                            .is_some_and(|alloc| alloc.ul_dl_assigned == UlDlAssignment::Ul)
+            )
+        }),
+        "local-origin Brew duplex must not emit a split UL-only allocation"
+    );
     assert!(connect.1.simplex_duplex_selection);
     assert_eq!(connect.1.transmission_grant, TransmissionGrant::Granted);
     let open_circuits: Vec<_> = connect_msgs
@@ -4805,30 +4793,19 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
         .collect();
     assert_eq!(
         open_circuits.len(),
-        2,
-        "local-origin Brew duplex must open separate local DL and UL RF bearers"
+        1,
+        "local-origin Brew duplex must open one ETSI single-slot local RF bearer"
     );
-    let dl_open = open_circuits
-        .iter()
-        .find(|circuit| circuit.direction == Direction::Dl)
-        .expect("local-origin Brew duplex must open a DL bearer");
-    let ul_open = open_circuits
-        .iter()
-        .find(|circuit| circuit.direction == Direction::Ul)
-        .expect("local-origin Brew duplex must open a UL bearer");
-    assert_eq!(dl_open.ts, 3);
-    assert_eq!(dl_open.peer_ts, Some(2));
-    assert_eq!(dl_open.dl_media_source, CircuitDlMediaSource::SwMI);
-    assert_eq!(dl_open.active_addr, Some(TetraAddress::issi(TEST_ISSI)));
-    assert_eq!(ul_open.ts, 2);
-    assert_eq!(ul_open.peer_ts, None);
-    assert_eq!(ul_open.dl_media_source, CircuitDlMediaSource::SwMI);
-    assert_eq!(ul_open.active_addr, Some(TetraAddress::issi(TEST_ISSI)));
+    let local_open = open_circuits[0];
+    assert_eq!(local_open.direction, Direction::Both);
+    assert_eq!(local_open.ts, 2);
+    assert_eq!(local_open.peer_ts, None);
+    assert_eq!(local_open.dl_media_source, CircuitDlMediaSource::SwMI);
+    assert_eq!(local_open.active_addr, Some(TetraAddress::issi(TEST_ISSI)));
     assert_eq!(
-        dl_open.usage,
+        local_open.usage,
         connect_alloc.usage.expect("duplex allocation should carry usage marker")
     );
-    assert_eq!(ul_open.usage, dl_open.usage);
     assert_eq!(
         count_network_circuit_connect_confirm(&connect_msgs, brew_uuid),
         0,
@@ -4852,38 +4829,18 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
     );
     assert_eq!(
         count_network_circuit_connect_confirm(&after_transmit_only_msgs, brew_uuid),
-        0,
-        "local caller duplex Brew connect waits for the secondary UL allocation too"
+        1,
+        "local caller duplex Brew connect confirms after the single local RF allocation transmits"
     );
     assert_eq!(
         count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
-        0,
-        "local caller duplex Brew media waits for both split allocations"
-    );
-
-    secondary_reporter.mark_transmitted();
-    test.run_stack(Some(1));
-    let after_split_alloc_msgs = test.dump_sinks();
-
-    assert_eq!(
-        count_network_circuit_connect_confirm(&after_split_alloc_msgs, brew_uuid),
         1,
-        "local caller duplex Brew connect confirms after both local RF allocations transmit"
+        "local caller duplex Brew media opens after the single local RF allocation transmits"
     );
     assert_eq!(
-        count_network_circuit_media_ready(&after_split_alloc_msgs, brew_uuid),
-        2,
-        "local caller duplex Brew media opens DL playout and UL forwarding after both RF allocations transmit"
-    );
-    assert_eq!(
-        count_network_circuit_media_ready_direction(&after_split_alloc_msgs, brew_uuid, 3, Direction::Dl),
+        count_network_circuit_media_ready_direction(&after_transmit_only_msgs, brew_uuid, 2, Direction::Both),
         1,
-        "local caller duplex Brew DL playout must be on the local DL TS"
-    );
-    assert_eq!(
-        count_network_circuit_media_ready_direction(&after_split_alloc_msgs, brew_uuid, 2, Direction::Ul),
-        1,
-        "local caller duplex Brew UL forwarding must be on the local UL TS"
+        "local caller duplex Brew media must use the same local DL/UL TS"
     );
 
     test.submit_message(SapMsg {
@@ -4906,16 +4863,12 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
     let cleanup_msgs = test.dump_sinks();
 
     assert_eq!(
-        count_umac_close_direction(&cleanup_msgs, Direction::Ul, 2),
+        count_umac_close_direction(&cleanup_msgs, Direction::Both, 2),
         1,
-        "local-origin Brew duplex cleanup must close the local UL bearer direction"
+        "local-origin Brew duplex cleanup must close the single local RF bearer"
     );
-    assert_eq!(
-        count_umac_close_direction(&cleanup_msgs, Direction::Dl, 3),
-        1,
-        "local-origin Brew duplex cleanup must close the local DL bearer direction"
-    );
-    assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Both, 2), 0);
+    assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Ul, 2), 0);
+    assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Dl, 3), 0);
     assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Both, 3), 0);
 }
 
@@ -5158,9 +5111,9 @@ fn test_network_origin_brew_private_call_updates_dashboard_last_heard() {
                 && *calling_issi == TEST_ISSI
                 && *called_issi == TEST_CALLED_ISSI
                 && !*simplex
-                && secondary_ts.is_some()
+                && secondary_ts.is_none()
         )),
-        "network-origin Brew duplex P2P setup must publish the secondary bearer timeslot"
+        "network-origin Brew duplex P2P remains duplex while using one local single-slot bearer"
     );
 
     let dashboard = DashboardServer::new("test.toml".to_string());
@@ -5291,8 +5244,8 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
     assert_eq!(
         test.config.state_read().timeslot_alloc.owner(3),
-        Some(TimeslotOwner::Cmce),
-        "network-origin private duplex must reserve the external/network bearer timeslot"
+        None,
+        "network-origin private duplex must keep one ETSI single-slot local RF bearer"
     );
 
     test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, true, true));
@@ -5323,7 +5276,7 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     assert_eq!(count_umac_open(&connect_request_msgs), 0);
     assert_eq!(count_umac_call_ended_or_close(&connect_request_msgs), 0);
     assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
-    assert_eq!(test.config.state_read().timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(3), None);
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -5357,37 +5310,25 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     assert_eq!(
         connect_ack_alloc.timeslots,
         [false, true, false, false],
-        "network-origin Brew duplex D-CONNECT ACK must carry only the local DL allocation"
+        "network-origin Brew duplex D-CONNECT ACK must carry the single local DL/UL slot"
     );
     assert_eq!(connect_ack_alloc.alloc_type, ChanAllocType::Replace);
-    assert_eq!(connect_ack_alloc.ul_dl_assigned, UlDlAssignment::Dl);
-    let secondary_alloc = confirm_msgs
-        .iter()
-        .find_map(|msg| match &msg.msg {
-            SapMsgInner::LcmcMleUnitdataReq(prim)
-                if prim.main_address.ssi == TEST_CALLED_ISSI
-                    && prim.sdu.get_len() == 0
-                    && prim
-                        .chan_alloc
-                        .as_ref()
-                        .is_some_and(|alloc| alloc.ul_dl_assigned == UlDlAssignment::Ul) =>
-            {
-                Some(prim)
-            }
-            _ => None,
-        })
-        .expect("network-origin Brew duplex must send a separate UL-only channel allocation");
-    let secondary_alloc_req = secondary_alloc.chan_alloc.as_ref().expect("secondary allocation should be present");
-    assert_eq!(secondary_alloc_req.timeslots, [false, false, true, false]);
-    assert_eq!(secondary_alloc_req.alloc_type, ChanAllocType::Additional);
-    assert_eq!(secondary_alloc_req.ul_dl_assigned, UlDlAssignment::Ul);
-    assert_eq!(secondary_alloc_req.usage, connect_ack_alloc.usage);
-    assert_eq!(secondary_alloc.layer2service, Layer2Service::Unacknowledged);
-    assert_eq!(secondary_alloc.unacked_bl_repetitions, Some(0));
-    let secondary_reporter = secondary_alloc
-        .tx_reporter
-        .clone()
-        .expect("secondary UL allocation must be reported before Brew media opens");
+    assert_eq!(connect_ack_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    assert!(
+        confirm_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address.ssi == TEST_CALLED_ISSI
+                        && prim.sdu.get_len() == 0
+                        && prim
+                            .chan_alloc
+                            .as_ref()
+                            .is_some_and(|alloc| alloc.ul_dl_assigned == UlDlAssignment::Ul)
+            )
+        }),
+        "network-origin Brew duplex must not emit a split UL-only allocation"
+    );
     assert_eq!(connect_ack.1.transmission_grant, TransmissionGrant::Granted);
     let open_circuits: Vec<_> = confirm_msgs
         .iter()
@@ -5398,30 +5339,19 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
         .collect();
     assert_eq!(
         open_circuits.len(),
-        2,
-        "network-origin private duplex must open separate local DL and UL RF bearers"
+        1,
+        "network-origin private duplex must open one ETSI single-slot local RF bearer"
     );
-    let dl_open = open_circuits
-        .iter()
-        .find(|circuit| circuit.direction == Direction::Dl)
-        .expect("network-origin Brew duplex must open a DL bearer");
-    let ul_open = open_circuits
-        .iter()
-        .find(|circuit| circuit.direction == Direction::Ul)
-        .expect("network-origin Brew duplex must open a UL bearer");
-    assert_eq!(dl_open.ts, 2);
-    assert_eq!(dl_open.peer_ts, Some(3));
-    assert_eq!(dl_open.dl_media_source, CircuitDlMediaSource::SwMI);
-    assert_eq!(dl_open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
-    assert_eq!(ul_open.ts, 3);
-    assert_eq!(ul_open.peer_ts, None);
-    assert_eq!(ul_open.dl_media_source, CircuitDlMediaSource::SwMI);
-    assert_eq!(ul_open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
+    let local_open = open_circuits[0];
+    assert_eq!(local_open.direction, Direction::Both);
+    assert_eq!(local_open.ts, 2);
+    assert_eq!(local_open.peer_ts, None);
+    assert_eq!(local_open.dl_media_source, CircuitDlMediaSource::SwMI);
+    assert_eq!(local_open.active_addr, Some(TetraAddress::new(TEST_CALLED_ISSI, SsiType::Issi)));
     assert_eq!(
-        dl_open.usage,
+        local_open.usage,
         connect_ack_alloc.usage.expect("duplex allocation should carry usage marker")
     );
-    assert_eq!(ul_open.usage, dl_open.usage);
     assert_eq!(
         count_network_circuit_media_ready(&confirm_msgs, brew_uuid),
         0,
@@ -5440,34 +5370,19 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     );
     assert_eq!(
         count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
-        0,
-        "network-origin duplex Brew media waits for the secondary UL allocation too"
+        1,
+        "network-origin duplex Brew media opens after the single local RF allocation transmits"
     );
-
-    secondary_reporter.mark_transmitted();
-    test.run_stack(Some(1));
-    let after_split_alloc_msgs = test.dump_sinks();
-
-    assert_eq!(
-        count_network_circuit_media_ready(&after_split_alloc_msgs, brew_uuid),
-        2,
-        "network-origin duplex Brew media opens DL playout and UL forwarding after both RF allocations transmit"
-    );
-    assert_eq!(count_d_releases(&after_split_alloc_msgs), 0);
-    assert_eq!(count_d_disconnects(&after_split_alloc_msgs), 0);
-    assert_eq!(count_network_circuit_release(&after_split_alloc_msgs, brew_uuid), 0);
-    assert_eq!(count_umac_call_ended_or_close(&after_split_alloc_msgs), 0);
+    assert_eq!(count_d_releases(&after_transmit_only_msgs), 0);
+    assert_eq!(count_d_disconnects(&after_transmit_only_msgs), 0);
+    assert_eq!(count_network_circuit_release(&after_transmit_only_msgs, brew_uuid), 0);
+    assert_eq!(count_umac_call_ended_or_close(&after_transmit_only_msgs), 0);
     assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
-    assert_eq!(test.config.state_read().timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(3), None);
     assert_eq!(
-        count_network_circuit_media_ready_direction(&after_split_alloc_msgs, brew_uuid, 2, Direction::Dl),
+        count_network_circuit_media_ready_direction(&after_transmit_only_msgs, brew_uuid, 2, Direction::Both),
         1,
-        "network-origin duplex Brew DL playout must be on the local DL TS"
-    );
-    assert_eq!(
-        count_network_circuit_media_ready_direction(&after_split_alloc_msgs, brew_uuid, 3, Direction::Ul),
-        1,
-        "network-origin duplex Brew UL forwarding must be on the local UL TS"
+        "network-origin duplex Brew media must use the same local DL/UL TS"
     );
 
     test.submit_message(SapMsg {
@@ -5490,16 +5405,12 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     let cleanup_msgs = test.dump_sinks();
 
     assert_eq!(
-        count_umac_close_direction(&cleanup_msgs, Direction::Dl, 2),
+        count_umac_close_direction(&cleanup_msgs, Direction::Both, 2),
         1,
-        "network-origin Brew duplex cleanup must close the local DL bearer direction"
+        "network-origin Brew duplex cleanup must close the single local RF bearer"
     );
-    assert_eq!(
-        count_umac_close_direction(&cleanup_msgs, Direction::Ul, 3),
-        1,
-        "network-origin Brew duplex cleanup must close the local UL bearer direction"
-    );
-    assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Both, 2), 0);
+    assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Dl, 2), 0);
+    assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Ul, 3), 0);
     assert_eq!(count_umac_close_direction(&cleanup_msgs, Direction::Both, 3), 0);
 }
 
@@ -5546,8 +5457,8 @@ fn test_network_origin_brew_private_duplex_accepts_local_simplex_offer_without_l
     assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
     assert_eq!(
         test.config.state_read().timeslot_alloc.owner(3),
-        Some(TimeslotOwner::Cmce),
-        "duplex setup should reserve the second bearer before the local MS answers"
+        None,
+        "network-origin Brew duplex setup should reserve only one local single-slot bearer"
     );
 
     test.submit_message(build_u_connect_custom_msg_with_hook(TEST_CALLED_ISSI, call_id, false, false));
@@ -5572,7 +5483,7 @@ fn test_network_origin_brew_private_duplex_accepts_local_simplex_offer_without_l
     assert_eq!(
         test.config.state_read().timeslot_alloc.owner(3),
         None,
-        "unused network/calling bearer must be released when the local MS offers simplex"
+        "local simplex offer must not create or leak a second local bearer"
     );
 
     test.submit_message(SapMsg {
@@ -13055,7 +12966,7 @@ fn test_p2p_duplex_u_connect_waits_for_called_delivery_before_caller_d_connect()
 }
 
 #[test]
-fn test_p2p_duplex_from_frequency_simplex_ms_keeps_two_local_bearers() {
+fn test_p2p_duplex_from_frequency_simplex_ms_keeps_one_both_bearer_per_local_ms() {
     debug::setup_logging_verbose();
 
     let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
@@ -13137,8 +13048,12 @@ fn test_p2p_duplex_from_frequency_simplex_ms_keeps_two_local_bearers() {
         "local MS-MS private duplex must open one assigned bearer per MS"
     );
     assert!(
+        open_circuits.iter().all(|circuit| circuit.direction == Direction::Both),
+        "each frequency half-duplex MS must receive one same-numbered DL/UL bearer"
+    );
+    assert!(
         open_circuits.iter().all(|circuit| circuit.peer_ts.is_some()),
-        "duplex local bearers must be cross-routed with peer_ts on both legs"
+        "local MS-MS duplex needs two local RF bearers cross-routed between the two MSs"
     );
     assert_ne!(
         open_circuits[0].ts, open_circuits[1].ts,
