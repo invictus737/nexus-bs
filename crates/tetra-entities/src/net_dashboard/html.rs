@@ -1906,7 +1906,7 @@ td code{
       <div class="about-hero">
         <div class="about-panel">
           <div class="about-kicker">NEXUS-BS PROJECT</div>
-          <div class="about-title">Nexus-BS Project - version {{PRODUCT_VERSION_TAG}} by Chris YO3TCO</div>
+          <div class="about-title">Nexus-BS Project</div>
           <div class="about-copy">
             Nexus-BS is a TETRA base-station stack for lab, amateur-radio and research work.
             The dashboard identifies this build as Nexus-BS. Historical credits are listed
@@ -1917,6 +1917,7 @@ td code{
             <a class="about-link" href="https://github.com/invictus737/nexus-bs" target="_blank" rel="noopener noreferrer">github.com/invictus737/nexus-bs</a>
           </div>
           <div class="about-chip-row">
+            <span class="about-chip">Version {{PRODUCT_VERSION_TAG}}</span>
             <span class="about-chip">User-Agent {{PRODUCT_USER_AGENT}}</span>
             <span class="about-chip">TETRA BS</span>
             <span class="about-chip">Rust stack</span>
@@ -1944,8 +1945,8 @@ td code{
               <div class="about-credit-desc">Historical TETRA base-station foundation, protocol-structure and early SDR-stack contributions.</div>
             </div>
             <div class="about-credit">
-              <div class="about-credit-name"><a href="https://github.com/tejeez/sxxcvr" target="_blank" rel="noopener noreferrer">Tatu Peltola</a></div>
-              <div class="about-credit-desc">rust-soapysdr timestamping and native Rust Viterbi encoder/decoder contributions.</div>
+              <div class="about-credit-name">Tatu Peltola</div>
+              <div class="about-credit-desc">For his <a href="https://sxceiver.com/" target="_blank" rel="noopener noreferrer">SXCEIVER</a>.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name"><a href="https://github.com/misadeks/tetra-bluestation" target="_blank" rel="noopener noreferrer">Mihajlo YU4MSH</a></div>
@@ -1954,10 +1955,6 @@ td code{
             <div class="about-credit">
               <div class="about-credit-name"><a href="https://github.com/razvanzeces/flowstation" target="_blank" rel="noopener noreferrer">FlowStation Project</a></div>
               <div class="about-credit-desc">Historical field-feature, dashboard, Brew integration and deployment-hardening contributions.</div>
-            </div>
-            <div class="about-credit">
-              <div class="about-credit-name"><a href="https://sxceiver.com" target="_blank" rel="noopener noreferrer">SXCEIVER</a></div>
-              <div class="about-credit-desc">SDR hardware ecosystem context, RF integration work and station-oriented deployment support.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name">Dennis DB2OE</div>
@@ -4420,7 +4417,7 @@ input:focus{border-color:var(--accent2);background:var(--bg4);}
   </form>
 
   <div class="footer">
-    Nexus-BS Project - version {{PRODUCT_VERSION_TAG}} by Chris YO3TCO
+    Nexus-BS Project · {{PRODUCT_VERSION_TAG}}
   </div>
 </div>
 

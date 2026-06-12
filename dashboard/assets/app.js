@@ -1834,7 +1834,7 @@ function renderSystem() {
   setText("runtimeConfigPath", sys.runtime_config_path || sys.config_path || "--");
   setText("sdrName", sys.sdr_name || "--");
   setText("soapyInfo", sys.soapy_info || "--");
-  setText("aboutVersion", sys.product_name && sys.product_version_tag ? `Nexus-BS Project ${sys.product_version_tag} by Chris YO3TCO` : "Nexus-BS Project by Chris YO3TCO");
+  setText("aboutVersion", sys.product_version_tag || sys.stack_version || "--");
   renderSite();
 }
 

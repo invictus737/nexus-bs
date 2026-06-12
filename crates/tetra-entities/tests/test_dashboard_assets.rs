@@ -103,13 +103,23 @@ fn external_dashboard_asset_manifest_is_coherent() {
         index.contains(r#"id="settingsSection""#) && index.contains(r#"id="aboutSection""#),
         "dashboard must keep Settings/Admin and About/Credits sections"
     );
+    assert!(
+        index.contains(r#"<dt>Project</dt><dd>Nexus-BS Project</dd>"#)
+            && index.contains(r#"<dt>Version</dt><dd id="aboutVersion">--</dd>"#),
+        "external dashboard About must keep the project name separate from the dynamic version"
+    );
+    assert!(
+        app.contains(r#"setText("aboutVersion", sys.product_version_tag || sys.stack_version || "--")"#)
+            && !app.contains("Nexus-BS Project ${sys.product_version_tag} by Chris YO3TCO")
+            && !index.contains("Nexus-BS Project by Chris YO3TCO"),
+        "external dashboard About version must be populated dynamically without mixing project name and author"
+    );
     for link in [
         "https://github.com/invictus737/nexus-bs",
         "https://github.com/misadeks/tetra-bluestation",
         "https://github.com/MidnightBlueLabs/tetra-bluestation",
         "https://github.com/razvanzeces/flowstation",
-        "https://github.com/tejeez/sxxcvr",
-        "https://sxceiver.com",
+        "https://sxceiver.com/",
     ] {
         assert!(index.contains(link), "external dashboard About must contain link {link}");
     }
@@ -122,12 +132,15 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "external dashboard About must credit Mihajlo YU4MSH separately for FDX P2P"
     );
     assert!(
-        index.contains("Tatu Peltola") && index.contains("native Rust Viterbi"),
-        "external dashboard About must credit Tatu Peltola under the BlueStation lineage"
+        index.contains("Tatu Peltola for his") && index.contains(r#"href="https://sxceiver.com/""#) && index.contains(">SXCEIVER</a>"),
+        "external dashboard About must credit Tatu Peltola for his hyperlinked SXCEIVER"
     );
     assert!(
-        !index.contains("Tatu Peltola</a> for SXCEIVER work"),
-        "external dashboard About must not duplicate SXCEIVER in the Tatu Peltola credit"
+        !index.contains("(https://sxceiver.com/)")
+            && !index.contains("native Rust Viterbi")
+            && !index.contains("rust-soapysdr")
+            && !index.contains("Tatu Peltola</a> for SXCEIVER work"),
+        "external dashboard About must not show old Tatu wording or a raw SXCEIVER URL"
     );
     assert!(
         index.contains(r#"id="configManager""#) && index.contains(r#"id="configProfileSelect""#) && index.contains(r#"id="configEditor""#),

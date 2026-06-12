@@ -4464,7 +4464,7 @@ mod tests {
     fn shipped_dashboard_pages_render_current_version_identity() {
         let dashboard = render_product_template(crate::net_dashboard::html::DASHBOARD_HTML);
         let login = render_product_template(crate::net_dashboard::html::LOGIN_HTML);
-        let expected_project_line = format!("Nexus-BS Project - version {} by Chris YO3TCO", tetra_core::PRODUCT_VERSION_TAG);
+        let stale_project_line = format!("Nexus-BS Project - version {} by Chris YO3TCO", tetra_core::PRODUCT_VERSION_TAG);
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
 
         for rendered in [&dashboard, &login] {
@@ -4477,9 +4477,11 @@ mod tests {
             assert!(!rendered.contains("YO6RVZ"));
         }
 
-        assert!(dashboard.contains(&expected_project_line));
+        assert!(dashboard.contains("Nexus-BS Project"));
         assert!(dashboard.contains(tetra_core::PRODUCT_USER_AGENT));
-        assert!(login.contains(&expected_project_line));
+        assert!(login.contains("Nexus-BS Project"));
+        assert!(!dashboard.contains(&stale_project_line));
+        assert!(!login.contains(&stale_project_line));
     }
 
     #[test]
@@ -4495,7 +4497,7 @@ mod tests {
         for credit in [
             "BlueStation Project",
             "Tatu Peltola",
-            "native Rust Viterbi",
+            "his",
             "Mihajlo YU4MSH",
             "FDX P2P",
             "FlowStation Project",
@@ -4510,11 +4512,11 @@ mod tests {
             "https://github.com/misadeks/tetra-bluestation",
             "https://github.com/MidnightBlueLabs/tetra-bluestation",
             "https://github.com/razvanzeces/flowstation",
-            "https://github.com/tejeez/sxxcvr",
-            "https://sxceiver.com",
+            "https://sxceiver.com/",
         ] {
             assert!(dashboard.contains(link), "missing About link {link}");
         }
+        assert!(!dashboard.contains("(https://sxceiver.com/)"));
         assert!(dashboard.contains("current Nexus-BS project governance"));
     }
 
