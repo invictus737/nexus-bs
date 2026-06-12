@@ -1945,7 +1945,7 @@ td code{
             </div>
             <div class="about-credit">
               <div class="about-credit-name"><a href="https://github.com/tejeez/sxxcvr" target="_blank" rel="noopener noreferrer">Tatu Peltola</a></div>
-              <div class="about-credit-desc">SXCEIVER work, rust-soapysdr timestamping and native Rust Viterbi encoder/decoder contributions.</div>
+              <div class="about-credit-desc">rust-soapysdr timestamping and native Rust Viterbi encoder/decoder contributions.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name"><a href="https://github.com/misadeks/tetra-bluestation" target="_blank" rel="noopener noreferrer">Mihajlo YU4MSH</a></div>

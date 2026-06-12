@@ -125,6 +125,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "external dashboard About must credit Tatu Peltola under the BlueStation lineage"
     );
     assert!(
+        !index.contains("Tatu Peltola</a> for SXCEIVER work"),
+        "external dashboard About must not duplicate SXCEIVER in the Tatu Peltola credit"
+    );
+    assert!(
         index.contains(r#"id="configManager""#) && index.contains(r#"id="configProfileSelect""#) && index.contains(r#"id="configEditor""#),
         "Settings must expose config profile selection and current TOML editing controls"
     );
