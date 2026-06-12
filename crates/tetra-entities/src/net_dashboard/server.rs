@@ -4511,6 +4511,7 @@ mod tests {
             "https://github.com/MidnightBlueLabs/tetra-bluestation",
             "https://github.com/razvanzeces/flowstation",
             "https://github.com/tejeez/sxxcvr",
+            "https://sxceiver.com",
         ] {
             assert!(dashboard.contains(link), "missing About link {link}");
         }

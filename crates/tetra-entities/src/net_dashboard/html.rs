@@ -1956,7 +1956,7 @@ td code{
               <div class="about-credit-desc">Historical field-feature, dashboard, Brew integration and deployment-hardening contributions.</div>
             </div>
             <div class="about-credit">
-              <div class="about-credit-name"><a href="https://github.com/tejeez/sxxcvr" target="_blank" rel="noopener noreferrer">SXCEIVER</a></div>
+              <div class="about-credit-name"><a href="https://sxceiver.com" target="_blank" rel="noopener noreferrer">SXCEIVER</a></div>
               <div class="about-credit-desc">SDR hardware ecosystem context, RF integration work and station-oriented deployment support.</div>
             </div>
             <div class="about-credit">

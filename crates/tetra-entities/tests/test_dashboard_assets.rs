@@ -109,6 +109,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "https://github.com/MidnightBlueLabs/tetra-bluestation",
         "https://github.com/razvanzeces/flowstation",
         "https://github.com/tejeez/sxxcvr",
+        "https://sxceiver.com",
     ] {
         assert!(index.contains(link), "external dashboard About must contain link {link}");
     }
