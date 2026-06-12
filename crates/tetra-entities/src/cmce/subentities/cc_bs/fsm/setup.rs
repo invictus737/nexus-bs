@@ -1048,20 +1048,6 @@ impl CcBsSubentity {
         };
         let mut network_call = Self::build_network_circuit_call_from_u_setup(pdu, calling_party.ssi);
 
-        // Short service numbers (< 1_000_000) must be sent to TetraPack
-        // with destination=0 and the number as a string.
-        // Keep communication=P2p(0), mode=TchS(0), duplex=0 — this combination
-        // resulted in SETUP_ACCEPT in previous tests.
-        if network_call.destination > 0 && network_call.destination < 1_000_000 && network_call.number.is_empty() {
-            tracing::debug!(
-                "CMCE: converting short service SSI {} to number string for TetraPack",
-                network_call.destination
-            );
-            network_call.number = network_call.destination.to_string();
-            network_call.destination = 0;
-            network_call.duplex = 0;
-        }
-
         if !net_brew::is_active(&self.config) {
             tracing::info!(
                 "CMCE: rejecting U-SETUP P2P from ISSI {} (Brew disabled, called_ssi={})",
@@ -1156,12 +1142,19 @@ impl CcBsSubentity {
             }
         }
 
-        // Allocate one bearer for the local MS.
+        // Allocate the local RF bearer(s) for the originating MS. Full-duplex
+        // Brew interconnect uses two standard assigned timeslots on the local
+        // air interface: one UL bearer toward Brew and one DL bearer from Brew.
+        let calling_circuit_direction = if pdu.simplex_duplex_selection {
+            Direction::Ul
+        } else {
+            Direction::Both
+        };
         let occupied_call_ids = self.occupied_call_ids();
-        let circuit_calling = {
+        let (circuit_calling, circuit_called) = {
             let mut state = self.config.state_write();
-            match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
-                Direction::Both,
+            let circuit_calling = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
+                calling_circuit_direction,
                 pdu.basic_service_information.communication_type,
                 pdu.simplex_duplex_selection,
                 &mut state.timeslot_alloc,
@@ -1186,20 +1179,65 @@ impl CcBsSubentity {
                     );
                     return;
                 }
-            }
+            };
+
+            let circuit_called = if pdu.simplex_duplex_selection {
+                match self.circuits.allocate_circuit_for_call_with_allocator(
+                    circuit_calling.call_id,
+                    Direction::Dl,
+                    pdu.basic_service_information.communication_type,
+                    pdu.simplex_duplex_selection,
+                    &mut state.timeslot_alloc,
+                    TimeslotOwner::Cmce,
+                ) {
+                    Ok(circuit) => Some(circuit.clone()),
+                    Err(e) => {
+                        let _ = self.circuits.close_circuit(Direction::Both, circuit_calling.ts);
+                        let _ = state.timeslot_alloc.release(TimeslotOwner::Cmce, circuit_calling.ts);
+                        tracing::info!(
+                            "CMCE: rejecting U-SETUP over Brew src={} dst={} (second duplex allocation failed: {:?})",
+                            calling_party.ssi,
+                            called_addr.ssi,
+                            e
+                        );
+                        Self::reject_u_setup_before_call_id(
+                            queue,
+                            calling_party,
+                            prim.handle,
+                            prim.link_id,
+                            prim.endpoint_id,
+                            DisconnectCause::CongestionInInfrastructure,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                None
+            };
+
+            (circuit_calling.clone(), circuit_called)
         };
 
         let call_id = circuit_calling.call_id;
-        let ts = circuit_calling.ts;
-        let usage = circuit_calling.usage;
+        let calling_ts = circuit_calling.ts;
+        let calling_usage = circuit_calling.usage;
+        let (called_ts, called_usage) = if let Some(called) = &circuit_called {
+            // Keep one usage marker for the split duplex pair. The second CMCE
+            // reservation owns the second TS for cleanup, while UMAC receives
+            // a coherent DL/UL bearer pair with a shared traffic marker.
+            (called.ts, calling_usage)
+        } else {
+            (calling_ts, calling_usage)
+        };
         let brew_uuid = uuid::Uuid::new_v4();
 
         tracing::info!(
-            "CMCE: forwarding U-SETUP over Brew call_id={} src={} dst={} ts={} duplex={} number='{}' uuid={}",
+            "CMCE: forwarding U-SETUP over Brew call_id={} src={} dst={} ts(local_ul)={} ts(local_dl)={} duplex={} number='{}' uuid={}",
             call_id,
             calling_party.ssi,
             network_call.destination,
-            ts,
+            calling_ts,
+            called_ts,
             network_call.duplex,
             network_call.number,
             brew_uuid
@@ -1228,10 +1266,10 @@ impl CcBsSubentity {
                 called_handle: None,
                 called_link_id: None,
                 called_endpoint_id: None,
-                calling_ts: ts,
-                called_ts: ts,
-                calling_usage: usage,
-                called_usage: usage,
+                calling_ts,
+                called_ts,
+                calling_usage,
+                called_usage,
                 simplex_duplex: pdu.simplex_duplex_selection,
                 request_to_transmit_send_data: pdu.request_to_transmit_send_data,
                 state: IndividualCallState::CallSetupPending,
@@ -1255,8 +1293,8 @@ impl CcBsSubentity {
                 calling_issi: calling_party.ssi,
                 called_issi: called_addr.ssi,
                 simplex: !pdu.simplex_duplex_selection,
-                ts,
-                secondary_ts: None,
+                ts: calling_ts,
+                secondary_ts: if called_ts != calling_ts { Some(called_ts) } else { None },
             });
         } else if let Err(err) = create_result {
             match err {

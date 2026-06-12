@@ -70,10 +70,14 @@ MemoryMax=512M
 TasksMax=128
 LimitNOFILE=4096
 NoNewPrivileges=yes
-# Keep the RF/TETRA core on its dedicated application CPU. CPU 0 remains
-# available for the OS/kernel work.
-CPUAffinity=1
+# Keep the RF/TETRA core off CPU 0 and give it two application cores.
+CPUAffinity=1 2
 CPUWeight=900
+# Real-time round-robin scheduling for the RF/DSP core. This mirrors
+# `chrt -r 80` while avoiding FIFO starvation on small ARM boards.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=80
+LimitRTPRIO=80
 
 # Remove start rate limiting entirely — let RestartSec govern the pace.
 # Without this, systemd stops trying after 5 restarts in 10s (the default).

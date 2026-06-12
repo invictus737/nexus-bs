@@ -248,8 +248,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "dashboard must call the core-owned service lifecycle API"
     );
     assert!(
-        core_unit.contains("CPUAffinity=1") && control_unit.contains("CPUAffinity=2") && dashboard_unit.contains("CPUAffinity=2"),
-        "systemd split deployment must pin RF core to CPU 1 and dashboard/control to CPU 2"
+        core_unit.contains("CPUAffinity=1 2") && control_unit.contains("CPUAffinity=3") && dashboard_unit.contains("CPUAffinity=3"),
+        "systemd split deployment must pin RF core to CPU 1+2 and dashboard/control to CPU 3"
+    );
+    assert!(
+        core_unit.contains("CPUSchedulingPolicy=rr")
+            && core_unit.contains("CPUSchedulingPriority=80")
+            && core_unit.contains("LimitRTPRIO=80"),
+        "RF core must run with systemd RT scheduling equivalent to chrt -r 80"
     );
     assert!(
         app.contains(r#"fetch("/api/logs/clear""#)

@@ -166,8 +166,18 @@ pub enum CallControl {
     NetworkCircuitSimplexGranted { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
     /// Brew -> CMCE / CMCE -> Brew: simplex floor idle on an active individual circuit.
     NetworkCircuitSimplexIdle { brew_uuid: uuid::Uuid, grant: u8, permission: u8 },
-    /// CMCE -> Brew: traffic channel is open, bridge can start media.
-    NetworkCircuitMediaReady { brew_uuid: uuid::Uuid, call_id: u16, ts: u8 },
+    /// CMCE -> Brew: traffic channel is open, bridge can start media on this RF direction.
+    ///
+    /// `direction` is relative to the local RF bearer. Simplex/single-slot
+    /// private circuits use `Both`; split full-duplex private circuits use one
+    /// `Dl` ready for Brew->RF playout and one `Ul` ready for RF->Brew
+    /// forwarding.
+    NetworkCircuitMediaReady {
+        brew_uuid: uuid::Uuid,
+        call_id: u16,
+        ts: u8,
+        direction: Direction,
+    },
     /// CMCE -> Brew: DTMF/U-INFO payload forwarded from local MS.
     NetworkCircuitDtmf {
         brew_uuid: uuid::Uuid,

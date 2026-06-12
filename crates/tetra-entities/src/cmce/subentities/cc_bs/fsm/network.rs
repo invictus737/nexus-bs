@@ -1,6 +1,7 @@
 use super::*;
 
 const NETWORK_INDIVIDUAL_CONNECT_PENDING_TIMEOUT_TIMESLOTS: i32 = 2 * 18 * 4;
+const NETWORK_DUPLEX_CONNECT_ACK_UNACKED_REPETITIONS: u8 = 0;
 
 #[derive(Clone, Copy)]
 enum PendingNetworkConnectAction {
@@ -85,13 +86,115 @@ impl CcBsSubentity {
         }
     }
 
-    fn push_network_circuit_media_ready(queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call_id: u16, ts: u8) {
+    fn push_network_circuit_media_ready(queue: &mut MessageQueue, brew_uuid: uuid::Uuid, call_id: u16, ts: u8, direction: Direction) {
         queue.push_back(SapMsg {
             sap: Sap::Control,
             src: TetraEntity::Cmce,
             dest: TetraEntity::Brew,
-            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady { brew_uuid, call_id, ts }),
+            msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitMediaReady {
+                brew_uuid,
+                call_id,
+                ts,
+                direction,
+            }),
         });
+    }
+
+    fn brew_private_single_ts_chan_alloc(ts: u8, usage: u8, alloc_type: ChanAllocType, ul_dl_assigned: UlDlAssignment) -> CmceChanAllocReq {
+        let mut timeslots = [false; 4];
+        timeslots[ts as usize - 1] = true;
+
+        CmceChanAllocReq {
+            usage: Some(usage),
+            alloc_type,
+            carrier: None,
+            timeslots,
+            ul_dl_assigned,
+        }
+    }
+
+    fn build_brew_private_channel_allocation_only_msg(
+        address: TetraAddress,
+        chan_alloc: CmceChanAllocReq,
+        reporter: Option<TxReporter>,
+    ) -> SapMsg {
+        SapMsg {
+            sap: Sap::LcmcSap,
+            src: TetraEntity::Cmce,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::LcmcMleUnitdataReq(LcmcMleUnitdataReq {
+                // EN 300 392-2 clause 23.5.4.1 permits channel allocation in
+                // MAC-RESOURCE without a TM-SDU. Use this for the second half
+                // of a split Brew duplex bearer instead of a non-standard
+                // multi-slot `Both` bitmap.
+                sdu: BitBuffer::new(0),
+                handle: 0,
+                endpoint_id: 0,
+                link_id: 0,
+                layer2service: Layer2Service::Unacknowledged,
+                pdu_prio: 0,
+                layer2_qos: 0,
+                stealing_permission: false,
+                stealing_repeats_flag: false,
+                unacked_bl_repetitions: None,
+                chan_alloc: Some(chan_alloc),
+                main_address: address,
+                tx_reporter: reporter,
+            }),
+        }
+    }
+
+    fn push_brew_private_split_duplex_ul_allocation(queue: &mut MessageQueue, address: TetraAddress, ul_ts: u8, usage: u8) -> TxReporter {
+        let reporter = TxReporter::new_unacked();
+        let chan_alloc = Self::brew_private_single_ts_chan_alloc(ul_ts, usage, ChanAllocType::Additional, UlDlAssignment::Ul);
+        queue.push_back(Self::build_brew_private_channel_allocation_only_msg(
+            address,
+            chan_alloc,
+            Some(reporter.clone()),
+        ));
+        reporter
+    }
+
+    fn signal_brew_private_split_duplex_rf(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        dl_ts: u8,
+        ul_ts: u8,
+        usage: u8,
+        circuit_mode: CircuitModeType,
+        comm_type: CommunicationType,
+        speech_service: Option<u8>,
+        etee_encrypted: bool,
+        active_addr: TetraAddress,
+    ) {
+        let dl_circuit = CmceCircuit {
+            ts_created: self.dltime,
+            direction: Direction::Dl,
+            ts: dl_ts,
+            call_id,
+            usage,
+            circuit_mode,
+            comm_type,
+            simplex_duplex: true,
+            speech_service,
+            etee_encrypted,
+        };
+        Self::signal_umac_circuit_open(queue, &dl_circuit, Some(ul_ts), CircuitDlMediaSource::SwMI, Some(active_addr));
+
+        let ul_circuit = CmceCircuit {
+            ts_created: self.dltime,
+            direction: Direction::Ul,
+            ts: ul_ts,
+            call_id,
+            usage,
+            circuit_mode,
+            comm_type,
+            simplex_duplex: true,
+            speech_service,
+            etee_encrypted,
+        };
+        Self::signal_umac_circuit_open(queue, &ul_circuit, None, CircuitDlMediaSource::SwMI, Some(active_addr));
     }
 
     fn complete_pending_network_individual_connect(&mut self, queue: &mut MessageQueue, pending: PendingNetworkIndividualConnect) {
@@ -153,7 +256,10 @@ impl CcBsSubentity {
             });
         }
 
-        Self::push_network_circuit_media_ready(queue, pending.brew_uuid, pending.call_id, pending.ts);
+        Self::push_network_circuit_media_ready(queue, pending.brew_uuid, pending.call_id, pending.ts, pending.media_direction);
+        if let Some((secondary_ts, secondary_direction)) = pending.secondary_media.filter(|(secondary_ts, _)| *secondary_ts != pending.ts) {
+            Self::push_network_circuit_media_ready(queue, pending.brew_uuid, pending.call_id, secondary_ts, secondary_direction);
+        }
 
         let completion_basis = if pending.reporter.is_acknowledged() {
             "local L2 ACK"
@@ -171,6 +277,22 @@ impl CcBsSubentity {
         );
 
         let _ = call_snapshot;
+    }
+
+    fn pending_network_primary_connect_complete(pending: &PendingNetworkIndividualConnect) -> bool {
+        pending.reporter.is_acknowledged()
+            || (Self::pending_network_individual_connect_can_complete_on_tx(pending) && pending.reporter.is_transmitted())
+    }
+
+    fn pending_network_secondary_allocation_complete(pending: &PendingNetworkIndividualConnect) -> bool {
+        pending.secondary_reporter.as_ref().map_or(true, TxReporter::is_transmitted)
+    }
+
+    fn pending_network_secondary_allocation_failed(pending: &PendingNetworkIndividualConnect) -> bool {
+        pending
+            .secondary_reporter
+            .as_ref()
+            .is_some_and(|reporter| reporter.is_in_final_state() && !reporter.is_transmitted())
     }
 
     fn pending_network_simplex_connect_can_complete_on_tx(pending: &PendingNetworkIndividualConnect) -> bool {
@@ -212,11 +334,12 @@ impl CcBsSubentity {
             .pending_network_individual_connects
             .iter()
             .filter_map(|(&call_id, pending)| {
-                if pending.reporter.is_acknowledged()
-                    || (Self::pending_network_individual_connect_can_complete_on_tx(pending) && pending.reporter.is_transmitted())
-                {
+                let primary_complete = Self::pending_network_primary_connect_complete(pending);
+                let secondary_complete = Self::pending_network_secondary_allocation_complete(pending);
+                if primary_complete && secondary_complete {
                     Some((call_id, PendingNetworkConnectAction::Complete))
-                } else if pending.reporter.is_in_final_state()
+                } else if (!primary_complete && pending.reporter.is_in_final_state())
+                    || Self::pending_network_secondary_allocation_failed(pending)
                     || pending.started_at.age(self.dltime) >= NETWORK_INDIVIDUAL_CONNECT_PENDING_TIMEOUT_TIMESLOTS
                 {
                     Some((call_id, PendingNetworkConnectAction::Fail))
@@ -342,12 +465,13 @@ impl CcBsSubentity {
 
         let communication = CommunicationType::try_from(call.communication as u64).unwrap_or(CommunicationType::P2p);
         let simplex_duplex = call.duplex != 0;
+        let called_circuit_direction = if simplex_duplex { Direction::Dl } else { Direction::Both };
 
         let occupied_call_ids = self.occupied_call_ids();
         let (circuit_called, circuit_calling) = {
             let mut state = self.config.state_write();
             let circuit_called = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
-                Direction::Both,
+                called_circuit_direction,
                 communication,
                 simplex_duplex,
                 &mut state.timeslot_alloc,
@@ -379,7 +503,7 @@ impl CcBsSubentity {
             let circuit_calling = if simplex_duplex {
                 match self.circuits.allocate_circuit_for_call_with_allocator(
                     circuit_called.call_id,
-                    Direction::Both,
+                    Direction::Ul,
                     communication,
                     simplex_duplex,
                     &mut state.timeslot_alloc,
@@ -613,14 +737,11 @@ impl CcBsSubentity {
             }
         }
 
-        let mut calling_timeslots = [false; 4];
-        calling_timeslots[call.calling_ts as usize - 1] = true;
-        let chan_alloc_calling = CmceChanAllocReq {
-            usage: Some(call.calling_usage),
-            alloc_type: ChanAllocType::Replace,
-            carrier: None,
-            timeslots: calling_timeslots,
-            ul_dl_assigned: UlDlAssignment::Both,
+        let split_brew_duplex = call.simplex_duplex && call.calling_ts != call.called_ts;
+        let chan_alloc_calling = if split_brew_duplex {
+            Self::brew_private_single_ts_chan_alloc(call.called_ts, call.called_usage, ChanAllocType::Replace, UlDlAssignment::Dl)
+        } else {
+            Self::brew_private_single_ts_chan_alloc(call.calling_ts, call.calling_usage, ChanAllocType::Replace, UlDlAssignment::Both)
         };
 
         let grant_enum = Self::network_circuit_grant(call_info.grant);
@@ -668,19 +789,52 @@ impl CcBsSubentity {
         };
         queue.push_back(connect_msg);
 
-        let circuit = CmceCircuit {
-            ts_created: self.dltime,
-            direction: Direction::Both,
-            ts: call.calling_ts,
-            call_id,
-            usage: call.calling_usage,
-            circuit_mode: CircuitModeType::TchS,
-            comm_type: CommunicationType::P2p,
-            simplex_duplex: call.simplex_duplex,
-            speech_service: Some(0),
-            etee_encrypted: false,
+        let secondary_reporter = if split_brew_duplex {
+            Some(Self::push_brew_private_split_duplex_ul_allocation(
+                queue,
+                call.calling_addr,
+                call.calling_ts,
+                call.called_usage,
+            ))
+        } else {
+            None
         };
-        Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.calling_addr));
+
+        if split_brew_duplex {
+            tracing::info!(
+                "CMCE: local-origin Brew duplex call_id={} opening split RF bearers dl_ts={} ul_ts={} usage={}",
+                call_id,
+                call.called_ts,
+                call.calling_ts,
+                call.called_usage
+            );
+            self.signal_brew_private_split_duplex_rf(
+                queue,
+                call_id,
+                call.called_ts,
+                call.calling_ts,
+                call.called_usage,
+                CircuitModeType::TchS,
+                CommunicationType::P2p,
+                Some(0),
+                false,
+                call.calling_addr,
+            );
+        } else {
+            let circuit = CmceCircuit {
+                ts_created: self.dltime,
+                direction: Direction::Both,
+                ts: call.calling_ts,
+                call_id,
+                usage: call.calling_usage,
+                circuit_mode: CircuitModeType::TchS,
+                comm_type: CommunicationType::P2p,
+                simplex_duplex: call.simplex_duplex,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            };
+            Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.calling_addr));
+        }
 
         self.pending_network_individual_connects.insert(
             call_id,
@@ -688,7 +842,10 @@ impl CcBsSubentity {
                 reporter,
                 brew_uuid,
                 call_id,
-                ts: call.calling_ts,
+                ts: if split_brew_duplex { call.called_ts } else { call.calling_ts },
+                media_direction: if split_brew_duplex { Direction::Dl } else { Direction::Both },
+                secondary_media: split_brew_duplex.then_some((call.calling_ts, Direction::Ul)),
+                secondary_reporter,
                 local_addr: call.calling_addr,
                 peer_addr: call.called_addr,
                 simplex_duplex: call.simplex_duplex,
@@ -751,14 +908,11 @@ impl CcBsSubentity {
             permission
         );
 
-        let mut called_timeslots = [false; 4];
-        called_timeslots[call.called_ts as usize - 1] = true;
-        let chan_alloc_called = CmceChanAllocReq {
-            usage: Some(call.called_usage),
-            alloc_type: ChanAllocType::Replace,
-            carrier: None,
-            timeslots: called_timeslots,
-            ul_dl_assigned: UlDlAssignment::Both,
+        let split_brew_duplex = call.simplex_duplex && call.calling_ts != call.called_ts;
+        let chan_alloc_called = if split_brew_duplex {
+            Self::brew_private_single_ts_chan_alloc(call.called_ts, call.called_usage, ChanAllocType::Replace, UlDlAssignment::Dl)
+        } else {
+            Self::brew_private_single_ts_chan_alloc(call.called_ts, call.called_usage, ChanAllocType::Replace, UlDlAssignment::Both)
         };
 
         let grant_enum = if call.calling_over_brew && !call.simplex_duplex {
@@ -781,14 +935,38 @@ impl CcBsSubentity {
             proprietary: None,
         };
 
-        tracing::info!("-> {:?}", d_connect_ack);
+        let complete_duplex_on_rf_tx = call.simplex_duplex && grant_enum == TransmissionGrant::Granted;
+        let layer2service = if complete_duplex_on_rf_tx {
+            Layer2Service::Unacknowledged
+        } else {
+            Layer2Service::Acknowledged
+        };
+        let unacked_bl_repetitions = if complete_duplex_on_rf_tx {
+            Some(NETWORK_DUPLEX_CONNECT_ACK_UNACKED_REPETITIONS)
+        } else {
+            None
+        };
+
+        tracing::info!(
+            "-> {:?} ({})",
+            d_connect_ack,
+            if complete_duplex_on_rf_tx {
+                "network-origin duplex D-CONNECT ACK one-shot unacknowledged delivery; Brew media gates on RF transmission"
+            } else {
+                "acknowledged delivery"
+            }
+        );
         let mut ack_sdu = BitBuffer::new_autoexpand(28);
         d_connect_ack
             .to_bitbuf(&mut ack_sdu)
             .expect("Failed to serialize DConnectAcknowledge");
         ack_sdu.seek(0);
 
-        let reporter = TxReporter::new();
+        let reporter = if complete_duplex_on_rf_tx {
+            TxReporter::new_unacked()
+        } else {
+            TxReporter::new()
+        };
         let ack_msg = SapMsg {
             sap: Sap::LcmcSap,
             src: TetraEntity::Cmce,
@@ -798,18 +976,29 @@ impl CcBsSubentity {
                 handle: called_handle,
                 endpoint_id: called_endpoint_id,
                 link_id: called_link_id,
-                layer2service: Layer2Service::Acknowledged,
+                layer2service,
                 pdu_prio: 0,
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
-                unacked_bl_repetitions: None,
+                unacked_bl_repetitions,
                 chan_alloc: Some(chan_alloc_called),
                 main_address: call.called_addr,
                 tx_reporter: Some(reporter.clone()),
             }),
         };
         queue.push_back(ack_msg);
+
+        let secondary_reporter = if split_brew_duplex {
+            Some(Self::push_brew_private_split_duplex_ul_allocation(
+                queue,
+                call.called_addr,
+                call.calling_ts,
+                call.called_usage,
+            ))
+        } else {
+            None
+        };
 
         let (circuit_mode, comm_type, speech_service, etee_encrypted) = if let Some(cached) = self.cached_setups.get(&call_id) {
             (
@@ -822,28 +1011,40 @@ impl CcBsSubentity {
             (CircuitModeType::TchS, CommunicationType::P2p, Some(0), false)
         };
 
-        let circuit = CmceCircuit {
-            ts_created: self.dltime,
-            direction: Direction::Both,
-            ts: call.called_ts,
-            call_id,
-            usage: call.called_usage,
-            circuit_mode,
-            comm_type,
-            simplex_duplex: call.simplex_duplex,
-            speech_service,
-            etee_encrypted,
-        };
-        Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.called_addr));
-
-        if call.simplex_duplex && call.calling_ts != call.called_ts {
+        if split_brew_duplex {
             tracing::info!(
-                "CMCE: network-origin duplex call_id={} reserved external bearer ts={} usage={} without RF UMAC open; Brew media bridges on local ts={}",
+                "CMCE: network-origin Brew duplex call_id={} opening split RF bearers dl_ts={} ul_ts={} usage={}",
                 call_id,
+                call.called_ts,
                 call.calling_ts,
-                call.calling_usage,
-                call.called_ts
+                call.called_usage
             );
+            self.signal_brew_private_split_duplex_rf(
+                queue,
+                call_id,
+                call.called_ts,
+                call.calling_ts,
+                call.called_usage,
+                circuit_mode,
+                comm_type,
+                speech_service,
+                etee_encrypted,
+                call.called_addr,
+            );
+        } else {
+            let circuit = CmceCircuit {
+                ts_created: self.dltime,
+                direction: Direction::Both,
+                ts: call.called_ts,
+                call_id,
+                usage: call.called_usage,
+                circuit_mode,
+                comm_type,
+                simplex_duplex: call.simplex_duplex,
+                speech_service,
+                etee_encrypted,
+            };
+            Self::signal_umac_circuit_open(queue, &circuit, None, CircuitDlMediaSource::SwMI, Some(call.called_addr));
         }
 
         self.pending_network_individual_connects.insert(
@@ -853,6 +1054,9 @@ impl CcBsSubentity {
                 brew_uuid,
                 call_id,
                 ts: call.called_ts,
+                media_direction: if split_brew_duplex { Direction::Dl } else { Direction::Both },
+                secondary_media: split_brew_duplex.then_some((call.calling_ts, Direction::Ul)),
+                secondary_reporter,
                 local_addr: call.called_addr,
                 peer_addr: call.calling_addr,
                 simplex_duplex: call.simplex_duplex,

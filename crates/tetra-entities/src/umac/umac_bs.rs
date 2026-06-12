@@ -2802,6 +2802,12 @@ impl UmacBs {
                 if (1..=4).contains(&ts) && self.channel_scheduler.circuit_is_active(Direction::Ul, ts) {
                     self.last_ul_voice[ts as usize - 1] = Some(self.dltime);
                 }
+                if let Some(peer_ul_ts) = self.channel_scheduler.dl_circuit_peer_ts(ts)
+                    && (1..=4).contains(&peer_ul_ts)
+                    && self.channel_scheduler.circuit_is_active(Direction::Ul, peer_ul_ts)
+                {
+                    self.last_ul_voice[peer_ul_ts as usize - 1] = Some(self.dltime);
+                }
                 if self.channel_scheduler.circuit_is_active(Direction::Dl, ts) {
                     if let Some(block_num) = prim.raw_tch_s_block {
                         if block_num == PhyBlockNum::Block2 && prim.data.len() == 216 {

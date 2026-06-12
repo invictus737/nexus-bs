@@ -27,7 +27,7 @@ TimeoutStopSec=10
 Restart=on-failure
 RestartSec=5
 # Dashboard and local command bridge share the non-RF application CPU.
-CPUAffinity=2
+CPUAffinity=3
 CPUWeight=50
 Nice=5
 

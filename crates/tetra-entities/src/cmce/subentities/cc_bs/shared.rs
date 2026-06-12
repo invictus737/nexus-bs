@@ -3340,6 +3340,16 @@ impl CcBsSubentity {
 
         let send_calling_leg = !call.calling_over_brew && release_to_issi.map_or(true, |issi| issi == call.calling_addr.ssi);
         let send_called_leg = !call.called_over_brew && release_to_issi.map_or(true, |issi| issi == call.called_addr.ssi);
+        let (calling_release_ts, calling_release_usage) =
+            if call.called_over_brew && call.simplex_duplex && call.called_ts != call.calling_ts {
+                // Local-origin Brew duplex stores the local UL bearer in
+                // calling_ts and the local DL bearer in called_ts. CMCE release
+                // signalling for the only local MS must ride the DL assigned
+                // channel.
+                (call.called_ts, call.called_usage)
+            } else {
+                (call.calling_ts, call.calling_usage)
+            };
 
         if send_calling_leg {
             let reporter = TxReporter::new_unacked();
@@ -3351,8 +3361,8 @@ impl CcBsSubentity {
                     queue,
                     call_id,
                     call.calling_addr,
-                    call.calling_ts,
-                    call.calling_usage,
+                    calling_release_ts,
+                    calling_release_usage,
                 );
                 Some(NOTIFICATION_IMMINENT_CALL_DISCONNECTION)
             } else {
@@ -3361,8 +3371,8 @@ impl CcBsSubentity {
             let facch = Self::build_sapmsg_stealing_ul_dl_reported(
                 self.build_individual_release_sdu_with_notification(call_id, disconnect_cause, notification),
                 call.calling_addr,
-                call.calling_ts,
-                Some(call.calling_usage),
+                calling_release_ts,
+                Some(calling_release_usage),
                 UlDlAssignment::Dl,
                 Some(reporter.clone()),
             );
@@ -3418,7 +3428,7 @@ impl CcBsSubentity {
         for ts in ts_list {
             if let Some(circuit) = preclosed_circuits.iter().find(|circuit| circuit.ts == ts).cloned() {
                 Self::signal_umac_circuit_close(queue, circuit);
-            } else if let Ok(circuit) = self.circuits.close_circuit(Direction::Both, ts) {
+            } else if let Ok(circuit) = self.circuits.close_circuit(Self::individual_release_close_direction(&call, ts), ts) {
                 Self::signal_umac_circuit_close(queue, circuit);
             }
 
@@ -3458,6 +3468,20 @@ impl CcBsSubentity {
         }
         self.emit(crate::net_telemetry::TelemetryEvent::IndividualCallEnded { call_id });
         self.release_echo_session_if_matches(call_id);
+    }
+
+    fn individual_release_close_direction(call: &IndividualCall, ts: u8) -> Direction {
+        if call.simplex_duplex && call.called_ts != call.calling_ts && (call.called_over_brew || call.calling_over_brew) {
+            if ts == call.calling_ts {
+                Direction::Ul
+            } else if ts == call.called_ts {
+                Direction::Dl
+            } else {
+                Direction::Both
+            }
+        } else {
+            Direction::Both
+        }
     }
 
     pub(super) fn drain_pending_individual_releases(&mut self, queue: &mut MessageQueue) {

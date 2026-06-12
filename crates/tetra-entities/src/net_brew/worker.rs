@@ -881,11 +881,6 @@ impl<T: NetworkTransport> BrewWorker<T> {
             CALL_STATE_CALL_RELEASE => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
                 tracing::info!("BrewWorker: CALL_RELEASE uuid={} cause={}", cc.identifier, cause);
-                // Send both events — entity will handle whichever is relevant
-                self.enqueue_event(BrewEvent::GroupCallEnd {
-                    uuid: cc.identifier,
-                    cause,
-                });
                 self.enqueue_event(BrewEvent::CircuitCallRelease {
                     uuid: cc.identifier,
                     cause,

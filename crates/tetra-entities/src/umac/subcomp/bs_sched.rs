@@ -2172,6 +2172,13 @@ impl BsChannelScheduler {
         self.circuits.ul[ts as usize - 1].as_ref().and_then(|c| c.peer_ts)
     }
 
+    pub fn dl_circuit_peer_ts(&self, ts: u8) -> Option<u8> {
+        if !(1..=4).contains(&ts) {
+            return None;
+        }
+        self.circuits.dl[ts as usize - 1].as_ref().and_then(|c| c.peer_ts)
+    }
+
     /// Return the DL media source policy for the UL circuit on `ts`.
     /// `LocalLoopback` = reflect UL back to DL (group/simplex calls).
     /// `LocalParrot` = CMCE records UL media and feeds DL playback later.
