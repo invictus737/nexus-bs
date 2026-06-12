@@ -1,338 +1,312 @@
-# Nexus-BS v0.1.65
+<p align="center">
+  <img src="assets/nexus-bs-logo.png" alt="Nexus-BS Project logo" width="420">
+</p>
 
-> **TETRA base station software for amateur radio operators and researchers.**
-> Built in Rust. Runs on a Raspberry Pi with a LimeSDR. Works with real TETRA radios.
+# Nexus-BS
 
-Nexus-BS is an independently maintained TETRA base-station stack by the Nexus-BS Project, with ongoing dashboard, SDR and ETSI EN 300 392-2 clause-scoped hardening work. Historical credits are listed below; they do not describe current Nexus-BS project governance.
+Nexus-BS is a source-available TETRA base-station project focused on practical
+HAM-radio, lab, and research operation with real SDR hardware and real TETRA
+terminals.
 
-Tested hardware: **LimeSDR Mini 2.0** · **Motorola MXP600** · **Motorola MTM800E** · **Motorola MTM5400**
+The project prioritizes stable core behavior over visual polish or feature
+count. Its goal is a solid, auditable starting point for the services an
+amateur TETRA operator actually needs: voice, SDS/data signalling, tested
+group operation, private P2P calls, Brew interconnect, monitoring, and
+long-running service stability.
 
----
+Nexus-BS is developed around clause-scoped engineering alignment with ETSI
+TETRA standards, primarily EN 300 392-2. It does not claim formal ETSI/TETRA
+certification. Formal certification requires official conformance evidence.
 
-## What it does
+## Quick Links
 
-Nexus-BS implements a functional TETRA base station (BS) in software. You plug in a supported SDR, point it at your TETRA radios, and get:
-
-- Group calls, individual (P2P) calls, half-duplex PTT — all working
-- SDS messaging (text messages between radios)
-- Network interconnect via [Brew / TetraPack](https://wiki.tetrapack.online/books/tetra/page/brew) — connects your local cell to BrandMeister or TetraPack
-- UTC time broadcast so radios sync their clocks automatically
-- A web dashboard at `http://<bts-ip>:8080` for monitoring and remote management
-
----
-
-## Feature overview
-
-| Feature | Status |
+| Need | Start here |
 |---|---|
-| Group calls (local) | ✅ |
-| Group calls via Brew (BrandMeister / TetraPack) | ✅ |
-| Full-duplex P2P calls (local + Brew) | ✅ |
-| Half-duplex P2P calls (simplex PTT) | ✅ |
-| SDS forwarding (local + Brew) | ✅ |
-| WAP MVP over SDS Type4 | ✅ |
-| UTC time broadcast (D-NWRK-BROADCAST) | ✅ |
-| T351 periodic re-registration | ✅ |
-| Home Mode Display (SDS-TL text) | ✅ |
-| Supplemental SDS broadcast (custom PID) | ✅ |
-| ISSI whitelist (access control) | ✅ |
-| Local SSI ranges (local-only traffic) | ✅ |
-| Remote control via U-STATUS from radio | ✅ |
-| Neighbor cell broadcast | ✅ |
-| Web dashboard | ✅ |
-| OTA update button | Disabled for now |
-| Dashboard login session | ✅ |
-| Fallback config on bad edit | ✅ |
-| Live SDS broadcast queue | ✅ |
-| Edit inactive config profiles in dashboard | ✅ |
-| System / RF hardware tab | ✅ |
-| Coordinated handover | 🔜 |
-| Emergency calls | 🔜 |
-| Authentication (TEA) | 🔜 |
-| AIE encryption | 🔜 |
-| Multi-carrier (2× SDR) | 🔜 |
+| Install the prebuilt Linux/aarch64 bundle | [`compiled_distribution/README.md`](compiled_distribution/README.md) |
+| Configure a station | [`example_config/config.toml`](example_config/config.toml) |
+| Use systemd services | [`contrib/systemd/`](contrib/systemd/) |
+| Review standards workflow/cache | [`Docs/tetra-standards/`](Docs/tetra-standards/) |
+| Inspect dashboard assets | [`dashboard/`](dashboard/) |
+| Build from source | [`Cargo.toml`](Cargo.toml) |
 
----
+## Status
+
+| Area | Current project status |
+|---|---|
+| Local group calls | Implemented and field-tested in local lab/operator configurations |
+| Private P2P simplex | Implemented and field-tested |
+| Private P2P duplex | Implemented and field-tested where supported by terminal/configuration |
+| SDS / status / HMD | Implemented for tested local and Brew-routed paths; not a claim of complete SDS-TL/SNDCP packet-data coverage |
+| Brew v1 interconnect | Implemented and tested with multiple TETRA core setups |
+| Dashboard | Minimal operational dashboard with telemetry, logs, call/radio state and controls |
+| Service supervision / recovery guards | Implemented as bounded queues, fallback config handling, health snapshots, and systemd readiness/watchdog integration |
+| WAP over SDS Type4 | MVP, not a full SNDCP/IP packet-data bearer |
+| TEA/AIE authentication/encryption | Not implemented as a complete service offering |
+| Formal TETRA certification | Not claimed |
+
+Feature behavior can vary by terminal model, firmware, codeplug, RF setup,
+frequency plan, SDR driver, and network configuration. Treat the current release
+as engineering work made available for audit, testing, and improvement.
+
+## Field-Tested Terminals
+
+Nexus-BS has been tested in the project operator/lab environment with Motorola
+and Hytera TETRA terminals across older and current firmware generations,
+including Motorola firmware releases from MR5.10-era devices through MR2026.1.
+
+Documented field-test equipment includes:
+
+| Vendor | Terminals |
+|---|---|
+| Motorola | MTP850, MTH800, MTM800E, MTM5400, MXP600 |
+| Hytera | PT580H Plus |
+
+Maintainer field tests have covered core local operation, group calls, P2P
+simplex, P2P duplex, SDS/status paths, and interconnect behavior. This is not a
+universal compatibility guarantee for every firmware, codeplug, terminal
+variant, RF setup, or network configuration. Motorola and Hytera are named only
+to identify tested hardware; Nexus-BS is not affiliated with, sponsored by, or
+endorsed by those vendors.
+
+## What Changed Compared with the Baseline
+
+Nexus-BS started from the BlueStation/FlowStation lineage, but the cited
+engineering delta is not a cosmetic rename comparison. The project has
+significant rewrites, hardening, new state machines, new TETRA primitives,
+dashboard/control integration, and a much larger test surface.
+
+The internal delta report compares Nexus-BS `v0.1.61-1-g4ab64b2`
+(commit `4ab64b2`) against FlowStation `v0.2.7` (commit `c2f0ee6`) using
+function-level Rust source metrics. These numbers are code-history metrics for
+that comparison point. They are not proof of complete semantic coverage,
+current-release coverage, or formal conformance.
+
+From the FlowStation v0.2.7 comparison:
+
+| Scope | FlowStation | Nexus-BS | Modified | Added | Removed |
+|---|---:|---:|---:|---:|---:|
+| All `tetra-*` production functions | 1,867 | 3,303 | 516 | 1,444 | 8 |
+| TETRA protocol-core production functions | 1,596 | 2,853 | 436 | 1,265 | 8 |
+| Test functions | 50 | 1,168 | 19 | 1,122 | 4 |
+
+Largest areas of change recorded in the report:
+
+| Component area | Modified | Added |
+|---|---:|---:|
+| UMAC/MAC scheduler | 66 | 269 |
+| CMCE call control | 84 | 171 |
+| CMCE/SDS PDUs | 41 | 234 |
+| UMAC/MAC PDUs | 32 | 114 |
+| MM attach / energy economy / affiliation | 28 | 106 |
+| MM PDUs / IEs | 35 | 97 |
+| LLC timers / ACKs | 14 | 79 |
+| Brew/IP gateway | 30 | 44 |
+| SDS service | 16 | 32 |
+| MLE broadcast / network time | 22 | 23 |
+| MLE PDUs | 20 | 31 |
+| LMAC / burst codec | 18 | 8 |
+| PHY / RF IO | 16 | 8 |
+| SNDCP / WAP bearer | 1 | 4 |
+| Parrot private-call service | 0 | 15 |
+
+The public release may omit internal history files while still carrying the
+current source snapshot.
+
+## TETRA Core Focus
+
+Nexus-BS concentrates on base-station core behavior before optional or cosmetic
+features.
+
+Main engineering areas:
+
+- **UMAC/MAC scheduling:** resource grants, random access handling, STCH/TCH/S
+  scheduling, fragmentation, burst timing, listener scheduling and traffic slot
+  management.
+- **CMCE call control:** local and routed group calls, private individual calls,
+  setup/connect/release flows, floor grants, floor release, hangtime, timers,
+  clear-down behavior and compatibility guards for older terminals.
+- **MM registration and affiliation:** attach/update handling, group identity
+  affiliation, restart recovery, local SSI/GSSI policy and energy economy
+  negotiation/assignment.
+- **LLC behavior:** ACK/retransmission timing, duplicate guards, downlink
+  signalling-frame timing and robustness around delivery reports.
+- **SDS/status:** tested local ISSI/GSSI SDS paths, Brew-forwarded SDS,
+  delivery-report handling, U-STATUS/D-STATUS work, Home Mode Display,
+  supplemental SDS broadcast and dashboard-triggered SDS.
+- **MLE broadcast:** network broadcast, network time and cell/system
+  information.
+- **LMAC/PHY/RF integration:** burst codec work, SoapySDR timing, RF IO,
+  calibration support and field-oriented SDR operation.
+- **Brew/IP gateway:** Brew v1 framing, group/private interconnect, SDS,
+  heartbeat/reconnect behavior, RSSI reporting and dashboard state.
+
+## ETSI Standards Position
+
+Protocol changes are developed against local ETSI standards text and targeted
+tests. The project uses EN 300 392-2 clause-scoped reasoning for CMCE, MM, LLC,
+MLE, UMAC/MAC, SDS/status and energy economy behavior.
+
+Important wording:
+
+- Nexus-BS aims for standards-aligned engineering behavior.
+- Nexus-BS includes tests and field checks for many TETRA primitives.
+- Nexus-BS does not claim formal ETSI/TETRA certification.
+- Nexus-BS does not claim complete coverage of every TETRA service, optional
+  feature, terminal vendor behavior or conformance-test scenario.
+
+The `Docs/tetra-standards/` folder contains the standards workflow and local
+text cache used by this project for repeatable review.
+
+## Brew / TetraPack / SmartConnect
+
+Nexus-BS implements Brew v1 interconnect using WebSocket transport and Brew
+framing. In tested configurations, Brew functionality has been confirmed through
+multiple TETRA core setups.
+
+Covered areas include:
+
+- subscriber registration and group affiliation propagation;
+- group call start/end and voice frame routing;
+- private circuit-call setup/connect/release;
+- private simplex floor granted/idle handling;
+- SDS transfer and delivery reports;
+- heartbeat/reconnect behavior;
+- RSSI and operational status reporting to the dashboard.
+
+P2P simplex and duplex paths have also been verified through TetraPack
+SmartConnect in tested configurations.
+
+Nexus-BS is not affiliated with, sponsored by, or endorsed by BrandMeister,
+TetraPack, SmartConnect, Motorola, Hytera, or any third-party core
+operator/vendor. Use requires valid credentials and operator permission for the
+network being used.
+
+## Dashboard and Operations
+
+The dashboard is intentionally operational and minimal. It exists to support
+monitoring, diagnosis and service control, not to be a showcase UI.
+
+The recommended deployment uses three processes:
+
+| Service | Public | Role |
+|---|---:|---|
+| `nexus-bs@USER.service` | No | RF/TETRA core and loopback dashboard API |
+| `nexus-bs-dashboard@USER.service` | Yes, port `8080` | Static dashboard and API/WebSocket proxy |
+| `nexus-bs-control@USER.service` | No | Local command/control bridge |
+
+Dashboard and telemetry coverage includes:
+
+- registered radios, ISSIs, groups, RSSI and energy-saving state;
+- active calls and last-heard voice/SDS activity;
+- Brew link state and traffic status;
+- logs with filtering;
+- RF/system information;
+- config profile management;
+- live SDS broadcast queue;
+- service control hooks;
+- health snapshots and core-stall monitoring.
+
+Operational hardening includes fallback config loading, bounded queues, bounded
+HTTP/body handling, slow-client handling, persistent config editing, volatile
+runtime cache support, health snapshots, and systemd readiness/watchdog
+integration. These are engineering recovery guards, not a guarantee of
+uninterrupted service.
+
+The long-term target is 24x7 operation, nonstop use, high redundancy and high
+availability for voice, data/SDS and control services. Stability and core
+completeness are preferred over decorative features.
+
+## Tests and Evidence
+
+The delta report records 1,168 test functions under `crates/tetra-*` test scope
+for Nexus-BS, compared with 50 for FlowStation v0.2.7 at the cited comparison
+point. That is engineering regression evidence, not formal conformance
+evidence.
+
+The test tree exercises areas including TETRA entities, PDUs, configuration
+parsing, dashboard contracts, control paths, CMCE group/private call behavior,
+SDS/status routing, MM registration/affiliation/restart recovery, UMAC
+scheduling, LLC ACK/retransmission behavior, bounded queues, and parser guards.
 
 ## Installation
 
-### Requirements
-
-- **Rust** — latest stable (`rustup update stable`)
-- **SoapySDR** with drivers for your SDR
-- A supported SDR — LimeSDR Mini 2.0 is the reference hardware
-
-### From git
-
-```bash
-git clone <nexus-bs-repository-url>
-cd nexus-bs
-cp example_config/config.toml ./config.toml
-# Edit config.toml — at minimum set tx_freq, rx_freq, mcc, mnc
-cargo build --release
-./target/release/nexus-bs config.toml
-```
+For a prebuilt Linux/aarch64 deployment bundle, see:
 
-### As a systemd service
-
-The current service layout keeps the runtime files under the target user's
-`nexus-bs` directory. The RF core and config stay flat; the optional dashboard
-module is a static asset directory served by the core API gateway:
-
-```text
-/home/<user>/nexus-bs/nexus-bs
-/home/<user>/nexus-bs/nexus-bs-control-service
-/home/<user>/nexus-bs/nexus-bs-control
-/home/<user>/nexus-bs/config.toml
-/home/<user>/nexus-bs/dashboard/index.html
-/home/<user>/nexus-bs/dashboard/assets/app.js
-/home/<user>/nexus-bs/dashboard/assets/styles.css
-```
-
-Install the templated units from `contrib/systemd/` and start them for the target user:
-
-```bash
-install -m 0644 contrib/systemd/nexus-bs@.service /etc/systemd/system/
-install -m 0644 contrib/systemd/nexus-bs-control@.service /etc/systemd/system/
-install -D -m 0644 contrib/systemd/journald-nexus-bs-volatile.conf /etc/systemd/journald.conf.d/90-nexus-bs-volatile.conf
-systemctl daemon-reload
-systemctl enable --now nexus-bs-control@<user>.service nexus-bs@<user>.service
-```
-
-The service name (`nexus-bs`) must match the `service_name` used in any restart/shutdown commands. The legacy `contrib/systemd/nexus-bs.service` remains only as a reference for old single-user installs.
-
----
-
-## Configuration
+- [`compiled_distribution/README.md`](compiled_distribution/README.md)
 
-The full config is documented in `example_config/config.toml`. Key sections:
-
-### Mandatory
-
-```toml
-[phy_io.soapysdr]
-tx_freq = 438025000   # DL frequency in Hz
-rx_freq = 433025000   # UL frequency in Hz
-
-[net_info]
-mcc = 204             # Mobile Country Code
-mnc = 1337            # Mobile Network Code
-
-[cell_info]
-freq_band = 4         # 400 MHz band
-main_carrier = 1521
-duplex_spacing = 4
-location_area = 2
-colour_code = 1
-```
-
-### Timing (Nexus-BS-specific)
-
-| Parameter | Default | Description |
-|---|---|---|
-| `hangtime_secs` | `5` | Hold group call circuit after floor release (0–300s) |
-| `call_timeout_secs` | `120` | Max call duration before forced D-RELEASE (0 = unlimited) |
-| `ul_inactivity_secs` | `3` | UL silence before forced TX-CEASED (1–30s) |
-| `call_preemptive` | `false` | Enable CMCE D-TX INTERRUPT for configured pre-emptive group-call floor withdrawal. Alias: `transmission_interruption_enabled` |
-| `force_private_p2p_hook_signalling` | `false` | Compatibility override for local private P2P calls: offer on/off-hook signalling even when the calling MS requests direct through-connect |
-| `legacy_gssi_group_call` | `false` | Compatibility profile for older terminals that fail same-speaker GSSI hangtime retake; releases local no-handoff group overs so the next PTT starts fresh setup |
-| `energy_saving_mode` | `auto` | Energy economy policy used by MM/UMAC scheduling; `auto` accepts the terminal-requested StayAlive/EG1..EG7 mode, explicit `eg1`..`eg7` may be used for lab forcing, and `stay_alive` disables sleep |
-| `periodic_registration_secs` | `0` | Local periodic-registration watchdog; `0` = disabled, non-zero enables BS-forced registration refresh |
-| `allowed_gssi_ranges` | unset | Optional MM group provisioning ranges; unset accepts dynamic GSSIs, set ranges reject unprovisioned group attach as unknown group identity |
-
-### Dashboard
-
-```toml
-[dashboard]
-port = 18080
-bind = "127.0.0.1"
-
-# Optional: form login + cookie session
-# username = "admin"
-# password = "change-this-before-exposing-the-dashboard"
-
-# Optional: reserved git source path for future OTA updates.
-# OTA update is disabled in Nexus-BS v0.1.65.
-# source_dir = "/opt/nexus-bs"
-
-# Optional: external dashboard assets for legacy all-in-one mode.
-# In the recommended split systemd deployment, nexus-bs-dashboard serves this.
-# static_dir = "/home/chris/nexus-bs/dashboard"
-```
+For source configuration, start with:
 
-### Fallback config
-
-If Nexus-BS fails to parse `config.toml` at startup (e.g. after a bad edit in the dashboard), it automatically tries `config.toml.fallback`. Create it once from a known-good config:
+- [`example_config/config.toml`](example_config/config.toml)
 
-```bash
-cp config.toml config.toml.fallback
-```
+For systemd deployment templates:
 
-When running on fallback, the dashboard shows a persistent red warning banner with the parse error, so you can fix the primary config remotely without losing access.
+- [`contrib/systemd/`](contrib/systemd/)
 
-### Home Mode Display (callsign on radio screen)
+For cross-build helper material:
 
-```toml
-[cell_info.home_mode_display]
-text = "Nexus-BS"            # Shown on radio home screen
-interval_multiframes = 96    # ≈ 96 seconds
-protocol_id = 130            # 0x82 SDS-TL text
-text_coding_scheme = "LATIN"
-```
+- [`contrib/cross-compile/`](contrib/cross-compile/)
 
-### Access control
+Before transmitting, verify RF frequency plan, legal operating authority,
+MCC/MNC, carrier plan, SDR hardware selection, gains, antennas, Brew
+credentials and dashboard access controls.
 
-```toml
-[security]
-issi_whitelist = [2260571, 2260572]   # Only these ISSIs can register
-```
+## Licensing
 
-### Remote control from radio (U-STATUS)
+Nexus-BS is **source-available** for permitted noncommercial use under the
+PolyForm Noncommercial License 1.0.0.
 
-```toml
-[cell_info.sds_command_control]
-authorized_issis = [2260570, 2260571]
+Commercial use requires a separate written agreement before that use begins.
 
-[[cell_info.sds_command_control.commands]]
-status_code = 36865
-action = "restart"        # restart / shutdown / kick_all
+Repository access, source publication, binary access, forks, issues, pull
+requests or public discussion do not grant a commercial license.
 
-[[cell_info.sds_command_control.commands]]
-status_code = 36867
-action = "kick_all"
-```
+See:
 
-### Brew (TetraPack / BrandMeister interconnect)
+- [`LICENSE`](LICENSE)
+- [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md)
+- [`NOTICE`](NOTICE)
+- [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt)
 
-```toml
-[brew]
-host = "core.tetraflow.ro"
-port = 9000
-tls = true
-username = 123456700
-password = "hotspot_password"
-```
+Upstream portions remain subject to their applicable upstream license notices
+and attribution requirements. Nothing in the Nexus-BS licensing text removes or
+narrows rights granted directly by upstream copyright holders under their
+original licenses.
 
----
-
-## Web dashboard
-
-Available at `http://<bts-ip>:8080` when the recommended
-`nexus-bs-dashboard@USER.service` front-end is running.
-
-For appliance installs, `nexus-bs@USER.service` runs the RF core from a volatile
-`/run/nexus-bs-USER/config.toml` copy, but dashboard config APIs edit the
-persistent `/home/USER/nexus-bs/config.toml` through
-`NEXUS_BS_PERSISTENT_CONFIG`. This keeps subscriber recovery/cache files
-volatile without losing operator config edits after restart.
-
-For the split Nexus-BS dashboard, `nexus-bs@USER.service` exposes the core
-dashboard API only on `127.0.0.1:18080`, while
-`nexus-bs-dashboard@USER.service` runs as a separate process on public port
-`8080`, serves `/home/USER/nexus-bs/dashboard`, and proxies `/api/*`, `/ws`,
-`/login` and `/logout` to the loopback-only core API. The dashboard service is
-assigned its own systemd CPU/cgroup limits so browser refreshes and static file
-serving stay outside the RF-critical core process. If `[dashboard] username` and
-`password` are configured, the split front-end also checks the core
-`fs_session` status before serving `/` or static assets, so the browser UI and
-API share the same login boundary.
-
-Dashboard hardening is verified by focused automated tests and deployment
-checks. This is not a formal security or ETSI/TETRA certification claim; use an
-HTTPS reverse proxy before exposing the dashboard outside a trusted LAN.
-
-**Radios tab** — live table of registered terminals with ISSI, groups, RSSI signal bar, energy saving mode, last seen time. Kick button forces immediate re-registration. SDS button sends a text message. Timeslot visualizer shows TS2–TS4 state in real time — idle (grey), call allocated (amber), voice active (red flash with animated waveform).
-
-**Calls tab** — active calls with caller, destination, duration, simplex/duplex.
-
-**Last Heard** — rolling history of call starts and SDS activity.
-
-**Log tab** — live log with level filter and autoscroll.
-
-**Settings / Config Manager** — edit the current `config.toml`, load and edit inactive flat-file profiles in the same Nexus-BS folder, duplicate a config as `config+N.toml`, and activate a selected profile. Activation copies the selected profile over the persistent `config.toml` and records the selected profile marker, so the same config is used again after service restart or reboot.
-
-**System tab:**
-- BTS / Brew connection status
-- System uptime, hostname
-- CPU model, core count, load bar, RAM usage bar
-- CPU temperature (where available)
-- RF hardware info (SoapySDR probe output)
-- Auto-refresh checkbox (5s interval)
-- Config profiles — select, activate, duplicate, and edit flat TOML profiles in the Nexus-BS runtime folder
-- Live SDS broadcast queue — broadcast a text message to all radios on the cell, repeating at the HMD interval until deleted or repeat count exhausted
-- OTA update is intentionally disabled for now; update controls are visible but grayed out
-
-### WAP MVP over SDS
-
-Nexus-BS v0.1.65 includes an operator-triggered WAP MVP carried as SDS Type4. This is not a full SNDCP/IP packet-data bearer, so keep `sndcp_service = false` unless that bearer is implemented and verified.
-
-From the flat install directory, send the default WML page to a terminal ISSI:
-
-```bash
-./nexus-bs-control sendwap 16777215 2260618 false
-```
-
-The default page contains:
-
-```text
-Hello! You are running Nexus-BS. Gretings and 73! from Chris YO3TCO!
-```
-
-For terminal browsers that support basic HTML/color handling, use:
-
-```bash
-./nexus-bs-control sendwapcolor 16777215 2260618 false
-```
-
----
-
-## Key fixes vs upstream
-
-**ExpiryOfTimer crash loop** — `release_group_call` now sends `NetworkCallEnd` to Brew when a network-initiated group call expires. Without this, Brew kept the call alive and re-issued `NetworkCallStart` with new speakers, generating thousands of `ExpiryOfTimer` releases per minute and crashing the stack.
-
-**Simplex P2P (half-duplex PTT)** — `transmission_request_permission` correctly set to `false` in `D-CONNECT`, `D-CONNECT-ACK`, `D-TX-CEASED`, and `D-TX-GRANTED` (`false` encodes EN 300 392-2 14.8.43/table 14.81 value 0, allowed to request transmission). On `U-TX-CEASED`, BS sends `D-TX-CEASED` to both private-call parties so both terminals leave the active transmission state; it sends `D-TX-GRANTED(Granted)` only after a queued or new `U-TX-DEMAND`, avoiding an unsolicited grant while still unlocking the next PTT request.
-
-**Sepura post-PTT RoamingLocationUpdating** — Sepura terminals send `RoamingLocationUpdating` after every PTT release, not just on power cycle. Without the heuristic (< 60s since last registration → treat as soft re-attach), CMCE briefly loses track of the terminal and the next PTT is denied. Fixed with timing-based soft re-attach detection.
-
-**BCD external subscriber number** — decoder was shifting from nibble count instead of from bit 64, producing incorrect ISSI values in certain call scenarios.
-
-**UL audio routing to Brew** — `TmdCircuitDataInd` was not routed to Brew in `cmce_bs.rs`, causing one-way audio on Brew-interconnected calls.
-
-**SDS ACK for ISSI 9999** — SDS ACK for the local BS control ISSI was being forwarded to Brew, generating spurious traffic. Now absorbed locally.
-
-**Chan_alloc in DConnect for echo service 999** — echo service calls were being allocated without a traffic channel, causing audio to fail.
-
----
-
-## Branches
-
-| Branch | Purpose |
-|---|---|
-| `main` | Stable, tested releases |
-| `beta` | Work in progress, new features |
-
----
+Redistribution of Nexus-BS or derivative works must preserve the `Required
+Notice:` line in `NOTICE`, the PolyForm Noncommercial terms for Nexus-BS-covered
+work, and all applicable upstream license notices. Public use, publication, or
+derived work should credit the original upstream authors and Chris YO3TCO /
+Nexus-BS Project for the Nexus-BS additions, integration, packaging, dashboard
+work, standards-alignment work, and current project form.
 
 ## Credits
 
-- **Harald Welte** and the **osmocom** team for the foundational osmocom-tetra work
-- **Tatu Peltola** for rust-soapysdr timestamping and the native Rust Viterbi encoder/decoder used in LMAC
-- **BlueStation Project** for historical TETRA BS foundation and protocol-structure contributions
-- **FlowStation Project** for historical field-feature, dashboard and deployment-hardening contributions
-- **SXCEIVER** for SDR hardware ecosystem context and station-oriented RF integration work
-- **Stichting NLnet** for partially funding this work through the [RETETRA3 grant](https://nlnet.nl/project/RETETRA3/)
-- All historical, fork, testing, documentation, hardware, dashboard and integration contributors, including the operator community — ON6RF, EA7KEN, BU2GQ, DK5RTA, DO5MF, ES4TIX, DK5RTA and others — for testing, bug reports, and feature requests that shaped this release
+Nexus-BS exists because of earlier public TETRA research, upstream projects,
+forks, field testing and community work.
 
----
+Credits and thanks include:
 
-## License
+- [BlueStation Project](https://github.com/MidnightBlueLabs/tetra-bluestation)
+  for the historical TETRA BS foundation and protocol structure.
+- [FlowStation Project](https://github.com/razvanzeces/flowstation) for
+  historical field-feature, dashboard, integration and deployment-hardening
+  lineage.
+- Mihajlo YU4MSH and the
+  [misadeks/tetra-bluestation fork](https://github.com/misadeks/tetra-bluestation)
+  for contributions relevant to FDX P2P direction and field behavior.
+- Harald Welte and the osmocom team for foundational osmocom-tetra work.
+- Tatu Peltola for his [SXCEIVER](https://sxceiver.com/) project.
+- Stichting NLnet for partial funding through the RETETRA3 grant.
+- Dennis DB2OE for dashboard-theme inspiration.
+- All historical testing, documentation, hardware, dashboard, integration and
+  operator-community contributors, including ON6RF, EA7KEN, BU2GQ, DK5RTA,
+  DO5MF, ES4TIX and others.
 
-Nexus-BS is source-available for permitted noncommercial use under the
-PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE).
+This release is offered back to the community as a practical starting point for
+HAM TETRA operators who want a more complete and stable base for voice, SDS and
+interconnect experimentation. Bugs certainly remain. The code is available so
+it can be read, audited, tested, validated and improved.
 
-Commercial use requires a separate written agreement. See
-[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+73,
 
-Historical BlueStation/FlowStation upstream notices and Apache-2.0 license
-text are preserved in [NOTICE](NOTICE) and
-[LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt).
+Chris YO3TCO
