@@ -450,6 +450,26 @@ fn private_call_open_msg(caller_issi: u32, called_issi: u32, ts: u8) -> SapMsg {
     }
 }
 
+fn swmi_private_call_open_msg(local_issi: u32, ts: u8) -> SapMsg {
+    SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Cmce,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::CmceCallControl(CallControl::Open(Circuit {
+            direction: Direction::Both,
+            ts,
+            peer_ts: None,
+            usage: 4,
+            circuit_mode: CircuitModeType::TchS,
+            speech_service: Some(0),
+            etee_encrypted: false,
+            dl_media_source: CircuitDlMediaSource::SwMI,
+            active_addr: Some(TetraAddress::issi(local_issi)),
+            active_secondary_addrs: Vec::new(),
+        })),
+    }
+}
+
 fn floor_released_msg(call_id: u16, ts: u8) -> SapMsg {
     SapMsg {
         sap: Sap::Control,
@@ -1698,6 +1718,43 @@ fn test_private_simplex_acelp_waits_for_delayed_floor_grant() {
         traffic_ts,
         &early_acelp,
         "EN 300 392-2 clauses 14.5.1.2.1 b), 14.5.1.4.2, 23.5 and 23.8.5: private-simplex ACELP TCH/S received just before the internal FloorGranted must be retained briefly and routed after the grant",
+    );
+}
+
+#[test]
+fn test_brew_private_simplex_external_floor_grant_preserves_network_dl_media() {
+    debug::setup_logging_verbose();
+
+    let local_issi = 2_260_616;
+    let brew_peer_issi = 2_260_618;
+    let traffic_ts = 2;
+    let call_id = 61;
+    let start = TdmaTime { h: 0, m: 1, f: 1, t: 4 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac]);
+
+    test.submit_message(swmi_private_call_open_msg(local_issi, traffic_ts));
+    test.submit_message(floor_granted_msg(call_id, local_issi, brew_peer_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.submit_message(floor_released_msg(call_id, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    let remote_acelp = acelp_test_bits();
+    submit_dl_tmd_req(&mut test, traffic_ts, remote_acelp.clone(), None);
+    test.submit_message(floor_granted_msg(call_id, brew_peer_issi, local_issi, traffic_ts));
+    test.run_stack(Some(1));
+    let _ = test.dump_sinks();
+
+    test.run_stack(Some(12));
+    let msgs = test.dump_sinks();
+    assert_dl_tch_contains_bits(
+        &msgs,
+        traffic_ts,
+        &remote_acelp,
+        "EN 300 392-2 clause 14.5.1.2.1 b): when Brew grants the external private peer, queued SwMI DL speech is the new speaker's media and must not be purged as stale local loopback",
     );
 }
 

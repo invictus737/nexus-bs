@@ -244,14 +244,23 @@ impl CcBsSubentity {
         );
 
         if pending.kind == PendingNetworkIndividualConnectKind::LocalCallerDConnect {
+            let (grant, permission) = if pending.simplex_duplex {
+                (pending.grant, pending.permission)
+            } else {
+                // The local RF caller's D-CONNECT grant is viewed from the
+                // opposite side on the Brew circuit. For simplex P2P, the
+                // external peer must learn that another user owns the initial
+                // floor, while still being allowed to request transmission.
+                (Self::opposite_private_simplex_grant(pending.grant), 0)
+            };
             queue.push_back(SapMsg {
                 sap: Sap::Control,
                 src: TetraEntity::Cmce,
                 dest: TetraEntity::Brew,
                 msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
                     brew_uuid: pending.brew_uuid,
-                    grant: pending.grant.into_raw() as u8,
-                    permission: pending.permission,
+                    grant: grant.into_raw() as u8,
+                    permission,
                 }),
             });
         }

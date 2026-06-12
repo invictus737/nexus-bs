@@ -3404,8 +3404,10 @@ impl UmacBs {
                                     floor_ts,
                                     "new external SwMI private floor grant; discard local stale media",
                                 );
-                                self.channel_scheduler
-                                    .clear_dl_media_queue(floor_ts, "new external SwMI private floor grant");
+                                // Brew may deliver the first remote speech frames before
+                                // the matching circuit SIMPLEX_GRANTED reaches UMAC. On a
+                                // SwMI-fed private bearer the DL queue contains network
+                                // media, not locally looped-back stale speaker media.
                             } else {
                                 self.discard_pending_private_ul_media_except_source(
                                     floor_ts,

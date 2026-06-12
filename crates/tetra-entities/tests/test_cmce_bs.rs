@@ -1907,6 +1907,19 @@ fn count_network_circuit_connect_confirm(msgs: &[SapMsg], brew_uuid: uuid::Uuid)
         .count()
 }
 
+fn network_circuit_connect_confirm_grants(msgs: &[SapMsg], brew_uuid: uuid::Uuid) -> Vec<(u8, u8)> {
+    msgs.iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectConfirm {
+                brew_uuid: got_uuid,
+                grant,
+                permission,
+            }) if msg.dest == TetraEntity::Brew && *got_uuid == brew_uuid => Some((*grant, *permission)),
+            _ => None,
+        })
+        .collect()
+}
+
 fn count_brew_floor_granted(msgs: &[SapMsg], call_id: u16, source_issi: u32, dest_ssi: u32) -> usize {
     msgs.iter()
         .filter(|msg| {
@@ -4335,7 +4348,7 @@ fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
         })
         .expect("local private U-SETUP should be forwarded to Brew");
     network_call.grant = TransmissionGrant::Granted.into_raw() as u8;
-    network_call.permission = 0;
+    network_call.permission = 1;
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -4396,7 +4409,40 @@ fn test_local_origin_brew_private_simplex_connect_sets_initial_floor() {
         "EN 300 392-2 clause 14.5.1.2.1 plus Annex D.4: Brew-routed simplex D-CONNECT grant seeds the local floor after L2 ACK"
     );
     assert_eq!(count_network_circuit_connect_confirm(&after_ack_msgs, brew_uuid), 1);
+    assert_eq!(
+        network_circuit_connect_confirm_grants(&after_ack_msgs, brew_uuid),
+        vec![(TransmissionGrant::GrantedToOtherUser.into_raw() as u8, 0)],
+        "Brew-facing CONNECT_CONFIRM must describe the external peer perspective: local RF owns the initial simplex floor"
+    );
     assert_eq!(count_network_circuit_media_ready(&after_ack_msgs, brew_uuid), 1);
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSimplexIdle {
+            brew_uuid,
+            grant: TransmissionGrant::Granted.into_raw() as u8,
+            permission: 1,
+        }),
+    });
+    test.run_stack(Some(1));
+    let idle_msgs = test.dump_sinks();
+    assert_eq!(
+        count_d_tx_ceased(&idle_msgs),
+        0,
+        "Brew SIMPLEX_IDLE received while local RF still owns the floor must not synthesize D-TX CEASED"
+    );
+    assert_eq!(
+        count_umac_floor_released(&idle_msgs),
+        0,
+        "Brew SIMPLEX_IDLE received while local RF still owns the floor must not release the local U-plane"
+    );
+    assert_eq!(
+        count_network_circuit_release(&idle_msgs, brew_uuid),
+        0,
+        "Brew SIMPLEX_IDLE must not tear down an active local-origin private simplex circuit"
+    );
 
     test.submit_message(build_u_tx_ceased_msg(TEST_ISSI, call_id));
     test.run_stack(Some(1));
@@ -4681,6 +4727,11 @@ fn test_local_origin_brew_private_d_connect_transmitted_without_l2_ack_opens_loc
         count_network_circuit_connect_confirm(&after_transmit_only_msgs, brew_uuid),
         1,
         "local caller-first Brew simplex confirms after local RF D-CONNECT transmission"
+    );
+    assert_eq!(
+        network_circuit_connect_confirm_grants(&after_transmit_only_msgs, brew_uuid),
+        vec![(TransmissionGrant::GrantedToOtherUser.into_raw() as u8, 0)],
+        "local caller-first Brew simplex must confirm the Brew peer as listener while local RF has the floor"
     );
     assert_eq!(
         count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
