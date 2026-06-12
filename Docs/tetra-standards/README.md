@@ -3,11 +3,12 @@
 This folder is for fast local consultation of ETSI TETRA standards while
 working on Nexus-BS.
 
-Full ETSI deliverables are copyrighted. The repo keeps only this manifest and
-fetch script. Generated `.txt` files live under `cache/` and are intentionally
-ignored by git.
+The public release includes the generated text cache under `cache/` so protocol
+work can be reviewed repeatably without depending on live downloads. The fetch
+script remains available to refresh the cache from the source URLs listed in
+`standards.tsv`.
 
-Generate or refresh the local text cache:
+Refresh the local text cache:
 
 ```sh
 Docs/tetra-standards/fetch_etsi_text.sh

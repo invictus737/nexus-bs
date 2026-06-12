@@ -1,0 +1,525 @@
+ETSI TS 100 392-15 V1.4.1 (2010-03)
+                                    Technical Specification
+
+
+
+
+             Terrestrial Trunked Radio (TETRA);
+                           Voice plus Data (V+D);
+               Part 15: TETRA frequency bands,
+        duplex spacings and channel numbering
+                                                                   2                           ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+                                                             Reference
+                                                        RTS/TETRA-03205
+
+                                                             Keywords
+                                                        radio, TETRA, V+D
+
+
+
+
+                                                                ETSI
+
+                                                   650 Route des Lucioles
+                                          F-06921 Sophia Antipolis Cedex - FRANCE
+
+                                        Tel.: +33 4 92 94 42 00 Fax: +33 4 93 65 47 16
+
+                                              Siret N° 348 623 562 00017 - NAF 742 C
+                                             Association à but non lucratif enregistrée à la
+                                             Sous-Préfecture de Grasse (06) N° 7803/88
+
+
+
+
+                                                      Important notice
+
+                             Individual copies of the present document can be downloaded from:
+                                                       http://www.etsi.org
+
+ The present document may be made available in more than one electronic version or in print. In any case of existing or
+ perceived difference in contents between such versions, the reference version is the Portable Document Format (PDF).
+In case of dispute, the reference shall be the printing on ETSI printers of the PDF version kept on a specific network drive
+                                                   within ETSI Secretariat.
+
+   Users of the present document should be aware that the document may be subject to revision or change of status.
+                   Information on the current status of this and other ETSI documents is available at
+                                        http://portal.etsi.org/tb/status/status.asp
+
+           If you find errors in the present document, please send your comment to one of the following services:
+                                         http://portal.etsi.org/chaircor/ETSI_support.asp
+
+                                                  Copyright Notification
+
+                         No part may be reproduced except as authorized by written permission.
+                      The copyright and the foregoing restriction extend to reproduction in all media.
+
+                                 © European Telecommunications Standards Institute 2010.
+                                                  All rights reserved.
+      TM                TM         TM          TM
+DECT , PLUGTESTS , UMTS , TIPHON , the TIPHON logo and the ETSI logo are Trade Marks of ETSI registered
+                                            for the benefit of its Members.
+      TM
+  3GPP is a Trade Mark of ETSI registered for the benefit of its Members and of the 3GPP Organizational Partners.
+                            LTE™ is a Trade Mark of ETSI currently being registered
+                    for the benefit of its Members and of the 3GPP Organizational Partners.
+           GSM® and the GSM logo are Trade Marks registered and owned by the GSM Association.
+
+
+
+                                                                ETSI
+                                                                                        3                                  ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+Contents
+Intellectual Property Rights ................................................................................................................................4
+Foreword.............................................................................................................................................................4
+1        Scope ........................................................................................................................................................5
+2        References ................................................................................................................................................5
+2.1           Normative references ......................................................................................................................................... 5
+2.2           Informative references ........................................................................................................................................ 5
+3        Definitions and abbreviations ...................................................................................................................5
+3.1           Definitions .......................................................................................................................................................... 5
+3.2           Abbreviations ..................................................................................................................................................... 6
+4        Carrier frequencies and radio channel numbers .......................................................................................6
+5        TETRA frequency bands ..........................................................................................................................7
+6        Duplex spacing .........................................................................................................................................9
+Annex A (informative):                           Examples .........................................................................................................10
+A.1      Frequency band 380 MHz to 400 MHz ..................................................................................................10
+Annex B (informative):                           Change requests .............................................................................................11
+History ..............................................................................................................................................................12
+
+
+
+
+                                                                                      ETSI
+                                                            4                      ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+Intellectual Property Rights
+IPRs essential or potentially essential to the present document may have been declared to ETSI. The information
+pertaining to these essential IPRs, if any, is publicly available for ETSI members and non-members, and can be found
+in ETSI SR 000 314: "Intellectual Property Rights (IPRs); Essential, or potentially Essential, IPRs notified to ETSI in
+respect of ETSI standards", which is available from the ETSI Secretariat. Latest updates are available on the ETSI Web
+server (http://webapp.etsi.org/IPR/home.asp).
+
+Pursuant to the ETSI IPR Policy, no investigation, including IPR searches, has been carried out by ETSI. No guarantee
+can be given as to the existence of other IPRs not referenced in ETSI SR 000 314 (or the updates on the ETSI Web
+server) which are, or may be, or may become, essential to the present document.
+
+
+
+Foreword
+This Technical Specification (TS) has been produced by ETSI Technical Committee Terrestrial Trunked Radio
+(TETRA).
+
+The present document is part 15 of a multi-part deliverable covering Voice plus Data (V+D), as identified below:
+
+EN 300 392-1:        "General network design";
+
+EN 300 392-2:        "Air Interface (AI)";
+
+EN 300 392-3:        "Interworking at the Inter-System Interface (ISI)";
+
+ETS 300 392-4:       "Gateways basic operation";
+
+EN 300 392-5:        "Peripheral Equipment Interface (PEI)";
+
+EN 300 392-7:        "Security";
+
+EN 300 392-9:        "General requirements for supplementary services";
+
+EN 300 392-10:       "Supplementary services stage 1";
+
+EN 300 392-11:       "Supplementary services stage 2";
+
+EN 300 392-12:       "Supplementary services stage 3";
+
+ETS 300 392-13:      "SDL model of the Air Interface (AI)";
+
+ETS 300 392-14:      "Protocol Implementation Conformance Statement (PICS) proforma specification";
+
+TS 100 392-15:       "TETRA frequency bands, duplex spacings and channel numbering";
+
+TS 100 392-16:       "Network Performance Metrics";
+
+TR 100 392-17:       "TETRA V+D and DMO specifications";
+
+TS 100 392-18:       "Air interface optimized applications".
+
+   NOTE:      Part 13 (SDL) and part 14 (PICS) of this multi-part are of status "historical" and will not be updated
+              according to this version of the standard.
+
+
+
+
+                                                          ETSI
+                                                               5                       ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+1                Scope
+The present document defines TETRA frequency bands, duplex spacings and channel numbering for the
+Terrestrial Trunked Radio (TETRA) system supporting Voice plus Data (V+D).
+
+The informative annex A gives an example of the radio channel definition.
+
+
+
+2                References
+References are either specific (identified by date of publication and/or edition number or version number) or
+non-specific.
+
+    •       For a specific reference, subsequent revisions do not apply.
+
+    •       Non-specific reference may be made only to a complete document or a part thereof and only in the following
+            cases:
+
+            -    if it is accepted that it will be possible to use all future changes of the referenced document for the
+                 purposes of the referring document;
+
+            -    for informative references.
+
+Referenced documents which are not found to be publicly available in the expected location might be found at
+http://docbox.etsi.org/Reference.
+
+    NOTE:        While any hyperlinks included in this clause were valid at the time of publication ETSI cannot guarantee
+                 their long term validity.
+
+
+2.1              Normative references
+The following referenced documents are indispensable for the application of the present document. For dated
+references, only the edition cited applies. For non-specific references, the latest edition of the referenced document
+(including any amendments) applies.
+
+    [1]                 ETSI EN 300 392-2: "Terrestrial Trunked Radio (TETRA); Voice plus Data (V+D); Part 2: Air
+                        Interface (AI)".
+
+
+2.2              Informative references
+The following referenced documents are not essential to the use of the present document but they assist the user with
+regard to a particular subject area. For non-specific references, the latest version of the referenced document (including
+any amendments) applies.
+
+    [i.1]               CEPT T/R 25-08: "Planning criteria and coordination of frequencies in the land mobile service in
+                        the range 29.7-960 MHz".
+
+
+
+3                Definitions and abbreviations
+
+3.1              Definitions
+For the purposes of the present document, the terms and definitions given in EN 300 392-2 [1] apply.
+
+
+
+
+                                                             ETSI
+                                                            6                      ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+3.2           Abbreviations
+For the purposes of the present document, the abbreviations given in EN 300 392-2 [1] apply.
+
+
+
+4             Carrier frequencies and radio channel numbers
+TETRA can support multiple carrier frequency requirements such as different offsets from multiples of 25 kHz. If the
+same frequency band will be allocated in different countries using different variants, the same base frequency of the
+frequency band is used and the migrating MS shall carefully study SYSINFO broadcast to find out the applied offset
+and duplex spacing values.
+
+In the clause 21.4.4.1 in EN 300 392-2 [1] the main carrier frequency is defined as:
+
+    •    downlink main carrier frequency = base frequency + (main carrier × 25 kHz) + offset kHz; and
+
+in the clause 21.5.2 in EN 300 392-2 [1] the carrier number is defined as:
+
+    •    downlink carrier frequency = base frequency + (carrier number × 25 kHz) + offset kHz.
+
+For the purpose of the TETRA carrier frequency definition the base frequency shall be equal to the reference frequency
+for the band. The reference frequency need not coincide with the band edge frequency. The main carrier (or carrier
+number) is the carrier number (N).
+
+The carrier frequency offsets defined in clause 21.4.4.1 in EN 300 392-2 [1] allow values:
+
+    a)   -6,25 kHz;
+
+    b)   0 kHz;
+
+    c)   +6,25 kHz; and
+
+    d)   +12,5 kHz.
+
+With those values up to four different radio carrier frequency allocations are possible as shown in figure 1. The number
+of the first whole radio channel is always "1". The radio channel numbers for different allocations are marked by a letter
+A, B, C or D. That marking of radio channels by additional letter allows to keep channel numbers running 1, 2, 3 etc. If
+there is only one region (country) wide allocation variant in use, as for the band 380 MHz to 400 MHz in Europe, then
+the letter can be left out.
+
+The possible variants are shown in the figure 1 where the band edge frequency is the reference frequency + the band
+position. Both the reference frequency and the band position values are assumed to be even numbers of form
+XXX,000 MHz. The band position is not transferred over the air interface protocol as a separate information element
+but it is included into the carrier number N.
+
+    NOTE:     The radio channel number is intended for human purposes and it normally starts with value "1" for the
+              lowest radio channel. The main carrier (carrier number) is defined for the MAC layer protocol purposes to
+              be used in the air interface signalling. The numerical values of the radio channel number and the carrier
+              number are normally different for the same radio channel. The radio channel number values are outside
+              the scope of the present document.
+
+
+
+
+                                                          ETSI
+                                                                            7                             ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+    Variant A:
+    Band edge freq. + 0 kHz                           Band edge freq. + 25 kHz
+                              Channel number 1A                              Channel number 2A
+                              Carrier number N                               Carrier number N+1
+    Carrier frequency         Band edge freq. + 12,5 kHz                     Band edge freq. + 37,5 kHz
+                              Offset = 12,5 kHz                              Offset = 12,5 kHz
+
+    Variant B:
+                 Band edge freq. + 6,25 kHz                      Band edge freq. + 31,25 kHz
+                                         Channel number 1B                               Channel number 2B
+                                         Carrier number N+1                              Carrier number N+2
+    Carrier frequency                    Band edge freq. + 18,75 kHz                     Band edge freq. + 43,75 kHz
+                                         Offset = - 6,25 kHz                             Offset = - 6,25 kHz
+
+    Variant C:
+                              Band edge freq. + 12,5 kHz                      Band edge freq. + 32,5 kHz
+                                                      Channel number 1C                               Channel number 2C
+                                                      Carrier number N+1                              Carrier number N+2
+    Carrier frequency                                 Band edge freq. + 25,0 kHz                      Band edge freq. + 50,0 kHz
+                                                      Offset = 0,0 kHz                                Offset = 0,0 kHz
+
+    Variant D:
+                                         Band edge freq. + 18,75 kHz                     Band edge freq. + 43,75 kHz
+                                                                 Channel number 1D                               Channel number 2D
+                                                                 Carrier number N+1                              Carrier number N+2
+    Carrier frequency                                            Band edge freq. + 31,25 kHz                     Band edge freq. + 56,25 kHz
+                                                                 Offset = + 6,25 kHz                             Offset = + 6,25 kHz
+
+
+
+                                              Figure 1: Channel allocation possibilities
+
+The radio channel number is what a user may see especially in direct mode operation and may be defined in the
+frequency band allocation documentation. It is proposed to define radio channel numbers starting from the band edge
+independently whether radio channels allocated for TETRA usage starting from band edge so that the radio channel
+numbers will be same in all countries.
+
+The carrier number N is a TETRA radio protocol internal number, which is used in the radio carrier definition. Both the
+radio channel number and the associated carrier number are the same for both base station and mobile station and the
+difference in transmitter frequencies is defined by the duplex spacing and the normal/reverse information elements.
+
+Most probably only variants A and B will be applied for TETRA frequency allocations in Europe. As a regulatory issue
+the radio channel centre frequency (offset) allocations are outside the scope of the present document.
+
+
+
+5                TETRA frequency bands
+The frequency band information element values generally and for the current defined bands for TETRA in Europe shall
+be encoded as defined in table 1. The frequency band information element value is valid for the whole indicated
+frequency range although it may not be allocated totally for TETRA service. The reference and base frequency is
+defined by the frequency band of the BS transmitter.
+
+As a regulatory issue the frequency band allocations are outside the scope of the present document and the indicated
+band pairs are for information to indicate the information element encoding for those bands.
+
+
+
+
+                                                                          ETSI
+                                                         8                      ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+                                      Table 1: TETRA frequency bands
+
+ Frequency band of        Frequency band of       Reference and          Value of the       Value of the Reverse
+ the MS transmitter       the BS transmitter      base frequency       Frequency band        operation element
+                                                                           element
+100 MHz (see note 1)     100 MHz (see note 1)       100,000 MHz             00012                02 (Normal)
+                                                                                                 (see note 2)
+200 MHz (see note 1)     200 MHz (see note 1)       200,000 MHz              00102               02 (Normal)
+                                                                                                 (see note 2)
+300 MHz (see note 1)     300 MHz (see note 1)       300,000 MHz              00112               02 (Normal)
+                                                                                                 (see note 2)
+ 380 MHz to 390 MHz      390 MHz to 400 MHz         300,000 MHz              00112               02 (Normal)
+400 MHz (see note 1)     400 MHz (see note 1)       400,000 MHz              01002               02 (Normal)
+                                                                                                 (see note 2)
+ 410 MHz to 420 MHz      420 MHz to 430 MHz         400,000 MHz              01002               02 (Normal)
+ 450 MHz to 460 MHz      460 MHz to 470 MHz         400,000 MHz              01002                02 (Normal)
+500 MHz (see note 1)     500 MHz (see note 1)       500,000 MHz              01012               02 (Normal)
+                                                                                                 (see note 2)
+600 MHz (see note 1)     600 MHz (see note 1)       600,000 MHz              01102               02 (Normal)
+                                                                                                 (see note 2)
+700 MHz (see note 1)     700 MHz (see note 1)       700,000 MHz              01112               02 (Normal)
+                                                                                                 (see note 2)
+800 MHz (see note 1)     800 MHz (see note 1)       800,000 MHz              10002               02 (Normal)
+                                                                                                 (see note 2)
+ 870 MHz to 876 MHz      915 MHz to 921 MHz         900,000 MHz              10012               02 (Normal)
+900 MHz (see note 1)     900 MHz (see note 1)       900,000 MHz              10012                02 (Normal)
+                                                                                                  (see note 2)
+NOTE 1: For this frequency band only the reference frequency is defined and the actual band limits will be
+        defined by regulatory bodies. It is preferred that the lowest possible radio channel in all areas where this
+        band is available is numbered to be "1" independently whether it is actually available for TETRA usage.
+NOTE 2: Also reverse operation may be used in some frequency allocation.
+
+
+NOTE 1: The air interface protocol is independent of the actual frequency bands as the reference/base frequency
+        (a multiple of 100 MHz) and the carrier number with the offset, duplex spacing and reverse operation
+        information elements alone define as a mathematical equation the real carrier frequency.
+
+NOTE 2: In future more frequency bands may be defined or more details added to the TETRA frequency bands.
+
+
+
+
+                                                       ETSI
+                                                             9                       ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+6             Duplex spacing
+The duplex spacing values are defined without any mathematical rule. The duplex spacing shall be reference/base
+frequency dependent as defined in table 2. The 0,000 MHz duplex value may be needed for direct mode operation and
+is included here for completeness.
+
+                    Table 2: Duplex spacing as function of the reference/base frequency
+
+                                             Duplex spacing information element value (next row) and
+                                               corresponding duplex spacing (other rows; in MHz)
+    Frequency Base/reference 0002            0012     0102     0112        1002         1012      1102         1112
+       band     frequency
+      00002       note 1     note 1         note 1       0         note 1        note 1      note 1    note 1 note 1
+      00012        100 MHz        1,6         4,5        0         note 1        note 1      note 1    note 1 note 1
+      00102        200 MHz        10        note 1       0         note 1        note 1      note 1    note 1 note 1
+      00112        300 MHz        10           36        0            8            18         note 1    note 1 note 1
+                                          (see note 2)           (see note 2) (see note 2)
+      01002        400 MHz        10           7         0            8            5           9,5      note 1 note 1
+                                          (see note 2)           (see note 2) (see note 2) (see note 2)
+      01012        500 MHz        10         note 1      0          note 1       note 1       note 1    note 1 note 1
+      01102        600 MHz        10        note 1       0         note 1         30,        note 1    note 1 note 1
+                                                                              (see note 2)
+      01112        700 MHz       note 1     note 1       0         note 1          30        note 1    note 1 note 1
+                                                                              (see note 2)
+      10002        800 MHz       note 1       45         0            18         note 1      note 1    note 1 note 1
+                                                                 (see note 2)
+      10012        900 MHz       note 1       45         0            18           39        note 1    note 1 note 1
+                                                                 (see note 2) (see note 2)
+      10102         note 1       note 1     note 1       0          note 1       note 1      note 1    note 1 note 1
+      10112         note 1       note 1     note 1       0         note 1        note 1      note 1    note 1 note 1
+      11002         note 1       note 1     note 1       0         note 1        note 1      note 1    note 1 note 1
+      11012         note 1       note 1     note 1       0         note 1        note 1      note 1    note 1 note 1
+      11102         note 1       note 1     note 1       0         note 1        note 1      note 1    note 1 note 1
+      11112         note 1       note 1     note 1       0         note 1        note 1      note 1    note 1 note 1
+    NOTE 1: The value is reserved for future standardization.
+    NOTE 2: These values are not in accordance with CEPT T/R 25-08 [i.1] and hence the use of these values is
+            subject to a specific frequency allocation from individual National Regulatory Authorities.
+
+
+
+
+                                                         ETSI
+                                                                 10                         ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+Annex A (informative):
+Examples
+
+A.1           Frequency band 380 MHz to 400 MHz
+CEPT/SE has defined for TETRA frequency band 380 MHz to 400 MHz channel numbers as shown in figure A.1,
+which shows only two first radio channels of that frequency band. The reference/base frequency is 300 MHz and for
+base station transmitter the band position value is 90 MHz so that the base station band starts from 390 MHz. The
+duplex spacing is 10 MHz with normal band allocation (no reverse operation) so that that the mobile station transmitter
+is 10 MHz below the base station transmitter. The offset is +12,5 kHz so that the band edge frequency and the lower
+edge of the first radio channel coincide. The lowest possible base station radio channel 1 has carrier number 3 600, refer
+to table A.1.
+
+
+   Band edge frequency =
+   Reference frequency + band position            Band edge freq. + 25 kHz                       Band edge freq. + 50 kHz
+                          Channel number 1                               Channel number 2
+                          Carrier number N                               Carrier number N+1
+                          Band edge freq. + 12,5 kHz                     Band edge freq. + 37,5 kHz
+   Carrier frequency      Offset = + 12,5 kHz                            Offset = + 12,5 kHz
+
+
+
+     Figure A.1: Radio channel arrangement and radio channel numbering on 380 MHz to 400 MHz
+
+As an example the carrier frequencies 380,0125 MHz to 390,0125 MHz of the first radio channel on the 380 MHz to
+400 MHz band are indicated in the TETRA protocol by information elements as shown in table A.1.
+
+                      Table A.1: The first radio channel on the band 380 MHz to 400 MHz
+
+                    Information element                  Value of the                          Remark
+                                                         information
+                                                           element
+            Radio channel number                              -               1
+            Frequency band                                  00112             300 MHz reference frequency
+            Main carrier/Carrier number                      3 600            (390 000 - 300 000) / 25
+            Offset                                            112             +12,5 kHz
+            Duplex spacing                                    0002            10 MHz
+            Reverse operation                                  02             normal
+
+
+
+
+                                                                ETSI
+                                                           11                     ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+Annex B (informative):
+Change requests
+The present document contains change requests as listed in table B.1 since version 1.2.1.
+
+  No      CR Standard Clauses                                   Title                             CR Status
+         vers. Version affected
+  101    APP    1.2.1  6               36 MHz duplex spacing added for 300 MHz base         EPT approved 040224
+                                       frequency
+  102     11      1.3.1    6           9,5 MHz duplex spacing added for 400 MHz base        WG3 approved 091013
+                                       frequency
+
+
+
+
+                                                         ETSI
+                                              12          ETSI TS 100 392-15 V1.4.1 (2010-03)
+
+
+
+
+History
+                                       Document history
+V1.1.1    October 2000   Publication
+
+V1.2.1    April 2002     Publication
+
+V1.3.1    June 2004      Publication
+
+V1.4.1    March 2010     Publication
+
+
+
+
+                                             ETSI
+
