@@ -2,6 +2,7 @@
 name = "tetra-config"
 version.workspace = true
 edition.workspace = true
+license-file.workspace = true
 
 [dependencies]
 tetra-core = { workspace = true }

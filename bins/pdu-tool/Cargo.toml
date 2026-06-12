@@ -2,6 +2,7 @@
 name = "pdu-tool"
 version.workspace = true
 edition.workspace = true
+license-file.workspace = true
 
 [[bin]]
 name = "pdu-tool"

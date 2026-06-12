@@ -327,4 +327,12 @@ For terminal browsers that support basic HTML/color handling, use:
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE)
+Nexus-BS is source-available for permitted noncommercial use under the
+PolyForm Noncommercial License 1.0.0. See [LICENSE](LICENSE).
+
+Commercial use requires a separate written agreement. See
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md).
+
+Historical BlueStation/FlowStation upstream notices and Apache-2.0 license
+text are preserved in [NOTICE](NOTICE) and
+[LICENSES/Apache-2.0.txt](LICENSES/Apache-2.0.txt).

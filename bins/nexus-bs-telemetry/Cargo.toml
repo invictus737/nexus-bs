@@ -2,6 +2,7 @@
 name = "nexus-bs-telemetry"
 version.workspace = true
 edition.workspace = true
+license-file.workspace = true
 
 [[bin]]
 name = "nexus-bs-telemetry-service"

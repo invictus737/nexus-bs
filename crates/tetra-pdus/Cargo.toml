@@ -2,6 +2,7 @@
 name = "tetra-pdus"
 version.workspace = true
 edition.workspace = true
+license-file.workspace = true
 
 [dependencies]
 tetra-core = { workspace = true }

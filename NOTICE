@@ -1,0 +1,39 @@
+Nexus-BS Notices
+================
+
+Required Notice: Copyright (c) Chris YO3TCO / Nexus-BS Project.
+
+Nexus-BS is source-available for permitted noncommercial use under the
+PolyForm Noncommercial License 1.0.0. Commercial use requires a separate
+written commercial license agreement. See `LICENSE` and
+`COMMERCIAL-LICENSE.md`.
+
+Upstream and Historical Notices
+-------------------------------
+
+Nexus-BS is based on historical BlueStation and FlowStation work and
+retains protocol-structure, field-feature, dashboard, deployment, testing,
+and integration lineage from those projects.
+
+Historical upstream Apache-2.0 license text is preserved in
+`LICENSES/Apache-2.0.txt`. Upstream portions that were originally provided
+under Apache-2.0 remain subject to the applicable upstream license notices
+and attribution requirements. This notice does not remove or narrow rights
+granted directly by upstream copyright holders under their original licenses.
+
+Credits
+-------
+
+- BlueStation Project for historical TETRA BS foundation and
+  protocol-structure contributions.
+- FlowStation Project for historical field-feature, dashboard, and
+  deployment-hardening contributions.
+- Harald Welte and the osmocom team for foundational osmocom-tetra work.
+- Tatu Peltola for rust-soapysdr timestamping and the native Rust Viterbi
+  encoder/decoder used in LMAC.
+- SXCEIVER for SDR hardware ecosystem context and station-oriented RF
+  integration work.
+- Stichting NLnet for partial funding through the RETETRA3 grant.
+- Historical, fork, testing, documentation, hardware, dashboard, integration,
+  and operator-community contributors, including ON6RF, EA7KEN, BU2GQ,
+  DK5RTA, DO5MF, ES4TIX, and others.
