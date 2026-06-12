@@ -136,7 +136,7 @@ impl CcBsSubentity {
                 layer2_qos: 0,
                 stealing_permission: false,
                 stealing_repeats_flag: false,
-                unacked_bl_repetitions: None,
+                unacked_bl_repetitions: Some(0),
                 chan_alloc: Some(chan_alloc),
                 main_address: address,
                 tx_reporter: reporter,

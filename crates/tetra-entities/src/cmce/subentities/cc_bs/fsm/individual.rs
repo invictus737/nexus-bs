@@ -1022,9 +1022,9 @@ impl CcBsSubentity {
             };
 
             let mut call_info = call_snapshot.network_call.clone().unwrap_or(NetworkCircuitCall {
-                source_issi: call_snapshot.calling_addr.ssi,
-                destination: call_snapshot.called_addr.ssi,
-                number: call_snapshot.called_addr.ssi.to_string(),
+                source_issi: call_snapshot.called_addr.ssi,
+                destination: call_snapshot.calling_addr.ssi,
+                number: String::new(),
                 priority: 0,
                 service: 0,
                 mode: CircuitModeType::TchS.into_raw() as u8,
@@ -1037,6 +1037,12 @@ impl CcBsSubentity {
                 ownership: 0,
                 queued: 0,
             });
+            // Brew CONNECT_REQUEST represents the called side's acceptance and is
+            // forwarded unchanged by Tetra-Core to the original caller. Keep the
+            // party orientation aligned with TETRALink/TetraPack: source is the
+            // accepting local MS, destination is the original Brew caller.
+            call_info.source_issi = call_snapshot.called_addr.ssi;
+            call_info.destination = call_snapshot.calling_addr.ssi;
             call_info.duplex = pdu.simplex_duplex_selection as u8;
             call_info.method = pdu.hook_method_selection as u8;
             let called_ms_transmits_first = Self::private_simplex_called_ms_transmits_first(

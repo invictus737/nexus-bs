@@ -3933,6 +3933,8 @@ fn test_network_origin_private_call_preserves_method_and_timeout_fields() {
             _ => None,
         })
         .expect("called MS U-CONNECT should be forwarded to Brew");
+    assert_eq!(connect_request.source_issi, TEST_CALLED_ISSI);
+    assert_eq!(connect_request.destination, TEST_ISSI);
     assert_eq!(connect_request.timeout, CallTimeout::T10m.into_raw() as u8);
     assert_eq!(connect_request.method, 0);
     assert_eq!(connect_request.grant, TransmissionGrant::Granted.into_raw() as u8);
@@ -4787,6 +4789,7 @@ fn test_local_origin_brew_private_duplex_d_connect_transmitted_without_l2_ack_op
     assert_eq!(secondary_alloc_req.ul_dl_assigned, UlDlAssignment::Ul);
     assert_eq!(secondary_alloc_req.usage, connect_alloc.usage);
     assert_eq!(secondary_alloc.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(secondary_alloc.unacked_bl_repetitions, Some(0));
     let secondary_reporter = secondary_alloc
         .tx_reporter
         .clone()
@@ -5305,7 +5308,22 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
             _ => None,
         })
         .expect("called MS duplex U-CONNECT should be forwarded to Brew");
+    assert_eq!(
+        connect_request.source_issi, TEST_CALLED_ISSI,
+        "Brew CONNECT_REQUEST accept must identify the local called MS as source"
+    );
+    assert_eq!(
+        connect_request.destination, TEST_ISSI,
+        "Brew CONNECT_REQUEST accept must target the original external caller"
+    );
     assert_eq!(connect_request.duplex, 1);
+    assert_eq!(count_d_releases(&connect_request_msgs), 0);
+    assert_eq!(count_d_disconnects(&connect_request_msgs), 0);
+    assert_eq!(count_network_circuit_release(&connect_request_msgs, brew_uuid), 0);
+    assert_eq!(count_umac_open(&connect_request_msgs), 0);
+    assert_eq!(count_umac_call_ended_or_close(&connect_request_msgs), 0);
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
 
     test.submit_message(SapMsg {
         sap: Sap::Control,
@@ -5364,6 +5382,8 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
     assert_eq!(secondary_alloc_req.alloc_type, ChanAllocType::Additional);
     assert_eq!(secondary_alloc_req.ul_dl_assigned, UlDlAssignment::Ul);
     assert_eq!(secondary_alloc_req.usage, connect_ack_alloc.usage);
+    assert_eq!(secondary_alloc.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(secondary_alloc.unacked_bl_repetitions, Some(0));
     let secondary_reporter = secondary_alloc
         .tx_reporter
         .clone()
@@ -5433,6 +5453,12 @@ fn test_network_origin_brew_private_duplex_d_connect_ack_transmitted_without_l2_
         2,
         "network-origin duplex Brew media opens DL playout and UL forwarding after both RF allocations transmit"
     );
+    assert_eq!(count_d_releases(&after_split_alloc_msgs), 0);
+    assert_eq!(count_d_disconnects(&after_split_alloc_msgs), 0);
+    assert_eq!(count_network_circuit_release(&after_split_alloc_msgs, brew_uuid), 0);
+    assert_eq!(count_umac_call_ended_or_close(&after_split_alloc_msgs), 0);
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+    assert_eq!(test.config.state_read().timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
     assert_eq!(
         count_network_circuit_media_ready_direction(&after_split_alloc_msgs, brew_uuid, 2, Direction::Dl),
         1,
@@ -5537,6 +5563,8 @@ fn test_network_origin_brew_private_duplex_accepts_local_simplex_offer_without_l
             _ => None,
         })
         .expect("called MS simplex U-CONNECT should be forwarded to Brew");
+    assert_eq!(connect_request.source_issi, TEST_CALLED_ISSI);
+    assert_eq!(connect_request.destination, TEST_ISSI);
     assert_eq!(
         connect_request.duplex, 0,
         "local simplex offer must be mapped to Brew CONNECT_REQUEST as simplex"
