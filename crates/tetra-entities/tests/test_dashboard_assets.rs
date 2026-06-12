@@ -117,6 +117,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "external dashboard About must credit Dennis DB2OE for dashboard theme inspiration"
     );
     assert!(
+        index.contains("Mihajlo YU4MSH") && index.contains("FDX P2P contribution"),
+        "external dashboard About must credit Mihajlo YU4MSH separately for FDX P2P"
+    );
+    assert!(
         index.contains(r#"id="configManager""#) && index.contains(r#"id="configProfileSelect""#) && index.contains(r#"id="configEditor""#),
         "Settings must expose config profile selection and current TOML editing controls"
     );

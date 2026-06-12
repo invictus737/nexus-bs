@@ -1940,8 +1940,12 @@ td code{
         <div class="card-body" style="padding:14px 18px">
           <div class="about-grid">
             <div class="about-credit">
-              <div class="about-credit-name"><a href="https://github.com/misadeks/tetra-bluestation" target="_blank" rel="noopener noreferrer">BlueStation Project</a></div>
-              <div class="about-credit-desc">Historical TETRA base-station foundation, protocol-structure and early SDR-stack contributions. Also referenced: <a href="https://github.com/MidnightBlueLabs/tetra-bluestation" target="_blank" rel="noopener noreferrer">MidnightBlueLabs/tetra-bluestation</a>.</div>
+              <div class="about-credit-name"><a href="https://github.com/MidnightBlueLabs/tetra-bluestation" target="_blank" rel="noopener noreferrer">BlueStation Project</a></div>
+              <div class="about-credit-desc">Historical TETRA base-station foundation, protocol-structure and early SDR-stack contributions.</div>
+            </div>
+            <div class="about-credit">
+              <div class="about-credit-name"><a href="https://github.com/misadeks/tetra-bluestation" target="_blank" rel="noopener noreferrer">Mihajlo YU4MSH</a></div>
+              <div class="about-credit-desc">BlueStation fork work and FDX P2P contribution.</div>
             </div>
             <div class="about-credit">
               <div class="about-credit-name"><a href="https://github.com/razvanzeces/flowstation" target="_blank" rel="noopener noreferrer">FlowStation Project</a></div>

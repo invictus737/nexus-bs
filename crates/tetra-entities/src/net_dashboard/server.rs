@@ -4494,6 +4494,8 @@ mod tests {
 
         for credit in [
             "BlueStation Project",
+            "Mihajlo YU4MSH",
+            "FDX P2P",
             "FlowStation Project",
             "SXCEIVER",
             "Dennis DB2OE",
