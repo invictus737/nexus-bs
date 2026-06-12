@@ -1,0 +1,43 @@
+# Nexus-BS external dashboard front-end template.
+#
+# This service intentionally runs outside the RF core process. It serves the
+# browser assets on port 8080 and proxies API/WebSocket traffic to the core's
+# loopback-only dashboard API on 127.0.0.1:18080.
+
+[Unit]
+Description=Nexus-BS v0.1.65 external dashboard front-end for %i
+Documentation=man:systemd.service(5)
+After=network-online.target nexus-bs@%i.service
+Wants=network-online.target nexus-bs@%i.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=%i
+WorkingDirectory=/home/%i/nexus-bs
+Environment=NEXUS_BS_DASHBOARD_BIND=0.0.0.0
+Environment=NEXUS_BS_DASHBOARD_PORT=8080
+Environment=NEXUS_BS_DASHBOARD_CORE=127.0.0.1:18080
+Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/%i/nexus-bs/dashboard
+Environment=RUST_LOG=info
+ExecStart=/home/%i/nexus-bs/nexus-bs-dashboard
+
+KillSignal=SIGINT
+TimeoutStopSec=10
+Restart=on-failure
+RestartSec=5
+MemoryMax=192M
+TasksMax=64
+LimitNOFILE=2048
+NoNewPrivileges=yes
+# Dashboard and local command bridge share the non-RF application CPU.
+CPUAffinity=3
+CPUWeight=20
+Nice=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=nexus-bs-dashboard
+
+[Install]
+WantedBy=multi-user.target

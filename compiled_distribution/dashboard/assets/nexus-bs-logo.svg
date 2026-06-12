@@ -1,0 +1,50 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 330 90" role="img" aria-labelledby="title desc">
+  <title id="title">Nexus-BS</title>
+  <desc id="desc">Nexus-BS TETRA base station brand lockup with radio tower mark.</desc>
+  <defs>
+    <linearGradient id="ink" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#1e3b4f"/>
+      <stop offset="1" stop-color="#071a28"/>
+    </linearGradient>
+    <linearGradient id="inkSide" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#102f41"/>
+      <stop offset="1" stop-color="#071923"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" x2="1" y1="0" y2="1">
+      <stop offset="0" stop-color="#1aa4df"/>
+      <stop offset="0.52" stop-color="#116fcc"/>
+      <stop offset="1" stop-color="#0751a6"/>
+    </linearGradient>
+    <filter id="lift" x="-10%" y="-20%" width="120%" height="140%">
+      <feDropShadow dx="0" dy="1.8" stdDeviation="1.2" flood-color="#dce8eb" flood-opacity="0.72"/>
+      <feDropShadow dx="0" dy="2.4" stdDeviation="1.6" flood-color="#0a1b24" flood-opacity="0.22"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#lift)">
+    <g transform="translate(2 9) scale(0.82)">
+      <path d="M10 20 31 2 58 27v15L37 24v38l-11 9-16-14Z" fill="url(#ink)"/>
+      <path d="M10 57 31 78V62L21 53V31L10 20Z" fill="url(#inkSide)"/>
+      <path d="M41 78h24l23-22V35L76 46v12L60 73H41Z" fill="url(#blue)"/>
+      <g fill="none" stroke="#132b39" stroke-linecap="round" stroke-linejoin="round" stroke-width="3.6">
+        <path d="M49 76 56 38 64 76"/>
+        <path d="M50.5 67h12"/>
+        <path d="M52 58h9"/>
+        <path d="m53 67 8-9m-7-7 9 16"/>
+      </g>
+      <circle cx="56" cy="36" r="8.5" fill="url(#blue)"/>
+      <g fill="none" stroke="url(#blue)" stroke-linecap="round" stroke-width="7">
+        <path d="M71 35c6 6 8 13 7 21"/>
+        <path d="M73 21c13 8 20 20 19 36"/>
+        <path d="M75 7c21 10 32 29 31 52"/>
+      </g>
+    </g>
+
+    <text x="88" y="59"
+          fill="url(#ink)"
+          font-family="Inter, Segoe UI, Arial, sans-serif"
+          font-size="43"
+          font-weight="900"
+          letter-spacing="0">Nexus-BS</text>
+  </g>
+</svg>
