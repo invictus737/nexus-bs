@@ -1781,7 +1781,7 @@ impl CcBsSubentity {
     }
 
     fn complete_group_tx_ceased_tail_drain(&mut self, queue: &mut MessageQueue, pending: PendingGroupTxCeasedTailDrain) {
-        let (queued_requester, legacy_release_after_cease) = {
+        let (queued_requester, release_after_no_handoff_over, release_after_reason) = {
             let Some(call) = self.active_calls.get(&pending.call_id) else {
                 return;
             };
@@ -1795,7 +1795,16 @@ impl CcBsSubentity {
             }
             let legacy_release_after_cease =
                 self.config.config().cell.legacy_gssi_group_call && matches!(&call.origin, CallOrigin::Local { .. });
-            let queued_requester = if legacy_release_after_cease {
+            let brew_routable_release_after_cease = net_brew::is_brew_gssi_routable(&self.config, call.dest_gssi);
+            let release_after_no_handoff_over = legacy_release_after_cease || brew_routable_release_after_cease;
+            let release_after_reason = if legacy_release_after_cease {
+                "legacy GSSI group call mode"
+            } else if brew_routable_release_after_cease {
+                "Brew-routable GSSI group call mode"
+            } else {
+                "standard GSSI group call mode"
+            };
+            let queued_requester = if release_after_no_handoff_over {
                 let mut first_affiliated = None;
                 let mut first_affiliated_other_speaker = None;
                 for requester in call.queued_tx_demands() {
@@ -1819,7 +1828,7 @@ impl CcBsSubentity {
             } else {
                 self.first_affiliated_group_floor_requester(pending.call_id, call, "group TX-CEASED tail drain")
             };
-            (queued_requester, legacy_release_after_cease)
+            (queued_requester, release_after_no_handoff_over, release_after_reason)
         };
 
         let queued_requester = {
@@ -1831,9 +1840,9 @@ impl CcBsSubentity {
             }
 
             let queued_requester = call.take_queued_tx_demand_through(queued_requester.map(|requester| requester.ssi));
-            let legacy_same_speaker_retake =
-                legacy_release_after_cease && queued_requester.is_some_and(|requester| requester.ssi == pending.sender.ssi);
-            if let Some(requester) = queued_requester.filter(|_| !legacy_same_speaker_retake) {
+            let same_speaker_retake_requires_fresh_setup =
+                release_after_no_handoff_over && queued_requester.is_some_and(|requester| requester.ssi == pending.sender.ssi);
+            if let Some(requester) = queued_requester.filter(|_| !same_speaker_retake_requires_fresh_setup) {
                 call.grant_floor(requester.ssi, Some(requester));
                 Some(requester)
             } else {
@@ -1842,10 +1851,10 @@ impl CcBsSubentity {
             }
         };
 
-        let legacy_same_speaker_retake =
-            legacy_release_after_cease && queued_requester.is_some_and(|requester| requester.ssi == pending.sender.ssi);
+        let same_speaker_retake_requires_fresh_setup =
+            release_after_no_handoff_over && queued_requester.is_some_and(|requester| requester.ssi == pending.sender.ssi);
 
-        if let Some(requester) = queued_requester.filter(|_| !legacy_same_speaker_retake) {
+        if let Some(requester) = queued_requester.filter(|_| !same_speaker_retake_requires_fresh_setup) {
             tracing::info!(
                 "U-TX CEASED (group) call_id={} tail-drained from ISSI {} -> granting queued floor to ISSI {}",
                 pending.call_id,
@@ -1890,9 +1899,10 @@ impl CcBsSubentity {
             return;
         }
 
-        if legacy_same_speaker_retake {
+        if same_speaker_retake_requires_fresh_setup {
             tracing::info!(
-                "CMCE: legacy GSSI group call mode suppresses same-speaker fast retake call_id={} ISSI {}; clearing old over before fresh setup",
+                "CMCE: {} suppresses same-speaker fast retake call_id={} ISSI {}; clearing old over before fresh setup",
+                release_after_reason,
                 pending.call_id,
                 pending.sender.ssi
             );
@@ -1928,20 +1938,20 @@ impl CcBsSubentity {
             });
         }
 
-        if legacy_release_after_cease {
+        if release_after_no_handoff_over {
             // Compatibility mode for older Motorola MR5/MR19 class terminals:
             // D-TX-CEASED is the normal clause 14.5.2.2.1(e)
             // end-of-transmission edge, and D-RELEASE is the clause 14.5.2.3
-            // group release PDU. The release-after-over decision is a local
+            // group release PDU. The release-after-over decision is a local/Brew
             // compatibility policy, not a general ETSI requirement. Release the
-            // maintained group call after the normal D-TX-CEASED edge so the
-            // next PTT uses the proven fresh
-            // U-SETUP/D-CONNECT/D-SETUP sequence instead of a same-channel
-            // hangtime retake that some old terminals acknowledge but do not
-            // transmit on.
+            // maintained group call after the normal D-TX-CEASED edge so the next
+            // PTT uses the proven fresh U-SETUP/D-CONNECT/D-SETUP sequence
+            // instead of a same-channel hangtime retake that some terminals
+            // acknowledge but do not transmit on.
             tracing::info!(
-                "CMCE: legacy GSSI group call mode releasing local group call_id={} after no-handoff over",
-                pending.call_id
+                "CMCE: {} releasing group call_id={} after no-handoff over",
+                release_after_reason,
+                pending.call_id,
             );
             self.release_group_call(queue, pending.call_id, DisconnectCause::SwmiRequestedDisconnection);
         }

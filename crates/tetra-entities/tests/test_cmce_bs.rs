@@ -3337,6 +3337,97 @@ fn test_network_group_local_retake_after_network_end_does_not_transfer_call_owne
 }
 
 #[test]
+fn test_brew_routable_network_group_local_no_handoff_over_releases_for_fresh_retake() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    config.cell.hangtime_secs = 30;
+
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, LAB_ISSI_B, LAB_GROUP_GSSI);
+
+    let brew_uuid = uuid::Uuid::new_v4();
+    let (call_id, ts, _setup_msgs) = start_network_group_call(&mut test, brew_uuid, LAB_ISSI_MXP600, LAB_GROUP_GSSI, 0);
+
+    test.submit_message(build_network_call_end_msg(brew_uuid));
+    test.run_stack(Some(1));
+    let network_end_msgs = test.dump_sinks();
+    assert_eq!(count_d_releases(&network_end_msgs), 0);
+    assert_eq!(count_umac_floor_released(&network_end_msgs), 1);
+
+    test.submit_message(build_u_tx_demand_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let retake_msgs = test.dump_sinks();
+    assert!(count_d_tx_granted(&retake_msgs) >= 1);
+    let activation_msgs = transmit_positive_group_grant_and_assert_floor(
+        &mut test,
+        &retake_msgs,
+        TetraAddress::issi(LAB_ISSI_B),
+        call_id,
+        LAB_ISSI_B,
+        LAB_GROUP_GSSI,
+        ts,
+    );
+    assert!(
+        activation_msgs.iter().any(|msg| matches!(
+            &msg.msg,
+            SapMsgInner::CmceCallControl(CallControl::SetDlMediaSource {
+                ts: update_ts,
+                dl_media_source: CircuitDlMediaSource::LocalLoopback,
+            }) if *update_ts == ts
+        )),
+        "local retake after Brew speaker should switch the bearer back to local loopback"
+    );
+
+    test.submit_message(build_u_tx_ceased_msg(LAB_ISSI_B, call_id));
+    test.run_stack(Some(1));
+    let ceased_start_msgs = test.dump_sinks();
+    assert_eq!(count_d_tx_ceased(&ceased_start_msgs), 0);
+    assert_eq!(count_d_releases(&ceased_start_msgs), 0);
+    assert_eq!(count_umac_floor_released(&ceased_start_msgs), 0);
+
+    drain_group_tx_ceased_tail(&mut test, dltime);
+    let mut release_msgs = test.dump_sinks();
+
+    assert_eq!(count_d_tx_ceased(&release_msgs), 1);
+    assert_eq!(count_umac_floor_released(&release_msgs), 1);
+    assert_eq!(
+        count_d_tx_granted(&release_msgs),
+        0,
+        "Brew-routable same-speaker no-handoff over must not emit the positive fast retake that field radios can acknowledge but fail to transmit on"
+    );
+    assert_eq!(count_umac_floor_granted(&release_msgs), 0);
+    assert_eq!(
+        count_d_releases(&release_msgs),
+        2,
+        "Brew-routable no-handoff over should send FACCH and MCCH D-RELEASE so the next PTT uses fresh setup"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "D-RELEASE reporter/guard must close the old circuit later, not before release delivery"
+    );
+
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1, "Only FACCH D-RELEASE should carry a reporter");
+    reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
+    assert!(count_umac_call_ended_or_close(&closed_msgs) >= 2);
+    assert_eq!(
+        count_network_call_end(&closed_msgs, brew_uuid),
+        1,
+        "closing the old network-origin group call should clear the stale Brew hanging-call handle"
+    );
+}
+
+#[test]
 fn test_network_group_no_listener_release_reports_network_end_once_after_d_release_delivery() {
     debug::setup_logging_verbose();
 
@@ -4662,6 +4753,81 @@ fn test_brew_private_simplex_remote_floor_idle_grants_queued_local_ptt() {
         count_network_circuit_simplex_granted(&idle_msgs, brew_uuid, TransmissionGrant::GrantedToOtherUser),
         1,
         "queued local floor must be reflected back to Brew as SIMPLEX_GRANTED for the external peer"
+    );
+}
+
+#[test]
+fn test_local_origin_brew_private_simplex_not_granted_transmitted_without_l2_ack_does_not_open_media() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    let mut test = ComponentTest::from_config(config, Some(dltime));
+    {
+        let mut state = test.config.state_write();
+        state.network_connected = true;
+    }
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+
+    let remote_issi = 7_000_105;
+    let mut u_setup = default_p2p_u_setup();
+    u_setup.called_party_ssi = Some(remote_issi as u64);
+    u_setup.simplex_duplex_selection = false;
+
+    test.submit_message(build_u_setup_p2p_custom_msg(TEST_ISSI, u_setup));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    let (brew_uuid, mut network_call) = setup_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::CmceCallControl(CallControl::NetworkCircuitSetupRequest { brew_uuid, call }) => Some((*brew_uuid, call.clone())),
+            _ => None,
+        })
+        .expect("local private U-SETUP should be forwarded to Brew");
+    network_call.grant = TransmissionGrant::NotGranted.into_raw() as u8;
+    network_call.permission = 0;
+
+    test.submit_message(SapMsg {
+        sap: Sap::Control,
+        src: TetraEntity::Brew,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::CmceCallControl(CallControl::NetworkCircuitConnectRequest {
+            brew_uuid,
+            call: network_call,
+        }),
+    });
+    test.run_stack(Some(1));
+    let connect_msgs = test.dump_sinks();
+
+    let connect_reporter = d_connect_reporter(&connect_msgs, TEST_ISSI);
+    connect_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let after_transmit_only_msgs = test.dump_sinks();
+
+    assert_eq!(
+        count_umac_floor_granted(&after_transmit_only_msgs),
+        0,
+        "private simplex D-CONNECT transmitted-only completion is restricted to grants with an unambiguous initial floor holder"
+    );
+    assert_eq!(
+        count_network_circuit_connect_confirm(&after_transmit_only_msgs, brew_uuid),
+        0,
+        "Brew CONNECT_CONFIRM must not be sent for NotGranted private simplex before local L2 ACK"
+    );
+    assert_eq!(
+        count_network_circuit_media_ready(&after_transmit_only_msgs, brew_uuid),
+        0,
+        "Brew private simplex media must stay closed for NotGranted until local L2 ACK"
+    );
+    assert_eq!(
+        count_d_tx_granted(&after_transmit_only_msgs),
+        0,
+        "NotGranted setup completion must not synthesize private simplex floor-control PDUs"
     );
 }
 
