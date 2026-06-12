@@ -1,9 +1,10 @@
 # Nexus-BS v0.1.65 example configuration
 #
 # This file is intentionally valid as-is so it can be parsed by tests and used
-# as a clean starting point. Before transmitting, edit frequencies, MCC/MNC,
-# SSI/GSSI policy and service credentials to match your licence, hardware and
-# local legal limits.
+# as a clean starting point. It follows the Nexus-BS field profile while keeping
+# the original BlueStation example carrier/RF plan. Before transmitting, edit
+# frequencies, MCC/MNC, SSI/GSSI policy and service credentials to match your
+# licence, hardware and local legal limits.
 
 config_version = "0.6"
 
@@ -14,7 +15,9 @@ stack_mode = "Bs"
 # debug_log = "./verbose_log.txt"
 
 # Explicit systemd service unit name. Used by dashboard/service-control paths
-# and by optional SDS command control. Keep this aligned with your unit name.
+# and by optional SDS command control. Keep this aligned with your unit name:
+#   - legacy unit: "nexus-bs"
+#   - template unit: "nexus-bs@user.service"
 service_name = "nexus-bs"
 
 ###############################################################################
@@ -34,8 +37,6 @@ service_name = "nexus-bs"
 # the broken config.toml from the dashboard without losing remote access.
 ###############################################################################
 
-###############################################################################
-
 [phy_io]
 
 # RF backend. Nexus-BS v0.1.65 supports the direct SoapySDR backend here.
@@ -47,8 +48,8 @@ backend = "SoapySdr"
 # ul_rx_file = "./ul_output.bin"    # Debug; uncomment to save received UL RF samples
 
 [phy_io.soapysdr]
-# Downlink transmit and uplink receive frequencies in Hz.
-# These MUST match the [cell_info] carrier fields below.
+# BlueStation reference RF profile. Downlink transmit and uplink receive
+# frequencies are in Hz and MUST match the [cell_info] carrier fields below.
 tx_freq = 438025000
 rx_freq = 433025000
 
@@ -94,11 +95,11 @@ tx_calibration_apply_iq = true
 
 [net_info]
 # Mobile Country Code (MCC) - identifies your country/network.
-mcc = 204  # Netherlands
+mcc = 901
 
 # Mobile Network Code (MNC) - identifies the TETRA network.
 # Make sure the chosen MNC is legally usable in your deployment.
-mnc = 1337
+mnc = 9999
 
 ###############################################################################
 
@@ -116,11 +117,19 @@ duplex_spacing = 4                  # Use 5MHz spacing between ul and dl (for 40
 freq_offset = 0                     # Carrier offset. Usually 0. Options: 0, 6250, -6250, 12500 Hz.
 reverse_operation = false           # False: UL below DL. True: UL above DL.
 
-# Location area identifier
-location_area = 2
+# Location area identifier.
+location_area = 3
 
 # Colour code (0-63), helps distinguish adjacent cells on the same frequency
 colour_code = 1
+
+# MAC-SYNC system code. 3 is the Nexus-BS/ETSI EN 300 392-2 V3 profile.
+system_code = 3
+
+# Neighbor-cell broadcast indication for D-MLE-SYNC/dashboard state. Keep this
+# at 1 for the field profile; add [[cell_info.neighbor_cells_ca]] entries below
+# only when you have real adjacent cells to advertise.
+neighbor_cell_broadcast = 1
 
 # IANA timezone for time broadcasting via D-NWRK-BROADCAST. When set, the BS will
 # broadcast UTC time and local time offset twice per hyperframe (~30.6s) so that
@@ -132,14 +141,16 @@ colour_code = 1
 # conservatively for ETSI EN 300 392-2 fixed-frame signalling.
 frame_18_ext = false
 
-# Local SSI/GSSI exceptions for this cell. Traffic for these SSIs/GSSIs will not
-# leave the cell. Overrides any settings in the brew section, if enabled.
-# Incoming brew traffic on these values will also be rejected.
+# Local SSI/GSSI exceptions for this cell. Traffic for these SSIs/GSSIs stays
+# local and is not routed through Brew. Incoming Brew traffic to these values is
+# also rejected. This is a routing policy, not a list of registered terminals.
 # The end of the range is INCLUSIVE — the end number IS in the range.
 local_ssi_ranges = [
     [1, 90],
-    [226333, 226333],
 ]
+
+# To keep a lab/local talkgroup off Brew, add one explicit GSSI range, e.g.:
+#     [3000, 3000],
 
 # Optional restart recovery seed list. Normally omit this: Nexus-BS auto-manages
 # a volatile subscriber cache beside the runtime config and probes previously
@@ -418,6 +429,16 @@ bind = "127.0.0.1"
 # In the recommended split deployment, `nexus-bs-dashboard` serves this folder
 # and proxies `/api/*` plus `/ws` to the loopback-only core API above.
 # static_dir = "/home/chris/nexus-bs/dashboard"
+
+###############################################################################
+
+# Local command/control WebSocket used by the split `nexus-bs-control@user`
+# service and by the flat `./nexus-bs-control` helper.
+#
+[command]
+host = "127.0.0.1"
+port = 9002
+use_tls = false
 
 ###############################################################################
 
