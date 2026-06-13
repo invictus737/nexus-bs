@@ -3,20 +3,20 @@ SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 -->
 
-# Easy Install: Release Package (.deb)
+# Instalación fácil: paquete release (.deb)
 
-Languages: **English** | [Română](Install-from-APT-ro) | [Deutsch](Install-from-APT-de) | [Español](Install-from-APT-es)
+Idiomas: [English](Install-from-APT) | [Română](Install-from-APT-ro) | [Deutsch](Install-from-APT-de) | **Español**
 
-Use this if your target prints `arm64`:
+Usa esto si tu sistema muestra `arm64`:
 
 ```sh
 dpkg --print-architecture
 ```
 
-## Copy This To Install
+## Copia esto para instalar
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Cuando se abra el editor de configuración, guarda y ciérralo; el siguiente
+comando inicia Nexus-BS.
 
 ```sh
 sudo apt update
@@ -32,24 +32,24 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-The live config is:
+La configuración activa es:
 
 ```text
 /etc/nexus-bs/config.toml
 ```
 
-## What To Edit
+## Qué editar
 
-Before you start RF, edit only the settings you know:
+Antes de iniciar RF, cambia solo los ajustes que conoces:
 
-- legal TX/RX frequencies;
-- SDR device;
-- antenna and gain settings;
-- MCC/MNC and local group IDs;
-- dashboard password;
-- Brew/TetraPack credentials only if you already have valid credentials.
+- frecuencias legales TX/RX;
+- dispositivo SDR;
+- antena y ganancias;
+- MCC/MNC e IDs de grupos locales;
+- contraseña del dashboard;
+- credenciales Brew/TetraPack solo si ya tienes credenciales válidas.
 
-## Useful Service Commands
+## Comandos útiles
 
 ```sh
 nexus-bs-service status
@@ -63,16 +63,16 @@ Dashboard:
 http://<target-ip>:8080
 ```
 
-## Update Later
+## Actualizar después
 
-Download the newer `.deb`, then:
+Descarga el `.deb` nuevo, luego:
 
 ```sh
 sudo apt install ./nexus-bs_NEW_VERSION_arm64.deb
 nexus-bs-service restart
 ```
 
-Package updates do not replace:
+Las actualizaciones del paquete no reemplazan:
 
 ```text
 /etc/nexus-bs/config.toml

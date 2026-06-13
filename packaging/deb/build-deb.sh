@@ -172,6 +172,9 @@ install_payload() {
     install -m 0755 "${DIST_DIR}/bin/nexus-bs" "${root}/${prefix_rel}/bin/nexus-bs"
     install -m 0755 "${DIST_DIR}/bin/nexus-bs-control-service" "${root}/${prefix_rel}/bin/nexus-bs-control-service"
     install -m 0755 "${DIST_DIR}/bin/nexus-bs-dashboard" "${root}/${prefix_rel}/bin/nexus-bs-dashboard"
+    install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-service" "${root}/${prefix_rel}/bin/nexus-bs-service"
+    install -d -m 0755 "${root}/usr/bin"
+    install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-service" "${root}/usr/bin/nexus-bs-service"
 
     install -d -m 0755 "${root}/${prefix_rel}/dashboard/assets"
     install -m 0644 "${DIST_DIR}/dashboard/index.html" "${root}/${prefix_rel}/dashboard/index.html"

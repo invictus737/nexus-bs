@@ -33,19 +33,18 @@ Other optional overrides:
 - `WORK_DIR`: temporary staging directory.
 - `KEEP_BUILD_DIR=1`: keep the staging tree after a build.
 
-The package installs binaries and dashboard assets under `/opt/nexus-bs`,
-systemd service templates under `/lib/systemd/system`, and config examples
-under `/etc/nexus-bs/examples`. On first install, `postinst` creates
-`/etc/nexus-bs/config.toml` and `/etc/nexus-bs/config.toml.fallback` from those
-examples only if they do not already exist.
+The package installs binaries and the dashboard under `/opt/nexus-bs`,
+`nexus-bs-service` on `PATH`, systemd service templates under
+`/lib/systemd/system`, and config examples under `/etc/nexus-bs/examples`. On
+first install, `postinst` creates `/etc/nexus-bs/config.toml` and
+`/etc/nexus-bs/config.toml.fallback` from those examples only if they do not
+already exist.
 
-Package upgrades, `apt remove`, and `apt purge` do not overwrite or delete the
-live `/etc/nexus-bs/config.toml` files because they are not owned by the Debian
-package. Review the global live config before starting services:
+Package upgrades, `apt remove`, and `apt purge` intentionally leave the live
+`/etc/nexus-bs/config.toml` files in place. Review the global live config before
+starting services:
 
 ```sh
-sudoedit /etc/nexus-bs/config.toml
-sudo systemctl enable --now nexus-bs-control@chris.service
-sudo systemctl enable --now nexus-bs@chris.service
-sudo systemctl enable --now nexus-bs-dashboard@chris.service
+nexus-bs-service edit-config
+nexus-bs-service start
 ```

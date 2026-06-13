@@ -15,4 +15,4 @@ Description: Nexus-BS TETRA base station runtime
  /etc/nexus-bs/config.toml only when the live file is missing.
  .
  Services are not enabled or started automatically. Review
- /etc/nexus-bs/config.toml before enabling nexus-bs@<user>.service.
+ /etc/nexus-bs/config.toml, then run: nexus-bs-service start.

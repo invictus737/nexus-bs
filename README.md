@@ -28,8 +28,8 @@ certification. Formal certification requires official conformance evidence.
 
 | Need | Start here |
 |---|---|
-| Install from source | [Classic Source Install](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source) |
-| Install the optional Debian package | [GitHub Releases](https://github.com/invictus737/nexus-bs/releases) and [Optional .deb Install](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT) |
+| Easy install `.deb` | [Easy Install (.deb)](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT) |
+| Build and install from source | [Build From Source](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source) |
 | Configure a station | [`example_config/config.toml`](example_config/config.toml) |
 | Use systemd services | [`contrib/systemd/`](contrib/systemd/) |
 | Review standards workflow/cache | [`Docs/tetra-standards/`](Docs/tetra-standards/) |
@@ -192,13 +192,15 @@ network being used.
 The dashboard is intentionally operational and minimal. It exists to support
 monitoring, diagnosis and service control, not to be a showcase UI.
 
-The recommended deployment uses three processes:
+Nexus-BS runs a few background parts for reliability, but normal operation uses
+one helper command:
 
-| Service | Public | Role |
-|---|---:|---|
-| `nexus-bs@USER.service` | No | RF/TETRA core and loopback dashboard API |
-| `nexus-bs-dashboard@USER.service` | Yes, port `8080` | Static dashboard and API/WebSocket proxy |
-| `nexus-bs-control@USER.service` | No | Local command/control bridge |
+```sh
+nexus-bs-service start
+nexus-bs-service status
+nexus-bs-service logs
+nexus-bs-service restart
+```
 
 Dashboard and telemetry coverage includes:
 
@@ -236,24 +238,40 @@ scheduling, LLC ACK/retransmission behavior, bounded queues, and parser guards.
 
 ## Installation
 
-The normal operator path is the classic source install:
+There are two beginner install methods:
 
-1. `git clone` or `git pull --ff-only`
-2. `cargo build --release --locked`
-3. copy the release binaries and dashboard assets to `/home/<run-user>/nexus-bs`
-4. install the systemd templates from [`contrib/systemd/`](contrib/systemd/)
-5. edit `/etc/nexus-bs/config.toml`
-6. start `nexus-bs-control@USER`, `nexus-bs@USER`, and
-   `nexus-bs-dashboard@USER`
+| Method | Use this when |
+|---|---|
+| [Easy Install (.deb)](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT) | You want the prebuilt `arm64` release package from GitHub Releases. |
+| [Build From Source](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source) | You want to compile Nexus-BS yourself or your target is not `arm64`. |
 
-See the GitHub Wiki:
+Easy install:
 
-- [Classic Source Install](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source)
-- [Optional .deb Install](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT)
+```sh
+dpkg --print-architecture
+```
 
-Before transmitting, verify RF frequency plan, legal operating authority,
-MCC/MNC, carrier plan, SDR hardware selection, gains, antennas, Brew
-credentials and dashboard access controls.
+If it prints `arm64`, use [Easy Install (.deb)](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT).
+
+Both methods end with the same commands:
+
+```sh
+nexus-bs-service edit-config
+nexus-bs-service start
+```
+
+The live config path is:
+
+```text
+/etc/nexus-bs/config.toml
+```
+
+Before transmitting, edit only the settings you know: legal TX/RX frequencies,
+SDR device, antenna/gains, MCC/MNC, local groups, dashboard password, and
+Brew/TetraPack credentials if you have them.
+
+Behind the scenes, the helper manages the RF/TETRA core, dashboard front-end and
+local control bridge as separate supervised services.
 
 ## Licensing
 

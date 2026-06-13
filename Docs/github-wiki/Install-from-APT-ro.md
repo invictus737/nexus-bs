@@ -3,20 +3,20 @@ SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 -->
 
-# Easy Install: Release Package (.deb)
+# Instalare ușoară: pachet release (.deb)
 
-Languages: **English** | [Română](Install-from-APT-ro) | [Deutsch](Install-from-APT-de) | [Español](Install-from-APT-es)
+Limbi: [English](Install-from-APT) | **Română** | [Deutsch](Install-from-APT-de) | [Español](Install-from-APT-es)
 
-Use this if your target prints `arm64`:
+Folosește asta dacă targetul afișează `arm64`:
 
 ```sh
 dpkg --print-architecture
 ```
 
-## Copy This To Install
+## Copiază asta pentru instalare
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Când se deschide editorul de config, salvează și închide; comanda următoare
+pornește Nexus-BS.
 
 ```sh
 sudo apt update
@@ -32,24 +32,24 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-The live config is:
+Config-ul live este:
 
 ```text
 /etc/nexus-bs/config.toml
 ```
 
-## What To Edit
+## Ce trebuie editat
 
-Before you start RF, edit only the settings you know:
+Înainte să pornești RF, modifică doar setările pe care le știi:
 
-- legal TX/RX frequencies;
-- SDR device;
-- antenna and gain settings;
-- MCC/MNC and local group IDs;
-- dashboard password;
-- Brew/TetraPack credentials only if you already have valid credentials.
+- frecvențele legale TX/RX;
+- dispozitivul SDR;
+- antena și gain-urile;
+- MCC/MNC și grupurile locale;
+- parola dashboard-ului;
+- credențiale Brew/TetraPack doar dacă ai deja credențiale valide.
 
-## Useful Service Commands
+## Comenzi utile
 
 ```sh
 nexus-bs-service status
@@ -63,16 +63,16 @@ Dashboard:
 http://<target-ip>:8080
 ```
 
-## Update Later
+## Update mai târziu
 
-Download the newer `.deb`, then:
+Descarcă pachetul `.deb` mai nou, apoi:
 
 ```sh
 sudo apt install ./nexus-bs_NEW_VERSION_arm64.deb
 nexus-bs-service restart
 ```
 
-Package updates do not replace:
+Update-ul pachetului nu înlocuiește:
 
 ```text
 /etc/nexus-bs/config.toml

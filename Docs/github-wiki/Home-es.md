@@ -5,29 +5,29 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 # Nexus-BS Wiki
 
-## Choose Language
+## Elegir idioma
 
-| Language | Start | Easy install | Source install |
+| Idioma | Inicio | Instalación fácil | Instalación desde fuente |
 |---|---|---|---|
-| English | **Start** | [Easy `.deb`](Install-from-APT) | [Build from source](Build-from-Source) |
+| English | [Start](Home) | [Easy `.deb`](Install-from-APT) | [Build from source](Build-from-Source) |
 | Română | [Start](Home-ro) | [Instalare `.deb`](Install-from-APT-ro) | [Build din surse](Build-from-Source-ro) |
 | Deutsch | [Start](Home-de) | [`.deb` Installation](Install-from-APT-de) | [Aus Quellen bauen](Build-from-Source-de) |
-| Español | [Inicio](Home-es) | [Instalación `.deb`](Install-from-APT-es) | [Compilar desde fuente](Build-from-Source-es) |
+| Español | **Inicio** | [Instalación `.deb`](Install-from-APT-es) | [Compilar desde fuente](Build-from-Source-es) |
 
-## Start Here: Easy Install (.deb)
+## Empieza aquí: instalación fácil (.deb)
 
-Use this on an `arm64` Debian/Ubuntu/Raspberry Pi style target.
+Usa este método en un sistema Debian/Ubuntu/Raspberry Pi `arm64`.
 
-Check first:
+Comprueba primero:
 
 ```sh
 dpkg --print-architecture
 ```
 
-If it prints `arm64`, copy this:
+Si muestra `arm64`, copia esto:
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Cuando se abra el editor de configuración, guarda y ciérralo; el siguiente
+comando inicia Nexus-BS.
 
 ```sh
 sudo apt update
@@ -43,15 +43,15 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-Full page: [Easy Install (.deb)](Install-from-APT)
+Página completa: [Instalación fácil (.deb)](Install-from-APT-es)
 
-## Advanced: Build From Source
+## Avanzado: compilar desde fuente
 
-Use this only when you want to compile Nexus-BS yourself or your target is not
+Usa esto solo si quieres compilar Nexus-BS tú mismo o si el sistema no es
 `arm64`.
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Cuando se abra el editor de configuración, guarda y ciérralo; el siguiente
+comando inicia Nexus-BS.
 
 ```sh
 sudo apt update
@@ -63,9 +63,9 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-Full page: [Build From Source](Build-from-Source)
+Página completa: [Compilar desde fuente](Build-from-Source-es)
 
-## One Command After Install
+## Un solo comando después de instalar
 
 ```sh
 nexus-bs-service start
@@ -74,12 +74,12 @@ nexus-bs-service logs
 nexus-bs-service restart
 ```
 
-Config path:
+La configuración activa está aquí:
 
 ```text
 /etc/nexus-bs/config.toml
 ```
 
-Before transmitting, edit only the settings you know: legal TX/RX frequencies,
-SDR device, antenna/gains, MCC/MNC, local groups, dashboard password, and
-Brew/TetraPack credentials if you have them.
+Antes de transmitir RF, cambia solo los ajustes que conoces: frecuencias legales
+TX/RX, dispositivo SDR, antena/ganancias, MCC/MNC, grupos locales, contraseña
+del dashboard y credenciales Brew/TetraPack si las tienes.

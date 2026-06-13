@@ -3,20 +3,20 @@ SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 -->
 
-# Easy Install: Release Package (.deb)
+# Einfache Installation: Release-Paket (.deb)
 
-Languages: **English** | [Română](Install-from-APT-ro) | [Deutsch](Install-from-APT-de) | [Español](Install-from-APT-es)
+Sprachen: [English](Install-from-APT) | [Română](Install-from-APT-ro) | **Deutsch** | [Español](Install-from-APT-es)
 
-Use this if your target prints `arm64`:
+Nutze dies, wenn dein Zielsystem `arm64` ausgibt:
 
 ```sh
 dpkg --print-architecture
 ```
 
-## Copy This To Install
+## Zum Installieren kopieren
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Wenn der Konfigurationseditor geöffnet wird, speichern und schließen; der
+nächste Befehl startet Nexus-BS.
 
 ```sh
 sudo apt update
@@ -32,24 +32,24 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-The live config is:
+Die Live-Konfiguration ist:
 
 ```text
 /etc/nexus-bs/config.toml
 ```
 
-## What To Edit
+## Was zu bearbeiten ist
 
-Before you start RF, edit only the settings you know:
+Vor dem RF-Start ändere nur Einstellungen, die du kennst:
 
-- legal TX/RX frequencies;
-- SDR device;
-- antenna and gain settings;
-- MCC/MNC and local group IDs;
-- dashboard password;
-- Brew/TetraPack credentials only if you already have valid credentials.
+- legale TX/RX Frequenzen;
+- SDR-Gerät;
+- Antenne und Gain-Einstellungen;
+- MCC/MNC und lokale Gruppen-IDs;
+- Dashboard-Passwort;
+- Brew/TetraPack-Zugangsdaten nur, wenn du gültige Zugangsdaten hast.
 
-## Useful Service Commands
+## Nützliche Service-Kommandos
 
 ```sh
 nexus-bs-service status
@@ -63,16 +63,16 @@ Dashboard:
 http://<target-ip>:8080
 ```
 
-## Update Later
+## Später aktualisieren
 
-Download the newer `.deb`, then:
+Lade das neuere `.deb` herunter, dann:
 
 ```sh
 sudo apt install ./nexus-bs_NEW_VERSION_arm64.deb
 nexus-bs-service restart
 ```
 
-Package updates do not replace:
+Paketupdates ersetzen diese Dateien nicht:
 
 ```text
 /etc/nexus-bs/config.toml

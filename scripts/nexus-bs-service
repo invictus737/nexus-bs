@@ -1,0 +1,178 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+set -eu
+
+RUN_USER="${NEXUS_BS_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
+CONFIG_FILE="${NEXUS_BS_CONFIG:-/etc/nexus-bs/config.toml}"
+LOG_LINES="${NEXUS_BS_LOG_LINES:-160}"
+SUDO_CMD="${NEXUS_BS_SUDO-sudo}"
+SYSTEMCTL_CMD="${NEXUS_BS_SYSTEMCTL:-systemctl}"
+JOURNALCTL_CMD="${NEXUS_BS_JOURNALCTL:-journalctl}"
+EDITOR_CMD="${NEXUS_BS_EDITOR:-sudoedit}"
+
+CONTROL_UNIT="nexus-bs-control@${RUN_USER}.service"
+CORE_UNIT="nexus-bs@${RUN_USER}.service"
+DASHBOARD_UNIT="nexus-bs-dashboard@${RUN_USER}.service"
+
+systemctl_cmd() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$SYSTEMCTL_CMD" "$@"
+    elif [ -n "$SUDO_CMD" ]; then
+        "$SUDO_CMD" "$SYSTEMCTL_CMD" "$@"
+    else
+        "$SYSTEMCTL_CMD" "$@"
+    fi
+}
+
+journalctl_cmd() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$JOURNALCTL_CMD" "$@"
+    elif [ -n "$SUDO_CMD" ]; then
+        "$SUDO_CMD" "$JOURNALCTL_CMD" "$@"
+    else
+        "$JOURNALCTL_CMD" "$@"
+    fi
+}
+
+as_root() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    elif [ -n "$SUDO_CMD" ]; then
+        "$SUDO_CMD" "$@"
+    else
+        "$@"
+    fi
+}
+
+ensure_service_name() {
+    expected="nexus-bs@${RUN_USER}.service"
+    [ -f "$CONFIG_FILE" ] || return 0
+    command -v awk >/dev/null 2>&1 || return 0
+
+    if [ "$(id -u)" -ne 0 ] && [ ! -r "$CONFIG_FILE" ]; then
+        printf 'Config is not readable by this user: %s\n' "$CONFIG_FILE" >&2
+        printf 'Use sudoedit or fix ownership before relying on automatic service_name setup.\n' >&2
+        return 0
+    fi
+
+    current="$(
+        awk -F '"' '
+            /^[[:space:]]*service_name[[:space:]]*=/ {
+                print $2
+                exit
+            }
+        ' "$CONFIG_FILE" 2>/dev/null || true
+    )"
+
+    if [ "$current" = "$expected" ]; then
+        return 0
+    fi
+
+    if [ -n "$current" ] && [ "$current" != "nexus-bs" ]; then
+        printf 'Config service_name is %s; expected %s. Keeping existing value.\n' "$current" "$expected" >&2
+        return 0
+    fi
+
+    tmp="${TMPDIR:-/tmp}/nexus-bs-service-config.$$"
+    awk -v unit="$expected" '
+        BEGIN { done = 0 }
+        /^[[:space:]]*service_name[[:space:]]*=/ && done == 0 {
+            print "service_name = \"" unit "\""
+            done = 1
+            next
+        }
+        { print }
+        END {
+            if (done == 0) {
+                print ""
+                print "service_name = \"" unit "\""
+            }
+        }
+    ' "$CONFIG_FILE" > "$tmp"
+
+    as_root cp "$tmp" "$CONFIG_FILE"
+    rm -f "$tmp"
+    printf 'Updated config service_name to %s\n' "$expected"
+}
+
+usage() {
+    cat <<EOF
+Usage: $(basename "$0") COMMAND
+
+Commands:
+  start       Enable and start Nexus-BS
+  stop        Stop Nexus-BS
+  restart     Restart Nexus-BS
+  status      Show service status
+  logs        Show recent logs
+  follow      Follow live logs
+  edit-config Open the live config with sudoedit
+  config      Print the live config path
+
+Environment:
+  NEXUS_BS_USER       Service user, default: ${RUN_USER}
+  NEXUS_BS_CONFIG     Config path, default: ${CONFIG_FILE}
+  NEXUS_BS_LOG_LINES  Lines for logs, default: ${LOG_LINES}
+EOF
+}
+
+edit_config() {
+    printf 'Opening config: %s\n' "$CONFIG_FILE"
+    printf 'Save and close the editor, then continue.\n'
+
+    if [ -n "${NEXUS_BS_EDITOR+x}" ]; then
+        "$EDITOR_CMD" "$CONFIG_FILE"
+    elif command -v nano >/dev/null 2>&1; then
+        if [ -w "$CONFIG_FILE" ]; then
+            nano "$CONFIG_FILE"
+        else
+            as_root nano "$CONFIG_FILE"
+        fi
+    else
+        "$EDITOR_CMD" "$CONFIG_FILE"
+    fi
+}
+
+case "${1:-}" in
+    start)
+        ensure_service_name
+        systemctl_cmd enable --now "$CONTROL_UNIT" "$CORE_UNIT" "$DASHBOARD_UNIT"
+        ;;
+    stop)
+        systemctl_cmd stop "$DASHBOARD_UNIT" "$CORE_UNIT" "$CONTROL_UNIT"
+        ;;
+    restart)
+        ensure_service_name
+        systemctl_cmd stop "$DASHBOARD_UNIT" "$CORE_UNIT" "$CONTROL_UNIT" || true
+        systemctl_cmd enable --now "$CONTROL_UNIT" "$CORE_UNIT" "$DASHBOARD_UNIT"
+        ;;
+    status)
+        "$SYSTEMCTL_CMD" status --no-pager --full "$CORE_UNIT" "$DASHBOARD_UNIT" "$CONTROL_UNIT" || true
+        ;;
+    logs)
+        journalctl_cmd -u "$CORE_UNIT" -u "$DASHBOARD_UNIT" -u "$CONTROL_UNIT" -n "$LOG_LINES" --no-pager
+        ;;
+    follow)
+        journalctl_cmd -u "$CORE_UNIT" -u "$DASHBOARD_UNIT" -u "$CONTROL_UNIT" -f
+        ;;
+    edit-config)
+        edit_config
+        ;;
+    config)
+        printf '%s\n' "$CONFIG_FILE"
+        ;;
+    help|-h|--help)
+        usage
+        ;;
+    "")
+        usage
+        exit 1
+        ;;
+    *)
+        printf 'Unknown command: %s\n\n' "$1" >&2
+        usage >&2
+        exit 1
+        ;;
+esac

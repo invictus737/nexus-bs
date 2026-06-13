@@ -5,29 +5,29 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 # Nexus-BS Wiki
 
-## Choose Language
+## Alege limba
 
-| Language | Start | Easy install | Source install |
+| Limbă | Start | Instalare ușoară | Instalare din surse |
 |---|---|---|---|
-| English | **Start** | [Easy `.deb`](Install-from-APT) | [Build from source](Build-from-Source) |
-| Română | [Start](Home-ro) | [Instalare `.deb`](Install-from-APT-ro) | [Build din surse](Build-from-Source-ro) |
+| English | [Start](Home) | [Easy `.deb`](Install-from-APT) | [Build from source](Build-from-Source) |
+| Română | **Start** | [Instalare `.deb`](Install-from-APT-ro) | [Build din surse](Build-from-Source-ro) |
 | Deutsch | [Start](Home-de) | [`.deb` Installation](Install-from-APT-de) | [Aus Quellen bauen](Build-from-Source-de) |
 | Español | [Inicio](Home-es) | [Instalación `.deb`](Install-from-APT-es) | [Compilar desde fuente](Build-from-Source-es) |
 
-## Start Here: Easy Install (.deb)
+## Începe aici: instalare ușoară (.deb)
 
-Use this on an `arm64` Debian/Ubuntu/Raspberry Pi style target.
+Folosește metoda asta pe un sistem Debian/Ubuntu/Raspberry Pi `arm64`.
 
-Check first:
+Verifică întâi:
 
 ```sh
 dpkg --print-architecture
 ```
 
-If it prints `arm64`, copy this:
+Dacă afișează `arm64`, copiază asta:
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Când se deschide editorul de config, salvează și închide; comanda următoare
+pornește Nexus-BS.
 
 ```sh
 sudo apt update
@@ -43,15 +43,15 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-Full page: [Easy Install (.deb)](Install-from-APT)
+Pagina completă: [Instalare ușoară (.deb)](Install-from-APT-ro)
 
-## Advanced: Build From Source
+## Avansat: build din surse
 
-Use this only when you want to compile Nexus-BS yourself or your target is not
+Folosește asta doar dacă vrei să compilezi Nexus-BS sau dacă targetul nu este
 `arm64`.
 
-When the config editor opens, save and close it; the next command starts
-Nexus-BS.
+Când se deschide editorul de config, salvează și închide; comanda următoare
+pornește Nexus-BS.
 
 ```sh
 sudo apt update
@@ -63,9 +63,9 @@ nexus-bs-service edit-config
 nexus-bs-service start
 ```
 
-Full page: [Build From Source](Build-from-Source)
+Pagina completă: [Build din surse](Build-from-Source-ro)
 
-## One Command After Install
+## O singură comandă după instalare
 
 ```sh
 nexus-bs-service start
@@ -74,12 +74,12 @@ nexus-bs-service logs
 nexus-bs-service restart
 ```
 
-Config path:
+Config-ul live este aici:
 
 ```text
 /etc/nexus-bs/config.toml
 ```
 
-Before transmitting, edit only the settings you know: legal TX/RX frequencies,
-SDR device, antenna/gains, MCC/MNC, local groups, dashboard password, and
-Brew/TetraPack credentials if you have them.
+Înainte să transmiți RF, modifică doar setările pe care le știi: frecvențele
+legale TX/RX, SDR-ul, antena/gain-urile, MCC/MNC, grupurile locale, parola de
+dashboard și credențialele Brew/TetraPack dacă le ai.
