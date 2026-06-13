@@ -134,7 +134,7 @@ neighbor_cell_broadcast = 1
 # IANA timezone for time broadcasting via D-NWRK-BROADCAST. When set, the BS will
 # broadcast UTC time and local time offset twice per hyperframe (~30.6s) so that
 # radios can synchronize their clocks. Daylight saving time is handled automatically.
-# timezone = "Europe/Bucharest"
+# timezone = "Etc/UTC"
 
 # Keep disabled unless full all-slot frame-18 receive support is implemented and
 # verified for the target terminals. Nexus-BS currently handles frame 18
@@ -313,8 +313,8 @@ energy_saving_mode = "auto"
 #
 # CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
 # nexus-bs-control@<user>.service endpoint is enabled:
-#   ./nexus-bs-control sendwap 16777215 2260618 false
-#   ./nexus-bs-control sendwapcolor 16777215 2260618 false
+#   ./nexus-bs-control sendwap 16777215 1001 false
+#   ./nexus-bs-control sendwapcolor 16777215 1001 false
 #
 # Advanced override variables for non-default service users/runtimes:
 #   NEXUS_BS_USER=<user>
@@ -322,7 +322,7 @@ energy_saving_mode = "auto"
 #   NEXUS_BS_CONTROL_FIFO=/run/nexus-bs-<user>/control.commands
 #
 # Default WML page text:
-#   Hello! You are running Nexus-BS. Gretings and 73! from Chris YO3TCO!
+#   Hello! You are running Nexus-BS.
 #
 # Keep sndcp_service=false above unless a real packet-data/SNDCP bearer is
 # implemented and verified.
@@ -343,7 +343,7 @@ energy_saving_mode = "auto"
 #   "kick_all"  — deregisters all currently registered terminals; they re-attach immediately
 #
 # [cell_info.sds_command_control]
-# authorized_issis = [2260570, 2260571]   # ISSIs allowed to send commands
+# authorized_issis = [1001, 1002]   # ISSIs allowed to send commands
 #
 # [[cell_info.sds_command_control.commands]]
 # status_code = 36865             # 0x9001; ETSI network/user-specific U-STATUS code sent to ISSI 9999
@@ -367,7 +367,7 @@ energy_saving_mode = "auto"
 # Leave empty or omit the section entirely to accept any terminal (open network).
 #
 # [security]
-# issi_whitelist = [2260571, 2260572, 2260575]
+# issi_whitelist = [1001, 1002, 1003]
 
 ###############################################################################
 
@@ -375,7 +375,7 @@ energy_saving_mode = "auto"
 #
 # A weather responder that runs inside Nexus-BS — no external bot needed.
 #
-#   On-demand:  a radio sends an SDS like "METAR LROP" (or "WX LROP", or just "LROP")
+#   On-demand:  a radio sends an SDS like "METAR EGLL" (or "WX EGLL", or just "EGLL")
 #               to service_issi and receives a decoded, ASCII report back.
 #   Periodic:   Nexus-BS auto-sends a fixed station's METAR to periodic_issi every
 #               periodic_interval_secs (minimum 300 s).
@@ -389,7 +389,7 @@ energy_saving_mode = "auto"
 # periodic_enabled = false       # auto-broadcast a fixed station periodically
 # periodic_issi = 1001           # destination (ISSI, or a GSSI if periodic_is_group)
 # periodic_is_group = false      # true = periodic_issi is a talkgroup (GSSI)
-# periodic_icao = "LROP"         # station whose METAR is auto-sent
+# periodic_icao = "EGLL"         # station whose METAR is auto-sent
 # periodic_interval_secs = 1800  # send period in seconds (>= 300)
 
 ###############################################################################
@@ -428,7 +428,7 @@ bind = "127.0.0.1"
 # OPTIONAL: external dashboard asset directory for legacy all-in-one mode.
 # In the recommended split deployment, `nexus-bs-dashboard` serves this folder
 # and proxies `/api/*` plus `/ws` to the loopback-only core API above.
-# static_dir = "/home/chris/nexus-bs/dashboard"
+# static_dir = "/opt/nexus-bs/dashboard"
 
 ###############################################################################
 
@@ -466,8 +466,8 @@ restart_cooldown_secs = 600
 # [brew]
 
 # Server address
-# host = "core.tetraflow.ro"
-# port = 9000
+# host = "core.tetrapack.online"
+# port = 443
 
 # Use TLS (wss:// / https://)
 # tls = true
@@ -475,8 +475,8 @@ restart_cooldown_secs = 600
 # HTTP Digest authentication credentials, registered in BrandMeister.
 # Username should be your SSID (DMR ID + 2-digit suffix).
 # Password is your BrandMeister hotspot password.
-# username = 123456700
-# password = "012345"
+# username = 123456789
+# password = "change-me"
 
 # Reconnect delay (seconds)
 # reconnect_delay_secs = 15
@@ -491,7 +491,7 @@ restart_cooldown_secs = 600
 # Export RSSI measurements to the Brew server as Service (0xf4) JSON messages.
 # Disabled by default. Enable if your Brew server supports RSSI data ingestion.
 # When enabled, each radio's signal level is sent at most once every 5 seconds.
-# Format: {"issi": 2260570, "rssi_dbfs": -42.3}
+# Format: {"issi": 1001, "rssi_dbfs": -42.3}
 # feature_rssi_export = false
 
 # Uncomment to allow only calls for selected SSIs to be forwarded through Brew.
