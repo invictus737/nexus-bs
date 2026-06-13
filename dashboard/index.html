@@ -1,0 +1,395 @@
+<!doctype html>
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+-->
+
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <meta name="nexus-bs-radioid-endpoint" content="/api/radioid">
+  <title>Nexus-BS Operations</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app">
+    <aside class="rail">
+      <div class="brand">
+        <img class="brand-logo" src="/assets/nexus-bs-logo.svg" alt="Nexus-BS">
+      </div>
+
+      <nav class="nav" aria-label="Dashboard pages">
+        <button class="nav-item active" data-page="system" type="button">System</button>
+        <button class="nav-item" data-page="traffic" type="button">Traffic</button>
+        <button class="nav-item" data-page="settings" type="button">Settings</button>
+        <button class="nav-item" data-page="logs" type="button">Logs</button>
+        <button class="nav-item" data-page="about" type="button">About</button>
+      </nav>
+
+      <div class="rail-status" aria-label="Live status">
+        <div class="status-line"><span>Console</span><strong id="railConsoleState">START</strong></div>
+        <div class="status-line"><span>Telemetry</span><strong id="railTelemetryState">SYNC</strong></div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div class="top-title">
+          <h1 id="pageTitle">System</h1>
+          <p id="subtitle">Local TETRA eBTS operations console</p>
+        </div>
+        <div class="top-actions">
+          <button class="icon-btn" id="refreshBtn" title="Refresh system state" aria-label="Refresh system state" type="button">↻</button>
+        </div>
+      </header>
+
+      <section class="page active" id="page-system" aria-labelledby="systemHeading">
+        <div class="page-head">
+          <div>
+            <h2 id="systemHeading">System</h2>
+            <p>Host, runtime, RF chain, and registered terminals.</p>
+          </div>
+        </div>
+
+        <section class="status-strip" id="systemRfOpsStatusStrip" aria-label="System and RF operations status">
+          <div class="strip-cell" id="systemStatusStrip">
+            <span>System</span>
+            <strong id="coreState">CONNECTING</strong>
+            <small>Core and host telemetry</small>
+          </div>
+          <div class="strip-cell" id="rfOpsStatusStrip">
+            <span>RF Ops</span>
+            <strong id="rfState">WAITING</strong>
+            <small>SDR, carrier, and slot operations</small>
+          </div>
+          <div class="strip-cell" id="brewStatusStrip">
+            <span>Backhaul</span>
+            <strong id="brewState">OFFLINE</strong>
+            <small>Brew and local routing state</small>
+          </div>
+          <div class="strip-cell" id="telemetryStatusStrip">
+            <span>Telemetry</span>
+            <strong id="systemTelemetryState">SYNC</strong>
+            <small>Snapshot and WebSocket feeds</small>
+          </div>
+        </section>
+
+        <section class="panel device-map-panel" id="deviceMapPanel" aria-label="Nexus-BS device view">
+          <div class="panel-head"><h2>Location: Nexus-BS</h2><span id="diagramProgram">local carrier</span></div>
+          <div class="device-map">
+            <div class="map-meters">
+              <div class="map-meter" id="mapCoreMeter">
+                <span>Core State</span>
+                <strong id="diagramCoreState">SYNC</strong>
+                <div class="meter-scale"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              </div>
+              <div class="map-meter" id="mapRfMeter">
+                <span>RF Path</span>
+                <strong id="diagramRfState">WAITING</strong>
+                <div class="meter-scale"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              </div>
+            </div>
+
+            <div class="component-stage">
+              <div class="component-stack exciters">
+                <div class="component-node" id="nodeRfDevice">
+                  <span class="node-led"></span>
+                  <strong>SDR / RF Front-End</strong>
+                  <small id="diagramRfDevice">SXceiver</small>
+                </div>
+                <div class="component-node secondary" id="nodeBrew">
+                  <span class="node-led"></span>
+                  <strong>Brew / SwMI Backhaul</strong>
+                  <small id="diagramBrewState">LOCAL</small>
+                </div>
+              </div>
+
+              <div class="component-node baseband" id="nodePhy">
+                <span class="node-led"></span>
+                <strong>PHY / Baseband</strong>
+                <small id="diagramPhyState">pi/4-DQPSK, TX visual</small>
+              </div>
+
+              <div class="component-node controller" id="nodeScheduler">
+                <span class="node-led"></span>
+                <strong>UMAC Scheduler</strong>
+                <small id="diagramSlotState">TS1 control, TS2-TS4 traffic</small>
+              </div>
+
+              <div class="component-node output" id="nodeOutput">
+                <span class="node-led"></span>
+                <strong>Air Interface Services</strong>
+                <small id="diagramServicesState">CMCE voice, MM, SDS</small>
+              </div>
+
+              <div class="antenna-stage" aria-label="Antenna path">
+                <div class="antenna-symbol" aria-hidden="true"></div>
+                <strong>Antenna</strong>
+                <small id="diagramAntennaState">program path on</small>
+              </div>
+            </div>
+
+            <div class="program-card">
+              <strong>Carrier Plan</strong>
+              <span id="diagramFrequency">--</span>
+              <small id="diagramNetwork">--</small>
+            </div>
+
+            <button type="button" class="path-toggle is-warn" id="diagramPathToggle" aria-pressed="false" aria-label="RF carrier control">
+              <strong>RF Carrier</strong>
+              <span><i></i><em id="diagramPathToggleState">WAIT</em></span>
+            </button>
+          </div>
+        </section>
+
+        <section class="panel slot-panel">
+          <div class="panel-head"><h2>Timeslots</h2><span id="slotSummary">TS1 control, TS2-TS4 traffic</span></div>
+          <div class="slot-grid" id="slotGrid"></div>
+        </section>
+
+        <section class="panel subscriber-registry-panel" aria-labelledby="radiosHeading">
+          <div class="panel-head"><h2 id="radiosHeading">Subscriber Registry</h2><span id="radiosUpdated">live</span></div>
+          <div class="table-wrap tall">
+            <table>
+              <thead><tr><th>ISSI</th><th>Groups / Scan List</th><th>RSSI dBFS</th><th>Energy Economy</th><th>Last Seen</th></tr></thead>
+              <tbody id="radiosTable"></tbody>
+            </table>
+          </div>
+        </section>
+
+        <div class="grid two system-grid">
+          <section class="panel">
+            <div class="panel-head"><h2>Host</h2><span id="hostName">--</span></div>
+            <dl class="facts">
+              <dt>Product</dt><dd id="productName">--</dd>
+              <dt>CPU</dt><dd id="cpuName">--</dd>
+              <dt>Memory</dt><dd id="memoryUse">--</dd>
+              <dt>Temperature</dt><dd id="cpuTemp">--</dd>
+              <dt>BS Uptime</dt><dd id="bsUptime">--</dd>
+              <dt>Host Uptime</dt><dd id="hostUptime">--</dd>
+              <dt>Config</dt><dd id="configPath">--</dd>
+              <dt>Runtime Config</dt><dd id="runtimeConfigPath">--</dd>
+            </dl>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head"><h2>Carrier Plan</h2><span id="rfFreqMatch">--</span></div>
+            <dl class="facts">
+              <dt>TX Frequency</dt><dd id="rfTxFreq">--</dd>
+              <dt>RX Frequency</dt><dd id="rfRxFreq">--</dd>
+              <dt>Duplex Shift</dt><dd id="rfDuplexShift">--</dd>
+              <dt>Band / Carrier</dt><dd id="rfBandCarrier">--</dd>
+              <dt>MCC / MNC</dt><dd id="rfMccMnc">--</dd>
+              <dt>Location Area</dt><dd id="rfLocationArea">--</dd>
+              <dt>Colour Code</dt><dd id="rfColourCode">--</dd>
+              <dt>Frame 18</dt><dd id="rfFrame18">--</dd>
+            </dl>
+          </section>
+        </div>
+
+        <div class="grid two system-grid lower-system">
+          <section class="panel">
+            <div class="panel-head"><h2>RF Device</h2><span id="sdrName">--</span></div>
+            <dl class="facts">
+              <dt>Device</dt><dd id="rfDevice">--</dd>
+              <dt>Sample Rate</dt><dd id="rfSampleRate">--</dd>
+              <dt>PPM</dt><dd id="rfPpm">--</dd>
+              <dt>Channels</dt><dd id="rfChannels">--</dd>
+              <dt>Antennas</dt><dd id="rfAntennas">--</dd>
+              <dt>TX Gains</dt><dd id="rfTxGains">--</dd>
+              <dt>RX Gains</dt><dd id="rfRxGains">--</dd>
+              <dt>Temperature</dt><dd id="rfTemp">--</dd>
+            </dl>
+          </section>
+
+          <section class="panel">
+            <div class="panel-head"><h2>Signal Quality</h2><span id="rfSnapshotAge">cached</span></div>
+            <dl class="facts">
+              <dt>RMS</dt><dd id="rfRms">--</dd>
+              <dt>Peak</dt><dd id="rfPeak">--</dd>
+              <dt>DSP EVM Est.</dt><dd id="rfEvm">--</dd>
+              <dt>PAPR</dt><dd id="rfPapr">--</dd>
+              <dt>Occupied BW</dt><dd id="rfObw">--</dd>
+              <dt>Carrier Leak</dt><dd id="rfCarrierLeak">--</dd>
+              <dt>System Power</dt><dd id="rfPower">--</dd>
+              <dt>Soapy Summary</dt><dd id="soapyInfo">--</dd>
+            </dl>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="page-traffic" aria-labelledby="trafficHeading">
+        <div class="page-head">
+          <div>
+            <h2 id="trafficHeading">Traffic</h2>
+            <p>Air-interface voice, SDS, and call activity.</p>
+          </div>
+        </div>
+
+        <div class="traffic-dashboard" id="trafficDashboard">
+          <div class="metrics">
+            <div class="metric"><span>Registered</span><strong id="metricRadios">0</strong></div>
+            <div class="metric"><span>Active Calls</span><strong id="metricCalls">0</strong></div>
+            <div class="metric"><span>Last Heard</span><strong id="metricHeard">0</strong></div>
+            <div class="metric"><span>CPU</span><strong id="metricCpu">--</strong></div>
+          </div>
+
+          <section class="panel active-calls-panel">
+            <div class="panel-head active-calls-head"><h2>Active Calls</h2><span id="callCountLabel">0 active</span></div>
+            <div class="active-call-board" id="overviewCalls"></div>
+          </section>
+
+          <section class="panel overview-heard-panel">
+            <div class="panel-head"><h2>Last Heard</h2><span id="overviewHeardLabel">Voice and SDS</span></div>
+            <div class="table-wrap heard-timeline">
+              <table>
+                <thead><tr><th>Time</th><th>Source</th><th>Event</th><th>Target</th></tr></thead>
+                <tbody id="overviewHeard"></tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+      </section>
+
+      <section class="page" id="page-settings" aria-labelledby="settingsHeading">
+        <div class="page-head">
+          <div>
+            <h2 id="settingsHeading">Settings</h2>
+            <p>RF, network, and service controls.</p>
+          </div>
+        </div>
+
+        <div class="grid two">
+          <section class="panel" id="settingsSection">
+            <div class="panel-head"><h2>Station Settings</h2><span>configuration</span></div>
+            <dl class="facts">
+              <dt>Carrier</dt><dd id="settingsCarrier">--</dd>
+              <dt>MCC / MNC</dt><dd id="settingsNetworkCode">--</dd>
+              <dt>Color Code</dt><dd id="settingsColorCode">--</dd>
+              <dt>Timeslots</dt><dd id="settingsTimeslots">TS1 control, TS2-TS4 traffic</dd>
+              <dt>Energy Economy</dt><dd id="settingsEnergyEconomy">auto</dd>
+              <dt>Config Mode</dt><dd id="settingsConfigMode">flat local config</dd>
+              <dt>RadioID</dt><dd id="settingsRadioIdEndpoint">/api/radioid</dd>
+            </dl>
+          </section>
+
+          <section class="panel" id="adminSection">
+            <div class="panel-head"><h2>Admin</h2><span>local</span></div>
+            <div class="ops-list">
+              <div class="ops-row"><span>Dashboard Access</span><strong id="adminAccessMode">local session</strong></div>
+              <div class="ops-row"><span>Update Channel</span><strong id="adminUpdateChannel">disabled</strong></div>
+              <div class="ops-row"><span>Maintenance Window</span><strong id="adminMaintenanceWindow">manual</strong></div>
+              <div class="ops-row"><span>Audit Sink</span><strong id="adminAuditSink">runtime log</strong></div>
+              <div class="ops-row"><span>Core Process</span><strong id="adminCoreProcess">separate service</strong></div>
+              <div class="ops-row"><span>Dashboard Process</span><strong id="adminDashboardProcess">separate low-priority service</strong></div>
+            </div>
+            <div class="service-controls" id="serviceControls">
+              <button class="action-btn" id="serviceRestartBtn" type="button">Restart BS</button>
+              <button class="action-btn danger" id="serviceShutdownBtn" type="button">Shutdown BS</button>
+              <button class="action-btn primary" id="serviceStopGoBtn" type="button">Stop &amp; Go 5s</button>
+              <span id="serviceActionStatus">idle</span>
+            </div>
+          </section>
+        </div>
+
+        <section class="panel calibration-panel" id="rfCalibrationPanel">
+          <div class="panel-head"><h2>RF Calibration</h2><span id="calibrationStatus">idle</span></div>
+          <div class="calibration-grid">
+            <div class="calibration-copy">
+              <dl class="facts compact-facts">
+                <dt>File</dt><dd id="calibrationPath">calibration.toml</dd>
+                <dt>Applied</dt><dd id="calibrationApplied">--</dd>
+                <dt>Carrier Leak</dt><dd id="calibrationCarrier">--</dd>
+                <dt>Image Rejection</dt><dd id="calibrationImage">--</dd>
+                <dt>DC/Image Proxy</dt><dd id="calibrationEvm">--</dd>
+              </dl>
+            </div>
+            <div class="calibration-actions">
+              <button class="action-btn danger" id="calibrationRunBtn" type="button">Calibrate TX DC/IQ</button>
+              <span id="calibrationActionStatus">traffic outage required</span>
+              <pre id="calibrationLog" class="calibration-log"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel config-manager" id="configManager">
+          <div class="panel-head"><h2>Config Manager</h2><span id="configProfileStatus">loading</span></div>
+          <div class="config-controls">
+            <label class="field compact">
+              <span>Profile</span>
+              <select id="configProfileSelect"></select>
+            </label>
+            <button class="action-btn" id="configLoadSelectedBtn" type="button">Load</button>
+            <button class="action-btn" id="configActivateBtn" type="button">Activate</button>
+            <button class="action-btn" id="configDuplicateBtn" type="button">Duplicate</button>
+            <button class="action-btn danger" id="configDeleteBtn" type="button">Delete</button>
+            <button class="action-btn secondary" id="configRefreshBtn" type="button">Refresh</button>
+          </div>
+          <div class="config-editor-bar">
+            <label class="field">
+              <span>File</span>
+              <input id="configFileName" type="text" autocomplete="off" spellcheck="false" value="config.toml">
+            </label>
+            <button class="action-btn secondary" id="configLoadCurrentBtn" type="button">Current</button>
+            <button class="action-btn primary" id="configSaveBtn" type="button">Save</button>
+          </div>
+          <textarea id="configEditor" class="config-editor" spellcheck="false" autocomplete="off"></textarea>
+          <div class="config-footer">
+            <span id="configEditorStatus">idle</span>
+            <span id="configApplyStatus">restart required after activation</span>
+          </div>
+        </section>
+      </section>
+
+      <section class="page" id="page-logs" aria-labelledby="logsHeading">
+        <div class="page-head">
+          <div>
+            <h2 id="logsHeading">Logs</h2>
+            <p>Runtime events.</p>
+          </div>
+        </div>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Runtime Log</h2>
+            <div class="panel-actions">
+              <button class="action-btn secondary compact" id="logAutoScrollBtn" type="button">Pause</button>
+              <button class="action-btn secondary compact" id="logExportBtn" type="button">Export</button>
+              <button class="action-btn danger compact" id="logClearBtn" type="button">Clear</button>
+              <span id="logCount">0 lines</span>
+            </div>
+          </div>
+          <div class="log-list" id="logList"></div>
+        </section>
+      </section>
+
+      <section class="page" id="page-about" aria-labelledby="aboutHeading">
+        <div class="page-head">
+          <div>
+            <h2 id="aboutHeading">About</h2>
+            <p>Build identity and operating context.</p>
+          </div>
+        </div>
+
+        <section class="panel" id="aboutSection">
+          <div class="panel-head"><h2>TETRA eBTS Dashboard</h2><span>about</span></div>
+          <dl class="facts">
+            <dt>Console</dt><dd>Nexus-BS Operations</dd>
+            <dt>Project</dt><dd>Nexus-BS Project</dd>
+            <dt>Version</dt><dd id="aboutVersion">--</dd>
+            <dt>GitHub</dt><dd><a href="https://github.com/invictus737/nexus-bs" target="_blank" rel="noopener noreferrer">github.com/invictus737/nexus-bs</a></dd>
+            <dt>Role</dt><dd>Local TETRA eBTS monitoring and control dashboard</dd>
+            <dt>Telemetry</dt><dd>WebSocket events with periodic REST reconciliation</dd>
+            <dt>Radio Lookup</dt><dd>RadioID cache-backed subscriber identity display</dd>
+            <dt>Credits</dt><dd><a href="https://github.com/MidnightBlueLabs/tetra-bluestation" target="_blank" rel="noopener noreferrer">BlueStation Project</a>, Tatu Peltola for his <a href="https://sxceiver.com/" target="_blank" rel="noopener noreferrer">SXCEIVER</a>, <a href="https://github.com/misadeks/tetra-bluestation" target="_blank" rel="noopener noreferrer">Mihajlo YU4MSH</a> for BlueStation fork work and FDX P2P contribution, <a href="https://github.com/razvanzeces/flowstation" target="_blank" rel="noopener noreferrer">FlowStation Project</a>, Dennis DB2OE for dashboard theme inspiration, and all contributors</dd>
+            <dt>Governance</dt><dd>Current Nexus-BS project governance by Chris YO3TCO</dd>
+          </dl>
+        </section>
+      </section>
+    </main>
+  </div>
+  <script src="/assets/app.js" defer></script>
+</body>
+</html>

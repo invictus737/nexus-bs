@@ -1,0 +1,499 @@
+# Nexus-BS v0.1.65 example configuration
+#
+# This file is intentionally valid as-is so it can be parsed by tests and used
+# as a clean starting point. It follows the Nexus-BS field profile while keeping
+# the original BlueStation example carrier/RF plan. Before transmitting, edit
+# frequencies, MCC/MNC, SSI/GSSI policy and service credentials to match your
+# licence, hardware and local legal limits.
+
+config_version = "0.6"
+
+# Stack operating mode: "Bs" (Base Station), "Ms" (Mobile Station), or "Mon" (Monitor)
+stack_mode = "Bs"
+
+# Uncomment to enable verbose logging. Files grow fast and generate additional load.
+# debug_log = "./verbose_log.txt"
+
+# Explicit systemd service unit name. Used by dashboard/service-control paths
+# and by optional SDS command control. Keep this aligned with your unit name:
+#   - legacy unit: "nexus-bs"
+#   - template unit: "nexus-bs@user.service"
+service_name = "nexus-bs"
+
+###############################################################################
+# FALLBACK CONFIG
+#
+# If Nexus-BS fails to parse this config file (e.g. after a bad edit in the
+# dashboard), it automatically tries the fallback file at the same path with
+# ".fallback" appended — e.g. /opt/nexus-bs/config.toml.fallback
+#
+# The fallback file is NEVER overwritten automatically. Create it once with a
+# known-good config and leave it alone:
+#
+#   cp config.toml config.toml.fallback
+#
+# When the fallback is active, the dashboard shows a persistent red warning
+# banner and logs the parse error from the primary config. This lets you fix
+# the broken config.toml from the dashboard without losing remote access.
+###############################################################################
+
+[phy_io]
+
+# RF backend. Nexus-BS v0.1.65 supports the direct SoapySDR backend here.
+# Keep this value exactly as shown unless a new backend is implemented.
+backend = "SoapySdr"
+
+# DEBUG/TEST CODE. Capture files grow fast.
+# dl_tx_file = "./dl_output.bin"    # Debug; uncomment to save generated DL RF samples
+# ul_rx_file = "./ul_output.bin"    # Debug; uncomment to save received UL RF samples
+
+[phy_io.soapysdr]
+# BlueStation reference RF profile. Downlink transmit and uplink receive
+# frequencies are in Hz and MUST match the [cell_info] carrier fields below.
+tx_freq = 438025000
+rx_freq = 433025000
+
+# Sample rate in samples/s. 600 kHz is used by the Nexus-BS/SXceiver field
+# profile and is a conservative starting point for supported SoapySDR devices.
+sample_rate = 600000
+
+# Adjust if your SDR has a non-negligible tuning error.
+ppm_err = 0.0
+
+# TX DC/IQ calibration. Keep disabled until Dashboard Settings -> RF Calibration
+# has generated calibration.toml and accepted a before/after improvement report.
+tx_calibration_enabled = false
+tx_calibration_file = "calibration.toml"
+tx_calibration_apply_dc = true
+tx_calibration_apply_iq = true
+
+################################################################################################
+## OPTIONAL: specific device, antenna, gain selection                                        ##
+## Check your device with SoapySDRUtil --probe                                               ##
+## See the Nexus-BS documentation for deployment-specific examples                           ##
+################################################################################################
+
+# Optional device selection arguments. Uncomment one matching your hardware.
+# If not specified, the first compatible device found is selected automatically.
+# For SXCEIVER / SoapySX:
+# device = "driver=sx,label=sx"
+#
+# Other examples:
+# device = "driver=plutosdr,uri=ip:192.168.42.42"
+# device = "driver=lime,serial=123456789"
+
+# Optional antenna selection (overrides device defaults)
+# rx_antenna = "LNAW"
+# tx_antenna = "BAND2"
+
+# Optional gain values (override device defaults)
+# Check valid gain names with SoapySDRUtil --probe
+# tx_gain_pad = 50.0
+# rx_gain_lna = 30.0
+
+###############################################################################
+
+[net_info]
+# Mobile Country Code (MCC) - identifies your country/network.
+mcc = 901
+
+# Mobile Network Code (MNC) - identifies the TETRA network.
+# Make sure the chosen MNC is legally usable in your deployment.
+mnc = 9999
+
+###############################################################################
+
+[cell_info]
+
+# Carrier plan. For this example, the values derive:
+#   DL = 438025000 Hz
+#   UL = 433025000 Hz
+# matching [phy_io.soapysdr] above.
+# See ETSI TS 100 392-15 clause 6 for duplex spacing tables.
+freq_band = 4                       # 400MHz band
+main_carrier = 1521                 # + 1521 * 25kHz = 38250kHz
+duplex_spacing = 4                  # Use 5MHz spacing between ul and dl (for 400 MHz band)
+# custom_duplex_spacing = 7600000   # Do not uncomment unless you have programmed a custom duplex spacing entry in your radios
+freq_offset = 0                     # Carrier offset. Usually 0. Options: 0, 6250, -6250, 12500 Hz.
+reverse_operation = false           # False: UL below DL. True: UL above DL.
+
+# Location area identifier.
+location_area = 3
+
+# Colour code (0-63), helps distinguish adjacent cells on the same frequency
+colour_code = 1
+
+# MAC-SYNC system code. 3 is the Nexus-BS/ETSI EN 300 392-2 V3 profile.
+system_code = 3
+
+# Neighbor-cell broadcast indication for D-MLE-SYNC/dashboard state. Keep this
+# at 1 for the field profile; add [[cell_info.neighbor_cells_ca]] entries below
+# only when you have real adjacent cells to advertise.
+neighbor_cell_broadcast = 1
+
+# IANA timezone for time broadcasting via D-NWRK-BROADCAST. When set, the BS will
+# broadcast UTC time and local time offset twice per hyperframe (~30.6s) so that
+# radios can synchronize their clocks. Daylight saving time is handled automatically.
+# timezone = "Etc/UTC"
+
+# Keep disabled unless full all-slot frame-18 receive support is implemented and
+# verified for the target terminals. Nexus-BS currently handles frame 18
+# conservatively for ETSI EN 300 392-2 fixed-frame signalling.
+frame_18_ext = false
+
+# Local SSI/GSSI exceptions for this cell. Traffic for these SSIs/GSSIs stays
+# local and is not routed through Brew. Incoming Brew traffic to these values is
+# also rejected. This is a routing policy, not a list of registered terminals.
+# The end of the range is INCLUSIVE — the end number IS in the range.
+local_ssi_ranges = [
+    [1, 90],
+]
+
+# To keep a lab/local talkgroup off Brew, add one explicit GSSI range, e.g.:
+#     [3000, 3000],
+
+# Optional restart recovery seed list. Normally omit this: Nexus-BS auto-manages
+# a volatile subscriber cache beside the runtime config and probes previously
+# attached terminals after service restart without static ISSI entries.
+
+# Optional GSSI provisioning policy for MM group attachment.
+# Leave commented to accept dynamic scan-list groups from radios.
+# When set, group attach requests outside these inclusive ranges are rejected
+# as unknown group identities.
+# allowed_gssi_ranges = [
+#     [3000, 3999],
+# ]
+
+# Cell services. Leave the defaults unless you know what you're changing.
+system_wide_services = true  # If false, radios will operate in fallback mode (ignored when Brew is enabled)
+voice_service = true
+circuit_mode_data_service = false
+sndcp_service = false        # Keep false: WAP MVP is SDS-based, not SNDCP/IP packet data.
+aie_service = false          # Air-interface encryption is not the focus of this profile.
+advanced_link = false
+
+# Group call hangtime in seconds.
+# How long the circuit of an inactive group call stays open after the last speaker
+# releases the floor, before the call is disconnected.
+# During hangtime, any MS can resume the floor without a new D-SETUP/D-CONNECT cycle.
+# Default: 5 seconds. Valid range: 0–300.
+# hangtime_secs = 5
+
+# Compatibility profile for older Motorola/MR-era terminals that can fail
+# same-speaker GSSI retake during hangtime: first PTT works, second PTT opens
+# the assigned channel without voice. When true, Nexus-BS releases a local GSSI
+# call after each no-handoff over so the next PTT uses a fresh group setup
+# instead of a fast same-channel hangtime retake. Default in code: false.
+legacy_gssi_group_call = true
+
+# Maximum active call duration in seconds — ETSI EN 300 392-2 §14.9.1 T310 equivalent (Nexus-BS).
+# After this time the BS sends D-RELEASE regardless of call activity.
+# 0 = no limit (infinite — call runs until U-DISCONNECT or hangtime).
+# Default: 120. Valid range: 30–86400, or 0 for no limit.
+# call_timeout_secs = 120
+
+# UL inactivity timeout in seconds: if no voice frames are received from the transmitting
+# MS during this time, the BS forces TX-CEASED and enters hangtime.
+# Must be greater than T.213 (1s) to tolerate DTX and short RF fading.
+# Default: 3 seconds. Valid range: 1–30.
+# ul_inactivity_secs = 3
+
+# CMCE group-call transmission interruption using D-TX INTERRUPT.
+# When enabled, a higher pre-emptive ETSI call priority can withdraw the
+# current group speaker's transmit permission. Default: false/off.
+# Simple private call works with this left off.
+call_preemptive = false
+
+# Compatibility override for local private P2P calls where a terminal requests
+# direct through-connect but renders that private simplex call as "No answer".
+# Default and ETSI baseline: false. Enable only for controlled Motorola A/B tests.
+force_private_p2p_hook_signalling = false
+
+# Energy economy allocation. "auto" accepts the terminal-requested
+# StayAlive/EG1..EG7 mode and does not impose a BS-initiated mode when the
+# terminal did not ask for one. Use explicit EG values only for controlled lab
+# forcing; use "stay_alive" for diagnostics or terminals that must monitor
+# continuously.
+energy_saving_mode = "auto"
+
+# Periodic registration watchdog interval in seconds.
+# This is not ETSI T351: EN 300 392-2 §16.11.1.1 defines T351 as the
+# MS-side 10 s location updating response timer. This BS-local watchdog uses
+# §16.9.2.8/§16.9.3.4 signalling: first expiry sends D-LOCATION-UPDATE-COMMAND
+# and waits a grace window; second grace expiry sends
+# D-LOCATION-UPDATE-REJECT (ExpiryOfTimer) and clears local registration state.
+# 0 = disabled — registrations never expire. Default: 0.
+# Set a non-zero value only if you intentionally want the BS to force periodic
+# registration refreshes; valid non-zero range: 60–86400.
+# periodic_registration_secs = 0
+
+###############################################################################
+# OPTIONAL: Neighbor Cell Broadcast (NCB)
+#
+# Advertises adjacent TETRA cells to terminals so they know where to roam.
+# Broadcast in D-NWRK-BROADCAST PDU, alongside the network time (~61s cadence).
+# Up to 7 neighbor cells supported. Each must have a unique cell_identifier_ca
+# and a unique main_carrier_number.
+#
+# Per ETSI EN 300 392-2 clause 18.5.17 / Table 18.64.
+#
+# Add one [[cell_info.neighbor_cells_ca]] block per neighboring cell.
+# Comment out the whole section if you have no neighbors.
+#
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 1                # 0-31, unique within CA cluster
+# cell_reselection_types_supported = 1  # 0=none, 1=announced, 2=unannounced, 3=both
+# neighbor_cell_synchronized = false    # true if time-sync'd with us
+# cell_load_ca = 0                      # 0=low, 1=medium-low, 2=medium-high, 3=high
+# main_carrier_number = 1525            # 0-4095, must differ from our main_carrier
+#
+# Optional fields (omit if not needed):
+# main_carrier_number_extension = 0     # 0-1023 (only if carrier > 4095 needed)
+# mcc = 204                             # 0-1023, only set if neighbor on different MCC
+# mnc = 1337                            # 0-16383, only set if neighbor on different MNC
+# location_area = 3                     # 0-16383, neighbor's location area
+# maximum_ms_transmit_power = 7         # 0-7 (0=lowest, 7=highest TX power for MS)
+# minimum_rx_access_level = 0           # 0-15 (minimum RSSI level for cell access)
+# subscriber_class = 0xFFFF             # 16 bits, which subscriber classes can access
+# timeshare_cell_information_or_security_parameters = 0  # 0-31
+# tdma_frame_offset = 0                 # 0-63, TDMA frame offset vs our cell
+#
+# Example with two neighbors:
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 1
+# cell_reselection_types_supported = 1
+# neighbor_cell_synchronized = false
+# cell_load_ca = 0
+# main_carrier_number = 1525
+#
+# [[cell_info.neighbor_cells_ca]]
+# cell_identifier_ca = 2
+# cell_reselection_types_supported = 1
+# neighbor_cell_synchronized = false
+# cell_load_ca = 0
+# main_carrier_number = 1529
+###############################################################################
+
+###############################################################################
+# OPTIONAL: Home Mode Display
+#
+# Periodically broadcasts a text string to all MSs on the cell via D-SDS-DATA.
+# The MS displays this text on its home screen (e.g. base station callsign).
+# Enabled by the presence of this sub-section; remove to disable.
+#
+# [cell_info.home_mode_display]
+# source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
+# interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
+# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text)
+# text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
+# text = "Nexus-BS"               # Text shown on radio display
+###############################################################################
+
+###############################################################################
+# OPTIONAL: Supplemental SDS broadcast (Nexus-BS)
+#
+# A second periodic SDS broadcast sent alongside the Home Mode Display.
+# Uses the same mechanism but with a configurable protocol ID and text.
+# Useful for sending additional data to radios that support custom SDS-TL PIDs.
+# Enabled by the presence of this sub-section; remove to disable.
+#
+# [cell_info.sds_broadcast]
+# source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
+# interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
+# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text)
+# text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
+# text = "Nexus-BS AUX"           # Text payload to broadcast
+###############################################################################
+
+###############################################################################
+# WAP MVP OVER SDS
+#
+# Nexus-BS v0.1.65 includes a WAP MVP as an SDS Type4/WML delivery path driven
+# by the control command, not as an always-on SNDCP/IP packet-data bearer.
+#
+# CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
+# nexus-bs-control@<user>.service endpoint is enabled:
+#   ./nexus-bs-control sendwap 16777215 1001 false
+#   ./nexus-bs-control sendwapcolor 16777215 1001 false
+#
+# Advanced override variables for non-default service users/runtimes:
+#   NEXUS_BS_USER=<user>
+#   NEXUS_BS_RUN_DIR=/run/nexus-bs-<user>
+#   NEXUS_BS_CONTROL_FIFO=/run/nexus-bs-<user>/control.commands
+#
+# Default WML page text:
+#   Hello! You are running Nexus-BS.
+#
+# Keep sndcp_service=false above unless a real packet-data/SNDCP bearer is
+# implemented and verified.
+###############################################################################
+
+###############################################################################
+# OPTIONAL: Remote control via U-STATUS (Nexus-BS)
+#
+# Allows authorized radios to trigger BS actions remotely by sending a U-STATUS
+# message to ISSI 9999 (the BS control address) from the radio menu.
+# Only ISSIs listed in authorized_issis can trigger commands.
+# Unrecognized status codes from authorized radios are silently ignored.
+# Enabled by the presence of this sub-section; remove to disable.
+#
+# Available actions:
+#   "restart"   — restarts the Nexus-BS service (equivalent to systemctl restart nexus-bs)
+#   "shutdown"  — stops the Nexus-BS service (must be restarted manually or via systemd)
+#   "kick_all"  — deregisters all currently registered terminals; they re-attach immediately
+#
+# [cell_info.sds_command_control]
+# authorized_issis = [1001, 1002]   # ISSIs allowed to send commands
+#
+# [[cell_info.sds_command_control.commands]]
+# status_code = 36865             # 0x9001; ETSI network/user-specific U-STATUS code sent to ISSI 9999
+# action = "restart"
+#
+# [[cell_info.sds_command_control.commands]]
+# status_code = 36866             # 0x9002
+# action = "shutdown"
+#
+# [[cell_info.sds_command_control.commands]]
+# status_code = 36867             # 0x9003
+# action = "kick_all"
+###############################################################################
+
+###############################################################################
+
+# OPTIONAL: ISSI access control — whitelist (Nexus-BS)
+#
+# When issi_whitelist is non-empty, only listed ISSIs can register.
+# All others receive D-LOCATION-UPDATE-REJECT and cannot make or receive calls.
+# Leave empty or omit the section entirely to accept any terminal (open network).
+#
+# [security]
+# issi_whitelist = [1001, 1002, 1003]
+
+###############################################################################
+
+# OPTIONAL: Built-in WX/METAR SDS service (Nexus-BS)
+#
+# A weather responder that runs inside Nexus-BS — no external bot needed.
+#
+#   On-demand:  a radio sends an SDS like "METAR EGLL" (or "WX EGLL", or just "EGLL")
+#               to service_issi and receives a decoded, ASCII report back.
+#   Periodic:   Nexus-BS auto-sends a fixed station's METAR to periodic_issi every
+#               periodic_interval_secs (minimum 300 s).
+#
+# Everything here can also be toggled/edited live from the dashboard (Config page),
+# which writes the values back to this section.
+#
+# [wx_service]
+# enabled = true                 # master on/off for the on-demand responder
+# service_issi = 9998            # ISSI that radios address to request weather
+# periodic_enabled = false       # auto-broadcast a fixed station periodically
+# periodic_issi = 1001           # destination (ISSI, or a GSSI if periodic_is_group)
+# periodic_is_group = false      # true = periodic_issi is a talkgroup (GSSI)
+# periodic_icao = "EGLL"         # station whose METAR is auto-sent
+# periodic_interval_secs = 1800  # send period in seconds (>= 300)
+
+###############################################################################
+
+# OPTIONAL: Core dashboard API.
+#
+# In the recommended systemd deployment, the RF core exposes this only on
+# loopback and the separate `nexus-bs-dashboard` process serves the public
+# browser dashboard at http://<BTS-IP>:8080. If you run `nexus-bs` manually
+# without the separate dashboard process, you may set bind="0.0.0.0" and
+# port=8080 for the legacy all-in-one dashboard.
+#
+[dashboard]
+port = 18080
+bind = "127.0.0.1"
+#
+# OPTIONAL: dashboard login — protect the dashboard with a username and password.
+# When set, the browser uses the Nexus-BS login page and an in-memory
+# `fs_session` cookie. In split deployment, `nexus-bs-dashboard` checks this
+# core session before serving the browser UI or static assets.
+# Both username and password must be set together, or neither.
+#
+# SECURITY NOTE: without TLS the login POST still crosses the LAN in clear text.
+# This protects against casual/accidental access on a trusted LAN, but is NOT
+# secure over the public internet without HTTPS. For internet-facing use, put a
+# reverse proxy with HTTPS (e.g. nginx, Caddy) in front of the dashboard.
+#
+# username = "admin"
+# password = "change-this-before-exposing-the-dashboard"
+#
+# OPTIONAL: reserved path to the Nexus-BS git source directory for future OTA
+# update support. OTA update is disabled in Nexus-BS v0.1.65, and the dashboard
+# button is grayed out. Keep this unset unless you are testing OTA code locally.
+# source_dir = "/opt/nexus-bs"
+#
+# OPTIONAL: external dashboard asset directory for legacy all-in-one mode.
+# In the recommended split deployment, `nexus-bs-dashboard` serves this folder
+# and proxies `/api/*` plus `/ws` to the loopback-only core API above.
+# static_dir = "/opt/nexus-bs/dashboard"
+
+###############################################################################
+
+# Local command/control WebSocket used by the split `nexus-bs-control@user`
+# service and by the flat `./nexus-bs-control` helper.
+#
+[command]
+host = "127.0.0.1"
+port = 9002
+use_tls = false
+
+###############################################################################
+
+# Operational health snapshots.
+#
+# By default this feeds dashboard/telemetry with service-loop, Brew, CMCE voice,
+# SDS, UMAC congestion and RF timing health. Automatic restart stays disabled
+# unless the operator explicitly enables the bounded core-stall restart guard.
+#
+[health]
+enabled = true
+snapshot_interval_secs = 1
+core_stall_critical_ms = 10000
+restart_on_core_stall = false
+restart_after_critical_secs = 30
+restart_cooldown_secs = 600
+
+###############################################################################
+
+# Brew Protocol: Connect to TetraPack/BrandMeister server via TETRA Homebrew Protocol.
+# All groups that radios affiliate to are transmitted to Brew as affiliations.
+# Uncomment this section to automatically enable the Brew entity.
+# See: https://wiki.tetrapack.online/books/tetra/page/brew
+
+# [brew]
+
+# Server address
+# host = "core.tetrapack.online"
+# port = 443
+
+# Use TLS (wss:// / https://)
+# tls = true
+
+# HTTP Digest authentication credentials, registered in BrandMeister.
+# Username should be your SSID (DMR ID + 2-digit suffix).
+# Password is your BrandMeister hotspot password.
+# username = 123456789
+# password = "change-me"
+
+# Reconnect delay (seconds)
+# reconnect_delay_secs = 15
+
+# Additional initial latency in frames for inbound Brew jitter playback.
+# Default: 0. Increase if you hear audio artifacts at the start of transmissions.
+# jitter_initial_latency_frames = 0
+
+# Enable SDS forwarding between local clients and Brew. Enabled by default.
+# feature_sds_enabled = true
+
+# Export RSSI measurements to the Brew server as Service (0xf4) JSON messages.
+# Disabled by default. Enable if your Brew server supports RSSI data ingestion.
+# When enabled, each radio's signal level is sent at most once every 5 seconds.
+# Format: {"issi": 1001, "rssi_dbfs": -42.3}
+# feature_rssi_export = false
+
+# Uncomment to allow only calls for selected SSIs to be forwarded through Brew.
+# If left commented, all calls (outside local_ssi_ranges) are allowed through Brew.
+# whitelisted_ssis = [91]

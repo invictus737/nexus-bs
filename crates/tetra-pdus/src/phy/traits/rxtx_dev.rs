@@ -1,0 +1,60 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
+use tetra_core::TdmaTime;
+use tetra_core::TrainingSequence;
+
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum RxTxDevError {
+    RxEndOfData,
+    RxReadError,
+    TxStreamError,
+}
+
+#[derive(Debug, Default)]
+pub struct RxBurstBits<'a> {
+    pub train_type: TrainingSequence,
+    pub bits: &'a [u8],
+    /// Received signal strength in dBFS (dB relative to ADC full-scale).
+    /// 0.0 = full scale, negative = weaker signal. Not calibrated to dBm.
+    pub rssi_dbfs: f32,
+}
+
+#[derive(Debug, Default)]
+pub struct RxSlotBits<'a> {
+    /// Number of slot received
+    pub time: TdmaTime,
+    /// Burst received in full slot
+    pub slot: RxBurstBits<'a>,
+    /// Burst received in subslot 1
+    pub subslot1: RxBurstBits<'a>,
+    /// Burst received in subslot 2
+    pub subslot2: RxBurstBits<'a>,
+}
+
+#[derive(Debug, Default)]
+pub struct TxSlotBits<'a> {
+    /// Number of slot to transmit
+    pub time: TdmaTime,
+    /// Burst to transmit in full slot
+    pub slot: Option<&'a [u8]>,
+    // /// Burst to transmit in subslot 1
+    // pub subslot1: Option<&'a [u8]>,
+    // /// Burst to transmit in subslot 2
+    // pub subslot2: Option<&'a [u8]>,
+}
+
+/// Trait for RX/TX devices that work with full slots.
+pub trait RxTxDev {
+    fn set_tx_inhibited(&mut self, _inhibited: bool) -> Result<(), RxTxDevError> {
+        Ok(())
+    }
+
+    fn run_tx_calibration(&mut self, _calibration_path: &str) -> Result<(), String> {
+        Err("TX calibration is not supported by this RX/TX device".to_string())
+    }
+
+    fn rxtx_timeslot(&mut self, tx_slot: &[TxSlotBits]) -> Result<Vec<Option<RxSlotBits<'_>>>, RxTxDevError>;
+}

@@ -1,0 +1,90 @@
+# SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.65.
+#
+# New deployments should prefer:
+#   contrib/systemd/nexus-bs@.service
+#   contrib/systemd/nexus-bs-control@.service
+#   contrib/systemd/nexus-bs-dashboard@.service
+#   contrib/systemd/journald-nexus-bs-volatile.conf
+#
+# Those templates keep runtime state under /run/nexus-bs-USER and use volatile
+# circular journald logging, which is better for read-only/appliance Pi images.
+#
+# Installation: (as root or with sudo)
+# - adapt your user/group and paths, sample assumes:
+#   - user/group are both "user",
+#   - installation in /home/user/nexus-bs
+#   - configuration in /home/user/nexus-bs/config.toml
+# - copy file to "/etc/systemd/system"
+# - execute "systemctl daemon-reload"
+#
+# Usage:
+# - start service with "systemctl start nexus-bs"
+# - show state with "systemctl status nexus-bs"
+# - stop service with "systemctl stop nexus-bs"
+# - to enable start at boot, execute: "systemctl enable nexus-bs"
+# - to disable start at boot, execute: "systemctl disable nexus-bs"
+# - see log with "journalctl -u nexus-bs --output=cat -f"
+
+[Unit]
+Description=Nexus-BS v0.1.65 TETRA base station service
+# network-online.target ensures the interface is UP and routable,
+# not just "declared active" like network.target.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=user
+Group=user
+Type=notify
+CPUSchedulingPolicy=fifo
+CPUSchedulingPriority=73
+WorkingDirectory=/home/user/nexus-bs/
+Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/user/nexus-bs/config.toml
+Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/user/nexus-bs/dashboard
+Environment=NEXUS_BS_CORE_DASHBOARD_BIND=127.0.0.1
+Environment=NEXUS_BS_CORE_DASHBOARD_PORT=18080
+
+# Reset the SXceiver/SoapySDR USB device before each start to prevent
+# stale hardware timestamp state causing "Too late to produce TX block" skips
+# on software restarts (as opposed to hard power cycles).
+# This unbinds and rebinds the USB device, forcing a clean hardware reset.
+# Adjust the USB path to match your device: find it with:
+#   udevadm info -q path -n /dev/bus/usb/$(lsusb | grep -i sxceiver | awk '{print $2"/"$4}' | tr -d ':')
+# or simply: ls /sys/bus/usb/devices/
+ExecStartPre=/bin/sh -c 'for dev in /sys/bus/usb/devices/*/idVendor; do dir=$(dirname $dev); [ -f "$dir/authorized" ] && echo 0 > "$dir/authorized" && sleep 0.5 && echo 1 > "$dir/authorized"; done; sleep 1'
+
+ExecStart=/home/user/nexus-bs/nexus-bs /home/user/nexus-bs/config.toml
+KillSignal=SIGINT
+NotifyAccess=main
+WatchdogSec=30s
+TimeoutStopSec=20
+
+# Restart automatically on crash or unexpected exit.
+# on-failure covers: non-zero exit, killed by signal, timeout.
+# Does NOT restart on clean exit (systemctl stop) or SIGINT (graceful shutdown).
+Restart=on-failure
+RestartSec=5
+RestartForceExitStatus=75
+OOMPolicy=stop
+MemoryMax=512M
+TasksMax=128
+LimitNOFILE=4096
+NoNewPrivileges=yes
+# Keep the RF/TETRA core off CPU 0 and give it two application cores.
+CPUAffinity=1 2
+CPUWeight=900
+# Real-time round-robin scheduling for the RF/DSP core. This mirrors
+# `chrt -r 80` while avoiding FIFO starvation on small ARM boards.
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=80
+LimitRTPRIO=80
+
+# Remove start rate limiting entirely — let RestartSec govern the pace.
+# Without this, systemd stops trying after 5 restarts in 10s (the default).
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

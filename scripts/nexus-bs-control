@@ -1,0 +1,21 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+set -eu
+
+RUN_USER="${NEXUS_BS_USER:-${USER:-$(id -un)}}"
+RUN_DIR="${NEXUS_BS_RUN_DIR:-/run/nexus-bs-$RUN_USER}"
+COMMAND_FILE="${NEXUS_BS_CONTROL_FIFO:-$RUN_DIR/control.commands}"
+
+if [ ! -p "$COMMAND_FILE" ]; then
+    echo "Nexus-BS control FIFO not found: $COMMAND_FILE" >&2
+    echo "Start nexus-bs-control@$RUN_USER.service first." >&2
+    exit 1
+fi
+
+if [ "$#" -gt 0 ]; then
+    printf '%s\n' "$*" > "$COMMAND_FILE"
+else
+    cat > "$COMMAND_FILE"
+fi

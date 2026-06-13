@@ -1,0 +1,61 @@
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+SPDX-FileComment: See CHANGES-NEXUS.md for the central Nexus-BS change notice.
+-->
+
+Nexus-BS Notices
+================
+
+Required Notice: Copyright (c) Chris YO3TCO / Nexus-BS Project.
+
+This NOTICE preserves Nexus-BS notices, upstream credits, and upstream
+Apache-2.0 notices for this mixed-license source-available project. It is not
+legal advice.
+
+Nexus-BS modifications and additions are source-available for permitted
+noncommercial use under the PolyForm Noncommercial License 1.0.0 unless
+file-level notices state otherwise. Commercial use of Nexus-BS-covered material
+requires a separate written commercial license agreement. See `LICENSE`,
+`LICENSES/PolyForm-Noncommercial-1.0.0.txt`, `LICENSE-OVERVIEW.md`,
+`CHANGES-NEXUS.md`, and `COMMERCIAL-LICENSE.md`.
+
+Upstream and Historical Notices
+-------------------------------
+
+Nexus-BS is based on historical BlueStation and FlowStation work and
+retains protocol-structure, field-feature, dashboard, deployment, testing,
+and integration lineage from those projects.
+
+Historical upstream Apache-2.0 license text is preserved in
+`LICENSES/Apache-2.0.txt`. Upstream portions that were originally provided
+under Apache-2.0 remain subject to the applicable upstream license notices
+and attribution requirements. This notice does not remove or narrow rights
+granted directly by upstream copyright holders under their original licenses.
+
+Commercial licensing offered by Chris YO3TCO / Nexus-BS Project applies only to
+Nexus-BS-covered material and only to the extent permitted by applicable
+upstream licenses.
+
+Credits
+-------
+
+- BlueStation Project for historical TETRA BS foundation and
+  protocol-structure contributions:
+  https://github.com/MidnightBlueLabs/tetra-bluestation
+- FlowStation Project for historical field-feature, dashboard, integration,
+  and deployment-hardening lineage:
+  https://github.com/razvanzeces/flowstation
+- Mihajlo YU4MSH and the misadeks/tetra-bluestation fork for BlueStation fork
+  work, FDX P2P direction, and field-behavior contributions:
+  https://github.com/misadeks/tetra-bluestation
+- Harald Welte and the osmocom team for foundational osmocom-tetra work:
+  https://osmocom.org/projects/tetra/wiki
+- Tatu Peltola for his SXCEIVER project:
+  https://sxceiver.com/
+- Stichting NLnet for partial funding through the RETETRA3 grant:
+  https://nlnet.nl/
+- Dennis DB2OE for dashboard-theme inspiration.
+- Historical, fork, testing, documentation, hardware, dashboard, integration,
+  and operator-community contributors, including ON6RF, EA7KEN, BU2GQ,
+  DK5RTA, DO5MF, ES4TIX, and others.
