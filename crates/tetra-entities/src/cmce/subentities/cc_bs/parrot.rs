@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 //! Local Parrot/Papagal simplex test service — ISSI 99999.
 //!
 //! The service records validated UL TCH/S frames from one caller, plays the

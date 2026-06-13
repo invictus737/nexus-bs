@@ -1,3 +1,8 @@
+/*
+ * SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+ * SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+ */
+
 /* Nexus-BS dashboard base layout; the industrial console theme below owns final paint and density. */
 :root {
   --bg: #0a0c0f;

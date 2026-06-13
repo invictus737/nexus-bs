@@ -1,0 +1,12 @@
+LicenseRef-ThirdParty-ETSI-Standards
+
+This identifier is used for local text-cache copies and source metadata for
+ETSI TETRA standards documents stored under Docs/tetra-standards/cache/.
+
+Those files are third-party standards/reference material. They are not
+Nexus-BS source code and are not licensed by Nexus-BS under PolyForm
+Noncommercial 1.0.0 or by upstream project authors under Apache-2.0.
+
+Use, copying, redistribution, or publication of the standards text is subject
+to the applicable ETSI terms and the source URLs recorded in
+Docs/tetra-standards/standards.tsv and the matching .source cache files.

@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 use tetra_core::TrainingSequence;
 
 use crate::phy::components::{burst_consts::*, train_consts::*};
@@ -82,7 +87,7 @@ const PHASE2BITS: [(i8, [u8; 2]); 6] = [
     /* +3 */ (3, [1, 0]),
 ];
 
-/// sum up the phases for a window of symbols;  
+/// sum up the phases for a window of symbols;
 /// `bits` is the full burst, `start_symbol` is index in *bits* of the first symbol to include,
 /// and `n_symbols` is how many symbols (each symbol = 2 bits).
 fn sum_up_phase(bits: &[u8], start_symbol: usize, n_symbols: usize) -> i32 {

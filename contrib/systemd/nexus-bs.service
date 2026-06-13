@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 # Legacy single-user sample systemd service file for Nexus-BS v0.1.65.
 #
 # New deployments should prefer:

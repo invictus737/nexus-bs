@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+-->
+
 # Build from Source
 
 Nexus-BS is source-available for permitted noncommercial use under the

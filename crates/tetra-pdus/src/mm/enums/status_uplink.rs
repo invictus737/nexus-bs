@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// 16.10.48a Status uplink (also B.3.11 Status uplink in ETSI EN 300 396-5, Gateway air interface)
 /// Bits: 6
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

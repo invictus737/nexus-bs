@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// Clause 29.4.3.9 SDS Protocol identifier. Values undefined here may be user definition or reserved
 /// Bits: 8
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

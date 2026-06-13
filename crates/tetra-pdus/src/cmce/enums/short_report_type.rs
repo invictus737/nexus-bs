@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// Clause 29.4.3.11 Short report type
 /// The Short report type information element shall indicate the reason for report as defined in table 29.23.
 /// Bits: 2

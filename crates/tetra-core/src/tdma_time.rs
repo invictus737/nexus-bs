@@ -1,9 +1,14 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 use core::fmt;
 
 use bitcode::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-/// Convert a number of hyperframes to timeslots.  
+/// Convert a number of hyperframes to timeslots.
 #[macro_export]
 macro_rules! hyperframes {
     ($h:expr) => {
@@ -11,7 +16,7 @@ macro_rules! hyperframes {
     };
 }
 
-/// Convert a number of multiframes to timeslots.  
+/// Convert a number of multiframes to timeslots.
 #[macro_export]
 macro_rules! multiframes {
     ($m:expr) => {
@@ -19,7 +24,7 @@ macro_rules! multiframes {
     };
 }
 
-/// Convert a number of frames to timeslots.  
+/// Convert a number of frames to timeslots.
 #[macro_export]
 macro_rules! frames {
     ($f:expr) => {

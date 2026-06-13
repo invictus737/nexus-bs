@@ -3,7 +3,7 @@
 # This script has some limitations. Most notably, it checks the files on-disk, which is a problem
 # if a file was edited, added and then re-edited. The added (and thus to be committed) file is
 # different from the on-disk file. Furthermore, small differences between cargo ftm and rustfmt may exist.
-# As this is just a helpful tool, we can accept those limitations. 
+# As this is just a helpful tool, we can accept those limitations.
 
 set -euo pipefail
 

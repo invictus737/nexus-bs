@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// Clause 14.8.5 / 14.8.9 — Called/Calling Party Type Identifier (CPTI).
 /// Indicates the type of address which follows in the PDU (Table 14.39).
 /// Bits: 2

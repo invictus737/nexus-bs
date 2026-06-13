@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// Clause 21.4.1 Table 21.38: MAC PDU types for SCH/F, SCH/HD, STCH, SCH-P8/F, SCH-P8/HD, SCH-Q/D, SCH-Q/B and SCH-Q/U
 /// Bits: 2
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

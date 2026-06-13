@@ -1,3 +1,9 @@
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+SPDX-FileComment: See CHANGES-NEXUS.md for the central Nexus-BS change notice.
+-->
+
 <p align="center">
   <img src="assets/nexus-bs-logo.png" alt="Nexus-BS Project logo" width="420">
 </p>
@@ -254,10 +260,22 @@ credentials and dashboard access controls.
 
 ## Licensing
 
-Nexus-BS is **source-available** for permitted noncommercial use under the
-PolyForm Noncommercial License 1.0.0.
+Nexus-BS is a **mixed-license, source-available** project.
 
-Commercial use requires a separate written agreement before that use begins.
+The short version:
+
+- Upstream Apache-2.0 portions remain Apache-2.0.
+- Nexus-BS modifications and additions are PolyForm Noncommercial License
+  1.0.0 unless file-level notices state otherwise.
+- Files that contain both upstream material and Nexus-BS modifications should be
+  read with their file-level SPDX notices, `LICENSE-OVERVIEW.md`,
+  `CHANGES-NEXUS.md`, and `NOTICE`.
+- Commercial licensing applies only to Nexus-BS-covered material, and only to
+  the extent permitted by upstream licenses. It does not relicense upstream
+  Apache-2.0 portions.
+
+Commercial use of Nexus-BS-covered material requires a separate written
+agreement before that use begins.
 
 Repository access, source publication, binary access, forks, issues, pull
 requests or public discussion do not grant a commercial license.
@@ -265,9 +283,12 @@ requests or public discussion do not grant a commercial license.
 See:
 
 - [`LICENSE`](LICENSE)
+- [`LICENSE-OVERVIEW.md`](LICENSE-OVERVIEW.md)
+- [`CHANGES-NEXUS.md`](CHANGES-NEXUS.md)
 - [`COMMERCIAL-LICENSE.md`](COMMERCIAL-LICENSE.md)
 - [`NOTICE`](NOTICE)
 - [`LICENSES/Apache-2.0.txt`](LICENSES/Apache-2.0.txt)
+- [`LICENSES/PolyForm-Noncommercial-1.0.0.txt`](LICENSES/PolyForm-Noncommercial-1.0.0.txt)
 
 Upstream portions remain subject to their applicable upstream license notices
 and attribution requirements. Nothing in the Nexus-BS licensing text removes or
@@ -280,6 +301,8 @@ work, and all applicable upstream license notices. Public use, publication, or
 derived work should credit the original upstream authors and Chris YO3TCO /
 Nexus-BS Project for the Nexus-BS additions, integration, packaging, dashboard
 work, standards-alignment work, and current project form.
+
+This README is not legal advice.
 
 ## Credits
 

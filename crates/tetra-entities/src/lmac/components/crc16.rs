@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// CRC-16 (ITU-T / X.25) over raw bits or byte streams.
 pub const GEN_POLY: u16 = 0x1021;
 pub const TETRA_CRC_OK: u16 = 0x1d0f;
@@ -10,7 +15,7 @@ pub fn get_nth_bit(input: &[u8], bit: usize) -> u16 {
 }
 
 /// CRC-16 ITU-T over a byte stream, processing `number_bits` bits (MSB first).
-/// `crc` is the initial CRC value.  
+/// `crc` is the initial CRC value.
 /// Returns the updated CRC.
 pub fn crc16_itut_bytes(mut crc: u16, input: &[u8], number_bits: usize) -> u16 {
     for i in 0..number_bits {
@@ -26,7 +31,7 @@ pub fn crc16_itut_bytes(mut crc: u16, input: &[u8], number_bits: usize) -> u16 {
 }
 
 /// CRC-16 ITU-T over a bit-per-byte slice: each `input[i] & 1` is one bit.
-/// `crc` is the initial CRC value.  
+/// `crc` is the initial CRC value.
 /// Processes the first `number_bits` entries of `input`.
 pub fn crc16_itut_bits(mut crc: u16, input: &[u8], number_bits: usize) -> u16 {
     for &b in input.iter().take(number_bits) {

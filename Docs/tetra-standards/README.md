@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+-->
+
 # TETRA Standards Local Text Cache
 
 This folder is for fast local consultation of ETSI TETRA standards while

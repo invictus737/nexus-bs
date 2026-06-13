@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 # Nexus-BS external dashboard front-end template.
 #
 # This service intentionally runs outside the RF core process. It serves the

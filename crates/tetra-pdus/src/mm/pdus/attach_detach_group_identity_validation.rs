@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 use tetra_core::typed_pdu_fields::{Type3FieldGeneric, Type4FieldGeneric, delimiters};
 use tetra_core::{BitBuffer, pdu_parse_error::PduParseErr};
 

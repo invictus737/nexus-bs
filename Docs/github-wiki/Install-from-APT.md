@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+-->
+
 # Install from APT
 
 This page explains how to package Nexus-BS as a Debian package, publish it in a

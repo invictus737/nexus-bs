@@ -1,3 +1,8 @@
+<!--
+SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+-->
+
 # Nexus-BS Static APT Repository
 
 `generate-apt-repo.sh` builds a small static APT repository from one or more

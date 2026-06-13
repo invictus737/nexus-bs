@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: Historical upstream contributors
+// SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+// SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
+// SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
+
 /// TETRA ACELP bit reordering: converts between codec order (STE format) and channel order (type-1 bits).
 ///
 /// TCH/S carries two 137-bit subframes (274 bits total), interleaved by sensitivity class (EN 300 395-2, Table 4):
