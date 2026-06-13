@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+
+if [ "$1" = "configure" ]; then
+    install -d -m 0755 /etc/nexus-bs
+
+    if [ ! -e /etc/nexus-bs/config.toml ]; then
+        install -m 0600 /etc/nexus-bs/examples/config.toml /etc/nexus-bs/config.toml
+    fi
+
+    if [ ! -e /etc/nexus-bs/config.toml.fallback ]; then
+        install -m 0600 /etc/nexus-bs/examples/config.toml.fallback /etc/nexus-bs/config.toml.fallback
+    fi
+
+    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+fi
+
+exit 0

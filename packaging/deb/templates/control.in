@@ -1,0 +1,18 @@
+Package: @PACKAGE@
+Version: @VERSION@
+Section: hamradio
+Priority: optional
+Architecture: @ARCH@
+Maintainer: @MAINTAINER@
+Depends: @DEPENDS@
+Installed-Size: @INSTALLED_SIZE@
+Description: Nexus-BS TETRA base station runtime
+ Nexus-BS packaged from the compiled_distribution binary bundle.
+ .
+ The package installs runtime binaries and dashboard assets under
+ /opt/nexus-bs, systemd service templates under /lib/systemd/system, and
+ example configuration under /etc/nexus-bs/examples and seeds
+ /etc/nexus-bs/config.toml only when the live file is missing.
+ .
+ Services are not enabled or started automatically. Review
+ /etc/nexus-bs/config.toml before enabling nexus-bs@<user>.service.
