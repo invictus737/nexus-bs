@@ -5,23 +5,30 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
-  build:
+  package:
     runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Install package tools
+        run: sudo apt-get update && sudo apt-get install -y dpkg-dev file
 
-      - name: Install cross
-        run: cargo install cross --git https://github.com/cross-rs/cross
+      - name: Build Debian package
+        run: packaging/deb/build-deb.sh
 
-      - name: Build aarch64
-        run: cross build --release --target aarch64-unknown-linux-gnu
+      - name: Generate checksums
+        run: |
+          cd packaging/deb/dist
+          sha256sum *.deb > SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
-          files: target/aarch64-unknown-linux-gnu/release/nexus-bs
+          files: |
+            packaging/deb/dist/*.deb
+            packaging/deb/dist/SHA256SUMS

@@ -22,12 +22,14 @@ certification. Formal certification requires official conformance evidence.
 
 | Need | Start here |
 |---|---|
+| Install the prebuilt Debian package | [GitHub Releases](https://github.com/invictus737/nexus-bs/releases) and [Install from APT](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT) |
 | Install the prebuilt Linux/aarch64 bundle | [`compiled_distribution/README.md`](compiled_distribution/README.md) |
+| Read operator install docs | [GitHub Wiki](https://github.com/invictus737/nexus-bs/wiki) |
 | Configure a station | [`example_config/config.toml`](example_config/config.toml) |
 | Use systemd services | [`contrib/systemd/`](contrib/systemd/) |
 | Review standards workflow/cache | [`Docs/tetra-standards/`](Docs/tetra-standards/) |
 | Inspect dashboard assets | [`dashboard/`](dashboard/) |
-| Build from source | [`Cargo.toml`](Cargo.toml) |
+| Build from source | [Build from Source](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source) |
 
 ## Status
 

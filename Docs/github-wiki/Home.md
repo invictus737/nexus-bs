@@ -4,12 +4,14 @@ This wiki contains operator and packaging notes for Nexus-BS.
 
 ## Installation
 
+- [Install the Release .deb](Install-from-APT#install-the-release-deb) -
+  download the published Debian package from GitHub Releases and install it
+  with `apt`.
 - [Build from Source](Build-from-Source) - compile Nexus-BS, install the
   binaries manually, prepare global config, install systemd units, and verify
   services.
-- [Install from APT](Install-from-APT) - build the Debian package, publish a
-  static APT repository, install `nexus-bs`, create global config, enable
-  services, and troubleshoot common install issues.
+- [Install from APT](Install-from-APT) - use a static APT repository, create
+  global config, enable services, and troubleshoot common install issues.
 
 ## Notes
 

@@ -19,6 +19,42 @@ It does not enable or start a live base-station instance automatically. Review
 the global live configuration generated on first install, then enable the
 systemd services.
 
+## Install the Release .deb
+
+For normal users, install the published `.deb` from GitHub Releases. The current
+prebuilt package is Linux `arm64` / `aarch64`.
+
+Install download tools:
+
+```sh
+sudo apt update
+sudo apt install ca-certificates curl
+```
+
+Download the package and checksum file:
+
+```sh
+export NEXUS_BS_VERSION=0.1.65
+
+curl -fLO "https://github.com/invictus737/nexus-bs/releases/download/v${NEXUS_BS_VERSION}/nexus-bs_${NEXUS_BS_VERSION}_arm64.deb"
+curl -fLO "https://github.com/invictus737/nexus-bs/releases/download/v${NEXUS_BS_VERSION}/SHA256SUMS"
+```
+
+Verify the package checksum:
+
+```sh
+sha256sum -c SHA256SUMS --ignore-missing
+```
+
+Install it with `apt` so dependencies are handled by the package manager:
+
+```sh
+sudo apt install "./nexus-bs_${NEXUS_BS_VERSION}_arm64.deb"
+```
+
+Continue with [Create Global Configuration](#create-global-configuration) and
+[Enable Systemd Services](#enable-systemd-services).
+
 ## Build the Debian Package
 
 From the repository root, make sure `compiled_distribution/` contains the files
