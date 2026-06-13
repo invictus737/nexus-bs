@@ -28,14 +28,12 @@ certification. Formal certification requires official conformance evidence.
 
 | Need | Start here |
 |---|---|
-| Install the prebuilt Debian package | [GitHub Releases](https://github.com/invictus737/nexus-bs/releases) and [Install from APT](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT) |
-| Install the prebuilt Linux/aarch64 bundle | [`compiled_distribution/README.md`](compiled_distribution/README.md) |
-| Read operator install docs | [GitHub Wiki](https://github.com/invictus737/nexus-bs/wiki) |
+| Install from source | [Classic Source Install](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source) |
+| Install the optional Debian package | [GitHub Releases](https://github.com/invictus737/nexus-bs/releases) and [Optional .deb Install](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT) |
 | Configure a station | [`example_config/config.toml`](example_config/config.toml) |
 | Use systemd services | [`contrib/systemd/`](contrib/systemd/) |
 | Review standards workflow/cache | [`Docs/tetra-standards/`](Docs/tetra-standards/) |
 | Inspect dashboard assets | [`dashboard/`](dashboard/) |
-| Build from source | [Build from Source](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source) |
 
 ## Status
 
@@ -238,21 +236,20 @@ scheduling, LLC ACK/retransmission behavior, bounded queues, and parser guards.
 
 ## Installation
 
-For a prebuilt Linux/aarch64 deployment bundle, see:
+The normal operator path is the classic source install:
 
-- [`compiled_distribution/README.md`](compiled_distribution/README.md)
+1. `git clone` or `git pull --ff-only`
+2. `cargo build --release --locked`
+3. copy the release binaries and dashboard assets to `/home/<run-user>/nexus-bs`
+4. install the systemd templates from [`contrib/systemd/`](contrib/systemd/)
+5. edit `/etc/nexus-bs/config.toml`
+6. start `nexus-bs-control@USER`, `nexus-bs@USER`, and
+   `nexus-bs-dashboard@USER`
 
-For source configuration, start with:
+See the GitHub Wiki:
 
-- [`example_config/config.toml`](example_config/config.toml)
-
-For systemd deployment templates:
-
-- [`contrib/systemd/`](contrib/systemd/)
-
-For cross-build helper material:
-
-- [`contrib/cross-compile/`](contrib/cross-compile/)
+- [Classic Source Install](https://github.com/invictus737/nexus-bs/wiki/Build-from-Source)
+- [Optional .deb Install](https://github.com/invictus737/nexus-bs/wiki/Install-from-APT)
 
 Before transmitting, verify RF frequency plan, legal operating authority,
 MCC/MNC, carrier plan, SDR hardware selection, gains, antennas, Brew

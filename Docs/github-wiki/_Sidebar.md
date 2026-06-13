@@ -6,6 +6,5 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 ## Nexus-BS
 
 - [Home](Home)
-- [Install the Release .deb](Install-from-APT#install-the-release-deb)
-- [Build from Source](Build-from-Source)
-- [Install from APT](Install-from-APT)
+- [Classic Source Install](Build-from-Source)
+- [Optional .deb Install](Install-from-APT)

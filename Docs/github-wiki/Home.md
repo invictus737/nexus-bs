@@ -5,25 +5,39 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 # Nexus-BS Wiki
 
-This wiki contains operator and packaging notes for Nexus-BS.
+This wiki is written for a normal operator install. The default path is the
+classic source install:
 
-## Installation
+```sh
+git pull
+cargo build --release --locked
+sudo install ...
+sudoedit /etc/nexus-bs/config.toml
+sudo systemctl start nexus-bs@USER.service
+```
 
-- [Install the Release .deb](Install-from-APT#install-the-release-deb) -
-  download the published Debian package from GitHub Releases and install it
-  with `apt`.
-- [Build from Source](Build-from-Source) - compile Nexus-BS, install the
-  binaries manually, prepare global config, install systemd units, and verify
-  services.
-- [Install from APT](Install-from-APT) - use a static APT repository, create
-  global config, enable services, and troubleshoot common install issues.
+## Start Here
 
-## Notes
+- [Classic Source Install](Build-from-Source) - build from the repository,
+  install the binaries, install the systemd service files, edit `config.toml`,
+  and start the base station.
+- [Optional .deb Install](Install-from-APT) - install the prebuilt GitHub
+  Release package when you want package-manager ownership of `/opt/nexus-bs`.
 
-- The packaged install path uses `/opt/nexus-bs` for binaries and dashboard
-  assets, `/etc/nexus-bs` for examples and global live config, and systemd
-  template services named `nexus-bs-control@USER.service`,
-  `nexus-bs@USER.service`, and `nexus-bs-dashboard@USER.service`.
-- Review all RF, identity, dashboard, and external-service settings before
-  starting a live service. Do not place private credentials in package examples
-  or published repository artifacts.
+## Runtime Layout
+
+Classic source installs use:
+
+```text
+/home/<run-user>/nexus-bs/       binaries, dashboard assets, helper script
+/etc/nexus-bs/config.toml        live operator configuration
+/etc/systemd/system/             service units copied from contrib/systemd
+```
+
+The shipped systemd templates expect the runtime folder under
+`/home/<run-user>/nexus-bs`. The install page keeps the live config in
+`/etc/nexus-bs/config.toml` and links it into the runtime folder.
+
+Before transmitting, verify RF authority, frequency plan, SDR hardware,
+antenna/gain settings, MCC/MNC, carrier plan, dashboard access, and any Brew or
+external-service credentials.
