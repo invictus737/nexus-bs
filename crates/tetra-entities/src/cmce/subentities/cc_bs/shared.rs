@@ -791,6 +791,44 @@ impl CcBsSubentity {
             })
     }
 
+    pub(in crate::cmce) fn busy_individual_issis(&self) -> HashSet<u32> {
+        fn insert_issi(set: &mut HashSet<u32>, addr: TetraAddress) {
+            if addr.ssi_type == SsiType::Issi {
+                set.insert(addr.ssi);
+            }
+        }
+
+        let mut busy = HashSet::new();
+        for call in self.individual_calls.values().filter(|call| call.has_assigned_circuit()) {
+            insert_issi(&mut busy, call.calling_addr);
+            insert_issi(&mut busy, call.called_addr);
+        }
+        for pending in self.pending_individual_releases.values() {
+            insert_issi(&mut busy, pending.call.calling_addr);
+            insert_issi(&mut busy, pending.call.called_addr);
+        }
+        for pending in self.pending_individual_disconnect_tail_drains.values() {
+            insert_issi(&mut busy, pending.sender);
+            busy.insert(pending.peer_issi);
+        }
+        for pending in self.pending_individual_disconnect_deliveries.values() {
+            busy.insert(pending.awaiting_release_from);
+            busy.insert(pending.release_to_issi);
+        }
+        for pending in self.pending_individual_disconnect_release_acks.values() {
+            busy.insert(pending.release_to_issi);
+        }
+        for pending in self.pending_individual_tx_ceased_tail_drains.values() {
+            insert_issi(&mut busy, pending.sender.addr);
+            insert_issi(&mut busy, pending.peer.addr);
+        }
+        for pending in self.pending_network_individual_connects.values() {
+            insert_issi(&mut busy, pending.local_addr);
+            insert_issi(&mut busy, pending.peer_addr);
+        }
+        busy
+    }
+
     pub(super) fn find_brew_individual_call(&self, brew_uuid: uuid::Uuid) -> Option<(u16, IndividualCall)> {
         self.individual_calls
             .iter()

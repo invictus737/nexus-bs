@@ -5,7 +5,7 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 # Nexus-BS Compiled Distribution
 
-Minimal Linux/aarch64 binary bundle for Nexus-BS `v0.1.65-fb39e15f`.
+Minimal Linux/aarch64 binary bundle for Nexus-BS `v0.1.66-fb39e15f`.
 
 This bundle is for manual installs. Beginners should normally use the GitHub
 Release `.deb` package instead.

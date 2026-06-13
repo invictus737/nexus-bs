@@ -82,13 +82,15 @@ impl CmceBs {
     ) {
         match cmd {
             ControlCommand::SendSds { handle, .. } => {
-                let success = sds.rx_sds_from_control(queue, cmd);
+                let busy_individual_issis = cc.busy_individual_issis();
+                let success = sds.rx_sds_from_control_with_busy(queue, cmd, &busy_individual_issis);
                 if let Some(cep) = responder {
                     cep.respond(ControlResponse::SendSdsResponse { handle, success });
                 }
             }
             ControlCommand::SendRawSds { handle, .. } => {
-                let success = sds.rx_raw_sds_from_control(queue, cmd);
+                let busy_individual_issis = cc.busy_individual_issis();
+                let success = sds.rx_raw_sds_from_control_with_busy(queue, cmd, &busy_individual_issis);
                 if let Some(cep) = responder {
                     cep.respond(ControlResponse::SendRawSdsResponse { handle, success });
                 }
@@ -254,7 +256,8 @@ impl CmceBs {
                 self.sds.route_status_deliver(queue, message);
             }
             CmcePduTypeUl::USdsData => {
-                self.sds.route_rf_deliver(queue, message);
+                let busy_individual_issis = self.cc.busy_individual_issis();
+                self.sds.route_rf_deliver_with_busy(queue, message, &busy_individual_issis);
             }
             CmcePduTypeUl::UFacility => {
                 // ETSI EN 300 392-2 §14.7.2.5:
@@ -321,6 +324,8 @@ impl TetraEntityTrait for CmceBs {
                 }
             }
         }
+        let busy_individual_issis = self.cc.busy_individual_issis();
+        self.sds.flush_deferred_individual_sds(queue, &busy_individual_issis);
         crate::health::registry().set_cmce_stats(self.cc.health_stats());
         crate::health::registry().set_sds_stats(self.sds.health_stats());
     }
@@ -351,7 +356,8 @@ impl TetraEntityTrait for CmceBs {
                     self.cc.handle_subscriber_update(queue, update, message.src);
                 }
                 SapMsgInner::CmceSdsData(_) => {
-                    self.sds.rx_sds_from_brew(queue, message);
+                    let busy_individual_issis = self.cc.busy_individual_issis();
+                    self.sds.rx_sds_from_brew_with_busy(queue, message, &busy_individual_issis);
                 }
                 SapMsgInner::CmceSdsStatus(_) => {
                     self.sds.rx_status_from_control(queue, message);

@@ -30,6 +30,7 @@ use tetra_pdus::cmce::pdus::d_connect_acknowledge::DConnectAcknowledge;
 use tetra_pdus::cmce::pdus::d_disconnect::DDisconnect;
 use tetra_pdus::cmce::pdus::d_info::DInfo;
 use tetra_pdus::cmce::pdus::d_release::DRelease;
+use tetra_pdus::cmce::pdus::d_sds_data::DSdsData;
 use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
@@ -41,6 +42,7 @@ use tetra_pdus::cmce::pdus::u_disconnect::UDisconnect;
 use tetra_pdus::cmce::pdus::u_facility::UFacility;
 use tetra_pdus::cmce::pdus::u_info::UInfo;
 use tetra_pdus::cmce::pdus::u_release::URelease;
+use tetra_pdus::cmce::pdus::u_sds_data::USdsData;
 use tetra_pdus::cmce::pdus::u_setup::USetup;
 use tetra_pdus::cmce::pdus::u_tx_ceased::UTxCeased;
 use tetra_pdus::cmce::pdus::u_tx_demand::UTxDemand;
@@ -59,6 +61,7 @@ use tetra_saps::control::brew::{BrewSubscriberAction, MmSubscriberUpdate};
 use tetra_saps::control::call_control::{CallControl, CircuitDlMediaSource, NetworkCircuitCall};
 use tetra_saps::control::enums::circuit_mode_type::CircuitModeType;
 use tetra_saps::control::enums::communication_type::CommunicationType;
+use tetra_saps::control::enums::sds_user_data::SdsUserData;
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
@@ -1116,6 +1119,38 @@ fn build_tmd_ind_to_cmce(ts: u8, data: Vec<u8>, raw_tch_s_block: Option<PhyBlock
     }
 }
 
+fn build_u_sds_data_msg(source_issi: u32, dest_ssi: u32, payload: u16) -> SapMsg {
+    let pdu = USdsData {
+        area_selection: 0,
+        called_party_type_identifier: PartyTypeIdentifier::Ssi,
+        called_party_short_number_address: None,
+        called_party_ssi: Some(dest_ssi as u64),
+        called_party_extension: None,
+        user_defined_data: SdsUserData::Type1(payload),
+        external_subscriber_number: None,
+        dm_ms_address: None,
+    };
+
+    let mut sdu = BitBuffer::new_autoexpand(80);
+    pdu.to_bitbuf(&mut sdu).expect("Failed to serialize U-SDS-DATA");
+    sdu.seek(0);
+
+    SapMsg {
+        sap: Sap::LcmcSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Cmce,
+        msg: SapMsgInner::LcmcMleUnitdataInd(LcmcMleUnitdataInd {
+            sdu,
+            handle: 1,
+            endpoint_id: 1,
+            link_id: 1,
+            received_tetra_address: TetraAddress::new(source_issi, SsiType::Issi),
+            chan_change_resp_req: false,
+            chan_change_handle: None,
+        }),
+    }
+}
+
 fn dl_pdu_type(prim: &LcmcMleUnitdataReq) -> Option<CmcePduTypeDl> {
     prim.sdu.peek_bits(5).and_then(|raw| CmcePduTypeDl::try_from(raw).ok())
 }
@@ -1364,6 +1399,15 @@ fn parse_d_release(prim: &LcmcMleUnitdataReq) -> Option<DRelease> {
     let mut sdu = prim.sdu.clone();
     sdu.seek(0);
     DRelease::from_bitbuf(&mut sdu).ok()
+}
+
+fn parse_d_sds_data(prim: &LcmcMleUnitdataReq) -> Option<DSdsData> {
+    if !is_dl_pdu(prim, CmcePduTypeDl::DSdsData) {
+        return None;
+    }
+    let mut sdu = prim.sdu.clone();
+    sdu.seek(0);
+    DSdsData::from_bitbuf(&mut sdu).ok()
 }
 
 fn parse_cmce_function_not_supported(prim: &LcmcMleUnitdataReq) -> Option<CmceFunctionNotSupported> {
@@ -2276,6 +2320,126 @@ fn start_active_p2p_call_between_with_connect_msgs(test: &mut ComponentTest, cal
     let floor_msgs = grant_initial_p2p_floor(test, caller_issi, call_id);
     connect_msgs.extend(floor_msgs);
     (call_id, connect_msgs)
+}
+
+#[test]
+fn test_individual_sds_to_private_busy_issi_defers_until_release_without_delaying_group_sds() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_CALLED_ISSI, TEST_GSSI);
+    register_subscriber(&mut test, TEST_OTHER_ISSI, TEST_GSSI);
+
+    let (call_id, _connect_msgs) = start_active_p2p_call_between_with_connect_msgs(&mut test, TEST_ISSI, TEST_CALLED_ISSI);
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_u_sds_data_msg(TEST_OTHER_ISSI, TEST_GSSI, 0xBEEF));
+    test.run_stack(Some(1));
+    let group_sds_msgs = test.dump_sinks();
+    let group_sds = group_sds_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi) => {
+                parse_d_sds_data(prim).map(|pdu| (prim, pdu))
+            }
+            _ => None,
+        })
+        .expect("GSSI SDS should not be delayed by an unrelated private P2P busy ISSI");
+    assert_eq!(group_sds.0.layer2service, Layer2Service::Unacknowledged);
+    assert_eq!(group_sds.1.user_defined_data, SdsUserData::Type1(0xBEEF));
+
+    test.submit_message(build_u_sds_data_msg(TEST_OTHER_ISSI, TEST_CALLED_ISSI, 0xCAFE));
+    test.run_stack(Some(1));
+    let busy_sds_msgs = test.dump_sinks();
+    assert!(
+        busy_sds_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && parse_d_sds_data(prim).is_some()
+            )
+        }),
+        "individual SDS to an ISSI held by a private assigned channel must not burn LLC retries immediately"
+    );
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut initiator_release_msgs = test.dump_sinks();
+    let initiator_release_reporters = extract_d_release_reporters(&mut initiator_release_msgs);
+    assert_eq!(
+        initiator_release_reporters.len(),
+        1,
+        "private release initiator should receive one prompt D-RELEASE"
+    );
+    assert!(
+        initiator_release_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && parse_d_sds_data(prim).is_some()
+            )
+        }),
+        "deferred SDS must not flush while the private release is still pending"
+    );
+
+    test.router
+        .set_dl_time(dltime.add_timeslots(PRIVATE_SIMPLEX_TAIL_DRAIN_TIMESLOTS + PRIVATE_TEST_TIME_JUMP_MARGIN_TIMESLOTS));
+    test.run_stack(Some(1));
+    let mut peer_release_msgs = test.dump_sinks();
+    let peer_release_reporters = extract_d_release_reporters(&mut peer_release_msgs);
+    assert_eq!(
+        peer_release_reporters.len(),
+        1,
+        "private release peer should receive one tail-drained D-RELEASE"
+    );
+    assert!(
+        peer_release_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && parse_d_sds_data(prim).is_some()
+            )
+        }),
+        "deferred SDS must not flush before peer D-RELEASE delivery is resolved"
+    );
+
+    peer_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let peer_only_msgs = test.dump_sinks();
+    assert!(
+        peer_only_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::LcmcMleUnitdataReq(prim)
+                    if prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) && parse_d_sds_data(prim).is_some()
+            )
+        }),
+        "deferred SDS must wait for both private release reporters"
+    );
+
+    initiator_release_reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let flushed_msgs = test.dump_sinks();
+    let flushed_sds = flushed_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address == TetraAddress::issi(TEST_CALLED_ISSI) => {
+                parse_d_sds_data(prim).map(|pdu| (prim, pdu))
+            }
+            _ => None,
+        })
+        .expect("deferred individual SDS should flush after the private call release cleanup");
+    assert_eq!(flushed_sds.0.layer2service, Layer2Service::Acknowledged);
+    assert!(!flushed_sds.0.stealing_permission);
+    assert!(flushed_sds.0.chan_alloc.is_none());
+    assert_eq!(flushed_sds.1.calling_party_address_ssi, Some(TEST_OTHER_ISSI as u64));
+    assert_eq!(flushed_sds.1.user_defined_data, SdsUserData::Type1(0xCAFE));
 }
 
 fn grant_initial_p2p_floor(test: &mut ComponentTest, speaker_issi: u32, call_id: u16) -> Vec<SapMsg> {

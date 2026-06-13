@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 # SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
-# Nexus-BS v0.1.65 example configuration
+# Nexus-BS v0.1.66 example configuration
 #
 # This file is intentionally valid as-is so it can be parsed by tests and used
 # as a clean starting point. It follows the Nexus-BS field profile while keeping
@@ -44,7 +44,7 @@ service_name = "nexus-bs"
 
 [phy_io]
 
-# RF backend. Nexus-BS v0.1.65 supports the direct SoapySDR backend here.
+# RF backend. Nexus-BS v0.1.66 supports the direct SoapySDR backend here.
 # Keep this value exactly as shown unless a new backend is implemented.
 backend = "SoapySdr"
 
@@ -289,7 +289,7 @@ energy_saving_mode = "auto"
 # [cell_info.home_mode_display]
 # source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
 # interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
-# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text)
+# protocol_id = 220               # SDS-TL transport PID (example: 220/0xDC custom)
 # text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
 # text = "Nexus-BS"               # Text shown on radio display
 ###############################################################################
@@ -305,7 +305,7 @@ energy_saving_mode = "auto"
 # [cell_info.sds_broadcast]
 # source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
 # interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
-# protocol_id = 130               # SDS-TL transport PID (default: 130/0x82 text)
+# protocol_id = 220               # SDS-TL transport PID (example: 220/0xDC custom)
 # text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
 # text = "Nexus-BS AUX"           # Text payload to broadcast
 ###############################################################################
@@ -313,7 +313,7 @@ energy_saving_mode = "auto"
 ###############################################################################
 # WAP MVP OVER SDS
 #
-# Nexus-BS v0.1.65 includes a WAP MVP as an SDS Type4/WML delivery path driven
+# Nexus-BS v0.1.66 includes a WAP MVP as an SDS Type4/WML delivery path driven
 # by the control command, not as an always-on SNDCP/IP packet-data bearer.
 #
 # CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
@@ -426,7 +426,7 @@ bind = "127.0.0.1"
 # password = "change-this-before-exposing-the-dashboard"
 #
 # OPTIONAL: reserved path to the Nexus-BS git source directory for future OTA
-# update support. OTA update is disabled in Nexus-BS v0.1.65, and the dashboard
+# update support. OTA update is disabled in Nexus-BS v0.1.66, and the dashboard
 # button is grayed out. Keep this unset unless you are testing OTA code locally.
 # source_dir = "/opt/nexus-bs"
 #

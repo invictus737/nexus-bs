@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::Layer2Service;
@@ -50,6 +50,7 @@ const SDS_TL_REPORT_CONSUMED_MASK: u8 = 0x02;
 // SDS-SHORT REPORT carries an 8-bit message reference. Keep one complete
 // reference space worth of remembered SDS-TL PIDs and evict older contexts.
 const SDS_TL_REPORT_CONTEXT_LIMIT: usize = 256;
+const DEFERRED_INDIVIDUAL_SDS_LIMIT: usize = 64;
 
 #[derive(Debug, Clone, Copy)]
 struct ControlSdsRoute {
@@ -71,6 +72,14 @@ struct SdsTlReportContext {
     converted_report_mask: u8,
 }
 
+#[derive(Debug)]
+struct PendingIndividualSds {
+    source_issi: u32,
+    dest_issi: u32,
+    user_defined_data: SdsUserData,
+    tx_reporter: Option<TxReporter>,
+}
+
 pub struct SdsBsSubentity {
     config: SharedConfig,
     telemetry: Option<TelemetrySink>,
@@ -87,6 +96,7 @@ pub struct SdsBsSubentity {
     last_periodic_wx: Option<std::time::Instant>,
     sds_tl_report_context: HashMap<SdsTlReportContextKey, SdsTlReportContext>,
     sds_tl_report_context_order: VecDeque<SdsTlReportContextKey>,
+    deferred_individual_sds: VecDeque<PendingIndividualSds>,
 }
 
 impl SdsBsSubentity {
@@ -102,11 +112,99 @@ impl SdsBsSubentity {
             last_periodic_wx: None,
             sds_tl_report_context: HashMap::new(),
             sds_tl_report_context_order: VecDeque::new(),
+            deferred_individual_sds: VecDeque::new(),
         }
     }
 
     pub fn set_telemetry(&mut self, sink: TelemetrySink) {
         self.telemetry = Some(sink);
+    }
+
+    pub fn flush_deferred_individual_sds(&mut self, queue: &mut MessageQueue, busy_individual_issis: &HashSet<u32>) {
+        if self.deferred_individual_sds.is_empty() {
+            return;
+        }
+
+        let mut remaining = VecDeque::new();
+        while let Some(pending) = self.deferred_individual_sds.pop_front() {
+            if busy_individual_issis.contains(&pending.dest_issi) {
+                remaining.push_back(pending);
+                continue;
+            }
+
+            if !self.config.state_read().subscribers.is_registered(pending.dest_issi) {
+                tracing::warn!(
+                    "SDS: dropping deferred D-SDS-DATA {} -> {} because destination is no longer registered",
+                    pending.source_issi,
+                    pending.dest_issi
+                );
+                Self::discard_sds_reporter(pending.tx_reporter);
+                continue;
+            }
+
+            tracing::info!(
+                "SDS: flushing deferred individual D-SDS-DATA {} -> {} after private-call release",
+                pending.source_issi,
+                pending.dest_issi
+            );
+            self.send_d_sds_data_with_reporter(
+                queue,
+                pending.source_issi,
+                pending.dest_issi,
+                SsiType::Issi,
+                pending.user_defined_data,
+                pending.tx_reporter,
+            );
+        }
+        self.deferred_individual_sds = remaining;
+    }
+
+    fn defer_individual_sds(&mut self, source_issi: u32, dest_issi: u32, user_defined_data: SdsUserData, tx_reporter: Option<TxReporter>) {
+        if self.deferred_individual_sds.len() >= DEFERRED_INDIVIDUAL_SDS_LIMIT {
+            tracing::warn!(
+                "SDS: deferred individual SDS queue full ({}), dropping {} -> {}",
+                DEFERRED_INDIVIDUAL_SDS_LIMIT,
+                source_issi,
+                dest_issi
+            );
+            Self::discard_sds_reporter(tx_reporter);
+            return;
+        }
+
+        tracing::info!(
+            "SDS: deferring individual D-SDS-DATA {} -> {} while destination is in a private call",
+            source_issi,
+            dest_issi
+        );
+        self.deferred_individual_sds.push_back(PendingIndividualSds {
+            source_issi,
+            dest_issi,
+            user_defined_data,
+            tx_reporter,
+        });
+    }
+
+    fn send_or_defer_d_sds_data(
+        &mut self,
+        queue: &mut MessageQueue,
+        source_issi: u32,
+        dest_ssi: u32,
+        dest_ssi_type: SsiType,
+        user_defined_data: SdsUserData,
+        tx_reporter: Option<TxReporter>,
+        busy_individual_issis: &HashSet<u32>,
+    ) {
+        if dest_ssi_type == SsiType::Issi && busy_individual_issis.contains(&dest_ssi) {
+            // EN 300 392-2 clauses 20.3.1.3.1, 23.5.2.2.7 and Annex A.1
+            // distinguish common-control delivery from signalling available
+            // on an assigned traffic channel. This stack does not yet deliver
+            // SDS over the active private-call FACCH/STCH path, so keep the
+            // SDS queued until the ISSI returns to common-control scheduling
+            // instead of exhausting LLC retries on MCCH.
+            self.defer_individual_sds(source_issi, dest_ssi, user_defined_data, tx_reporter);
+        } else {
+            self.send_d_sds_data_with_reporter(queue, source_issi, dest_ssi, dest_ssi_type, user_defined_data, tx_reporter);
+        }
     }
 
     /// Provide the control-command sender used to deliver WX/METAR replies.
@@ -462,7 +560,12 @@ impl SdsBsSubentity {
     }
 
     /// Handle incoming U-SDS-DATA from a local MS (via RF uplink)
-    pub fn route_rf_deliver(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+    pub fn route_rf_deliver(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        self.route_rf_deliver_with_busy(queue, message, &HashSet::new());
+    }
+
+    /// Handle incoming U-SDS-DATA while accounting for locally busy private-call ISSIs.
+    pub fn route_rf_deliver_with_busy(&mut self, queue: &mut MessageQueue, mut message: SapMsg, busy_individual_issis: &HashSet<u32>) {
         tracing::trace!("SDS route_rf_deliver");
 
         let SapMsgInner::LcmcMleUnitdataInd(prim) = &mut message.msg else {
@@ -539,7 +642,15 @@ impl SdsBsSubentity {
             // ISSI to the requester.
             if let Some(mr) = Self::sds_tl_message_reference(&pdu.user_defined_data) {
                 let report = SdsUserData::Type4(32, vec![0x82u8, 0x10u8, 0x00u8, mr]);
-                self.send_d_sds_data(queue, wx.service_issi, source_ssi, SsiType::Issi, report);
+                self.send_or_defer_d_sds_data(
+                    queue,
+                    wx.service_issi,
+                    source_ssi,
+                    SsiType::Issi,
+                    report,
+                    None,
+                    busy_individual_issis,
+                );
             }
             self.handle_wx_request(source_ssi, &pdu.user_defined_data);
             self.emit(TelemetryEvent::SdsActivity {
@@ -573,7 +684,15 @@ impl SdsBsSubentity {
 
         if is_local_issi {
             tracing::info!("SDS: local delivery: {} -> {}", source_ssi, dest_ssi);
-            self.send_d_sds_data(queue, source_ssi, dest_ssi, SsiType::Issi, pdu.user_defined_data);
+            self.send_or_defer_d_sds_data(
+                queue,
+                source_ssi,
+                dest_ssi,
+                SsiType::Issi,
+                pdu.user_defined_data,
+                None,
+                busy_individual_issis,
+            );
             self.emit(TelemetryEvent::SdsActivity {
                 source_issi: source_ssi,
                 dest_issi: dest_ssi,
@@ -606,6 +725,10 @@ impl SdsBsSubentity {
 
     /// Handle incoming SDS data from Brew entity (network-originated SDS)
     pub fn rx_sds_from_brew(&mut self, queue: &mut MessageQueue, message: SapMsg) {
+        self.rx_sds_from_brew_with_busy(queue, message, &HashSet::new());
+    }
+
+    pub fn rx_sds_from_brew_with_busy(&mut self, queue: &mut MessageQueue, message: SapMsg, busy_individual_issis: &HashSet<u32>) {
         let SapMsgInner::CmceSdsData(sds) = message.msg else {
             tracing::error!("SDS: rx_sds_from_brew expected CmceSdsData, got unexpected message type");
             return;
@@ -691,14 +814,16 @@ impl SdsBsSubentity {
             tracing::debug!("SDS: routing Brew SDS to local GSSI {}", sds.dest_issi);
         }
 
-        // Send D-SDS-DATA downlink to the local MS/group. Schedule on next ts1 to ensure it gets sent on the MCCH.
-        self.send_d_sds_data_with_reporter(
+        // Send D-SDS-DATA downlink to the local MS/group, or defer individual
+        // delivery while that ISSI is still held by an assigned private-call channel.
+        self.send_or_defer_d_sds_data(
             queue,
             air_source_ssi,
             sds.dest_issi,
             dest_ssi_type,
             user_defined_data,
             sds.tx_reporter,
+            busy_individual_issis,
         );
     }
 
@@ -849,6 +974,15 @@ impl SdsBsSubentity {
 
     /// Handle incoming SDS data from Control entity (network-originated SDS)
     pub fn rx_sds_from_control(&mut self, queue: &mut MessageQueue, message: ControlCommand) -> bool {
+        self.rx_sds_from_control_with_busy(queue, message, &HashSet::new())
+    }
+
+    pub fn rx_sds_from_control_with_busy(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: ControlCommand,
+        busy_individual_issis: &HashSet<u32>,
+    ) -> bool {
         let ControlCommand::SendSds {
             handle,
             source_ssi,
@@ -921,12 +1055,14 @@ impl SdsBsSubentity {
         }
         let wrapped_len_bits = (wrapped_payload.len() * 8) as u16;
 
-        self.send_d_sds_data(
+        self.send_or_defer_d_sds_data(
             queue,
             route.air_source_ssi,
             dest_ssi,
             route.dest_ssi_type,
             SdsUserData::Type4(wrapped_len_bits, wrapped_payload),
+            None,
+            busy_individual_issis,
         );
 
         true
@@ -934,6 +1070,15 @@ impl SdsBsSubentity {
 
     /// Handle incoming raw SDS data from Control entity (network-originated SDS).
     pub fn rx_raw_sds_from_control(&mut self, queue: &mut MessageQueue, message: ControlCommand) -> bool {
+        self.rx_raw_sds_from_control_with_busy(queue, message, &HashSet::new())
+    }
+
+    pub fn rx_raw_sds_from_control_with_busy(
+        &mut self,
+        queue: &mut MessageQueue,
+        message: ControlCommand,
+        busy_individual_issis: &HashSet<u32>,
+    ) -> bool {
         let ControlCommand::SendRawSds {
             handle,
             source_ssi,
@@ -974,7 +1119,15 @@ impl SdsBsSubentity {
             user_defined_data
         };
 
-        self.send_d_sds_data(queue, route.air_source_ssi, dest_ssi, route.dest_ssi_type, user_defined_data);
+        self.send_or_defer_d_sds_data(
+            queue,
+            route.air_source_ssi,
+            dest_ssi,
+            route.dest_ssi_type,
+            user_defined_data,
+            None,
+            busy_individual_issis,
+        );
 
         true
     }

@@ -100,8 +100,8 @@ mod tests {
             "configured short local exceptions must remain inside this cell instead of being routed over Brew"
         );
         assert!(
-            !is_brew_issi_routable(&config, 226333),
-            "configured GSSI/local exceptions must remain inside this cell instead of being routed over Brew"
+            is_brew_gssi_routable(&config, 226333),
+            "example config no longer marks the lab GSSI as a local SSI exception; GSSI routing remains open unless explicitly restricted"
         );
         assert!(
             is_brew_issi_routable(&config, 2260616),
