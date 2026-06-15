@@ -1,4 +1,4 @@
-# Nexus-BS v0.1.66 example configuration
+# Nexus-BS v0.1.66_dev example configuration
 #
 # This file is intentionally valid as-is so it can be parsed by tests and used
 # as a clean starting point. It follows the Nexus-BS field profile while keeping
@@ -39,7 +39,7 @@ service_name = "nexus-bs"
 
 [phy_io]
 
-# RF backend. Nexus-BS v0.1.66 supports the direct SoapySDR backend here.
+# RF backend. Nexus-BS v0.1.66_dev supports the direct SoapySDR backend here.
 # Keep this value exactly as shown unless a new backend is implemented.
 backend = "SoapySdr"
 
@@ -308,7 +308,7 @@ energy_saving_mode = "auto"
 ###############################################################################
 # WAP MVP OVER SDS
 #
-# Nexus-BS v0.1.66 includes a WAP MVP as an SDS Type4/WML delivery path driven
+# Nexus-BS v0.1.66_dev includes a WAP MVP as an SDS Type4/WML delivery path driven
 # by the control command, not as an always-on SNDCP/IP packet-data bearer.
 #
 # CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
@@ -421,7 +421,7 @@ bind = "127.0.0.1"
 # password = "change-this-before-exposing-the-dashboard"
 #
 # OPTIONAL: reserved path to the Nexus-BS git source directory for future OTA
-# update support. OTA update is disabled in Nexus-BS v0.1.66, and the dashboard
+# update support. OTA update is disabled in Nexus-BS v0.1.66_dev, and the dashboard
 # button is grayed out. Keep this unset unless you are testing OTA code locally.
 # source_dir = "/opt/nexus-bs"
 #

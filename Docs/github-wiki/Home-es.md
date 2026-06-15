@@ -33,8 +33,8 @@ comando inicia Nexus-BS.
 sudo apt update
 sudo apt install -y curl ca-certificates
 cd ~
-curl -fLO https://github.com/invictus737/nexus-bs/releases/download/v0.1.66/nexus-bs_0.1.66_arm64.deb
-curl -fLO https://github.com/invictus737/nexus-bs/releases/download/v0.1.66/SHA256SUMS
+curl -fLO https://github.com/invictus737/nexus-bs/releases/download/v0.1.66_dev/nexus-bs_0.1.66_arm64.deb
+curl -fLO https://github.com/invictus737/nexus-bs/releases/download/v0.1.66_dev/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 sudo apt install ./nexus-bs_0.1.66_arm64.deb
 sudo chown "$USER:$USER" /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback

@@ -9,8 +9,12 @@
 
 /// Public product name shown by tools, dashboard and network clients.
 pub const PRODUCT_NAME: &str = "Nexus-BS";
-/// Workspace package version shared by the Nexus-BS crates.
-pub const PRODUCT_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Cargo/package semver shared by the Nexus-BS crates.
+pub const PRODUCT_BASE_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Release channel suffix encoded into runtime-visible identity strings.
+pub const PRODUCT_VERSION_SUFFIX: &str = "_dev";
+/// Runtime-visible product version shown by dashboard/API/user-agent.
+pub const PRODUCT_VERSION: &str = const_format::formatcp!("{}{}", PRODUCT_BASE_VERSION, PRODUCT_VERSION_SUFFIX);
 /// Release-style version tag without the git suffix.
 pub const PRODUCT_VERSION_TAG: &str = const_format::formatcp!("v{}", PRODUCT_VERSION);
 /// HTTP/WebSocket User-Agent for external services and Nexus-BS clients.
@@ -25,7 +29,7 @@ pub const GIT_HASH: &str = git_version::git_version!(
     args = ["--always", "--dirty=-modified", "--match=", "--abbrev=8"],
     fallback = "unknown"
 );
-/// Full stack version string, e.g. "v0.1.66-g2aad62c"
+/// Full stack version string, e.g. "v0.1.66_dev-g2aad62c"
 pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", PRODUCT_VERSION_TAG, GIT_HASH);
 
 pub mod address;
@@ -63,10 +67,12 @@ mod tests {
     #[test]
     fn product_identity_tracks_workspace_version() {
         assert_eq!(PRODUCT_NAME, "Nexus-BS");
-        assert_eq!(PRODUCT_VERSION, "0.1.66");
-        assert_eq!(PRODUCT_VERSION_TAG, "v0.1.66");
-        assert_eq!(PRODUCT_USER_AGENT, "Nexus-BS/v0.1.66");
-        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.66");
-        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.66");
+        assert_eq!(PRODUCT_BASE_VERSION, "0.1.66");
+        assert_eq!(PRODUCT_VERSION_SUFFIX, "_dev");
+        assert_eq!(PRODUCT_VERSION, "0.1.66_dev");
+        assert_eq!(PRODUCT_VERSION_TAG, "v0.1.66_dev");
+        assert_eq!(PRODUCT_USER_AGENT, "Nexus-BS/v0.1.66_dev");
+        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.66_dev");
+        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.66_dev");
     }
 }

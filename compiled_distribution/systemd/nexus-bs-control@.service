@@ -8,7 +8,7 @@
 # sent by the flat-folder /home/USER/nexus-bs/nexus-bs-control wrapper.
 
 [Unit]
-Description=Nexus-BS v0.1.66 local control service for %i
+Description=Nexus-BS v0.1.66_dev local control service for %i
 Documentation=man:systemd.service(5)
 After=network-online.target
 Wants=network-online.target
