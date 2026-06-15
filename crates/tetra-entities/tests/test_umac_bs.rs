@@ -5,7 +5,7 @@
 
 mod common;
 
-use tetra_config::bluestation::{CfgWapIp, EnergySavingAssignment, SharedConfig, StackMode};
+use tetra_config::bluestation::{CfgBrew, CfgWapIp, EnergySavingAssignment, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     BitBuffer, BurstType, Direction, Layer2Service, PhyBlockNum, PhyBlockType, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress,
@@ -26,6 +26,7 @@ use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
 use tetra_pdus::llc::pdus::bl_udata::BlUdata;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
+use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
 use tetra_pdus::umac::enums::basic_slotgrant_cap_alloc::BasicSlotgrantCapAlloc;
 use tetra_pdus::umac::enums::basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay;
 use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
@@ -33,6 +34,7 @@ use tetra_pdus::umac::pdus::mac_access::MacAccess;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_frag_dl::MacFragDl;
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
+use tetra_pdus::umac::pdus::mac_sysinfo::MacSysinfo;
 use tetra_pdus::umac::pdus::mac_u_blck::MacUBlck;
 use tetra_pdus::umac::pdus::mac_u_signal::MacUSignal;
 use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSource};
@@ -196,6 +198,21 @@ fn enable_wap_ip_status_mvp_for_sysinfo(config: &mut tetra_config::bluestation::
     });
 }
 
+fn test_brew_config() -> CfgBrew {
+    CfgBrew {
+        host: "core.tetrapack.online".to_string(),
+        port: 443,
+        tls: true,
+        username: None,
+        password: None,
+        reconnect_delay: std::time::Duration::from_secs(1),
+        jitter_initial_latency_frames: 0,
+        feature_sds_enabled: true,
+        feature_rssi_export: false,
+        whitelisted_ssis: None,
+    }
+}
+
 #[test]
 fn test_mle_sysinfo_advertises_sndcp_only_for_explicit_wap_ip_profile() {
     debug::setup_logging_verbose();
@@ -230,6 +247,55 @@ fn test_mle_sysinfo_advertises_sndcp_only_for_explicit_wap_ip_profile() {
         wap_precomps.mle_sysinfo.bs_service_details.sndcp_service,
         "explicit WAP/IP profile must advertise SNDCP packet-data availability"
     );
+}
+
+#[test]
+fn test_wap_ip_bnch_advertises_packet_data_even_before_brew_connects() {
+    debug::setup_logging_verbose();
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.brew = Some(test_brew_config());
+    config.cell.system_wide_services = true;
+    config.cell.advanced_link = true;
+    enable_wap_ip_status_mvp_for_sysinfo(&mut config);
+    let shared_config = SharedConfig::from_parts(config, None);
+    assert!(
+        !shared_config.state_read().network_connected,
+        "test must model the startup window before external Brew backhaul connects"
+    );
+
+    let precomps = UmacBs::generate_precomps(&shared_config);
+    assert!(
+        precomps.mle_sysinfo.bs_service_details.system_wide_services,
+        "local WAP/IP SNDCP profile must keep the CA cell in normal mode even before Brew connects"
+    );
+
+    let mut bnch = BitBuffer::new(124);
+    precomps.mac_sysinfo2.to_bitbuf(&mut bnch);
+    precomps.mle_sysinfo.to_bitbuf(&mut bnch);
+    assert_eq!(
+        bnch.get_pos(),
+        124,
+        "SYSINFO with extended services plus D-MLE-SYSINFO must fill one pi/4-DQPSK BNCH block"
+    );
+    bnch.seek(0);
+
+    let decoded_sysinfo = MacSysinfo::from_bitbuf(&mut bnch).expect("MAC-SYSINFO should decode");
+    let decoded_mle = DMleSysinfo::from_bitbuf(&mut bnch).expect("D-MLE-SYSINFO should decode");
+    let ext_services = decoded_sysinfo.ext_services.expect("SYSINFO2 must carry extended services");
+
+    // EN 300 392-2 clauses 18.5.2.1/table 18.26, 21.4.4.1/tables
+    // 21.67-21.68 and 28.2: a CA MS may start SNDCP packet data only when
+    // the serving cell advertises SNDCP service availability. Nexus-BS
+    // advertises original advanced link only; QoS negotiation, D8PSK and
+    // extended advanced links remain false until their procedures are present.
+    assert!(decoded_mle.bs_service_details.system_wide_services);
+    assert!(decoded_mle.bs_service_details.sndcp_service);
+    assert!(decoded_mle.bs_service_details.advanced_link);
+    assert!(!decoded_mle.bs_service_details.circuit_mode_data_service);
+    assert!(!decoded_mle.bs_service_details.aie_service);
+    assert_eq!(ext_services.section, 0);
+    assert_eq!(ext_services.section_data, 0);
 }
 
 #[test]

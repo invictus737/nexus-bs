@@ -241,7 +241,7 @@ mod tests {
     fn options() -> WapDashboardSnapshotOptions {
         WapDashboardSnapshotOptions {
             title: "Nexus-BS WAP".to_string(),
-            stack_version: "v0.1.68_dev-test".to_string(),
+            stack_version: "v0.1.69_dev-test".to_string(),
             uptime_secs: 3661,
             service_state_override: None,
             max_radio_lines: WAP_STATUS_DETAIL_MAX_LINES,
@@ -317,7 +317,7 @@ mod tests {
         let snapshot = wap_status_snapshot_from_dashboard(&state, &options());
 
         assert_eq!(snapshot.title, "Nexus-BS WAP");
-        assert_eq!(snapshot.stack_version, "v0.1.68_dev-test");
+        assert_eq!(snapshot.stack_version, "v0.1.69_dev-test");
         assert_eq!(snapshot.service_state, "DEGRADED");
         assert_eq!(snapshot.registered_ms, 1);
         assert_eq!(snapshot.active_calls, 1);

@@ -232,7 +232,7 @@ mod tests {
     fn sample_snapshot() -> WapStatusSnapshot {
         WapStatusSnapshot {
             title: "Nexus-BS".to_string(),
-            stack_version: "v0.1.68_dev-test".to_string(),
+            stack_version: "v0.1.69_dev-test".to_string(),
             service_state: "ON AIR".to_string(),
             registered_ms: 3,
             active_calls: 1,
@@ -271,7 +271,7 @@ mod tests {
         assert!(page.contains("<span class=\"k\">Calls</span> 1"));
         assert!(page.contains("<span class=\"k\">SDS</span> 2"));
         assert!(page.contains("Up</span> 1d02h"));
-        assert!(page.contains("Ver</span> v0.1.68_dev-test"));
+        assert!(page.contains("Ver</span> v0.1.69_dev-test"));
         assert!(page.contains("Last: SDS 2260082&gt;2260618"));
         assert!(page.contains("Health:OK"));
         assert!(page.contains("CORE OK"));
@@ -336,7 +336,7 @@ mod tests {
     fn render_wml2_status_bounds_escaped_dashboard_text_for_small_mtu() {
         let mut snapshot = sample_snapshot();
         snapshot.title = "Nexus &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&".to_string();
-        snapshot.stack_version = "v0.1.68_dev-with-a-very-long-build-identifier-and-extra-channel-data".to_string();
+        snapshot.stack_version = "v0.1.69_dev-with-a-very-long-build-identifier-and-extra-channel-data".to_string();
         snapshot.service_state = "DEGRADED &&&&&&&&&&&&&&&&&&&&&&&&&&".to_string();
         snapshot.last_activity = Some("SDS 2260082>2260618 &&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&&".to_string());
 

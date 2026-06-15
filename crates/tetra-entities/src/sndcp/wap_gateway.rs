@@ -178,7 +178,7 @@ mod tests {
     fn snapshot() -> WapStatusSnapshot {
         WapStatusSnapshot {
             title: "Nexus-BS".to_string(),
-            stack_version: "v0.1.68_dev-test".to_string(),
+            stack_version: "v0.1.69_dev-test".to_string(),
             service_state: "ON AIR".to_string(),
             registered_ms: 3,
             active_calls: 1,
@@ -195,7 +195,7 @@ mod tests {
     fn detailed_snapshot() -> WapStatusSnapshot {
         WapStatusSnapshot {
             title: "Nexus-BS WAP &&&&&&&&&&&&".to_string(),
-            stack_version: "v0.1.68_dev-with-long-build-id".to_string(),
+            stack_version: "v0.1.69_dev-with-long-build-id".to_string(),
             service_state: "DEGRADED &&&&&&".to_string(),
             registered_ms: 6,
             active_calls: 2,

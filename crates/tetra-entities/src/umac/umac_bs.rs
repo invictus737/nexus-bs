@@ -232,6 +232,7 @@ impl UmacBs {
         let scrambling_code = scrambler::tetra_scramb_get_init(c.net.mcc, c.net.mnc, c.cell.colour_code);
         let system_wide_services = Self::get_system_wide_services_state(&config);
         let precomps = Self::generate_precomps(&config);
+        Self::log_on_air_service_capabilities(&config, &precomps);
         Self {
             self_component: TetraEntity::Umac,
             config,
@@ -1122,15 +1123,58 @@ impl UmacBs {
         }
     }
 
-    /// Retrieve currently set value of system-wide services. If SwMI is active, this governs connection state
-    /// Otherwise, value from config is used.
+    fn local_wap_ip_sndcp_profile_enabled(config: &SharedConfig) -> bool {
+        let cfg = config.config();
+        cfg.cell.sndcp_service && cfg.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled)
+    }
+
+    /// Retrieve currently set value of system-wide services.
+    ///
+    /// EN 300 392-2 table 18.26 exposes normal mode/system-wide services in
+    /// D-MLE-SYSINFO. When the local WAP/IP SNDCP profile is enabled, Nexus-BS
+    /// owns the packet-data service locally and must not make the CA cell
+    /// oscillate between normal and fallback mode because an external Brew
+    /// backhaul reconnects.
     fn get_system_wide_services_state(config: &SharedConfig) -> bool {
         let cfg = config.config();
-        if cfg.brew.is_some() {
+        if Self::local_wap_ip_sndcp_profile_enabled(config) {
+            cfg.cell.system_wide_services
+        } else if cfg.brew.is_some() {
             config.state_read().network_connected
         } else {
             cfg.cell.system_wide_services
         }
+    }
+
+    fn log_on_air_service_capabilities(config: &SharedConfig, precomps: &PrecomputedUmacPdus) {
+        let cfg = config.config();
+        let brew_connected = config.state_read().network_connected;
+        let details = &precomps.mle_sysinfo.bs_service_details;
+        let ext = precomps.mac_sysinfo2.ext_services.as_ref();
+        let (section, section_data) = ext.map(|services| (services.section, services.section_data)).unwrap_or((0, 0));
+        let section1_data_priority = section == 0 && (section_data & 0b100_0000) != 0;
+        let section1_extended_advanced_link = section == 0 && (section_data & 0b010_0000) != 0;
+        let section1_qos_negotiation = section == 0 && (section_data & 0b001_0000) != 0;
+        let section1_d8psk = section == 0 && (section_data & 0b000_1000) != 0;
+
+        tracing::info!(
+            "UmacBs: on-air CA services system_wide={} sndcp={} voice={} circuit_data={} advanced_link={} aie={} wap_ip_profile={} brew_configured={} brew_connected={} ext_section={} ext_section_data=0b{:07b} data_priority={} ext_advanced_link={} qos_negotiation={} d8psk={}",
+            details.system_wide_services,
+            details.sndcp_service,
+            details.voice_service,
+            details.circuit_mode_data_service,
+            details.advanced_link,
+            details.aie_service,
+            Self::local_wap_ip_sndcp_profile_enabled(config),
+            cfg.brew.is_some(),
+            brew_connected,
+            section,
+            section_data,
+            section1_data_priority,
+            section1_extended_advanced_link,
+            section1_qos_negotiation,
+            section1_d8psk
+        );
     }
 
     fn refresh_system_wide_services(&mut self) {

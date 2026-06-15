@@ -213,7 +213,7 @@ mod tests {
     fn snapshot() -> WapStatusSnapshot {
         WapStatusSnapshot {
             title: "Nexus-BS".to_string(),
-            stack_version: "v0.1.68_dev-test".to_string(),
+            stack_version: "v0.1.69_dev-test".to_string(),
             service_state: "ON AIR".to_string(),
             registered_ms: 4,
             active_calls: 0,
