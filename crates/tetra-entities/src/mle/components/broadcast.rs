@@ -215,9 +215,9 @@ fn cfg_to_bs_service_details(c: &CfgBsServiceDetails) -> BsServiceDetails {
         voice_service: c.voice_service,
         circuit_mode_data_service: c.circuit_mode_data_service,
         // EN 300 392-2 table 18.26 defines SNDCP service=1 as packet-data
-        // availability. The current WAP MVP is SDS-based, not a full SNDCP/IP
-        // bearer, so force the advertised bit off even if direct config bypassed
-        // parser validation.
+        // availability. Nexus-BS currently allows the opt-in WAP/IP MVP only
+        // on the serving cell; neighbor-cell advertising stays fail-closed
+        // until packet-data reselection/inter-cell behavior is implemented.
         sndcp_service: false,
         aie_service: c.aie_service,
         advanced_link: c.advanced_link,

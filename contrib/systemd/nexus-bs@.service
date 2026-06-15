@@ -10,13 +10,13 @@
 #
 # Layout expected:
 #   /home/%i/nexus-bs/nexus-bs
-#   /home/%i/nexus-bs/config.toml
+#   /etc/nexus-bs/config.toml
 #
 # Runtime state is copied to /run/nexus-bs-USER so subscriber recovery cache and
 # logs stay volatile on read-only/appliance installs.
 
 [Unit]
-Description=Nexus-BS v0.1.65 TETRA base station service for %i
+Description=Nexus-BS v0.1.68_dev TETRA base station service for %i
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs-control@%i.service
 Wants=network-online.target nexus-bs-control@%i.service
@@ -30,7 +30,7 @@ RuntimeDirectory=nexus-bs-%i
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs@%i.service
-Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/%i/nexus-bs/config.toml
+Environment=NEXUS_BS_PERSISTENT_CONFIG=/etc/nexus-bs/config.toml
 Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/%i/nexus-bs/dashboard
 Environment=NEXUS_BS_CORE_DASHBOARD_BIND=127.0.0.1
 Environment=NEXUS_BS_CORE_DASHBOARD_PORT=18080
@@ -38,9 +38,9 @@ Environment=RUST_LOG=info,tetra_entities::messagerouter=warn,tetra_entities::phy
 
 # Copy config into tmpfs before start. nexus-bs derives the subscriber recovery
 # path from the config path, so /run/nexus-bs-%i/config.toml keeps the
-# .subscribers cache volatile while the editable config stays beside the binary.
-ExecStartPre=/usr/bin/install -m 0600 /home/%i/nexus-bs/config.toml /run/nexus-bs-%i/config.toml
-ExecStartPre=/bin/sh -c 'if [ -f "$1" ]; then /usr/bin/install -m 0600 "$1" "$2"; fi' nexus-bs-copy-fallback /home/%i/nexus-bs/config.toml.fallback /run/nexus-bs-%i/config.toml.fallback
+# .subscribers cache volatile while the editable config stays under /etc.
+ExecStartPre=/usr/bin/install -m 0600 /etc/nexus-bs/config.toml /run/nexus-bs-%i/config.toml
+ExecStartPre=/bin/sh -c 'if [ -f "$1" ]; then /usr/bin/install -m 0600 "$1" "$2"; fi' nexus-bs-copy-fallback /etc/nexus-bs/config.toml.fallback /run/nexus-bs-%i/config.toml.fallback
 ExecStart=/home/%i/nexus-bs/nexus-bs /run/nexus-bs-%i/config.toml
 
 KillSignal=SIGINT

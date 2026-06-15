@@ -116,6 +116,8 @@ pub enum SapMsgInner {
     CmceSdsStatus(CmceSdsStatus),
 
     // LTPD-SAP (MLE-LTPD)
+    LtpdMleConfigureReq(LtpdMleConfigureReq),
+    LtpdMleConfigureInd(LtpdMleConfigureInd),
     LtpdMleReportInd(LtpdMleReportInd),
     LtpdMleUnitdataReq(LtpdMleUnitdataReq),
     LtpdMleUnitdataInd(LtpdMleUnitdataInd),
@@ -166,6 +168,8 @@ impl Display for SapMsgInner {
             SapMsgInner::LmmMleReportInd(_) => write!(f, "LmmMleReportInd"),
             SapMsgInner::LcmcMleConfigureReq(_) => write!(f, "LcmcMleConfigureReq"),
             SapMsgInner::LcmcMleReportInd(_) => write!(f, "LcmcMleReportInd"),
+            SapMsgInner::LtpdMleConfigureReq(_) => write!(f, "LtpdMleConfigureReq"),
+            SapMsgInner::LtpdMleConfigureInd(_) => write!(f, "LtpdMleConfigureInd"),
             SapMsgInner::LtpdMleReportInd(_) => write!(f, "LtpdMleReportInd"),
             SapMsgInner::LtpdMleUnitdataReq(_) => write!(f, "LtpdMleUnitdataReq"),
             SapMsgInner::LtpdMleUnitdataInd(_) => write!(f, "LtpdMleUnitdataInd"),

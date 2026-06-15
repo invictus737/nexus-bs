@@ -65,6 +65,16 @@ fn route_through_mle_with_subscriber_class(message: SapMsg, subscriber_class: u1
     test.dump_sinks()
 }
 
+fn route_sndcp_outbound_through_mle_with_direct_service_flag(message: SapMsg) -> Vec<SapMsg> {
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.sndcp_service = true;
+    let mut test = ComponentTest::from_config(config, None);
+    test.populate_entities(vec![TetraEntity::Mle], vec![TetraEntity::Llc]);
+    test.submit_message(message);
+    test.deliver_all_messages();
+    test.dump_sinks()
+}
+
 fn outbound_subscriber_class(msgs: &[SapMsg]) -> i32 {
     assert_eq!(msgs.len(), 1);
     match &msgs[0].msg {
@@ -377,7 +387,7 @@ fn test_lcmc_acknowledged_request_stays_tl_data_request() {
 
 #[test]
 fn test_sndcp_unacknowledged_request_uses_packet_data_tl_unitdata() {
-    let sink_msgs = route_through_mle(build_ltpd_req(Layer2Service::Unacknowledged));
+    let sink_msgs = route_sndcp_outbound_through_mle_with_direct_service_flag(build_ltpd_req(Layer2Service::Unacknowledged));
 
     assert_eq!(sink_msgs.len(), 1);
     let SapMsgInner::TlaTlUnitdataReqBl(prim) = &sink_msgs[0].msg else {
@@ -396,12 +406,28 @@ fn test_sndcp_unacknowledged_request_uses_packet_data_tl_unitdata() {
     assert!(prim.packet_data_flag);
     assert_eq!(prim.n_tlsdu_repeats, Some(2));
     assert_eq!(prim.data_class_info, Some(3));
+    assert!(
+        prim.chan_alloc.is_none(),
+        "runtime SNDCP remains fail-closed: no packet-data channel allocation is wired through MLE yet"
+    );
     assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Sndcp);
 }
 
 #[test]
+fn test_sndcp_unadvertised_request_does_not_reach_llc_packet_data() {
+    let sink_msgs = route_through_mle(build_ltpd_req(Layer2Service::Unacknowledged));
+
+    // EN 300 392-2 table 18.26 maps SNDCP service advertisement to packet-data
+    // availability. With local service unavailable, accidental WAP/SNDCP
+    // runtime wiring must not emit packet-data TL-UNITDATA to LLC.
+    assert!(sink_msgs.is_empty());
+}
+
+#[test]
 fn test_sndcp_terminal_report_routes_back_to_ltpd_sap() {
-    let mut test = ComponentTest::new(StackMode::Bs, None);
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.sndcp_service = true;
+    let mut test = ComponentTest::from_config(config, None);
     test.populate_entities(vec![TetraEntity::Mle], vec![TetraEntity::Llc, TetraEntity::Sndcp]);
 
     test.submit_message(build_ltpd_req(Layer2Service::Unacknowledged));

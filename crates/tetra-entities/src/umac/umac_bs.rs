@@ -1069,12 +1069,11 @@ impl UmacBs {
                 system_wide_services,
                 voice_service: c.cell.voice_service,
                 circuit_mode_data_service: c.cell.circuit_mode_data_service,
-                // EN 300 392-2 clauses 18.5.2.1 and 18.5.21 advertise
+                // EN 300 392-2 clauses 18.5.2.1/table 18.26 advertise
                 // packet-data/SNDCP availability through local BS service
-                // details. This stack currently routes SNDCP to a fail-closed
-                // stub, so never advertise a WAP/IP bearer from MAC SYSINFO
-                // until SNDCP bearer support is actually implemented.
-                sndcp_service: false,
+                // details. The parser only permits this bit for the explicit
+                // local WAP/IP SNDCP MVP profile.
+                sndcp_service: c.cell.sndcp_service && c.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled),
                 // Same fail-closed rule for air-interface encryption: do not
                 // advertise AIE until EN 300 392-7 security procedures are
                 // implemented and tested.

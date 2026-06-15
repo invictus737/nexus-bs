@@ -2741,7 +2741,7 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
             let page_text = if wap.color { WAP_MVP_COLOR_PAGE_TEXT } else { WAP_MVP_PAGE_TEXT };
             let payload = wap_sds_type4_payload(page_text);
             if payload.len() > WAP_SDS_TYPE4_MAX_BYTE_ALIGNED_PAYLOAD_BYTES {
-                tracing::warn!("Dashboard: WAP page is too large for SDS Type4");
+                tracing::warn!("Dashboard: SDS WAP page is too large for SDS Type4");
                 return;
             }
             let len_bits = (payload.len() * 8) as u16;
@@ -2758,11 +2758,11 @@ fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Opti
                 len_bits,
                 payload,
             }) {
-                tracing::info!("Dashboard: WAP page sent to {}", wap.dest_issi);
+                tracing::info!("Dashboard: SDS WAP page sent to {}", wap.dest_issi);
                 let mut s = state.write().unwrap();
-                s.push_log("INFO", format!("WAP page sent to ISSI {}", wap.dest_issi));
+                s.push_log("INFO", format!("SDS WAP page sent to ISSI {}", wap.dest_issi));
             } else {
-                tracing::warn!("Dashboard: no control dispatcher for WAP page");
+                tracing::warn!("Dashboard: no control dispatcher for SDS WAP page");
             }
         }
         _ => {}
@@ -4182,10 +4182,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.66_dev"));
+        assert!(rendered.contains("Nexus-BS v0.1.68_dev"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.66_dev"));
+        assert!(rendered.contains("Nexus-BS/v0.1.68_dev"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -4531,7 +4531,7 @@ mod tests {
 
         assert!(dashboard.contains(r#"onclick="sendWap(${m.issi})""#));
         assert!(dashboard.contains("function sendWap(issi){wsSend({type:'wap',dest_issi:issi});}"));
-        assert!(dashboard.contains("wap:'WAP'"));
+        assert!(dashboard.contains("wap:'SDS WAP'"));
     }
 
     #[test]
@@ -4539,9 +4539,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.66_dev");
-        assert_eq!(product.version_tag, "v0.1.66_dev");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.66_dev");
+        assert_eq!(product.version, "0.1.68_dev");
+        assert_eq!(product.version_tag, "v0.1.68_dev");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.68_dev");
     }
 
     #[test]

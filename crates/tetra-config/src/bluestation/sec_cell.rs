@@ -5,6 +5,7 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 
 use tetra_core::ranges::{SortedDisjointSsiRanges, SsiRange};
 use toml::Value;
@@ -26,6 +27,13 @@ pub const DEFAULT_ENERGY_SAVING_MODE: u8 = ENERGY_SAVING_MODE_AUTO;
 /// EN 300 392-2 table 29.21 assigns 0x82 to text messaging. Vendor/home-screen
 /// compatibility PIDs such as 0xDC remain supported when explicitly configured.
 pub const DEFAULT_SDS_TEXT_PROTOCOL_ID: u8 = 0x82;
+pub const DEFAULT_WAP_IP_ADDRESS: [u8; 4] = [10, 0, 0, 1];
+pub const DEFAULT_WAP_IP_PORT: u16 = 9200;
+pub const DEFAULT_WAP_IP_RESPONSE_TTL: u8 = 32;
+pub const DEFAULT_WAP_IP_DYNAMIC_POOL_PREFIX: [u8; 3] = [10, 0, 0];
+pub const DEFAULT_WAP_IP_DYNAMIC_POOL_FIRST_HOST: u8 = 2;
+pub const DEFAULT_WAP_IP_DYNAMIC_POOL_LAST_HOST: u8 = 254;
+pub const DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES: usize = 128;
 
 /// Local support predicate for SDS-TL transport PIDs used by SDS-TRANSFER.
 ///
@@ -82,6 +90,55 @@ pub struct HomeModeDisplayDto {
     pub protocol_id: Option<u8>,
     pub text_coding_scheme: Option<HomeModeDisplaySdsTextCodingScheme>,
     pub text: Option<String>,
+}
+
+/// Opt-in local WAP/IP status service over TETRA SNDCP packet data.
+///
+/// EN 300 392-2 clauses 17.3.5, 18.5.2.1, 28.3.3.5, 28.4.4.5 and
+/// 28.4.4.14 define the SNDCP/MLE/PDP/SN-UNITDATA protocol surface used by
+/// this MVP. This is a Nexus-BS local profile and not a formal conformance
+/// claim for full TETRA packet data.
+#[derive(Debug, Clone)]
+pub struct CfgWapIp {
+    pub enabled: bool,
+    pub address: [u8; 4],
+    pub port: u16,
+    pub response_ttl: u8,
+    pub dynamic_pool_prefix: [u8; 3],
+    pub dynamic_pool_first_host: u8,
+    pub dynamic_pool_last_host: u8,
+    pub allow_static_ipv4: bool,
+    pub accept_empty_probe: bool,
+    pub accept_root_path: bool,
+    pub accept_status_path: bool,
+    pub accept_status_wml_path: bool,
+    pub max_request_payload_bytes: usize,
+    pub assume_pdch_ready_after_data_transmit: bool,
+}
+
+/// Serde DTO for `[cell_info.wap_ip]`.
+#[derive(Default, Deserialize)]
+pub struct WapIpDto {
+    #[serde(default)]
+    pub enabled: bool,
+    pub address: Option<String>,
+    pub port: Option<u16>,
+    pub response_ttl: Option<u8>,
+    pub dynamic_pool_prefix: Option<String>,
+    pub dynamic_pool_first_host: Option<u8>,
+    pub dynamic_pool_last_host: Option<u8>,
+    pub allow_static_ipv4: Option<bool>,
+    pub accept_empty_probe: Option<bool>,
+    pub accept_root_path: Option<bool>,
+    pub accept_status_path: Option<bool>,
+    pub accept_status_wml_path: Option<bool>,
+    pub max_request_payload_bytes: Option<usize>,
+    #[serde(alias = "auto_mark_pdch_ready_on_ready")]
+    #[serde(alias = "runtime_assume_current_channel_pdch_ready")]
+    pub assume_pdch_ready_after_data_transmit: Option<bool>,
+
+    #[serde(flatten)]
+    pub extra: HashMap<String, Value>,
 }
 
 /// Service details for a neighbor cell — mirrors BsServiceDetails but for config parsing.
@@ -226,6 +283,9 @@ pub struct CfgCellInfo {
     /// Configured via `[cell_info.sds_broadcast]`. Uses the same structure as home_mode_display.
     pub sds_broadcast: Option<CfgHomeModeDisplay>,
 
+    /// Optional WAP/IP status page over SNDCP packet data.
+    pub wap_ip: Option<CfgWapIp>,
+
     /// Neighbor cells to include in D-NWRK-BROADCAST for cell reselection.
     /// Up to 7 entries. MSs use this list to find alternative cells when signal degrades.
     pub neighbor_cells_ca: Vec<CfgNeighborCellCa>,
@@ -335,6 +395,9 @@ pub struct CellInfoDto {
     /// Supplemental SDS broadcast with custom PID. Enabled by presence of this sub-section.
     pub sds_broadcast: Option<HomeModeDisplayDto>,
 
+    /// WAP/IP status page over SNDCP packet data. Optional and default-off.
+    pub wap_ip: Option<WapIpDto>,
+
     /// Neighbor cells for D-NWRK-BROADCAST. Up to 7 entries.
     /// Parsed separately in parsing.rs from toml::Value to avoid serde flatten conflict.
     #[serde(skip)]
@@ -389,13 +452,25 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         .sds_broadcast
         .map(|h| home_mode_display_dto_to_cfg("cell_info.sds_broadcast", h))
         .transpose()?;
-    if ci.sndcp_service.unwrap_or(false) {
-        // EN 300 392-2 clauses 17.2 and 18.5.21 advertise SNDCP packet-data
-        // service through local BS service details. This stack currently only
-        // routes MLE SNDCP SDUs to a stub SNDCP entity, so accepting true here
-        // would advertise a WAP/IP bearer that cannot be served.
-        return Err("cell_info.sndcp_service=true is not supported: SNDCP/WAP packet-data bearer is not implemented".into());
+    let wap_ip = ci
+        .wap_ip
+        .map(|w| wap_ip_dto_to_cfg("cell_info.wap_ip", w))
+        .transpose()?;
+    let wap_ip_enabled = wap_ip.as_ref().is_some_and(|w| w.enabled);
+    match ci.sndcp_service {
+        Some(true) if !wap_ip_enabled => {
+            // EN 300 392-2 table 18.26 advertises packet-data availability.
+            // Keep that bit fail-closed unless a local WAP/IP profile owns the
+            // PDP/SN-UNITDATA responses.
+            return Err("cell_info.sndcp_service=true requires cell_info.wap_ip.enabled=true".into());
+        }
+        Some(false) if wap_ip_enabled => {
+            return Err("cell_info.wap_ip.enabled=true conflicts with cell_info.sndcp_service=false".into());
+        }
+        _ => {}
     }
+    let sndcp_service = ci.sndcp_service.unwrap_or(wap_ip_enabled);
+    let wap_ip = wap_ip.filter(|w| w.enabled);
 
     let local_ssi_ranges = ci
         .local_ssi_ranges
@@ -422,7 +497,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         system_wide_services: ci.system_wide_services.unwrap_or(false),
         voice_service: ci.voice_service.unwrap_or(true),
         circuit_mode_data_service: ci.circuit_mode_data_service.unwrap_or(false),
-        sndcp_service: false,
+        sndcp_service,
         aie_service: ci.aie_service.unwrap_or(false),
         advanced_link: ci.advanced_link.unwrap_or(false),
         system_code: ci.system_code.unwrap_or(3), // 3 = ETSI EN 300 392-2 V3.1.1
@@ -438,6 +513,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         timezone: ci.timezone,
         home_mode_display,
         sds_broadcast,
+        wap_ip,
         neighbor_cells_ca: ci.neighbor_cells_ca,
         hangtime_secs: ci.hangtime_secs.unwrap_or(5).clamp(0, 300),
         call_timeout_secs: {
@@ -512,6 +588,101 @@ fn home_mode_display_dto_to_cfg(section: &str, h: HomeModeDisplayDto) -> Result<
         text_coding_scheme: h.text_coding_scheme.unwrap_or(HomeModeDisplaySdsTextCodingScheme::LATIN),
         text: h.text.unwrap_or_default(),
     })
+}
+
+fn wap_ip_dto_to_cfg(section: &str, dto: WapIpDto) -> Result<CfgWapIp, String> {
+    if !dto.extra.is_empty() {
+        let mut keys: Vec<_> = dto.extra.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        return Err(format!("Unrecognized fields in {section}: {keys:?}"));
+    }
+
+    let address = parse_ipv4_address(section, "address", dto.address.as_deref(), DEFAULT_WAP_IP_ADDRESS)?;
+    let port = dto.port.unwrap_or(DEFAULT_WAP_IP_PORT);
+    if port == 0 {
+        return Err(format!("{section}.port must be 1..65535"));
+    }
+    let response_ttl = dto.response_ttl.unwrap_or(DEFAULT_WAP_IP_RESPONSE_TTL);
+    if response_ttl == 0 {
+        return Err(format!("{section}.response_ttl must be 1..255"));
+    }
+
+    let dynamic_pool_prefix = parse_ipv4_prefix(
+        section,
+        "dynamic_pool_prefix",
+        dto.dynamic_pool_prefix.as_deref(),
+        DEFAULT_WAP_IP_DYNAMIC_POOL_PREFIX,
+    )?;
+    let dynamic_pool_first_host = dto.dynamic_pool_first_host.unwrap_or(DEFAULT_WAP_IP_DYNAMIC_POOL_FIRST_HOST);
+    let dynamic_pool_last_host = dto.dynamic_pool_last_host.unwrap_or(DEFAULT_WAP_IP_DYNAMIC_POOL_LAST_HOST);
+    validate_wap_ip_pool(section, address, dynamic_pool_prefix, dynamic_pool_first_host, dynamic_pool_last_host)?;
+
+    let max_request_payload_bytes = dto.max_request_payload_bytes.unwrap_or(DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES);
+    if !(1..=1024).contains(&max_request_payload_bytes) {
+        return Err(format!("{section}.max_request_payload_bytes must be 1..1024"));
+    }
+
+    Ok(CfgWapIp {
+        enabled: dto.enabled,
+        address,
+        port,
+        response_ttl,
+        dynamic_pool_prefix,
+        dynamic_pool_first_host,
+        dynamic_pool_last_host,
+        allow_static_ipv4: dto.allow_static_ipv4.unwrap_or(true),
+        accept_empty_probe: dto.accept_empty_probe.unwrap_or(true),
+        accept_root_path: dto.accept_root_path.unwrap_or(true),
+        accept_status_path: dto.accept_status_path.unwrap_or(true),
+        accept_status_wml_path: dto.accept_status_wml_path.unwrap_or(true),
+        max_request_payload_bytes,
+        assume_pdch_ready_after_data_transmit: dto.assume_pdch_ready_after_data_transmit.unwrap_or(true),
+    })
+}
+
+fn parse_ipv4_address(section: &str, field: &str, value: Option<&str>, default: [u8; 4]) -> Result<[u8; 4], String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+
+    value
+        .parse::<Ipv4Addr>()
+        .map(|addr| addr.octets())
+        .map_err(|_| format!("{section}.{field} must be an IPv4 address, for example 10.0.0.1"))
+}
+
+fn parse_ipv4_prefix(section: &str, field: &str, value: Option<&str>, default: [u8; 3]) -> Result<[u8; 3], String> {
+    let Some(value) = value else {
+        return Ok(default);
+    };
+
+    let parts = value.split('.').map(str::trim).collect::<Vec<_>>();
+    if !matches!(parts.len(), 3 | 4) {
+        return Err(format!("{section}.{field} must be an IPv4 /24 prefix such as 10.0.0 or 10.0.0.0"));
+    }
+    if parts.len() == 4 && parts[3] != "0" {
+        return Err(format!("{section}.{field} must end in .0 when four octets are used"));
+    }
+
+    let mut prefix = [0u8; 3];
+    for (index, part) in parts.iter().take(3).enumerate() {
+        prefix[index] = part
+            .parse::<u8>()
+            .map_err(|_| format!("{section}.{field} contains invalid IPv4 octet {part:?}"))?;
+    }
+    Ok(prefix)
+}
+
+fn validate_wap_ip_pool(section: &str, endpoint: [u8; 4], prefix: [u8; 3], first_host: u8, last_host: u8) -> Result<(), String> {
+    if first_host == 0 || first_host == 255 || last_host == 0 || last_host == 255 || first_host > last_host {
+        return Err(format!(
+            "{section}.dynamic_pool_first_host/dynamic_pool_last_host must describe an ascending host range inside 1..254"
+        ));
+    }
+    if endpoint[..3] == prefix[..] && (first_host..=last_host).contains(&endpoint[3]) {
+        return Err(format!("{section} endpoint address must not be inside the dynamic terminal address pool"));
+    }
+    Ok(())
 }
 
 fn parse_allowed_gssi_ranges(ranges: Option<Vec<(u32, u32)>>) -> Result<Option<SortedDisjointSsiRanges>, String> {

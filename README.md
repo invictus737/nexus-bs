@@ -47,6 +47,7 @@ certification. Formal certification requires official conformance evidence.
 | Dashboard | Minimal operational dashboard with telemetry, logs, call/radio state and controls |
 | Service supervision / recovery guards | Implemented as bounded queues, fallback config handling, health snapshots, and systemd readiness/watchdog integration |
 | WAP over SDS Type4 | MVP, not a full SNDCP/IP packet-data bearer |
+| SNDCP / WAP-IP status dashboard | Opt-in MVP over SNDCP packet data; default off, advertised only when `[cell_info.wap_ip] enabled=true` |
 | TEA/AIE authentication/encryption | Not implemented as a complete service offering |
 | Formal TETRA certification | Not claimed |
 
@@ -112,7 +113,7 @@ Largest areas of change recorded in the report:
 | MLE PDUs | 20 | 31 |
 | LMAC / burst codec | 18 | 8 |
 | PHY / RF IO | 16 | 8 |
-| SNDCP / WAP bearer | 1 | 4 |
+| SNDCP / WAP-IP primitives | 1 | 4 |
 | Parrot private-call service | 0 | 15 |
 
 The public release may omit internal history files while still carrying the
@@ -139,6 +140,11 @@ Main engineering areas:
 - **SDS/status:** tested local ISSI/GSSI SDS paths, Brew-forwarded SDS,
   delivery-report handling, U-STATUS/D-STATUS work, Home Mode Display,
   supplemental SDS broadcast and dashboard-triggered SDS.
+- **SNDCP/WAP-IP status service:** source-available SN-SAP, PDP context,
+  SN-UNITDATA, IPv4/UDP, WAP 2.0/WML2 XHTML-MP status page and LTPD/MLE runtime
+  wiring for an opt-in terminal WAP browser status page. The default remains
+  off; SNDCP is advertised only when `[cell_info.wap_ip] enabled=true`, and
+  terminal auto-open depends on the terminal WAP homepage/profile configuration.
 - **MLE broadcast:** network broadcast, network time and cell/system
   information.
 - **LMAC/PHY/RF integration:** burst codec work, SoapySDR timing, RF IO,

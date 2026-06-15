@@ -524,6 +524,14 @@ impl MleBs {
             tracing::error!("MLE-BS: rejecting SNDCP MLE-UNITDATA with unspecified Layer2Service::Todo");
             return;
         }
+        if !self.config.config().cell.sndcp_service {
+            // EN 300 392-2 clauses 18.5.2.1/table 18.26 and 18.5.21 expose
+            // SNDCP as available packet-data service. Until this stack has a
+            // live PDP/SN-SAP/WAP bearer, MLE must not turn internal SNDCP
+            // requests into lower-layer packet-data traffic.
+            tracing::warn!("MLE-BS: rejecting SNDCP MLE-UNITDATA while SNDCP service is not advertised");
+            return;
+        }
 
         let sdu_len = prim.sdu.get_len();
         let mut pdu = BitBuffer::new(3 + sdu_len);

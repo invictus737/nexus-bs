@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-# Legacy single-user sample systemd service file for Nexus-BS v0.1.65.
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.68_dev.
 #
 # New deployments should prefer:
 #   contrib/systemd/nexus-bs@.service
@@ -16,7 +16,7 @@
 # - adapt your user/group and paths, sample assumes:
 #   - user/group are both "user",
 #   - installation in /home/user/nexus-bs
-#   - configuration in /home/user/nexus-bs/config.toml
+#   - configuration in /etc/nexus-bs/config.toml
 # - copy file to "/etc/systemd/system"
 # - execute "systemctl daemon-reload"
 #
@@ -29,7 +29,7 @@
 # - see log with "journalctl -u nexus-bs --output=cat -f"
 
 [Unit]
-Description=Nexus-BS v0.1.65 TETRA base station service
+Description=Nexus-BS v0.1.68_dev TETRA base station service
 # network-online.target ensures the interface is UP and routable,
 # not just "declared active" like network.target.
 After=network-online.target
@@ -42,7 +42,7 @@ Type=notify
 CPUSchedulingPolicy=fifo
 CPUSchedulingPriority=73
 WorkingDirectory=/home/user/nexus-bs/
-Environment=NEXUS_BS_PERSISTENT_CONFIG=/home/user/nexus-bs/config.toml
+Environment=NEXUS_BS_PERSISTENT_CONFIG=/etc/nexus-bs/config.toml
 Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/home/user/nexus-bs/dashboard
 Environment=NEXUS_BS_CORE_DASHBOARD_BIND=127.0.0.1
 Environment=NEXUS_BS_CORE_DASHBOARD_PORT=18080
@@ -56,7 +56,7 @@ Environment=NEXUS_BS_CORE_DASHBOARD_PORT=18080
 # or simply: ls /sys/bus/usb/devices/
 ExecStartPre=/bin/sh -c 'for dev in /sys/bus/usb/devices/*/idVendor; do dir=$(dirname $dev); [ -f "$dir/authorized" ] && echo 0 > "$dir/authorized" && sleep 0.5 && echo 1 > "$dir/authorized"; done; sleep 1'
 
-ExecStart=/home/user/nexus-bs/nexus-bs /home/user/nexus-bs/config.toml
+ExecStart=/home/user/nexus-bs/nexus-bs /etc/nexus-bs/config.toml
 KillSignal=SIGINT
 NotifyAccess=main
 WatchdogSec=30s

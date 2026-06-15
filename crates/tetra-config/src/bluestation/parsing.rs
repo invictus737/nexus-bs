@@ -579,15 +579,61 @@ call_preemptive = false
     }
 
     #[test]
-    fn test_sndcp_service_is_rejected_until_packet_data_bearer_is_implemented() {
+    fn test_sndcp_service_requires_explicit_wap_ip_profile() {
         let toml = minimal_toml("sndcp_service = true");
 
-        // EN 300 392-2 clauses 17.2 and 18.5.21 map SNDCP packet data through
-        // MLE/TLPD service details. This stack does not implement SNDCP/WAP
-        // packet data yet, so the BS must not advertise that local service.
-        let err = from_toml_str(&toml).expect_err("SNDCP service advertising must stay fail-closed");
+        // EN 300 392-2 table 18.26 maps the SNDCP bit to packet-data
+        // availability. Nexus-BS only allows it when the local WAP/IP profile
+        // owns the PDP/SN-UNITDATA response path.
+        let err = from_toml_str(&toml).expect_err("SNDCP service advertising must stay gated");
         assert!(
-            err.to_string().contains("SNDCP/WAP packet-data bearer is not implemented"),
+            err.to_string()
+                .contains("cell_info.sndcp_service=true requires cell_info.wap_ip.enabled=true"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_wap_ip_profile_enables_serving_cell_sndcp_service() {
+        let toml = minimal_toml(
+            r#"
+[cell_info.wap_ip]
+enabled = true
+address = "10.0.0.1"
+port = 9200
+dynamic_pool_prefix = "10.0.0"
+dynamic_pool_first_host = 2
+dynamic_pool_last_host = 254
+"#,
+        );
+
+        let cfg = from_toml_str(&toml).expect("explicit WAP/IP profile should parse");
+        let wap = cfg.cell.wap_ip.as_ref().expect("WAP/IP profile should be present");
+        assert!(cfg.cell.sndcp_service);
+        assert!(wap.enabled);
+        assert_eq!(wap.address, [10, 0, 0, 1]);
+        assert_eq!(wap.port, 9200);
+        assert_eq!(wap.dynamic_pool_prefix, [10, 0, 0]);
+        assert_eq!(wap.dynamic_pool_first_host, 2);
+        assert_eq!(wap.dynamic_pool_last_host, 254);
+        assert!(wap.assume_pdch_ready_after_data_transmit);
+    }
+
+    #[test]
+    fn test_wap_ip_profile_rejects_conflicting_sndcp_false() {
+        let toml = minimal_toml(
+            r#"
+sndcp_service = false
+
+[cell_info.wap_ip]
+enabled = true
+"#,
+        );
+
+        let err = from_toml_str(&toml).expect_err("WAP/IP enabled cannot conflict with SNDCP disabled");
+        assert!(
+            err.to_string()
+                .contains("cell_info.wap_ip.enabled=true conflicts with cell_info.sndcp_service=false"),
             "unexpected error: {err}"
         );
     }
@@ -725,6 +771,7 @@ allowed_gssi_ranges = [
         assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
         assert_eq!(cfg.cell.periodic_registration_secs, 0);
         assert!(!cfg.cell.sndcp_service);
+        assert!(cfg.cell.wap_ip.is_none());
         assert!(cfg.dashboard.is_some());
         let control = cfg.control.as_ref().expect("example should configure local control endpoint");
         assert_eq!(control.host, "127.0.0.1");

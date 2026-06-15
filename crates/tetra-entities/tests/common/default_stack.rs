@@ -85,6 +85,7 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         timezone: None,
         home_mode_display: None,
         sds_broadcast: None,
+        wap_ip: None,
         neighbor_cells_ca: Vec::new(),
         hangtime_secs: 5,
         call_timeout_secs: 120,

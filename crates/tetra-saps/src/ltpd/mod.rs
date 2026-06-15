@@ -29,7 +29,9 @@ pub struct LtpdMleCloseInd {}
 
 #[derive(Debug, Clone)]
 pub struct LtpdMleConfigureReq {
-    pub chan_change_accepted: bool,
+    /// `Some(true)` accepts a channel change, `Some(false)` rejects it, and
+    /// `None` represents ignore/not-applicable in this abstract SAP model.
+    pub chan_change_accepted: Option<bool>,
     pub chan_change_handle: Todo,
     pub call_release: Todo,
     pub endpoint_id: EndpointId,

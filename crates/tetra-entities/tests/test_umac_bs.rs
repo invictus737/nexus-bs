@@ -5,7 +5,7 @@
 
 mod common;
 
-use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig, StackMode};
+use tetra_config::bluestation::{CfgWapIp, EnergySavingAssignment, SharedConfig, StackMode};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     BitBuffer, BurstType, Direction, Layer2Service, PhyBlockNum, PhyBlockType, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress,
@@ -176,22 +176,59 @@ fn test_mac_sync_defaults_to_etsi_v3_system_code() {
     assert_eq!(precomps.mac_sync.system_code, 3);
 }
 
+fn enable_wap_ip_status_mvp_for_sysinfo(config: &mut tetra_config::bluestation::StackConfig) {
+    config.cell.sndcp_service = true;
+    config.cell.wap_ip = Some(CfgWapIp {
+        enabled: true,
+        address: [10, 0, 0, 1],
+        port: 9200,
+        response_ttl: 32,
+        dynamic_pool_prefix: [10, 0, 0],
+        dynamic_pool_first_host: 2,
+        dynamic_pool_last_host: 254,
+        allow_static_ipv4: true,
+        accept_empty_probe: true,
+        accept_root_path: true,
+        accept_status_path: true,
+        accept_status_wml_path: true,
+        max_request_payload_bytes: 128,
+        assume_pdch_ready_after_data_transmit: true,
+    });
+}
+
 #[test]
-fn test_mle_sysinfo_does_not_advertise_sndcp_service_until_bearer_is_implemented() {
+fn test_mle_sysinfo_advertises_sndcp_only_for_explicit_wap_ip_profile() {
     debug::setup_logging_verbose();
 
-    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
-    config.cell.sndcp_service = true;
-    let shared_config = SharedConfig::from_parts(config, None);
-    let precomps = UmacBs::generate_precomps(&shared_config);
+    let default_config = ComponentTest::get_default_test_config(StackMode::Bs);
+    let default_shared_config = SharedConfig::from_parts(default_config, None);
+    let default_precomps = UmacBs::generate_precomps(&default_shared_config);
 
     // EN 300 392-2 clauses 18.5.2.1 and 18.5.21 expose packet-data/SNDCP
-    // availability via local BS service details. WAP/IP depends on this bearer,
-    // and the current SNDCP entity is fail-closed, so a direct StackConfig must
-    // not bypass parser validation and advertise SNDCP on-air.
+    // availability via local BS service details. Nexus-BS keeps the bit off by
+    // default and enables it only when the explicit WAP/IP status profile owns
+    // the PDP/READY/SN-UNITDATA response path.
     assert!(
-        !precomps.mle_sysinfo.bs_service_details.sndcp_service,
-        "local D-MLE-SYSINFO must not advertise SNDCP/WAP until the bearer is implemented"
+        !default_precomps.mle_sysinfo.bs_service_details.sndcp_service,
+        "default local D-MLE-SYSINFO must not advertise SNDCP/WAP-IP"
+    );
+
+    let mut direct_flag_config = ComponentTest::get_default_test_config(StackMode::Bs);
+    direct_flag_config.cell.sndcp_service = true;
+    let direct_flag_shared_config = SharedConfig::from_parts(direct_flag_config, None);
+    let direct_flag_precomps = UmacBs::generate_precomps(&direct_flag_shared_config);
+    assert!(
+        !direct_flag_precomps.mle_sysinfo.bs_service_details.sndcp_service,
+        "a raw StackConfig SNDCP flag must not bypass the explicit WAP/IP profile gate"
+    );
+
+    let mut wap_config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp_for_sysinfo(&mut wap_config);
+    let wap_shared_config = SharedConfig::from_parts(wap_config, None);
+    let wap_precomps = UmacBs::generate_precomps(&wap_shared_config);
+    assert!(
+        wap_precomps.mle_sysinfo.bs_service_details.sndcp_service,
+        "explicit WAP/IP profile must advertise SNDCP packet-data availability"
     );
 }
 
