@@ -7439,6 +7439,61 @@ fn test_restart_recovery_retries_are_long_lived_and_paced() {
     let _ = std::fs::remove_file(format!("{path}.tmp"));
 }
 
+#[test]
+fn test_restart_recovery_absent_issi_expires_and_clears_cache_after_max_attempts() {
+    debug::setup_logging_verbose();
+    let issi = 2260618;
+    let gssi = 226333;
+    let path = unique_restart_recovery_path("absent-expires-cache");
+    std::fs::write(&path, format!("{issi} {gssi}:0:4\n")).expect("failed to seed recovery cache");
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.security.issi_whitelist.clear();
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.config.state_write().subscriber_recovery_path = Some(path.clone());
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    let max_attempts = 15;
+    test.run_stack(Some(73));
+    let first_commands = location_update_commands(&test.dump_sinks());
+    assert_eq!(first_commands.len(), 1);
+    assert_eq!(first_commands[0].0, issi);
+    assert_eq!(debug_mm_restart_recovery_cache_len(&mut test), 1);
+
+    for attempt in 2..=max_attempts {
+        test.run_stack(Some(2 * 18 * 4));
+        let commands = location_update_commands(&test.dump_sinks());
+        assert_eq!(
+            commands.len(),
+            1,
+            "restart recovery attempt {attempt} should emit exactly one command"
+        );
+        assert_eq!(commands[0].0, issi);
+    }
+
+    test.run_stack(Some(2 * 18 * 4));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "expired absent ISSI must not receive another D-LOCATION-UPDATE-COMMAND"
+    );
+    assert_eq!(
+        debug_mm_restart_recovery_cache_len(&mut test),
+        0,
+        "expired absent ISSI must be removed from volatile restart recovery cache"
+    );
+
+    let cache = std::fs::read_to_string(&path).expect("expired recovery cache should still be readable");
+    assert!(
+        !cache.lines().any(|line| line.trim().starts_with(&issi.to_string())),
+        "expired absent ISSI must not be persisted for the next restart, got {cache:?}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}.tmp"));
+}
+
 fn assert_location_update_response_stay_alive(energy_saving_mode: Option<EnergySavingMode>) {
     debug::setup_logging_verbose();
 

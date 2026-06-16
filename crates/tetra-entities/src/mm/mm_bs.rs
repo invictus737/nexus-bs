@@ -178,7 +178,10 @@ impl MmBs {
     const RESTART_RECOVERY_INITIAL_DELAY_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_COMMAND_SPACING_TIMESLOTS: i32 = 18 * 4;
     const RESTART_RECOVERY_RETRY_TIMESLOTS: i32 = 2 * 18 * 4;
-    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 150;
+    // Keep restart recovery bounded: if a cached MS does not answer within a
+    // few local registration-command windows, expire the volatile cache entry
+    // and let any present terminal re-register normally.
+    const RESTART_RECOVERY_MAX_ATTEMPTS: u8 = 15;
     const RESTART_RECOVERY_CACHE_FLUSH_TIMESLOTS: i32 = 18 * 4;
     const RF_CARRIER_INHIBIT_NOTIFY_GUARD_TIMESLOTS: i32 = 2 * 18 * 4;
     // Local acceptance window for the group-report phase requested by
@@ -620,6 +623,30 @@ impl MmBs {
         }
     }
 
+    fn expire_restart_recovery_candidate(&mut self, issi: u32, attempts: u8) {
+        self.remove_restart_recovery_probe(issi);
+        self.clear_solicited_group_report(issi);
+        self.clear_critical_downlinks_for_issi(issi);
+        self.abandon_pending_swmi_group_transaction(
+            issi,
+            "restart recovery retry budget expired without a U-LOCATION UPDATE DEMAND response",
+        );
+
+        if self.sync_restart_recovery_cache_path().is_none() {
+            return;
+        }
+
+        if self.restart_recovery_cache.remove(&issi).is_some() {
+            tracing::warn!(
+                "MM: restart recovery cache entry for absent ISSI {} expired after {} D-LOCATION-UPDATE-COMMAND attempt(s)",
+                issi,
+                attempts
+            );
+            self.restart_recovery_cache_dirty = true;
+            self.flush_restart_recovery_cache_if_due(true);
+        }
+    }
+
     fn allocate_mm_downlink_handle(&mut self) -> MleHandle {
         loop {
             let handle = self.next_critical_downlink_handle;
@@ -761,6 +788,7 @@ impl MmBs {
                     issi,
                     probe.attempts
                 );
+                self.expire_restart_recovery_candidate(issi, probe.attempts);
                 continue;
             }
 
