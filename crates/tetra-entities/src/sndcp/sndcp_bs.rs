@@ -181,6 +181,15 @@ impl Sndcp {
 
         let prim = ltpd_ind_with_effective_sndcp_sdu(prim);
         let decode = decode_ltpd_sdu(&prim.sdu);
+        tracing::info!(
+            "WAP/IP diag: SNDCP inbound addr={:?} endpoint={} link={} sdu_bits={} decode={:?} runtime_policy={:?}",
+            prim.received_tetra_address,
+            prim.endpoint_id,
+            prim.link_id,
+            prim.sdu.get_len_remaining(),
+            decode,
+            self.runtime_handoff
+        );
         match self.runtime_handoff.decide_ltpd_unitdata_ind(true, &decode) {
             SndcpRuntimeHandoffDecision::HandleWapIpStatus => {
                 self.handle_wap_ip_ltpd_unitdata_ind(queue, prim, &decode);

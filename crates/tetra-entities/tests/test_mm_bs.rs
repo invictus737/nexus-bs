@@ -7,7 +7,9 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use tetra_config::bluestation::{CfgBrew, ENERGY_SAVING_MODE_AUTO, EnergySavingAssignment, StackConfig, StackMode, from_toml_str};
+use tetra_config::bluestation::{
+    CfgBrew, CfgWapIp, ENERGY_SAVING_MODE_AUTO, EnergySavingAssignment, StackConfig, StackMode, from_toml_str,
+};
 use tetra_core::ranges::SortedDisjointSsiRanges;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::typed_pdu_fields::Type3FieldGeneric;
@@ -755,6 +757,66 @@ fn test_location_update_accept_scch_frame18_distribution_uses_slot1_for_class_of
     // SCCH information in the upper 4 bits and distribution in the lower
     // 2 bits; distribution 00 means frame-18 time slot 1.
     assert_eq!(accept.scch_information_and_distribution_on_18th_frame, Some(0x00));
+}
+
+#[test]
+fn test_location_update_accept_omits_subscriber_class_without_wap_ip_sndcp_profile() {
+    debug::setup_logging_verbose();
+
+    let issi = 2043001;
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.subscriber_class = 0x00ff;
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+
+    assert_eq!(accept.subscriber_class, None);
+}
+
+#[test]
+fn test_location_update_accept_includes_subscriber_class_for_wap_ip_sndcp_profile() {
+    debug::setup_logging_verbose();
+
+    let issi = 2043002;
+    let subscriber_class = 0x00ff;
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.subscriber_class = subscriber_class;
+    config.cell.sndcp_service = true;
+    config.cell.advanced_link = true;
+    config.cell.wap_ip = Some(CfgWapIp {
+        enabled: true,
+        address: [10, 0, 0, 1],
+        port: 9200,
+        response_ttl: 64,
+        dynamic_pool_prefix: [10, 0, 0],
+        dynamic_pool_first_host: 2,
+        dynamic_pool_last_host: 254,
+        allow_static_ipv4: true,
+        accept_empty_probe: true,
+        accept_root_path: true,
+        accept_status_path: true,
+        accept_status_wml_path: true,
+        max_request_payload_bytes: 512,
+        assume_pdch_ready_after_data_transmit: true,
+    });
+
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+
+    submit_location_update(&mut test, issi, None);
+    test.run_stack(Some(1));
+    let sink_msgs = test.dump_sinks();
+    let accept = extract_location_update_accept(&sink_msgs);
+
+    // EN 300 392-2 clauses 16.4.9 and 28.2: SNDCP shall not be used on a
+    // subscriber-class mismatch. The WAP/IP profile therefore confirms the
+    // same class bitmap that the serving cell advertises in D-MLE-SYSINFO.
+    assert_eq!(accept.subscriber_class, Some(subscriber_class as u64));
 }
 
 #[test]

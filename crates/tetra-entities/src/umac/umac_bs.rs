@@ -1188,6 +1188,10 @@ impl UmacBs {
         }
     }
 
+    fn wap_ip_diag_enabled(&self) -> bool {
+        Self::local_wap_ip_sndcp_profile_enabled(&self.config)
+    }
+
     fn cmce_to_mac_chanalloc(chan_alloc: &CmceChanAllocReq, carrier_num: u16) -> ChanAllocElement {
         // We grant clch permission for Replace and Additional allocations on the uplink
         let clch_permission = (chan_alloc.alloc_type == ChanAllocType::Replace || chan_alloc.alloc_type == ChanAllocType::Additional)
@@ -1822,6 +1826,20 @@ impl UmacBs {
             tracing::warn!("truncating MAC-DATA len from {} to {}", pdu_len_bits, prim.pdu.get_len());
             pdu_len_bits = prim.pdu.get_len() as usize;
         }
+        if self.wap_ip_diag_enabled() {
+            tracing::info!(
+                "WAP/IP diag: UMAC MAC-DATA lchan={:?} block={:?} addr={:?} length_ind={:?} frag_flag={:?} reservation={:?} raw_bits={} pdu_len_bits={} null={}",
+                prim.logical_channel,
+                prim.block_num,
+                addr,
+                pdu.length_ind,
+                pdu.frag_flag,
+                pdu.reservation_req,
+                prim.pdu.get_len(),
+                pdu_len_bits,
+                is_null_pdu
+            );
+        }
 
         // Strip fill bits. Maintain original end to allow for later parsing of a second mac block
         tracing::trace!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
@@ -1969,6 +1987,20 @@ impl UmacBs {
         if pdu_len_bits > prim.pdu.get_len() {
             tracing::warn!("truncating MAC-ACCESS len from {} to {}", pdu_len_bits, prim.pdu.get_len());
             pdu_len_bits = prim.pdu.get_len();
+        }
+        if self.wap_ip_diag_enabled() {
+            tracing::info!(
+                "WAP/IP diag: UMAC MAC-ACCESS lchan={:?} block={:?} addr={:?} length_ind={:?} frag_flag={:?} reservation={:?} raw_bits={} pdu_len_bits={} null={}",
+                prim.logical_channel,
+                prim.block_num,
+                addr,
+                pdu.length_ind,
+                pdu.frag_flag,
+                pdu.reservation_req,
+                prim.pdu.get_len(),
+                pdu_len_bits,
+                pdu.is_null_pdu()
+            );
         }
 
         // Strip fill bits. Maintain original end to allow for later parsing of a second mac block

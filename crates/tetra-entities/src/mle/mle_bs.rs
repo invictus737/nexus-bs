@@ -99,6 +99,11 @@ impl MleBs {
         self.config.config().cell.subscriber_class as Todo
     }
 
+    fn wap_ip_diag_enabled(&self) -> bool {
+        let cfg = self.config.config();
+        cfg.cell.sndcp_service && cfg.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled)
+    }
+
     fn push_mle_report(
         queue: &mut MessageQueue,
         pending: PendingMleTransfer,
@@ -217,6 +222,17 @@ impl MleBs {
             tracing::warn!("invalid pdu type: {} in {}", bits, sdu.dump_bin());
             return;
         };
+        if self.wap_ip_diag_enabled() || pdu_type == MleProtocolDiscriminator::Sndcp {
+            tracing::info!(
+                "WAP/IP diag: MLE inbound TL-SDU addr={:?} endpoint={} link={} handle={} discriminator={} remaining_bits={}",
+                main_address,
+                endpoint_id,
+                link_id,
+                handle,
+                pdu_type,
+                sdu.get_len_remaining()
+            );
+        }
 
         match pdu_type {
             MleProtocolDiscriminator::Mm => {

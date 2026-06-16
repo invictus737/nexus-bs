@@ -16,7 +16,7 @@
 # logs stay volatile on read-only/appliance installs.
 
 [Unit]
-Description=Nexus-BS v0.1.68_dev TETRA base station service for %i
+Description=Nexus-BS v0.1.70_dev TETRA base station service for %i
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs-control@%i.service
 Wants=network-online.target nexus-bs-control@%i.service

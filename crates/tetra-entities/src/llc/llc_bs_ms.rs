@@ -199,6 +199,11 @@ impl Llc {
         }
     }
 
+    fn wap_ip_diag_enabled(&self) -> bool {
+        let cfg = self.config.config();
+        cfg.cell.sndcp_service && cfg.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled)
+    }
+
     fn append_tl_sdu_and_optional_fcs(pdu_buf: &mut BitBuffer, tl_sdu: &mut BitBuffer, has_fcs: bool) {
         let tl_sdu_start = pdu_buf.get_len_written();
         let sdu_len = tl_sdu.get_len_remaining();
@@ -1679,6 +1684,21 @@ impl Llc {
         }
         if has_fcs && fcs_ok {
             Self::strip_validated_fcs(&mut pdu);
+        }
+        if self.wap_ip_diag_enabled() {
+            tracing::info!(
+                "WAP/IP diag: LLC inbound BL addr={:?} endpoint={} pdu_type={} has_fcs={} fcs_ok={} ns={:?} nr={:?} tl_sdu_bits={} chan_change={} chan_info={:?}",
+                prim.main_address,
+                prim.endpoint_id,
+                pdu_type,
+                has_fcs,
+                fcs_ok,
+                ns,
+                nr,
+                pdu.get_len_remaining(),
+                prim.chan_change_response_req,
+                prim.chan_info
+            );
         }
 
         // If N(S) is present, a valid TL-SDU needs an ACK. For BL-ADATA with a

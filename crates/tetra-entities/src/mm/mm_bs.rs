@@ -2450,6 +2450,10 @@ impl MmBs {
             .class_of_ms
             .as_ref()
             .and_then(|c| if c.clch_needed || c.common_scch { Some(0x00u64) } else { None });
+        let class_tetra_packet_data = pdu.class_of_ms.as_ref().map(|c| c.tetra_packet_data);
+        let class_original_advanced_link = pdu.class_of_ms.as_ref().map(|c| c.original_advanced_link);
+        let class_extended_advanced_link = pdu.class_of_ms.as_ref().map(|c| c.extended_advanced_link);
+        let class_common_scch = pdu.class_of_ms.as_ref().map(|c| c.common_scch);
 
         let _ = self.client_mgr.set_client_class_of_ms(issi, pdu.class_of_ms);
 
@@ -2467,12 +2471,25 @@ impl MmBs {
             return;
         };
 
+        let wap_ip_subscriber_class = {
+            let cfg = self.config.config();
+            if cfg.cell.sndcp_service && cfg.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled) {
+                Some(cfg.cell.subscriber_class as u64)
+            } else {
+                None
+            }
+        };
+
         // Build D-LOCATION UPDATE ACCEPT pdu
         let pdu_response = DLocationUpdateAccept {
             location_update_accept_type: accept_type,
             ssi: Some(issi as u64),
             address_extension: None,
-            subscriber_class: None,
+            // EN 300 392-2 clauses 16.4.9, 16.9.2.7 and 28.2 make
+            // subscriber-class match relevant for SNDCP availability. When
+            // the local WAP/IP SNDCP profile is advertised, explicitly echo
+            // the serving cell class bitmap accepted by D-MLE-SYSINFO.
+            subscriber_class: wap_ip_subscriber_class,
             energy_saving_information: esi_for_accept,
             scch_information_and_distribution_on_18th_frame: scch_info,
             new_registered_area: None,
@@ -2484,6 +2501,20 @@ impl MmBs {
             cell_type_control: None,
             proprietary: None,
         };
+        if self.config.config().cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled) {
+            tracing::info!(
+                "WAP/IP diag: MM D-LOCATION UPDATE ACCEPT issi={} accept_type={} subscriber_class={:?} scch_info={:?} energy_saving={} class_pkt_data={:?} class_orig_adv_link={:?} class_ext_adv_link={:?} class_common_scch={:?}",
+                issi,
+                pdu_response.location_update_accept_type,
+                pdu_response.subscriber_class,
+                pdu_response.scch_information_and_distribution_on_18th_frame,
+                pdu_response.energy_saving_information.is_some(),
+                class_tetra_packet_data,
+                class_original_advanced_link,
+                class_extended_advanced_link,
+                class_common_scch
+            );
+        }
 
         // Convert pdu to bits
         let pdu_len = 4 + 3 + 24 + 1 + 1 + 1; // Minimal lenght; may expand beyond this.
