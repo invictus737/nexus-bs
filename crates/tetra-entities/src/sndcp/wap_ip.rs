@@ -18,6 +18,7 @@ pub const IPV4_UDP_HEADER_BYTES: usize = 28;
 pub const IPV4_TCP_HEADER_BYTES: usize = 40;
 const TCP_HTTP_DEFAULT_MAX_PAYLOAD_BYTES: usize = 536;
 const TCP_HTTP_RESPONSE_WINDOW_BYTES: u16 = 4096;
+const WTP_CON_FLAG: u8 = 0x80;
 const WTP_RID_FLAG: u8 = 0x01;
 const WTP_PDU_INVOKE: u8 = 1;
 const WTP_PDU_RESULT: u8 = 2;
@@ -31,7 +32,9 @@ const WSP_PDU_CONNECT_REPLY: u8 = 0x02;
 const WSP_PDU_REPLY: u8 = 0x04;
 const WSP_PDU_GET: u8 = 0x40;
 const WSP_STATUS_OK: u8 = 0x20;
-const WSP_CONTENT_TYPE_APPLICATION_VND_WAP_XHTML_XML: u8 = 0xc5;
+const WSP_SHORT_INTEGER_FLAG: u8 = 0x80;
+const WSP_CT_APP_VND_WAP_XHTML_XML_ASSIGNED_NUMBER: u8 = 0x45;
+const WSP_CT_APP_VND_WAP_XHTML_XML: u8 = WSP_SHORT_INTEGER_FLAG | WSP_CT_APP_VND_WAP_XHTML_XML_ASSIGNED_NUMBER;
 const WSP_CAP_CLIENT_SDU_SIZE: u8 = 0x80;
 const WSP_CAP_SERVER_SDU_SIZE: u8 = 0x81;
 const WSP_CAP_PROTOCOL_OPTIONS: u8 = 0x82;
@@ -114,6 +117,13 @@ struct WspCapability {
 struct WspConnectRequest {
     version: u8,
     capabilities: Vec<WspCapability>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WtpInvoke<'a> {
+    transaction_id: u16,
+    retransmission: bool,
+    wsp: &'a [u8],
 }
 
 impl From<IpPrimitiveError> for WapIpError {
@@ -526,8 +536,8 @@ fn tcp_server_iss(request_ip: &super::ip::Ipv4Packet<'_>, request_tcp: &TcpSegme
 
 pub fn parse_wap_udp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<WapUdpRequestKind, WapIpError> {
     // ETSI TS 100 392-2 clause 29.5.8 delegates WAP protocol details to WAP
-    // 2.0. This lab primitive intentionally admits only explicit diagnostic
-    // status probes until a full WAP/WSP profile is implemented.
+    // 2.0. This diagnostic gateway intentionally admits only the configured
+    // status resources over the WSP/WTP/UDP packet-data bearer.
     if !policy.status_enabled {
         return Err(WapIpError::StatusServiceDisabled);
     }
@@ -571,7 +581,6 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
     }
 
     let wtp_pdu_type = (payload[0] >> 3) & 0x0f;
-    let retransmission = payload[0] & WTP_RID_FLAG != 0;
     let transaction_id = u16::from_be_bytes([payload[1], payload[2]]) & WTP_TID_VALUE_MASK;
     if matches!(wtp_pdu_type, WTP_PDU_ACK | WTP_PDU_ABORT) {
         return Ok(Some(WapUdpRequestKind::WtpControlNoResponse {
@@ -583,15 +592,15 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
     if wtp_pdu_type != WTP_PDU_INVOKE {
         return Ok(None);
     }
-    if payload.len() < 5 {
-        return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
-    }
 
-    let wsp = &payload[4..];
+    let Some(invoke) = parse_wtp_invoke(payload)? else {
+        return Ok(None);
+    };
+    let wsp = invoke.wsp;
     match wsp.first().copied() {
         Some(WSP_PDU_CONNECT) => Ok(Some(WapUdpRequestKind::WtpWspConnect {
-            transaction_id,
-            retransmission,
+            transaction_id: invoke.transaction_id,
+            retransmission: invoke.retransmission,
         })),
         Some(pdu_type) if pdu_type == WSP_PDU_GET || (0x50..=0x5f).contains(&pdu_type) => {
             let (uri_len, len_octets) = read_uintvar(&wsp[1..]).ok_or(WapIpError::UnsupportedWapUdpPayload { len: payload.len() })?;
@@ -606,8 +615,8 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
             let path = normalize_get_path(uri_path(uri));
             if is_status_path(&path, policy) {
                 return Ok(Some(WapUdpRequestKind::WtpWspStatus {
-                    transaction_id,
-                    retransmission,
+                    transaction_id: invoke.transaction_id,
+                    retransmission: invoke.retransmission,
                 }));
             }
             Err(WapIpError::UnsupportedWapPath { path })
@@ -617,14 +626,66 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
 }
 
 fn parse_wtp_wsp_connect_request(payload: &[u8]) -> Result<Option<WspConnectRequest>, WapIpError> {
-    if payload.len() < 5 || ((payload[0] >> 3) & 0x0f) != WTP_PDU_INVOKE {
+    let Some(invoke) = parse_wtp_invoke(payload)? else {
         return Ok(None);
-    }
-    let wsp = &payload[4..];
+    };
+    let wsp = invoke.wsp;
     if wsp.first().copied() != Some(WSP_PDU_CONNECT) {
         return Ok(None);
     }
     parse_wsp_connect_request(wsp).map(Some)
+}
+
+fn parse_wtp_invoke(payload: &[u8]) -> Result<Option<WtpInvoke<'_>>, WapIpError> {
+    if payload.len() < 4 || ((payload[0] >> 3) & 0x0f) != WTP_PDU_INVOKE {
+        return Ok(None);
+    }
+    let invoke_header = payload[3];
+    let version = (invoke_header >> 6) & 0x03;
+    let reserved = invoke_header & 0x0c;
+    let transaction_class = invoke_header & 0x03;
+    if version != 0 || reserved != 0 || transaction_class != 2 {
+        return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
+    }
+
+    let wsp_start = if payload[0] & WTP_CON_FLAG != 0 {
+        parse_wtp_variable_header_end(payload, 4)?
+    } else {
+        4
+    };
+    if wsp_start >= payload.len() {
+        return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
+    }
+
+    Ok(Some(WtpInvoke {
+        transaction_id: u16::from_be_bytes([payload[1], payload[2]]) & WTP_TID_VALUE_MASK,
+        retransmission: payload[0] & WTP_RID_FLAG != 0,
+        wsp: &payload[wsp_start..],
+    }))
+}
+
+fn parse_wtp_variable_header_end(payload: &[u8], mut offset: usize) -> Result<usize, WapIpError> {
+    loop {
+        let Some(tpi_header) = payload.get(offset).copied() else {
+            return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
+        };
+        let tpi_continues = tpi_header & WTP_CON_FLAG != 0;
+        let tpi_is_long = tpi_header & 0x04 != 0;
+        offset = if tpi_is_long {
+            let Some(tpi_len) = payload.get(offset + 1).copied() else {
+                return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
+            };
+            offset + 2 + tpi_len as usize
+        } else {
+            offset + 1 + (tpi_header & 0x03) as usize
+        };
+        if offset > payload.len() {
+            return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
+        }
+        if !tpi_continues {
+            return Ok(offset);
+        }
+    }
 }
 
 fn parse_wsp_connect_request(wsp: &[u8]) -> Result<WspConnectRequest, WapIpError> {
@@ -728,10 +789,11 @@ fn parse_wtp_abort_info(payload: &[u8], pdu_type: u8) -> Option<WtpAbortInfo> {
     if pdu_type != WTP_PDU_ABORT || payload.len() < 4 {
         return None;
     }
-    let abort_type_and_reason = payload[3];
+    // OMA WTP puts the Abort type in the low bits of octet 1 and the Abort
+    // reason in octet 4. WSP user abort reasons use the full octet value.
     Some(WtpAbortInfo {
-        abort_type: abort_type_and_reason >> 5,
-        reason: abort_type_and_reason & 0x1f,
+        abort_type: payload[0] & 0x07,
+        reason: payload[3],
     })
 }
 
@@ -746,6 +808,23 @@ fn wtp_abort_reason_name(info: WtpAbortInfo) -> &'static str {
         (0, 6) => "provider/WTPVERSIONONE",
         (0, 7) => "provider/CAPTEMPEXCEEDED",
         (0, 8) => "provider/NORESPONSE",
+        (0, 9) => "provider/MESSAGETOOLARGE",
+        (0, 10) => "provider/NOTIMPLEMENTEDESAR",
+        (1, 0xe0) => "user/WSP_PROTOERR",
+        (1, 0xe1) => "user/WSP_DISCONNECT",
+        (1, 0xe2) => "user/WSP_SUSPEND",
+        (1, 0xe3) => "user/WSP_RESUME",
+        (1, 0xe4) => "user/WSP_CONGESTION",
+        (1, 0xe5) => "user/WSP_CONNECTERR",
+        (1, 0xe6) => "user/WSP_MRUEXCEEDED",
+        (1, 0xe7) => "user/WSP_MOREXCEEDED",
+        (1, 0xe8) => "user/WSP_PEERREQ",
+        (1, 0xe9) => "user/WSP_NETERR",
+        (1, 0xea) => "user/WSP_USERREQ",
+        (1, 0xeb) => "user/WSP_USERRFS",
+        (1, 0xec) => "user/WSP_USERPND",
+        (1, 0xed) => "user/WSP_USERDCR",
+        (1, 0xee) => "user/WSP_USERDCU",
         (1, _) => "user/WSP_OR_APPLICATION",
         _ => "unknown",
     }
@@ -778,7 +857,7 @@ fn build_wsp_reply(page: &[u8]) -> Vec<u8> {
     payload.push(WSP_PDU_REPLY);
     payload.push(WSP_STATUS_OK);
     write_uintvar(1, &mut payload);
-    payload.push(WSP_CONTENT_TYPE_APPLICATION_VND_WAP_XHTML_XML);
+    payload.push(WSP_CT_APP_VND_WAP_XHTML_XML);
     payload.extend_from_slice(page);
     payload
 }
@@ -908,6 +987,29 @@ mod tests {
         payload
     }
 
+    fn build_wtp_wsp_connect_payload(transaction_id: u16, capabilities: &[u8]) -> Vec<u8> {
+        let mut wsp = Vec::new();
+        wsp.push(WSP_PDU_CONNECT);
+        wsp.push(0x10);
+        write_uintvar(capabilities.len(), &mut wsp);
+        write_uintvar(0, &mut wsp);
+        wsp.extend_from_slice(capabilities);
+
+        let mut payload = Vec::new();
+        payload.push(0x0a);
+        payload.extend_from_slice(&(transaction_id & WTP_TID_VALUE_MASK).to_be_bytes());
+        payload.push(0x12);
+        payload.extend_from_slice(&wsp);
+        payload
+    }
+
+    fn prepend_short_wtp_tpi(mut payload: Vec<u8>) -> Vec<u8> {
+        assert!(payload.len() >= 4, "test helper expects a WTP Invoke fixed header");
+        payload[0] |= WTP_CON_FLAG;
+        payload.splice(4..4, [0x01, 0x00]);
+        payload
+    }
+
     #[test]
     fn wap_udp_request_classifier_accepts_only_mvp_safe_requests() {
         assert_eq!(parse_wap_udp_request(b"", &policy()), Ok(WapUdpRequestKind::Empty));
@@ -977,6 +1079,27 @@ mod tests {
     }
 
     #[test]
+    fn wap_udp_request_classifier_skips_wtp_tpis_before_wsp() {
+        let connect = prepend_short_wtp_tpi(build_wtp_wsp_connect_payload(0x1234, &[]));
+        assert_eq!(
+            parse_wap_udp_request(&connect, &policy()),
+            Ok(WapUdpRequestKind::WtpWspConnect {
+                transaction_id: 0x1234,
+                retransmission: false
+            })
+        );
+
+        let get = prepend_short_wtp_tpi(build_wtp_wsp_get_payload(0x1235, "status.xhtml"));
+        assert_eq!(
+            parse_wap_udp_request(&get, &policy()),
+            Ok(WapUdpRequestKind::WtpWspStatus {
+                transaction_id: 0x1235,
+                retransmission: false
+            })
+        );
+    }
+
+    #[test]
     fn wap_udp_request_classifier_accepts_wtp_wsp_get_status_path() {
         assert_eq!(
             parse_wap_udp_request(
@@ -1028,12 +1151,33 @@ mod tests {
             Ok(WapUdpRequestKind::WtpControlNoResponse {
                 transaction_id: 0x13cc,
                 pdu_type: WTP_PDU_ABORT,
-                abort: Some(WtpAbortInfo { abort_type: 7, reason: 0 }),
+                abort: Some(WtpAbortInfo {
+                    abort_type: 1,
+                    reason: 0xe0,
+                }),
+            })
+        );
+        assert_eq!(
+            parse_wap_udp_request(&[0x27, 0x13, 0xcc, 0xe0], &policy()),
+            Ok(WapUdpRequestKind::WtpControlNoResponse {
+                transaction_id: 0x13cc,
+                pdu_type: WTP_PDU_ABORT,
+                abort: Some(WtpAbortInfo {
+                    abort_type: 7,
+                    reason: 0xe0,
+                }),
             })
         );
         assert_eq!(
             wtp_abort_reason_name(WtpAbortInfo { abort_type: 0, reason: 1 }),
             "provider/PROTOERR"
+        );
+        assert_eq!(
+            wtp_abort_reason_name(WtpAbortInfo {
+                abort_type: 1,
+                reason: 0xe0,
+            }),
+            "user/WSP_PROTOERR"
         );
     }
 
@@ -1390,6 +1534,85 @@ mod tests {
     }
 
     #[test]
+    fn wap_status_response_negotiates_wsp_connect_reply_capabilities() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+        let mut capabilities = Vec::new();
+        push_wsp_uintvar_capability(&mut capabilities, WSP_CAP_CLIENT_SDU_SIZE, 2000);
+        push_wsp_uintvar_capability(&mut capabilities, WSP_CAP_SERVER_SDU_SIZE, 1600);
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_PROTOCOL_OPTIONS, &[0xf8]);
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_METHOD_MOR, &[3]);
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_EXTENDED_METHODS, b"\x50STATUS\0\x70POSTX\0");
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_HEADER_CODE_PAGES, b"\x78x-up-1\0");
+        let request_payload = build_wtp_wsp_connect_payload(0x1234, &capabilities);
+        let request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &request_payload, 0x2222, 64)
+            .expect("WSP Connect request N-PDU should build");
+
+        let response =
+            build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()).expect("WSP Connect response should build");
+        let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
+        let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
+
+        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR, 0x92, 0x34]);
+        assert_eq!(response_udp.payload[3], WSP_PDU_CONNECT_REPLY);
+        assert_eq!(response_udp.payload[4], 0x01);
+        let (capabilities_len, cap_len_octets) =
+            read_uintvar(&response_udp.payload[5..]).expect("ConnectReply capabilities length should parse");
+        let headers_len_start = 5 + cap_len_octets;
+        let (headers_len, headers_len_octets) =
+            read_uintvar(&response_udp.payload[headers_len_start..]).expect("ConnectReply headers length should parse");
+        let capabilities_start = headers_len_start + headers_len_octets;
+        let capabilities_end = capabilities_start + capabilities_len;
+        assert_eq!(headers_len, 0);
+        assert_eq!(capabilities_end, response_udp.payload.len());
+        let negotiated = parse_wsp_capabilities(&response_udp.payload[capabilities_start..capabilities_end])
+            .expect("ConnectReply capabilities should parse");
+
+        assert_eq!(
+            negotiated
+                .iter()
+                .find(|cap| cap.id == WSP_CAP_CLIENT_SDU_SIZE)
+                .and_then(|cap| read_uintvar(&cap.parameters).map(|(value, _)| value)),
+            Some(WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES)
+        );
+        assert_eq!(
+            negotiated
+                .iter()
+                .find(|cap| cap.id == WSP_CAP_SERVER_SDU_SIZE)
+                .and_then(|cap| read_uintvar(&cap.parameters).map(|(value, _)| value)),
+            Some(WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES)
+        );
+        assert_eq!(
+            negotiated
+                .iter()
+                .find(|cap| cap.id == WSP_CAP_PROTOCOL_OPTIONS)
+                .map(|cap| cap.parameters.as_slice()),
+            Some(&[0x00][..])
+        );
+        assert_eq!(
+            negotiated
+                .iter()
+                .find(|cap| cap.id == WSP_CAP_METHOD_MOR)
+                .map(|cap| cap.parameters.as_slice()),
+            Some(&[0x01][..])
+        );
+        assert_eq!(
+            negotiated
+                .iter()
+                .find(|cap| cap.id == WSP_CAP_EXTENDED_METHODS)
+                .map(|cap| cap.parameters.as_slice()),
+            Some(&[0x50][..])
+        );
+        assert!(
+            negotiated.iter().all(|cap| cap.id != WSP_CAP_HEADER_CODE_PAGES),
+            "ConnectReply must not advertise unsupported extension header code pages"
+        );
+    }
+
+    #[test]
     fn wap_status_response_suppresses_wtp_ack_control_pdu() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
@@ -1418,6 +1641,28 @@ mod tests {
     }
 
     #[test]
+    fn wap_status_response_suppresses_wtp_abort_control_pdu() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+        for abort_payload in [&[0x20, 0x13, 0xcc, 0x01][..], &[0x21, 0x13, 0xcc, 0xe0][..]] {
+            let request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, abort_payload, 0x2222, 64)
+                .expect("WTP Abort request N-PDU should build");
+
+            assert_eq!(
+                build_wap_status_response_npdu_optional_with_npdu_budget(&request, endpoint, &policy(), &snapshot(), Some(576)),
+                Ok(None)
+            );
+            assert_eq!(
+                build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()),
+                Err(WapIpError::NoResponseRequired)
+            );
+        }
+    }
+
+    #[test]
     fn wap_status_response_answers_wtp_wsp_get_with_xhtml_reply() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
@@ -1434,7 +1679,20 @@ mod tests {
 
         assert_eq!(
             &response_udp.payload[..7],
-            &[WTP_RESULT_GTR_TTR, 0x92, 0x34, WSP_PDU_REPLY, WSP_STATUS_OK, 0x01, 0xc5]
+            [
+                WTP_RESULT_GTR_TTR,
+                0x92,
+                0x34,
+                WSP_PDU_REPLY,
+                WSP_STATUS_OK,
+                0x01,
+                WSP_CT_APP_VND_WAP_XHTML_XML,
+            ]
+        );
+        assert_eq!(response_udp.payload[5], 1, "WSP Reply HeadersLen should contain only ContentType");
+        assert_eq!(
+            response_udp.payload[6], WSP_CT_APP_VND_WAP_XHTML_XML,
+            "WSP Reply ContentType should be application/vnd.wap.xhtml+xml as a short-integer"
         );
         assert!(
             response_udp.payload[3..].len() <= WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES,
@@ -1475,7 +1733,15 @@ mod tests {
 
         assert_eq!(
             &response_udp.payload[..7],
-            &[WTP_RESULT_GTR_TTR, 0x92, 0x34, WSP_PDU_REPLY, WSP_STATUS_OK, 0x01, 0xc5]
+            [
+                WTP_RESULT_GTR_TTR,
+                0x92,
+                0x34,
+                WSP_PDU_REPLY,
+                WSP_STATUS_OK,
+                0x01,
+                WSP_CT_APP_VND_WAP_XHTML_XML,
+            ]
         );
     }
 

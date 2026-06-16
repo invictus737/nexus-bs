@@ -562,11 +562,12 @@ pub fn validate_neighbor_sndcp_service_is_not_advertised(neighbor_cells: &[CfgNe
     for (index, cell) in neighbor_cells.iter().enumerate() {
         if cell.bs_service_details.as_ref().is_some_and(|details| details.sndcp_service) {
             // EN 300 392-2 clauses 17.2, 18.5.17 and table 18.26 define the
-            // SNDCP service bit as packet-data service availability. The WAP
-            // MVP in this stack is SDS-based; until a real SNDCP/IP bearer is
-            // implemented, neighbour-cell broadcasts must not advertise SNDCP.
+            // SNDCP service bit as packet-data service availability. The
+            // local WAP/IP profile can own serving-cell SNDCP advertisement,
+            // but neighbour-cell packet-data advertisement has no local bearer
+            // owner here, so keep it fail-closed.
             return Err(format!(
-                "cell_info.neighbor_cells_ca[{index}].bs_service_details.sndcp_service=true is not supported: SNDCP/WAP packet-data bearer is not implemented"
+                "cell_info.neighbor_cells_ca[{index}].bs_service_details.sndcp_service=true is not supported: neighbor-cell SNDCP/WAP-IP advertisement has no local bearer owner"
             ));
         }
     }

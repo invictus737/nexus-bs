@@ -750,8 +750,9 @@ fn test_mle_broadcast_forces_neighbor_sndcp_service_unavailable() {
         .expect("D-NWRK-BROADCAST should be emitted as TL-UNITDATA.req");
 
     // EN 300 392-2 clause 18.5.17 permits neighbour BS service details, and
-    // table 18.26 defines SNDCP service=1 as packet-data availability. The
-    // Nexus-BS WAP MVP is SDS-based, so MLE must fail-closed on the on-air bit.
+    // table 18.26 defines SNDCP service=1 as packet-data availability. Nexus-BS
+    // WAP/IP owns serving-cell packet data only, so MLE must fail-closed on
+    // neighbour-cell packet-data advertising.
     assert_eq!(pdu.number_of_ca_neighbour_cells, Some(1));
     let details = pdu.neighbour_cell_information_for_ca[0]
         .bs_service_details

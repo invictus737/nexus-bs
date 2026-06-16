@@ -660,7 +660,7 @@ enabled = true
     }
 
     #[test]
-    fn test_neighbor_sndcp_service_is_rejected_until_packet_data_bearer_is_implemented() {
+    fn test_neighbor_sndcp_service_is_rejected_without_local_bearer_owner() {
         let toml = minimal_toml(
             r#"
 neighbor_cell_broadcast = 2
@@ -680,8 +680,9 @@ sndcp_service = true
 
         // EN 300 392-2 clause 18.5.17 allows neighbour-cell BS service
         // details in D-NWRK-BROADCAST, while table 18.26 defines
-        // SNDCP service=1 as available packet data on that cell. The stack's
-        // WAP MVP is SDS-based, so packet-data service advertising stays off.
+        // SNDCP service=1 as available packet data on that cell. The local
+        // WAP/IP profile owns only serving-cell packet-data advertisement, so
+        // neighbour SNDCP service advertising stays fail-closed.
         let err = from_toml_str(&toml).expect_err("neighbour SNDCP service advertising must stay fail-closed");
         assert!(
             err.to_string()

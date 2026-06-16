@@ -318,11 +318,13 @@ energy_saving_mode = "auto"
 # WAP/IP profile is configured and you intentionally want the BS to advertise
 # SNDCP service in D-MLE-SYSINFO.
 #
-# Terminal WAP browser profile:
+# Terminal WAP browser profile, aligned with the ETSI-recommended WAP over
+# UDP/IP packet-data bearer:
 #   Gateway/server IP: 10.0.0.1
-#   Port: 9200
+#   WAP gateway transport: WSP/WTP over UDP/IP
+#   WAP gateway port: 9200
 #   Homepage: http://10.0.0.1:9200/status.xhtml
-#   Legacy alias: http://10.0.0.1:9200/status.wml
+#   Legacy alias: http://10.0.0.1:9200/status.wml (serves XHTML-MP, not WML 1.x)
 #   Terminal IP: dynamic, assigned from 10.0.0.2..10.0.0.254
 #
 # To enable:

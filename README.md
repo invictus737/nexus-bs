@@ -46,8 +46,8 @@ certification. Formal certification requires official conformance evidence.
 | Brew v1 interconnect | Implemented and tested with multiple TETRA core setups |
 | Dashboard | Minimal operational dashboard with telemetry, logs, call/radio state and controls |
 | Service supervision / recovery guards | Implemented as bounded queues, fallback config handling, health snapshots, and systemd readiness/watchdog integration |
-| WAP over SDS Type4 | MVP, not a full SNDCP/IP packet-data bearer |
-| SNDCP / WAP-IP status dashboard | Opt-in MVP over SNDCP packet data; default off, advertised only when `[cell_info.wap_ip] enabled=true` |
+| WAP over SDS Type4 | Legacy/manual SDS control path, separate from the terminal browser WAP/IP bearer |
+| SNDCP / WAP-IP status dashboard | Opt-in WSP/WTP over UDP/IP on SNDCP packet data; default off, advertised only when `[cell_info.wap_ip] enabled=true` |
 | TEA/AIE authentication/encryption | Not implemented as a complete service offering |
 | Formal TETRA certification | Not claimed |
 
@@ -141,10 +141,12 @@ Main engineering areas:
   delivery-report handling, U-STATUS/D-STATUS work, Home Mode Display,
   supplemental SDS broadcast and dashboard-triggered SDS.
 - **SNDCP/WAP-IP status service:** source-available SN-SAP, PDP context,
-  SN-UNITDATA, IPv4/UDP, WAP 2.0/WML2 XHTML-MP status page and LTPD/MLE runtime
-  wiring for an opt-in terminal WAP browser status page. The default remains
-  off; SNDCP is advertised only when `[cell_info.wap_ip] enabled=true`, and
-  terminal auto-open depends on the terminal WAP homepage/profile configuration.
+  SN-UNITDATA, IPv4/UDP, WSP/WTP over UDP/IP, WAP 2.0/WML2 XHTML-MP status page
+  and LTPD/MLE runtime wiring for an opt-in terminal WAP browser status page.
+  TCP/HTTP is a compatibility/debug path; the terminal browser profile should
+  use the WSP/WTP UDP gateway on port 9200. The default remains off; SNDCP is
+  advertised only when `[cell_info.wap_ip] enabled=true`, and terminal auto-open
+  depends on the terminal WAP homepage/profile configuration.
 - **MLE broadcast:** network broadcast, network time and cell/system
   information.
 - **LMAC/PHY/RF integration:** burst codec work, SoapySDR timing, RF IO,

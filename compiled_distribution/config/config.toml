@@ -173,7 +173,7 @@ local_ssi_ranges = [
 system_wide_services = true  # If false, radios will operate in fallback mode (ignored when Brew is enabled)
 voice_service = true
 circuit_mode_data_service = false
-sndcp_service = false        # Keep false: WAP MVP is SDS-based, not SNDCP/IP packet data.
+sndcp_service = false        # Set true only when [cell_info.wap_ip] is enabled below.
 aie_service = false          # Air-interface encryption is not the focus of this profile.
 advanced_link = false
 
@@ -311,26 +311,42 @@ energy_saving_mode = "auto"
 ###############################################################################
 
 ###############################################################################
-# WAP MVP OVER SDS
+# WAP/IP STATUS OVER SNDCP PACKET DATA
 #
-# Nexus-BS v0.1.66_dev includes a WAP MVP as an SDS Type4/WML delivery path driven
-# by the control command, not as an always-on SNDCP/IP packet-data bearer.
+# Nexus-BS includes an opt-in WAP 2.0/WML2 XHTML-MP status page over the TETRA
+# SNDCP packet-data path. Leave it disabled until the terminal WAP/IP profile is
+# configured and you intentionally want the BS to advertise SNDCP service in
+# D-MLE-SYSINFO.
 #
-# CLI examples from the flat /home/<user>/nexus-bs install folder, assuming the
-# nexus-bs-control@<user>.service endpoint is enabled:
-#   ./nexus-bs-control sendwap 16777215 1001 false
-#   ./nexus-bs-control sendwapcolor 16777215 1001 false
+# Terminal WAP browser profile, aligned with the ETSI-recommended WAP over
+# UDP/IP packet-data bearer:
+#   Gateway/server IP: 10.0.0.1
+#   WAP gateway transport: WSP/WTP over UDP/IP
+#   WAP gateway port: 9200
+#   Homepage: http://10.0.0.1:9200/status.xhtml
+#   Legacy alias: http://10.0.0.1:9200/status.wml (serves XHTML-MP, not WML 1.x)
+#   Terminal IP: dynamic, assigned from 10.0.0.2..10.0.0.254
 #
-# Advanced override variables for non-default service users/runtimes:
-#   NEXUS_BS_USER=<user>
-#   NEXUS_BS_RUN_DIR=/run/nexus-bs-<user>
-#   NEXUS_BS_CONTROL_FIFO=/run/nexus-bs-<user>/control.commands
+# To enable:
+#   1. Set sndcp_service = true above.
+#   2. Uncomment this [cell_info.wap_ip] block.
+#   3. Set the terminal WAP/IP homepage to the URL above.
 #
-# Default WML page text:
-#   Hello! You are running Nexus-BS.
-#
-# Keep sndcp_service=false above unless a real packet-data/SNDCP bearer is
-# implemented and verified.
+# [cell_info.wap_ip]
+# enabled = true
+# address = "10.0.0.1"
+# port = 9200
+# response_ttl = 32
+# dynamic_pool_prefix = "10.0.0"
+# dynamic_pool_first_host = 2
+# dynamic_pool_last_host = 254
+# allow_static_ipv4 = true
+# accept_empty_probe = true
+# accept_root_path = true
+# accept_status_path = true
+# accept_status_wml_path = true
+# max_request_payload_bytes = 1024
+# assume_pdch_ready_after_data_transmit = true
 ###############################################################################
 
 ###############################################################################
