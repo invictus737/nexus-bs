@@ -759,13 +759,15 @@ impl Llc {
         }
 
         // Original AL used by WAP/SNDCP keeps the logical packet-data endpoint
-        // in endpoint_id. That endpoint can be 1 even though the active PDCH is
-        // TS2-TS4, so do not treat endpoint 1 as MCCH TS1.
+        // separate from the active PDCH. Live packet-data responses can use
+        // endpoint 0 with a non-basic link, so non-zero link IDs without an
+        // explicit channel allocation must still age T.252 against PDCH, not
+        // the MCCH.
         let endpoint_ts = u8::try_from(prim.endpoint_id).ok();
         if let Some(ts @ 2..=4) = endpoint_ts {
             return ts;
         }
-        if prim.link_id != 0 && prim.endpoint_id == 1 {
+        if prim.link_id != 0 {
             return FIRST_PACKET_DATA_TIMESLOT;
         }
 
@@ -3819,6 +3821,33 @@ mod tests {
             Llc::expected_ack_timeslot_for_outbound_bl(&prim),
             2,
             "FACCH/STCH acknowledged signalling still ages T.251 against the assigned traffic timeslot"
+        );
+    }
+
+    #[test]
+    fn original_al_packet_data_endpoint_zero_nonzero_link_expects_pdch_ack_timeslot() {
+        let prim = TlaTlDataReqBl {
+            main_address: TetraAddress::issi(1001),
+            link_id: 1,
+            endpoint_id: 0,
+            tl_sdu: BitBuffer::from_bitstr("101010"),
+            pdu_prio: 5,
+            stealing_permission: true,
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_class_info: None,
+            req_handle: 1,
+            graceful_degradation: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        };
+
+        assert_eq!(
+            Llc::expected_ack_timeslot_for_outbound_al(&prim),
+            2,
+            "WAP/SNDCP original AL can use endpoint 0 with link 1; without an explicit allocation, peer AL-ACK timing must follow PDCH TS2, not MCCH TS1"
         );
     }
 

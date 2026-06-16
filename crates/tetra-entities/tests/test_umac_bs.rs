@@ -54,8 +54,9 @@ use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
+use tetra_saps::tla::TlaTlDataReqBl;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
-use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaUnitdataReq};
+use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::tmd::{TmdCircuitDataInd, TmdCircuitDataReq};
 use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel};
 use tetra_saps::tp::TpUnitdataInd;
@@ -3375,6 +3376,76 @@ fn build_al_setup_sdu() -> BitBuffer {
     sdu
 }
 
+fn build_inbound_al_setup_ind(addr: TetraAddress, endpoint_id: u32, advanced_link_number: u8) -> SapMsg {
+    let mut pdu = BitBuffer::new_autoexpand(32);
+    AlSetup {
+        acknowledged_service: true,
+        advanced_link_number,
+        max_tl_sdu_len_code: 6,
+        connection_width: false,
+        advanced_link_symmetry: false,
+        uplink_timeslots: None,
+        downlink_timeslots: None,
+        throughput_code: 6,
+        window_size_code: 1,
+        max_tl_sdu_retransmissions: 3,
+        max_segment_retransmissions: 3,
+        setup_report: AlSetup::SETUP_REPORT_SERVICE_DEFINITION,
+        ns: None,
+        augmented: None,
+    }
+    .to_bitbuf(&mut pdu);
+    pdu.seek(0);
+
+    SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+            pdu: Some(pdu),
+            main_address: addr,
+            scrambling_code: 0,
+            endpoint_id,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            air_interface_encryption: 0,
+            chan_change_response_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+        }),
+    }
+}
+
+fn build_sndcp_tl_data_req_on_link(addr: TetraAddress, endpoint_id: u32, link_id: u32, req_handle: i32) -> SapMsg {
+    let mut tl_sdu = BitBuffer::new_autoexpand(16);
+    tl_sdu.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+    tl_sdu.write_bits(0b0100, 4);
+    tl_sdu.seek(0);
+
+    SapMsg {
+        sap: Sap::TlaSap,
+        src: TetraEntity::Mle,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TlaTlDataReqBl(TlaTlDataReqBl {
+            main_address: addr,
+            link_id,
+            endpoint_id,
+            tl_sdu,
+            pdu_prio: 5,
+            stealing_permission: true,
+            subscriber_class: 0,
+            fcs_flag: false,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_class_info: None,
+            req_handle,
+            graceful_degradation: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    }
+}
+
 fn access_assign_for_slot(slot: &TmvUnitdataReqSlot) -> Option<AccessAssign> {
     let mut bbk = slot.bbk.as_ref()?.mac_block.clone();
     bbk.seek(0);
@@ -3404,10 +3475,10 @@ fn slot_carries_mac_resource_for_addr(slot: &TmvUnitdataReqSlot, target_addr: Te
     })
 }
 
-fn block_mac_resource_payloads_for_addr(block: &TmvUnitdataReq, target_addr: TetraAddress) -> Vec<BitBuffer> {
-    let mut payloads = Vec::new();
+fn block_mac_resources_and_payloads_for_addr(block: &TmvUnitdataReq, target_addr: TetraAddress) -> Vec<(MacResource, BitBuffer)> {
+    let mut resources = Vec::new();
     if block.logical_channel != LogicalChannel::SchF && block.logical_channel != LogicalChannel::Stch {
-        return payloads;
+        return resources;
     }
 
     let mut mac_block = block.mac_block.clone();
@@ -3440,12 +3511,38 @@ fn block_mac_resource_payloads_for_addr(block: &TmvUnitdataReq, target_addr: Tet
             let mut payload = BitBuffer::new_autoexpand(next_pos - payload_start);
             payload.copy_bits(&mut payload_reader, next_pos - payload_start);
             payload.seek(0);
-            payloads.push(payload);
+            resources.push((resource, payload));
         }
         mac_block.seek(next_pos);
     }
 
-    payloads
+    resources
+}
+
+fn block_mac_resource_payloads_for_addr(block: &TmvUnitdataReq, target_addr: TetraAddress) -> Vec<BitBuffer> {
+    block_mac_resources_and_payloads_for_addr(block, target_addr)
+        .into_iter()
+        .map(|(_, payload)| payload)
+        .collect()
+}
+
+fn slot_carries_sndcp_al_final_without_chan_alloc(slot: &TmvUnitdataReqSlot, target_addr: TetraAddress) -> bool {
+    [&slot.blk1, &slot.blk2].into_iter().flatten().any(|block| {
+        block_mac_resources_and_payloads_for_addr(block, target_addr)
+            .into_iter()
+            .any(|(resource, mut payload)| {
+                if resource.chan_alloc_element.is_some() {
+                    return false;
+                }
+                let Ok(al_data) = AlData::from_bitbuf(&mut payload) else {
+                    return false;
+                };
+                al_data.final_segment
+                    && al_data.acknowledgement_requested
+                    && payload.read_bits(3).and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok())
+                        == Some(MleProtocolDiscriminator::Sndcp)
+            })
+    })
 }
 
 fn slot_carries_al_setup_for_addr_with_report(slot: &TmvUnitdataReqSlot, target_addr: TetraAddress, expected_report: u8) -> bool {
@@ -3673,6 +3770,83 @@ fn test_advanced_link_control_after_pdch_allocation_uses_assigned_packet_data_sl
             )
         }),
         "AL control for an active PDCH must not fall back to TS1 common control"
+    );
+}
+
+#[test]
+fn test_wap_al_final_endpoint_zero_after_pdch_allocation_uses_assigned_pdch_even_when_stealing_requested() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 0x5109;
+    let target_addr = TetraAddress::issi(target_issi);
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac, TetraEntity::Llc], vec![TetraEntity::Lmac, TetraEntity::Mle]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 55,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: target_addr,
+            endpoint_id: 0,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_inbound_al_setup_ind(target_addr, 0, 0));
+    test.run_stack(Some(24));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_sndcp_tl_data_req_on_link(target_addr, 0, 1, 56));
+    test.run_stack(Some(24));
+
+    let sink_msgs = test.dump_sinks();
+    let routed_pdch_slots: Vec<_> = sink_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(slot)
+                if (2..=4).contains(&slot.ts.t) && slot_carries_sndcp_al_final_without_chan_alloc(slot, target_addr) =>
+            {
+                Some(slot.ts.t)
+            }
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !routed_pdch_slots.is_empty(),
+        "endpoint=0/link=1 WAP AL-FINAL-AR after active PDCH assignment must be routed on assigned TS2-TS4"
+    );
+    assert!(
+        routed_pdch_slots.iter().all(|ts| (2..=4).contains(ts)),
+        "AL-FINAL-AR routed outside assigned packet-data slots: {routed_pdch_slots:?}"
+    );
+    assert!(
+        sink_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 1 && slot_carries_mac_resource_for_addr(slot, target_addr)
+            )
+        }),
+        "stealing-permitted packet-data AL response without chan_alloc must not fall back to TS1/common control"
     );
 }
 

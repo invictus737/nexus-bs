@@ -1091,6 +1091,81 @@ mod tests {
     }
 
     #[test]
+    fn wap_status_response_repeats_tcp_responses_for_duplicate_segments() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+        let syn = build_ipv4_tcp_npdu(
+            [10, 0, 0, 2],
+            endpoint.address,
+            49152,
+            endpoint.port,
+            0x1000_0000,
+            0,
+            TCP_FLAG_SYN,
+            2048,
+            b"",
+            0x3333,
+            64,
+        )
+        .expect("TCP SYN N-PDU should build");
+
+        let first_syn_ack = build_wap_status_response_npdu_optional_with_npdu_budget(&syn, endpoint, &policy(), &snapshot(), Some(576))
+            .expect("first TCP SYN response should build")
+            .expect("TCP SYN should require a response");
+        let duplicate_syn_ack = build_wap_status_response_npdu_optional_with_npdu_budget(&syn, endpoint, &policy(), &snapshot(), Some(576))
+            .expect("duplicate TCP SYN response should build")
+            .expect("duplicate TCP SYN should require a response");
+        assert_eq!(duplicate_syn_ack, first_syn_ack);
+
+        let syn_ack_ip = parse_ipv4_packet(&first_syn_ack).expect("SYN-ACK IPv4 should parse");
+        let syn_ack_tcp = parse_tcp_segment(syn_ack_ip.payload).expect("SYN-ACK TCP should parse");
+        assert_eq!(syn_ack_tcp.flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
+        assert_eq!(syn_ack_tcp.acknowledgement_number, 0x1000_0001);
+
+        let request_payload = b"GET /status.xhtml HTTP/1.1\r\nHost: 10.0.0.1:9200\r\nConnection: close\r\n\r\n";
+        let get = build_ipv4_tcp_npdu(
+            [10, 0, 0, 2],
+            endpoint.address,
+            49152,
+            endpoint.port,
+            0x1000_0001,
+            syn_ack_tcp.sequence_number.wrapping_add(1),
+            TCP_FLAG_ACK | TCP_FLAG_PSH,
+            2048,
+            request_payload,
+            0x3334,
+            64,
+        )
+        .expect("TCP GET N-PDU should build");
+
+        let first_get_response =
+            build_wap_status_response_npdu_optional_with_npdu_budget(&get, endpoint, &policy(), &snapshot(), Some(576))
+                .expect("first TCP GET response should build")
+                .expect("TCP GET should require a response");
+        let duplicate_get_response =
+            build_wap_status_response_npdu_optional_with_npdu_budget(&get, endpoint, &policy(), &snapshot(), Some(576))
+                .expect("duplicate TCP GET response should build")
+                .expect("duplicate TCP GET should require a response");
+        assert_eq!(duplicate_get_response, first_get_response);
+        assert!(
+            first_get_response.len() <= 576,
+            "duplicate-safe TCP HTTP response should respect the negotiated N-PDU budget"
+        );
+
+        let response_ip = parse_ipv4_packet(&first_get_response).expect("HTTP response IPv4 should parse");
+        let response_tcp = parse_tcp_segment(response_ip.payload).expect("HTTP response TCP should parse");
+        assert_eq!(response_tcp.sequence_number, syn_ack_tcp.sequence_number.wrapping_add(1));
+        assert_eq!(
+            response_tcp.acknowledgement_number,
+            0x1000_0001u32.wrapping_add(request_payload.len() as u32)
+        );
+        assert_eq!(response_tcp.flags, TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN);
+    }
+
+    #[test]
     fn wap_status_response_answers_mxp600_wtp_wsp_connect() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
