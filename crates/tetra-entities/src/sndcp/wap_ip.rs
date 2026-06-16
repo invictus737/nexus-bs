@@ -13,11 +13,12 @@ use super::wap_status::{
 };
 
 pub const DEFAULT_WAP_UDP_REQUEST_MAX_BYTES: usize = 1024;
-pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = DEFAULT_WAP_STATUS_MAX_BYTES;
+pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES - WSP_REPLY_FIXED_HEADER_BYTES;
 pub const IPV4_UDP_HEADER_BYTES: usize = 28;
 pub const IPV4_TCP_HEADER_BYTES: usize = 40;
 const TCP_HTTP_DEFAULT_MAX_PAYLOAD_BYTES: usize = 536;
 const TCP_HTTP_RESPONSE_WINDOW_BYTES: u16 = 4096;
+const WTP_RID_FLAG: u8 = 0x01;
 const WTP_PDU_INVOKE: u8 = 1;
 const WTP_PDU_RESULT: u8 = 2;
 const WTP_PDU_ACK: u8 = 3;
@@ -38,6 +39,7 @@ const WSP_CAP_METHOD_MOR: u8 = 0x83;
 const WSP_CAP_HEADER_CODE_PAGES: u8 = 0x86;
 const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 1400;
 const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 1024;
+const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WapIpEndpoint {
@@ -61,8 +63,8 @@ pub struct WapIpServicePolicy {
 pub enum WapUdpRequestKind {
     Empty,
     Status,
-    WtpWspConnect { transaction_id: u16 },
-    WtpWspStatus { transaction_id: u16 },
+    WtpWspConnect { transaction_id: u16, retransmission: bool },
+    WtpWspStatus { transaction_id: u16, retransmission: bool },
     WtpControlNoResponse { transaction_id: u16, pdu_type: u8 },
 }
 
@@ -224,14 +226,20 @@ fn build_udp_status_response(
                 .unwrap_or(DEFAULT_WAP_STATUS_MAX_BYTES);
             render_wml2_status(snapshot, max_wml2_bytes)?.into_bytes()
         }
-        WapUdpRequestKind::WtpWspConnect { transaction_id } => build_wtp_wsp_result(transaction_id, &build_wsp_connect_reply()),
-        WapUdpRequestKind::WtpWspStatus { transaction_id } => {
+        WapUdpRequestKind::WtpWspConnect {
+            transaction_id,
+            retransmission,
+        } => build_wtp_wsp_result(transaction_id, retransmission, &build_wsp_connect_reply()),
+        WapUdpRequestKind::WtpWspStatus {
+            transaction_id,
+            retransmission,
+        } => {
             let max_wsp_page_bytes = max_npdu_bytes
-                .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES + 7))
+                .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES + 3 + WSP_REPLY_FIXED_HEADER_BYTES))
                 .unwrap_or(DEFAULT_WAP_WSP_STATUS_MAX_BYTES)
                 .min(DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
             let page = render_wml2_status(snapshot, max_wsp_page_bytes)?;
-            build_wtp_wsp_result(transaction_id, &build_wsp_reply(page.as_bytes()))
+            build_wtp_wsp_result(transaction_id, retransmission, &build_wsp_reply(page.as_bytes()))
         }
         WapUdpRequestKind::WtpControlNoResponse { transaction_id, pdu_type } => {
             tracing::info!(
@@ -516,6 +524,7 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
     }
 
     let wtp_pdu_type = (payload[0] >> 3) & 0x0f;
+    let retransmission = payload[0] & WTP_RID_FLAG != 0;
     let transaction_id = u16::from_be_bytes([payload[1], payload[2]]) & WTP_TID_VALUE_MASK;
     if matches!(wtp_pdu_type, WTP_PDU_ACK | WTP_PDU_ABORT) {
         return Ok(Some(WapUdpRequestKind::WtpControlNoResponse {
@@ -532,7 +541,10 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
 
     let wsp = &payload[4..];
     match wsp.first().copied() {
-        Some(WSP_PDU_CONNECT) => Ok(Some(WapUdpRequestKind::WtpWspConnect { transaction_id })),
+        Some(WSP_PDU_CONNECT) => Ok(Some(WapUdpRequestKind::WtpWspConnect {
+            transaction_id,
+            retransmission,
+        })),
         Some(pdu_type) if pdu_type == WSP_PDU_GET || (0x50..=0x5f).contains(&pdu_type) => {
             let (uri_len, len_octets) = read_uintvar(&wsp[1..]).ok_or(WapIpError::UnsupportedWapUdpPayload { len: payload.len() })?;
             let uri_start = 1 + len_octets;
@@ -545,7 +557,10 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
             };
             let path = normalize_get_path(uri_path(uri));
             if is_status_path(&path, policy) {
-                return Ok(Some(WapUdpRequestKind::WtpWspStatus { transaction_id }));
+                return Ok(Some(WapUdpRequestKind::WtpWspStatus {
+                    transaction_id,
+                    retransmission,
+                }));
             }
             Err(WapIpError::UnsupportedWapPath { path })
         }
@@ -553,10 +568,10 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
     }
 }
 
-fn build_wtp_wsp_result(transaction_id: u16, wsp_payload: &[u8]) -> Vec<u8> {
+fn build_wtp_wsp_result(transaction_id: u16, retransmission: bool, wsp_payload: &[u8]) -> Vec<u8> {
     let response_tid = (transaction_id & WTP_TID_VALUE_MASK) | WTP_TID_RESPONSE_FLAG;
     let mut payload = Vec::with_capacity(3 + wsp_payload.len());
-    payload.push(WTP_RESULT_GTR_TTR);
+    payload.push(WTP_RESULT_GTR_TTR | if retransmission { WTP_RID_FLAG } else { 0 });
     payload.extend_from_slice(&response_tid.to_be_bytes());
     payload.extend_from_slice(wsp_payload);
     payload
@@ -596,7 +611,7 @@ fn push_wsp_octets_capability(out: &mut Vec<u8>, capability_id: u8, value: &[u8]
 }
 
 fn build_wsp_reply(page: &[u8]) -> Vec<u8> {
-    let mut payload = Vec::with_capacity(4 + page.len());
+    let mut payload = Vec::with_capacity(WSP_REPLY_FIXED_HEADER_BYTES + page.len());
     payload.push(WSP_PDU_REPLY);
     payload.push(WSP_STATUS_OK);
     write_uintvar(1, &mut payload);
@@ -637,7 +652,14 @@ fn write_uintvar(mut value: usize, out: &mut Vec<u8>) {
 fn normalize_get_path(path: &str) -> String {
     let path = path.trim();
     let path = path.split(['?', '#']).next().unwrap_or(path).trim();
-    if path.is_empty() { "/".to_string() } else { path.to_string() }
+    let path = path.strip_prefix("./").unwrap_or(path);
+    if path.is_empty() {
+        "/".to_string()
+    } else if path.starts_with('/') {
+        path.to_string()
+    } else {
+        format!("/{path}")
+    }
 }
 
 fn uri_path(uri: &str) -> &str {
@@ -739,6 +761,14 @@ mod tests {
             Ok(WapUdpRequestKind::Status)
         );
         assert_eq!(
+            parse_wap_udp_request(b"GET status.xhtml?refresh=1 HTTP/1.0\r\n\r\n", &policy()),
+            Ok(WapUdpRequestKind::Status)
+        );
+        assert_eq!(
+            parse_wap_udp_request(b"GET ./status.xhtml HTTP/1.0\r\n\r\n", &policy()),
+            Ok(WapUdpRequestKind::Status)
+        );
+        assert_eq!(
             parse_wap_udp_request(b"GET /status.html HTTP/1.0\r\n\r\n", &policy()),
             Ok(WapUdpRequestKind::Status)
         );
@@ -776,7 +806,10 @@ mod tests {
     fn wap_udp_request_classifier_accepts_mxp600_wtp_wsp_connect() {
         assert_eq!(
             parse_wap_udp_request(&mxp600_wtp_wsp_connect_payload(), &policy()),
-            Ok(WapUdpRequestKind::WtpWspConnect { transaction_id: 0x13cc })
+            Ok(WapUdpRequestKind::WtpWspConnect {
+                transaction_id: 0x13cc,
+                retransmission: true
+            })
         );
     }
 
@@ -787,7 +820,17 @@ mod tests {
                 &build_wtp_wsp_get_payload(0x1234, "http://10.0.0.1:9200/status.xhtml?refresh=1"),
                 &policy()
             ),
-            Ok(WapUdpRequestKind::WtpWspStatus { transaction_id: 0x1234 })
+            Ok(WapUdpRequestKind::WtpWspStatus {
+                transaction_id: 0x1234,
+                retransmission: false
+            })
+        );
+        assert_eq!(
+            parse_wap_udp_request(&build_wtp_wsp_get_payload(0x1234, "status.xhtml"), &policy()),
+            Ok(WapUdpRequestKind::WtpWspStatus {
+                transaction_id: 0x1234,
+                retransmission: false
+            })
         );
     }
 
@@ -1074,7 +1117,7 @@ mod tests {
         assert_eq!(response_ip.destination, [10, 0, 0, 2]);
         assert_eq!(response_udp.source_port, endpoint.port);
         assert_eq!(response_udp.destination_port, 49152);
-        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR, 0x93, 0xcc]);
+        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR | WTP_RID_FLAG, 0x93, 0xcc]);
         assert_eq!(response_udp.payload[3], WSP_PDU_CONNECT_REPLY);
         assert_eq!(response_udp.payload[4], 0x01);
         assert_eq!(
@@ -1150,12 +1193,17 @@ mod tests {
             &[WTP_RESULT_GTR_TTR, 0x92, 0x34, WSP_PDU_REPLY, WSP_STATUS_OK, 0x01, 0xc5]
         );
         assert!(
-            response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 7,
-            "WSP response payload should fit current single AL-FINAL-AR delivery budget: {} bytes",
+            response_udp.payload[3..].len() <= WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES,
+            "WSP Reply SDU should not exceed negotiated Client-SDU-Size: {} bytes",
+            response_udp.payload[3..].len()
+        );
+        assert!(
+            response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 3 + WSP_REPLY_FIXED_HEADER_BYTES,
+            "WSP response payload should fit current AL delivery budget: {} bytes",
             response_udp.payload.len()
         );
         assert!(
-            response.len() <= IPV4_UDP_HEADER_BYTES + DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 7,
+            response.len() <= IPV4_UDP_HEADER_BYTES + DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 3 + WSP_REPLY_FIXED_HEADER_BYTES,
             "WSP response N-PDU should stay small enough for AL delivery: {} bytes",
             response.len()
         );
@@ -1163,6 +1211,36 @@ mod tests {
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("Welcome to Nexus-BS"));
         assert!(!page.contains("<wml"));
+    }
+
+    #[test]
+    fn wap_status_response_echoes_wtp_rid_on_retransmitted_get() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+        let mut request_payload = build_wtp_wsp_get_payload(0x1234, "/status.xhtml");
+        request_payload[0] |= WTP_RID_FLAG;
+        let request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &request_payload, 0x2222, 64)
+            .expect("WSP GET request N-PDU should build");
+
+        let response = build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()).expect("WSP GET response should build");
+        let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
+        let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
+
+        assert_eq!(
+            &response_udp.payload[..7],
+            &[
+                WTP_RESULT_GTR_TTR | WTP_RID_FLAG,
+                0x92,
+                0x34,
+                WSP_PDU_REPLY,
+                WSP_STATUS_OK,
+                0x01,
+                0xc5
+            ]
+        );
     }
 
     #[test]

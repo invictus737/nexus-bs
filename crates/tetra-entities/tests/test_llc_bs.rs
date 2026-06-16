@@ -414,9 +414,15 @@ fn build_bl_adata_ind_with_payload_and_fcs(addr: TetraAddress, nr: u8, ns: u8, p
 }
 
 fn build_al_setup_ind(addr: TetraAddress, endpoint_id: u32, al_number: u8) -> SapMsg {
-    let setup = AlSetup {
+    let mut setup = default_al_setup();
+    setup.advanced_link_number = al_number;
+    build_al_setup_ind_with_setup(addr, endpoint_id, setup)
+}
+
+fn default_al_setup() -> AlSetup {
+    AlSetup {
         acknowledged_service: true,
-        advanced_link_number: al_number,
+        advanced_link_number: 0,
         max_tl_sdu_len_code: 6,
         connection_width: false,
         advanced_link_symmetry: false,
@@ -429,8 +435,7 @@ fn build_al_setup_ind(addr: TetraAddress, endpoint_id: u32, al_number: u8) -> Sa
         setup_report: AlSetup::SETUP_REPORT_SERVICE_DEFINITION,
         ns: None,
         augmented: None,
-    };
-    build_al_setup_ind_with_setup(addr, endpoint_id, setup)
+    }
 }
 
 fn build_al_setup_ind_with_setup(addr: TetraAddress, endpoint_id: u32, setup: AlSetup) -> SapMsg {
@@ -1219,6 +1224,155 @@ fn test_outbound_nonzero_link_tldata_waits_t252_before_al_retransmission() {
         retry_msgs.iter().any(|msg| llc_pdu_type(msg) == Some(LlcPduType::AlDataAlFinal)),
         "missing peer AL-ACK after T.252 should retransmit AL-FINAL-AR"
     );
+}
+
+#[test]
+fn test_outbound_nonzero_link_late_al_ack_after_n273_zero_completes_during_pdch_grace() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let endpoint_id = 1;
+    let req_handle = 7106;
+    let service_reporter = TxReporter::new();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    test.submit_message(build_al_setup_ind_with_setup(addr, endpoint_id, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 2);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.endpoint_id = endpoint_id;
+    prim.link_id = 1;
+    prim.tx_reporter = Some(service_reporter.clone());
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut first_msgs = test.dump_sinks();
+    assert_eq!(
+        first_msgs
+            .iter()
+            .filter(|msg| llc_pdu_type(msg) == Some(LlcPduType::AlDataAlFinal))
+            .count(),
+        1,
+        "initial WAP/SNDCP AL-FINAL-AR should be submitted once on the assigned PDCH"
+    );
+    let reporter = take_first_tma_req_reporter(&mut first_msgs);
+    reporter.mark_transmitted();
+
+    test.run_stack(Some(T252_ACK_WAITING_TIMER as usize));
+    let grace_msgs = test.dump_sinks();
+    assert!(
+        !find_tla_report(&grace_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "late-ACK grace should retain an AL transfer after MAC success before reporting failed transfer"
+    );
+    assert!(
+        grace_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "N.273=0 grace must not queue extra AL retransmissions"
+    );
+    assert_eq!(service_reporter.get_state(), TxState::Transmitted);
+
+    test.submit_message(build_al_ack_ind(addr, endpoint_id, 0));
+    test.run_stack(Some(1));
+    let complete_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
+        "matching AL-ACK inside the late grace should complete the WAP/SNDCP AL transfer"
+    );
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
+}
+
+#[test]
+fn test_outbound_nonzero_link_al_reports_failed_after_late_ack_grace_expires() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let endpoint_id = 1;
+    let req_handle = 7107;
+    let service_reporter = TxReporter::new();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    test.submit_message(build_al_setup_ind_with_setup(addr, endpoint_id, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 2);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.endpoint_id = endpoint_id;
+    prim.link_id = 1;
+    prim.tx_reporter = Some(service_reporter.clone());
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut first_msgs = test.dump_sinks();
+    let reporter = take_first_tma_req_reporter(&mut first_msgs);
+    reporter.mark_transmitted();
+
+    test.run_stack(Some(T252_ACK_WAITING_TIMER as usize));
+    let grace_msgs = test.dump_sinks();
+    assert!(!find_tla_report(&grace_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER));
+
+    test.run_stack(Some((18 * 4 + 8) as usize));
+    let failed_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&failed_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "EN 300 392-2 22.3.3.2.4 requires failed transfer after N.273 is exceeded and late-ACK grace expires"
+    );
+    assert!(
+        failed_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "late-ACK grace expiry must not queue retransmissions after N.273=0"
+    );
+    assert_eq!(service_reporter.get_state(), TxState::Lost);
+}
+
+#[test]
+fn test_outbound_nonzero_link_al_no_late_ack_grace_after_mac_discard() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let endpoint_id = 1;
+    let req_handle = 7108;
+    let service_reporter = TxReporter::new();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    test.submit_message(build_al_setup_ind_with_setup(addr, endpoint_id, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 2);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.endpoint_id = endpoint_id;
+    prim.link_id = 1;
+    prim.tx_reporter = Some(service_reporter.clone());
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut first_msgs = test.dump_sinks();
+    let reporter = take_first_tma_req_reporter(&mut first_msgs);
+    reporter.mark_discarded();
+
+    test.run_stack(Some(T252_ACK_WAITING_TIMER as usize + 4));
+    let failed_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&failed_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "discarded MAC transfer must fail after T.252/N.273 instead of waiting in late-ACK grace"
+    );
+    assert_eq!(service_reporter.get_state(), TxState::Discarded);
 }
 
 #[test]

@@ -45,9 +45,11 @@ const T252_AL_ACK_WAITING_SIGNALLING_FRAMES: u32 = T252_ACK_WAITING_TIMER / TDMA
 const INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES: u32 =
     (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as u32 + 1) * T251_SENDER_RETRY_SIGNALLING_FRAMES;
 const CHANNEL_ALLOCATION_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 18;
+const AL_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 18;
 const N253_MAX_REQUESTED_TLSDU_REPEATS: u8 = 5;
 const TMA_HIGHEST_PDU_PRIORITY: Todo = 7;
 const COMMON_CONTROL_TIMESLOT: u8 = 1;
+const FIRST_PACKET_DATA_TIMESLOT: u8 = 2;
 const AL_SETUP_PHASE_MOD_PDCH_MAX_TIMESLOTS: u8 = 3;
 const AL_ORIGINAL_DATA_HEADER_BITS: usize = 17;
 const AL_ORIGINAL_SEGMENTS_PER_ACK_REQUEST: usize = 16;
@@ -131,9 +133,12 @@ struct ExpectedAlAck {
     t_umac_done: Option<TdmaTime>,
     tx_reporter: TxReporter,
     current_mac_reporter: Option<TxReporter>,
+    ack_timeslot: u8,
+    ack_stealing_repeats_flag: Option<bool>,
     segments: Vec<ExpectedAlSegment>,
     retransmit_count: u8,
     first_complete_report_sent: bool,
+    t_retransmissions_exhausted: Option<TdmaTime>,
 }
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
@@ -718,6 +723,14 @@ impl Llc {
         Self::t251_downlink_frames_elapsed(started_at, now, ack.ts, ack.stealing_repeats_flag) >= grace_frames
     }
 
+    fn al_late_ack_grace_expired(al: &ExpectedAlAck, now: TdmaTime) -> bool {
+        let Some(started_at) = al.t_retransmissions_exhausted else {
+            return false;
+        };
+        Self::t251_downlink_frames_elapsed(started_at, now, al.ack_timeslot, al.ack_stealing_repeats_flag)
+            >= AL_LATE_ACK_GRACE_SIGNALLING_FRAMES
+    }
+
     fn expected_ack_timeslot_for_outbound_bl(prim: &TlaTlDataReqBl) -> u8 {
         if !prim.stealing_permission && prim.chan_alloc.is_some() {
             // EN 300 392-2 clauses 23.5.2.2 and 23.5.4.3 allow a channel
@@ -732,6 +745,31 @@ impl Llc {
             .as_ref()
             .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
             .unwrap_or(COMMON_CONTROL_TIMESLOT)
+    }
+
+    fn first_assigned_timeslot(chan_alloc: Option<&CmceChanAllocReq>) -> Option<u8> {
+        chan_alloc
+            .and_then(|ca| ca.timeslots.iter().enumerate().find(|&(_, &set)| set).map(|(i, _)| (i + 1) as u8))
+            .filter(|ts| (1..=4).contains(ts))
+    }
+
+    fn expected_ack_timeslot_for_outbound_al(prim: &TlaTlDataReqBl) -> u8 {
+        if let Some(ts) = Self::first_assigned_timeslot(prim.chan_alloc.as_ref()) {
+            return ts;
+        }
+
+        // Original AL used by WAP/SNDCP keeps the logical packet-data endpoint
+        // in endpoint_id. That endpoint can be 1 even though the active PDCH is
+        // TS2-TS4, so do not treat endpoint 1 as MCCH TS1.
+        let endpoint_ts = u8::try_from(prim.endpoint_id).ok();
+        if let Some(ts @ 2..=4) = endpoint_ts {
+            return ts;
+        }
+        if prim.link_id != 0 && prim.endpoint_id == 1 {
+            return FIRST_PACKET_DATA_TIMESLOT;
+        }
+
+        COMMON_CONTROL_TIMESLOT
     }
 
     fn queued_udata_key(udata: &QueuedUdata) -> BasicLinkKey {
@@ -1553,6 +1591,8 @@ impl Llc {
         }
 
         let tx_reporter = prim.tx_reporter.take().unwrap_or_else(TxReporter::new);
+        let ack_timeslot = Self::expected_ack_timeslot_for_outbound_al(&prim);
+        let ack_stealing_repeats_flag = prim.stealing_repeats_flag;
 
         self.outbound_al_messages.push_back(ExpectedAlAck {
             key,
@@ -1566,9 +1606,12 @@ impl Llc {
             t_umac_done: None,
             tx_reporter,
             current_mac_reporter: None,
+            ack_timeslot,
+            ack_stealing_repeats_flag,
             segments,
             retransmit_count: 0,
             first_complete_report_sent: false,
+            t_retransmissions_exhausted: None,
         });
 
         Self::push_tla_report(queue, prim.req_handle, TLA_REPORT_NO_SPECIFIC_REPORT, Some(prim.endpoint_id));
@@ -2981,8 +3024,7 @@ impl Llc {
             let Some(t_umac_done) = al.t_umac_done else {
                 continue;
             };
-            let target_ts = u8::try_from(al.key.endpoint_id).ok().filter(|ts| (1..=4).contains(ts)).unwrap_or(1);
-            let age = Self::t251_downlink_frames_elapsed(t_umac_done, dltime, target_ts, None);
+            let age = Self::t251_downlink_frames_elapsed(t_umac_done, dltime, al.ack_timeslot, al.ack_stealing_repeats_flag);
             if age < T252_AL_ACK_WAITING_SIGNALLING_FRAMES {
                 continue;
             }
@@ -2994,6 +3036,7 @@ impl Llc {
                 .unwrap_or(0);
             if al.retransmit_count < max_retransmissions {
                 al.retransmit_count += 1;
+                al.t_retransmissions_exhausted = None;
                 Self::reset_al_transmission_attempt(al);
                 tracing::info!(
                     "LLC: retransmitting AL TL-SDU SSI {} endpoint {} link {} N(S) {} attempt {}",
@@ -3005,7 +3048,24 @@ impl Llc {
                 );
                 had_activity = true;
             } else {
-                removals.push(idx);
+                if !al.first_complete_report_sent {
+                    removals.push(idx);
+                    continue;
+                }
+                if al.t_retransmissions_exhausted.is_none() {
+                    al.t_retransmissions_exhausted = Some(dltime);
+                    tracing::warn!(
+                        "LLC: AL TL-SDU SSI {} endpoint {} link {} N(S) {} exhausted retransmissions after MAC success; waiting for late peer AL-ACK grace on TS{}",
+                        al.key.addr.ssi,
+                        al.key.endpoint_id,
+                        al.key.link_id,
+                        al.ns,
+                        al.ack_timeslot
+                    );
+                    had_activity = true;
+                } else if Self::al_late_ack_grace_expired(al, dltime) {
+                    removals.push(idx);
+                }
             }
         }
 
