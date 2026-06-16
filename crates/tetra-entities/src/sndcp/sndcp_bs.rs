@@ -284,7 +284,7 @@ impl Sndcp {
             }
         };
 
-        let response = match response {
+        let mut response = match response {
             Ok(response) => response,
             Err(err) => {
                 self.log_wap_pipeline_drop(&err);
@@ -293,12 +293,25 @@ impl Sndcp {
         };
 
         if self.should_mark_pdch_ready_after_response(decode, &response)
+            && let SndcpDecode::TransferControl(SndcpTransferControl::DataTransmitRequest(data_transmit)) = decode
             && let Ok(issi) = issi_from_ltpd_ind(&prim)
             && let Some(pipeline) = self.wap_pipeline.as_mut()
         {
-            // MVP-local common-control shortcut. Full PDCH/assigned-channel
-            // allocation is deliberately left out to avoid perturbing
-            // validated CMCE/voice resource handling.
+            let active_circuit_mode_service = snapshot.active_calls > 0;
+            if let Err(err) = pipeline.attach_mvp_pdch_allocation_for_data_transmit_response(
+                &mut response,
+                &prim,
+                issi,
+                data_transmit,
+                active_circuit_mode_service,
+            ) {
+                self.log_wap_pipeline_drop(&err);
+                return;
+            }
+            // MVP-local state transition after the SwMI accepts an MS
+            // SN-DATA TRANSMIT REQUEST and attaches a single-slot PDCH channel
+            // allocation to the lower MAC-RESOURCE. The lower confirmation
+            // primitive is still not wired into runtime SNDCP.
             pipeline.mark_pdch_ready(issi, prim.endpoint_id, prim.link_id);
         }
 

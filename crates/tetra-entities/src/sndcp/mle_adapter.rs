@@ -244,6 +244,7 @@ pub fn sndcp_pdu_to_ltpd_mle_unitdata_req(
         scheduled_data_status: optional_nonnegative_todo(options.scheduled_data_status, SndcpMleAdapterError::NegativeScheduledDataStatus)?,
         max_schedule_interval: optional_nonnegative_todo(options.max_schedule_interval, SndcpMleAdapterError::NegativeMaxScheduleInterval)?,
         fcs_flag: options.fcs_flag,
+        chan_alloc: None,
     })
 }
 

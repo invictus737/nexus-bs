@@ -12,7 +12,11 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress};
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_pdus::mle::pdus::d_nwrk_broadcast::DNwrkBroadcast;
-use tetra_saps::lcmc::LcmcMleUnitdataReq;
+use tetra_saps::lcmc::{
+    LcmcMleUnitdataReq,
+    enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment},
+    fields::chan_alloc_req::CmceChanAllocReq,
+};
 use tetra_saps::lmm::LmmMleUnitdataReq;
 use tetra_saps::ltpd::LtpdMleUnitdataReq;
 use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
@@ -138,6 +142,10 @@ fn build_lcmc_req(layer2service: Layer2Service) -> SapMsg {
 }
 
 fn build_ltpd_req(layer2service: Layer2Service) -> SapMsg {
+    build_ltpd_req_with_chan_alloc(layer2service, None)
+}
+
+fn build_ltpd_req_with_chan_alloc(layer2service: Layer2Service, chan_alloc: Option<CmceChanAllocReq>) -> SapMsg {
     SapMsg {
         sap: Sap::TlpdSap,
         src: TetraEntity::Sndcp,
@@ -161,7 +169,18 @@ fn build_ltpd_req(layer2service: Layer2Service) -> SapMsg {
             scheduled_data_status: 0,
             max_schedule_interval: 0,
             fcs_flag: true,
+            chan_alloc,
         }),
+    }
+}
+
+fn pdch_chan_alloc() -> CmceChanAllocReq {
+    CmceChanAllocReq {
+        usage: Some(4),
+        carrier: None,
+        timeslots: [false, true, false, false],
+        alloc_type: ChanAllocType::Replace,
+        ul_dl_assigned: UlDlAssignment::Both,
     }
 }
 
@@ -406,10 +425,30 @@ fn test_sndcp_unacknowledged_request_uses_packet_data_tl_unitdata() {
     assert!(prim.packet_data_flag);
     assert_eq!(prim.n_tlsdu_repeats, Some(2));
     assert_eq!(prim.data_class_info, Some(3));
-    assert!(
-        prim.chan_alloc.is_none(),
-        "runtime SNDCP remains fail-closed: no packet-data channel allocation is wired through MLE yet"
-    );
+    assert!(prim.chan_alloc.is_none());
+    assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Sndcp);
+}
+
+#[test]
+fn test_sndcp_unacknowledged_request_preserves_pdch_channel_allocation() {
+    let sink_msgs = route_sndcp_outbound_through_mle_with_direct_service_flag(build_ltpd_req_with_chan_alloc(
+        Layer2Service::Unacknowledged,
+        Some(pdch_chan_alloc()),
+    ));
+
+    assert_eq!(sink_msgs.len(), 1);
+    let SapMsgInner::TlaTlUnitdataReqBl(prim) = &sink_msgs[0].msg else {
+        panic!("expected TL-UNITDATA request for unacknowledged SNDCP service");
+    };
+    // EN 300 392-2 clause 28.3.5.2/2b permits the SwMI to include MAC
+    // channel allocation when accepting packet-data transfer. MLE must carry
+    // this SNDCP-owned allocation without changing CMCE/SDS service routing.
+    let chan_alloc = prim.chan_alloc.as_ref().expect("SNDCP PDCH allocation should reach LLC");
+    assert_eq!(chan_alloc.usage, Some(4));
+    assert_eq!(chan_alloc.carrier, None);
+    assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+    assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
+    assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Sndcp);
 }
 

@@ -8,6 +8,8 @@
 #![allow(unused)]
 use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, TetraAddress, Todo};
 
+use crate::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
+
 #[derive(Debug, Clone)]
 pub struct LtpdMleActivityReq {
     pub sleep_mode: bool,
@@ -222,6 +224,7 @@ pub struct LtpdMleUnitdataReq {
     pub scheduled_data_status: Todo,
     pub max_schedule_interval: Todo,
     pub fcs_flag: bool,
+    pub chan_alloc: Option<CmceChanAllocReq>,
 }
 
 #[derive(Debug, Clone)]

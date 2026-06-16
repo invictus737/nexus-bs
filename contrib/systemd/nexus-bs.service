@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
-# Legacy single-user sample systemd service file for Nexus-BS v0.1.70_dev.
+# Legacy single-user sample systemd service file for Nexus-BS v0.1.71_dev.
 #
 # New deployments should prefer:
 #   contrib/systemd/nexus-bs@.service
@@ -29,7 +29,7 @@
 # - see log with "journalctl -u nexus-bs --output=cat -f"
 
 [Unit]
-Description=Nexus-BS v0.1.70_dev TETRA base station service
+Description=Nexus-BS v0.1.71_dev TETRA base station service
 # network-online.target ensures the interface is UP and routable,
 # not just "declared active" like network.target.
 After=network-online.target

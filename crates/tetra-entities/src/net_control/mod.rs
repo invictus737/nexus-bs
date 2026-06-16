@@ -41,13 +41,13 @@ mod tests {
 
     #[test]
     fn control_protocol_tracks_nexus_bs_product_version() {
-        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.70_dev");
+        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.71_dev");
     }
 
     #[test]
     fn select_control_subprotocol_prefers_current_protocol() {
         assert_eq!(
-            select_control_subprotocol("nexus-bs-control-v0.1.70_dev"),
+            select_control_subprotocol("nexus-bs-control-v0.1.71_dev"),
             Some(CONTROL_PROTOCOL_VERSION)
         );
     }

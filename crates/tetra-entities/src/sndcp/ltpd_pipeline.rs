@@ -6,15 +6,23 @@
 use super::mle_adapter::{
     SndcpLtpdUnitdataOptions, SndcpMleAdapterError, sn_unitdata_req_to_ltpd_mle_unitdata_req, sndcp_pdu_to_ltpd_mle_unitdata_req,
 };
-use super::pdch::{SndcpPdchError, SndcpPdchManager};
+use super::pdch::{
+    SndcpChannelAdviceRequest, SndcpPacketDataPlanInput, SndcpPacketDataResourceRequest, SndcpPdchAllocationPolicy, SndcpPdchError,
+    SndcpPdchManager, packet_data_plan_to_lower_channel_allocation,
+};
+use super::transfer::SndcpDataTransmitRequest;
 use super::wap_gateway::WapStatusUnitdataResponse;
 use super::wap_session::{SndcpWapSession, SndcpWapSessionError, SndcpWapSessionResponse};
 use super::wap_status::WapStatusSnapshot;
 use tetra_core::{EndpointId, LinkId, MleHandle, SsiType, TetraAddress};
 use tetra_saps::ltpd::{LtpdMleUnitdataInd, LtpdMleUnitdataReq};
+use tetra_saps::sn::SnPacketDataMsType;
 
 pub const SNDCP_MLE_HANDLE_MIN: MleHandle = 1;
 pub const SNDCP_MLE_HANDLE_MAX: MleHandle = i32::MAX as MleHandle;
+const WAP_IP_MVP_PDCH_TIMESLOT: u8 = 2;
+const WAP_IP_MVP_PDCH_USAGE_MARKER: u8 = 4;
+const WAP_IP_MVP_NONFRAGMENTED_MAC_CAPACITY_BITS: usize = 124;
 
 #[derive(Debug, Clone)]
 pub struct SndcpWapLtpdPipeline {
@@ -86,6 +94,57 @@ impl SndcpWapLtpdPipeline {
 
     pub fn mark_pdch_ready(&mut self, issi: u32, endpoint_id: EndpointId, link_id: LinkId) {
         self.pdch.mark_pdch_ready(issi, endpoint_id, link_id);
+    }
+
+    pub fn attach_mvp_pdch_allocation_for_data_transmit_response(
+        &mut self,
+        req: &mut LtpdMleUnitdataReq,
+        ind: &LtpdMleUnitdataInd,
+        issi: u32,
+        data_transmit: &SndcpDataTransmitRequest,
+        active_circuit_mode_service: bool,
+    ) -> Result<(), SndcpWapLtpdPipelineError> {
+        let packet_data_ms_type = self
+            .session
+            .bearer()
+            .pdp()
+            .contexts()
+            .get_issi_nsapi(issi, data_transmit.nsapi)
+            .ok()
+            .flatten()
+            .map(|context| context.packet_data_ms_type)
+            .unwrap_or(SnPacketDataMsType::TypeAParallel);
+        let plan = self.pdch.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+            issi,
+            nsapi: data_transmit.nsapi,
+            endpoint_id: ind.endpoint_id,
+            link_id: ind.link_id,
+            swmi_state: self.session.state_for_issi(issi),
+            packet_data_ms_type,
+            layer2service: req.layer2service,
+            pdu_priority: req.pdu_prio as u8,
+            data_priority: None,
+            unacked_bl_repetitions: None,
+            scheduled_data_status: None,
+            fcs_flag: req.fcs_flag,
+            current_channel_packet_data_suitable: false,
+            allow_common_control_packet_data: false,
+            pdch_available: true,
+            channel_advice_request: SndcpChannelAdviceRequest::None,
+            resource_request: SndcpPacketDataResourceRequest::None,
+            downlink_sdu_bits: req.sdu.get_len(),
+            nonfragmented_sdu_capacity_bits: Some(WAP_IP_MVP_NONFRAGMENTED_MAC_CAPACITY_BITS),
+            fragmented_channel_allocation_mac_end_supported: false,
+            active_circuit_mode_service,
+            parallel_voice_data_permitted: false,
+        })?;
+        if let Some(allocation) = packet_data_plan_to_lower_channel_allocation(
+            &plan,
+            SndcpPdchAllocationPolicy::single_slot(WAP_IP_MVP_PDCH_TIMESLOT, Some(WAP_IP_MVP_PDCH_USAGE_MARKER)),
+        )? {
+            req.chan_alloc = Some(allocation.chan_alloc);
+        }
+        Ok(())
     }
 
     pub fn handle_ltpd_mle_unitdata_ind_allocating(
@@ -313,6 +372,13 @@ mod tests {
         req
     }
 
+    fn data_transmit() -> SndcpDataTransmitRequest {
+        SndcpDataTransmitRequest {
+            nsapi: 2,
+            logical_link_status: false,
+        }
+    }
+
     #[test]
     fn handle_allocator_stays_inside_ltpd_todo_range() {
         let mut allocator = SndcpWapLtpdHandleAllocator::new(0);
@@ -461,6 +527,52 @@ mod tests {
         assert_eq!(response_udp.source_port, endpoint().port);
         assert_eq!(response_udp.destination_port, 49_152);
         assert!(std::str::from_utf8(response_udp.payload).unwrap().contains("Nexus-BS"));
+    }
+
+    #[test]
+    fn accepted_data_transmit_response_gets_mvp_pdch_allocation() {
+        let mut pipeline = pipeline();
+        let address = TetraAddress::issi(ISSI);
+        pipeline
+            .handle_ltpd_mle_unitdata_ind(&ltpd_ind(address, dynamic_ipv4_demand(2)), HANDLE, &snapshot())
+            .expect("activation should produce accept");
+        let ind = ltpd_ind(address, data_transmit_request(2));
+        let mut req = pipeline
+            .handle_ltpd_mle_unitdata_ind(&ind, HANDLE, &snapshot())
+            .expect("SN-DATA TRANSMIT REQUEST should produce response");
+
+        pipeline
+            .attach_mvp_pdch_allocation_for_data_transmit_response(&mut req, &ind, ISSI, &data_transmit(), false)
+            .expect("MVP PDCH allocation should attach without active circuit-mode service");
+
+        let allocation = req.chan_alloc.expect("PDCH allocation should be present");
+        assert_eq!(allocation.usage, Some(4));
+        assert_eq!(allocation.carrier, None);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
+        assert_eq!(allocation.alloc_type, tetra_saps::lcmc::enums::alloc_type::ChanAllocType::Replace);
+        assert_eq!(
+            allocation.ul_dl_assigned,
+            tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment::Both
+        );
+    }
+
+    #[test]
+    fn mvp_pdch_allocation_refuses_active_circuit_mode_service() {
+        let mut pipeline = pipeline();
+        let address = TetraAddress::issi(ISSI);
+        pipeline
+            .handle_ltpd_mle_unitdata_ind(&ltpd_ind(address, dynamic_ipv4_demand(2)), HANDLE, &snapshot())
+            .expect("activation should produce accept");
+        let ind = ltpd_ind(address, data_transmit_request(2));
+        let mut req = pipeline
+            .handle_ltpd_mle_unitdata_ind(&ind, HANDLE, &snapshot())
+            .expect("SN-DATA TRANSMIT REQUEST should produce response");
+
+        assert_eq!(
+            pipeline.attach_mvp_pdch_allocation_for_data_transmit_response(&mut req, &ind, ISSI, &data_transmit(), true),
+            Err(SndcpWapLtpdPipelineError::Pdch(SndcpPdchError::CircuitModeConflict { issi: ISSI }))
+        );
+        assert!(req.chan_alloc.is_none());
     }
 
     #[test]

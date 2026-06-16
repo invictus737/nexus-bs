@@ -556,6 +556,7 @@ impl MleBs {
         pdu.seek(0);
 
         let subscriber_class = self.subscriber_class();
+        let chan_alloc = prim.chan_alloc.take();
         let msg = match prim.layer2service {
             Layer2Service::Unacknowledged => {
                 let tla_handle = self.track_tla_data_request(MleSapUser::Sndcp, Self::todo_to_mle_handle(prim.handle));
@@ -574,7 +575,7 @@ impl MleBs {
                     n_tlsdu_repeats: Self::ltpd_todo_to_optional_u8(prim.unacked_bl_repetitions),
                     data_class_info: Self::ltpd_todo_to_optional_todo(prim.data_class_info),
                     req_handle: tla_handle,
-                    chan_alloc: None,
+                    chan_alloc,
                     tx_reporter: None,
                 })
             }
@@ -609,7 +610,7 @@ impl MleBs {
                     data_class_info: Self::ltpd_todo_to_optional_todo(prim.data_class_info),
                     req_handle: tla_handle,
                     graceful_degradation: None,
-                    chan_alloc: None,
+                    chan_alloc,
                     tx_reporter: None,
                 })
             }

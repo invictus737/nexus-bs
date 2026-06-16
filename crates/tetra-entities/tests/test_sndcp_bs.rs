@@ -27,6 +27,7 @@ use tetra_entities::sndcp::transfer::{
 use tetra_entities::sndcp::unitdata::decode_sn_unitdata_pdu;
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::SapMsg;
+use tetra_saps::lcmc::enums::{alloc_type::ChanAllocType, ul_dl_assignment::UlDlAssignment};
 use tetra_saps::ltpd::{LtpdMleConfigureInd, LtpdMleConfigureReq, LtpdMleReportInd, LtpdMleUnitdataInd, LtpdMleUnitdataReq};
 use tetra_saps::sapmsg::SapMsgInner;
 use tetra_saps::sn::{SnAddress, SnPacketDataMsType};
@@ -463,9 +464,19 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     assert_eq!(ready.result, SndcpDataTransmitResponseResult::Accepted);
     assert_eq!(ltpd_reqs[1].layer2service, Layer2Service::Acknowledged);
     assert!(!ltpd_reqs[1].packet_data_flag);
+    let ready_alloc = ltpd_reqs[1]
+        .chan_alloc
+        .as_ref()
+        .expect("accepted SN-DATA TRANSMIT RESPONSE should carry the MVP PDCH allocation");
+    assert_eq!(ready_alloc.usage, Some(4));
+    assert_eq!(ready_alloc.carrier, None);
+    assert_eq!(ready_alloc.timeslots, [false, true, false, false]);
+    assert_eq!(ready_alloc.alloc_type, ChanAllocType::Replace);
+    assert_eq!(ready_alloc.ul_dl_assigned, UlDlAssignment::Both);
 
     assert_eq!(ltpd_reqs[2].layer2service, Layer2Service::Unacknowledged);
     assert!(ltpd_reqs[2].packet_data_flag);
+    assert!(ltpd_reqs[2].chan_alloc.is_none());
     let unitdata = decode_sn_unitdata_pdu(&ltpd_reqs.remove(2).sdu).expect("WAP response SN-UNITDATA should decode");
     let response_octets = bitbuffer_npdu_octets(&unitdata.n_pdu).expect("response N-PDU should be byte aligned");
     let response_ip = parse_ipv4_packet(&response_octets).expect("response IPv4 should parse");
@@ -541,6 +552,18 @@ fn sndcp_wap_ip_mvp_routes_through_live_mle_to_llc_when_enabled() {
         .filter(|msg| msg.sap == Sap::TlaSap && msg.dest == TetraEntity::Llc)
         .collect();
     assert_eq!(llc_msgs.len(), 3, "unexpected sink messages: {sinks:#?}");
+    let ready_alloc = llc_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::TlaTlDataReqBl(req) => req.chan_alloc.as_ref(),
+            _ => None,
+        })
+        .expect("SN-DATA TRANSMIT RESPONSE should route to LLC with a PDCH allocation");
+    assert_eq!(ready_alloc.usage, Some(4));
+    assert_eq!(ready_alloc.carrier, None);
+    assert_eq!(ready_alloc.timeslots, [false, true, false, false]);
+    assert_eq!(ready_alloc.alloc_type, ChanAllocType::Replace);
+    assert_eq!(ready_alloc.ul_dl_assigned, UlDlAssignment::Both);
     let packet_data = llc_msgs
         .iter()
         .find_map(|msg| match &msg.msg {
