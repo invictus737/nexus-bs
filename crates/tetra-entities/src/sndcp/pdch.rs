@@ -854,7 +854,7 @@ fn validate_channel_advice_and_resource_request(
 
 fn assigned_scch_pdch_timeslots_for_resource_request(resource_request: SndcpPacketDataResourceRequest) -> [bool; 4] {
     let requested_slots = match resource_request {
-        SndcpPacketDataResourceRequest::None => SNDCP_PDCH_TIMESLOT_MAX,
+        SndcpPacketDataResourceRequest::None => 1,
         SndcpPacketDataResourceRequest::PhaseModulation(request) => {
             if request.uplink_timeslots == 1 && request.downlink_timeslots == 1 {
                 1
@@ -1474,13 +1474,17 @@ mod tests {
         assert_eq!(lower.placement, SndcpMacChannelAllocationPlacement::MacResource);
         assert_eq!(lower.chan_alloc.usage, None);
         assert_eq!(lower.chan_alloc.carrier, None);
-        assert_eq!(lower.chan_alloc.timeslots, [false, true, true, true]);
+        assert_eq!(lower.chan_alloc.timeslots, [false, true, false, false]);
         assert_eq!(lower.chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(lower.chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     }
 
     #[test]
     fn resource_aware_assigned_scch_policy_maps_single_slot_and_four_slot_requests() {
+        let default_policy = SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(SndcpPacketDataResourceRequest::None);
+        assert_eq!(default_policy.usage_marker, None);
+        assert_eq!(default_policy.timeslots, SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT);
+
         let single_slot = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
             uplink_timeslots: 1,
             downlink_timeslots: 1,

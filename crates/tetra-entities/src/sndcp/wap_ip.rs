@@ -3,10 +3,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Nexus-BS original WAP-over-UDP/IP adapter primitives for TETRA SNDCP experiments.
 
-use super::ip::{
-    IPV4_PROTOCOL_TCP, IPV4_PROTOCOL_UDP, IpPrimitiveError, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN,
-    TcpSegment, build_ipv4_tcp_npdu, build_ipv4_udp_npdu, parse_ipv4_packet, parse_tcp_segment, parse_udp_datagram,
-};
+use super::ip::{IPV4_PROTOCOL_UDP, IpPrimitiveError, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use super::wap_status::{
     DEFAULT_WAP_STATUS_MAX_BYTES, WAP_STATUS_HTML_PATH, WAP_STATUS_LEGACY_WML_PATH, WAP_STATUS_REFRESH_PATH, WapStatusError,
     WapStatusSnapshot, render_wml2_status,
@@ -15,9 +12,6 @@ use super::wap_status::{
 pub const DEFAULT_WAP_UDP_REQUEST_MAX_BYTES: usize = 1024;
 pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES - WSP_REPLY_FIXED_HEADER_BYTES;
 pub const IPV4_UDP_HEADER_BYTES: usize = 28;
-pub const IPV4_TCP_HEADER_BYTES: usize = 40;
-const TCP_HTTP_DEFAULT_MAX_PAYLOAD_BYTES: usize = 536;
-const TCP_HTTP_RESPONSE_WINDOW_BYTES: u16 = 4096;
 const WTP_CON_FLAG: u8 = 0x80;
 const WTP_RID_FLAG: u8 = 0x01;
 const WTP_PDU_INVOKE: u8 = 1;
@@ -224,7 +218,6 @@ pub fn build_wap_status_response_npdu_optional_with_npdu_budget(
 
     match request_ip.protocol {
         IPV4_PROTOCOL_UDP => build_udp_status_response(&request_ip, endpoint, policy, snapshot, max_npdu_bytes),
-        IPV4_PROTOCOL_TCP => build_tcp_status_response(&request_ip, endpoint, policy, snapshot, max_npdu_bytes),
         protocol => Err(WapIpError::UnsupportedIpProtocol { protocol }),
     }
 }
@@ -325,213 +318,6 @@ fn build_udp_status_response(
     );
 
     Ok(Some(response))
-}
-
-fn build_tcp_status_response(
-    request_ip: &super::ip::Ipv4Packet<'_>,
-    endpoint: WapIpEndpoint,
-    policy: &WapIpServicePolicy,
-    snapshot: &WapStatusSnapshot,
-    max_npdu_bytes: Option<usize>,
-) -> Result<Option<Vec<u8>>, WapIpError> {
-    let request_tcp = parse_tcp_segment(request_ip.payload)?;
-    if request_tcp.destination_port != endpoint.port {
-        return Err(WapIpError::WrongTcpPort {
-            expected: endpoint.port,
-            actual: request_tcp.destination_port,
-        });
-    }
-    if !policy.status_enabled {
-        return Err(WapIpError::StatusServiceDisabled);
-    }
-    if request_tcp.payload.len() > policy.max_request_payload_bytes {
-        return Err(WapIpError::TcpPayloadTooLarge {
-            len: request_tcp.payload.len(),
-            max: policy.max_request_payload_bytes,
-        });
-    }
-    if request_tcp.flags & TCP_FLAG_RST != 0 {
-        tracing::debug!(
-            "WAP/IP diag: IPv4/TCP RST src={:?}:{} seq={} ack={}",
-            request_ip.source,
-            request_tcp.source_port,
-            request_tcp.sequence_number,
-            request_tcp.acknowledgement_number
-        );
-        return Ok(None);
-    }
-
-    let server_iss = tcp_server_iss(request_ip, &request_tcp);
-    if request_tcp.flags & TCP_FLAG_SYN != 0 {
-        tracing::info!(
-            "WAP/IP diag: IPv4/TCP SYN src={:?}:{} dst={:?}:{} seq={} -> SYN-ACK seq={} ack={}",
-            request_ip.source,
-            request_tcp.source_port,
-            request_ip.destination,
-            request_tcp.destination_port,
-            request_tcp.sequence_number,
-            server_iss,
-            request_tcp.sequence_number.wrapping_add(1)
-        );
-        return build_tcp_npdu_response(
-            request_ip,
-            &request_tcp,
-            endpoint,
-            server_iss,
-            request_tcp.sequence_number.wrapping_add(1),
-            TCP_FLAG_SYN | TCP_FLAG_ACK,
-            b"",
-        )
-        .map(Some);
-    }
-
-    if request_tcp.payload.is_empty() {
-        tracing::debug!(
-            "WAP/IP diag: IPv4/TCP ACK-only/no-payload src={:?}:{} flags={:#x} seq={} ack={}; no response",
-            request_ip.source,
-            request_tcp.source_port,
-            request_tcp.flags,
-            request_tcp.sequence_number,
-            request_tcp.acknowledgement_number
-        );
-        return Ok(None);
-    }
-
-    let request_path = parse_http_tcp_status_get(request_tcp.payload, policy)?;
-    let max_tcp_payload_bytes = max_npdu_bytes
-        .map(|max| max.saturating_sub(IPV4_TCP_HEADER_BYTES))
-        .unwrap_or(TCP_HTTP_DEFAULT_MAX_PAYLOAD_BYTES)
-        .min(TCP_HTTP_DEFAULT_MAX_PAYLOAD_BYTES);
-    let response_payload = build_http_status_payload(snapshot, max_tcp_payload_bytes)?;
-    let response_sequence = if request_tcp.flags & TCP_FLAG_ACK != 0 && request_tcp.acknowledgement_number != 0 {
-        request_tcp.acknowledgement_number
-    } else {
-        server_iss.wrapping_add(1)
-    };
-    let response_ack = tcp_ack_number(&request_tcp);
-
-    let response = build_tcp_npdu_response(
-        request_ip,
-        &request_tcp,
-        endpoint,
-        response_sequence,
-        response_ack,
-        TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN,
-        &response_payload,
-    )?;
-    tracing::info!(
-        "WAP/IP diag: IPv4/TCP HTTP GET src={:?}:{} path={} req_payload_len={} -> 200 XHTML payload_len={} npdu_len={} seq={} ack={}",
-        request_ip.source,
-        request_tcp.source_port,
-        request_path,
-        request_tcp.payload.len(),
-        response_payload.len(),
-        response.len(),
-        response_sequence,
-        response_ack
-    );
-    Ok(Some(response))
-}
-
-fn build_tcp_npdu_response(
-    request_ip: &super::ip::Ipv4Packet<'_>,
-    request_tcp: &TcpSegment<'_>,
-    endpoint: WapIpEndpoint,
-    sequence_number: u32,
-    acknowledgement_number: u32,
-    flags: u16,
-    payload: &[u8],
-) -> Result<Vec<u8>, WapIpError> {
-    Ok(build_ipv4_tcp_npdu(
-        endpoint.address,
-        request_ip.source,
-        endpoint.port,
-        request_tcp.source_port,
-        sequence_number,
-        acknowledgement_number,
-        flags,
-        TCP_HTTP_RESPONSE_WINDOW_BYTES,
-        payload,
-        request_ip.identification.wrapping_add(1),
-        endpoint.response_ttl,
-    )?)
-}
-
-fn parse_http_tcp_status_get(payload: &[u8], policy: &WapIpServicePolicy) -> Result<String, WapIpError> {
-    let Ok(text) = std::str::from_utf8(payload) else {
-        return Err(WapIpError::UnsupportedHttpTcpPayload { len: payload.len() });
-    };
-    let first_line = text.lines().next().unwrap_or("").trim_end_matches('\r').trim();
-    let Some(path) = first_line.strip_prefix("GET ") else {
-        return Err(WapIpError::UnsupportedHttpTcpPayload { len: payload.len() });
-    };
-    let path = path.split_whitespace().next().unwrap_or("/");
-    let path = normalize_get_path(uri_path(path));
-    if is_status_path(&path, policy) {
-        return Ok(path);
-    }
-    Err(WapIpError::UnsupportedWapPath { path })
-}
-
-fn build_http_status_payload(snapshot: &WapStatusSnapshot, max_tcp_payload_bytes: usize) -> Result<Vec<u8>, WapIpError> {
-    let mut body_budget = max_tcp_payload_bytes.saturating_sub(build_http_status_header(0).len() + 5);
-    for _ in 0..4 {
-        let body = render_wml2_status(snapshot, body_budget)?;
-        let header = build_http_status_header(body.len());
-        let total = header.len() + body.len();
-        if total <= max_tcp_payload_bytes {
-            let mut payload = Vec::with_capacity(total);
-            payload.extend_from_slice(header.as_bytes());
-            payload.extend_from_slice(body.as_bytes());
-            return Ok(payload);
-        }
-        let next_budget = max_tcp_payload_bytes.saturating_sub(header.len());
-        if next_budget >= body_budget {
-            return Err(WapIpError::Status(WapStatusError::RenderedTooLarge {
-                len: total,
-                max: max_tcp_payload_bytes,
-            }));
-        }
-        body_budget = next_budget;
-    }
-
-    Err(WapIpError::Status(WapStatusError::RenderedTooLarge {
-        len: max_tcp_payload_bytes.saturating_add(1),
-        max: max_tcp_payload_bytes,
-    }))
-}
-
-fn build_http_status_header(content_len: usize) -> String {
-    format!(
-        "HTTP/1.0 200 OK\r\nContent-Type: application/vnd.wap.xhtml+xml\r\nContent-Length: {content_len}\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
-    )
-}
-
-fn tcp_ack_number(segment: &TcpSegment<'_>) -> u32 {
-    let mut ack = segment.sequence_number.wrapping_add(segment.payload.len() as u32);
-    if segment.flags & TCP_FLAG_SYN != 0 {
-        ack = ack.wrapping_add(1);
-    }
-    if segment.flags & TCP_FLAG_FIN != 0 {
-        ack = ack.wrapping_add(1);
-    }
-    ack
-}
-
-fn tcp_server_iss(request_ip: &super::ip::Ipv4Packet<'_>, request_tcp: &TcpSegment<'_>) -> u32 {
-    let mut hash = 0x4e42_5300u32;
-    for byte in request_ip
-        .source
-        .iter()
-        .copied()
-        .chain(request_ip.destination.iter().copied())
-        .chain(request_tcp.source_port.to_be_bytes())
-        .chain(request_tcp.destination_port.to_be_bytes())
-    {
-        hash ^= byte as u32;
-        hash = hash.rotate_left(5).wrapping_mul(0x0100_0193);
-    }
-    hash
 }
 
 pub fn parse_wap_udp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<WapUdpRequestKind, WapIpError> {
@@ -748,6 +534,8 @@ fn build_wsp_connect_reply(connect: &WspConnectRequest) -> Vec<u8> {
 
 fn build_wsp_connect_reply_capabilities(connect: &WspConnectRequest) -> Vec<u8> {
     let mut capabilities = Vec::new();
+    // Keep the negotiated session minimal for terminal WAP browsers: echo only
+    // bounded SDU sizes and avoid synthesizing optional capabilities.
     if let Some(requested) = wsp_capability_uintvar(connect, WSP_CAP_CLIENT_SDU_SIZE) {
         push_wsp_uintvar_capability(
             &mut capabilities,
@@ -761,29 +549,6 @@ fn build_wsp_connect_reply_capabilities(connect: &WspConnectRequest) -> Vec<u8> 
             WSP_CAP_SERVER_SDU_SIZE,
             requested.min(WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES),
         );
-    }
-    if wsp_capability(connect, WSP_CAP_PROTOCOL_OPTIONS).is_some() {
-        push_wsp_octets_capability(&mut capabilities, WSP_CAP_PROTOCOL_OPTIONS, &[0x00]);
-    }
-    if let Some(requested) = wsp_capability(connect, WSP_CAP_METHOD_MOR).and_then(|capability| capability.parameters.first().copied()) {
-        let accepted = requested.min(1);
-        if accepted > 0 {
-            push_wsp_octets_capability(&mut capabilities, WSP_CAP_METHOD_MOR, &[accepted]);
-        }
-    }
-    if let Some(requested) = wsp_capability(connect, WSP_CAP_EXTENDED_METHODS) {
-        let accepted: Vec<u8> = requested
-            .parameters
-            .split(|octet| *octet == 0)
-            .filter_map(|entry| entry.first().copied())
-            .filter(|pdu_type| (0x50..=0x5f).contains(pdu_type))
-            .collect();
-        if !accepted.is_empty() {
-            push_wsp_octets_capability(&mut capabilities, WSP_CAP_EXTENDED_METHODS, &accepted);
-        }
-    }
-    if wsp_capability(connect, WSP_CAP_HEADER_CODE_PAGES).is_some() {
-        push_wsp_octets_capability(&mut capabilities, WSP_CAP_HEADER_CODE_PAGES, &[]);
     }
     capabilities
 }
@@ -928,7 +693,7 @@ fn is_status_path(path: &str, policy: &WapIpServicePolicy) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sndcp::ip::{parse_ipv4_packet, parse_tcp_segment, parse_udp_datagram};
+    use crate::sndcp::ip::{IPV4_PROTOCOL_TCP, build_ipv4_tcp_npdu, parse_ipv4_packet, parse_udp_datagram};
 
     fn snapshot() -> WapStatusSnapshot {
         WapStatusSnapshot {
@@ -1271,7 +1036,7 @@ mod tests {
     }
 
     #[test]
-    fn wap_status_response_answers_tcp_syn_with_syn_ack() {
+    fn wap_status_response_rejects_tcp_for_udp_wap_profile() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
             port: 9200,
@@ -1284,7 +1049,7 @@ mod tests {
             endpoint.port,
             0x0102_0304,
             0,
-            TCP_FLAG_SYN,
+            0x002,
             2048,
             b"",
             0x3333,
@@ -1292,195 +1057,12 @@ mod tests {
         )
         .expect("TCP SYN N-PDU should build");
 
-        let response = build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()).expect("TCP SYN response should build");
-        let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
-        let response_tcp = parse_tcp_segment(response_ip.payload).expect("response TCP should parse");
-
-        assert_eq!(response_ip.source, endpoint.address);
-        assert_eq!(response_ip.destination, [10, 0, 0, 226]);
-        assert_eq!(response_ip.identification, 0x3334);
-        assert_eq!(response_ip.ttl, 32);
-        assert_eq!(response_tcp.source_port, endpoint.port);
-        assert_eq!(response_tcp.destination_port, 49152);
-        assert_eq!(response_tcp.flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
-        assert_eq!(response_tcp.acknowledgement_number, 0x0102_0305);
-        assert!(response_tcp.payload.is_empty());
-    }
-
-    #[test]
-    fn wap_status_response_suppresses_tcp_ack_only_segments() {
-        let endpoint = WapIpEndpoint {
-            address: [10, 0, 0, 1],
-            port: 9200,
-            response_ttl: 32,
-        };
-        let request = build_ipv4_tcp_npdu(
-            [10, 0, 0, 226],
-            endpoint.address,
-            49152,
-            endpoint.port,
-            0x0102_0305,
-            0x9000_0001,
-            TCP_FLAG_ACK,
-            2048,
-            b"",
-            0x3334,
-            64,
-        )
-        .expect("TCP ACK N-PDU should build");
-
-        assert_eq!(
-            build_wap_status_response_npdu_optional_with_npdu_budget(&request, endpoint, &policy(), &snapshot(), Some(576)),
-            Ok(None)
-        );
         assert_eq!(
             build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()),
-            Err(WapIpError::NoResponseRequired)
+            Err(WapIpError::UnsupportedIpProtocol {
+                protocol: IPV4_PROTOCOL_TCP
+            })
         );
-    }
-
-    #[test]
-    fn wap_status_response_answers_tcp_http_get_with_xhtml_and_fin() {
-        let endpoint = WapIpEndpoint {
-            address: [10, 0, 0, 1],
-            port: 9200,
-            response_ttl: 32,
-        };
-        let syn = build_ipv4_tcp_npdu(
-            [10, 0, 0, 2],
-            endpoint.address,
-            49152,
-            endpoint.port,
-            0x1000_0000,
-            0,
-            TCP_FLAG_SYN,
-            2048,
-            b"",
-            0x3333,
-            64,
-        )
-        .expect("TCP SYN N-PDU should build");
-        let syn_ack = build_wap_status_response_npdu(&syn, endpoint, &policy(), &snapshot()).expect("TCP SYN response should build");
-        let syn_ack_ip = parse_ipv4_packet(&syn_ack).expect("SYN-ACK IPv4 should parse");
-        let syn_ack_tcp = parse_tcp_segment(syn_ack_ip.payload).expect("SYN-ACK TCP should parse");
-        let request_payload = b"GET /status.xhtml HTTP/1.1\r\nHost: 10.0.0.1:9200\r\nConnection: close\r\n\r\n";
-        let get = build_ipv4_tcp_npdu(
-            [10, 0, 0, 2],
-            endpoint.address,
-            49152,
-            endpoint.port,
-            0x1000_0001,
-            syn_ack_tcp.sequence_number.wrapping_add(1),
-            TCP_FLAG_ACK | TCP_FLAG_PSH,
-            2048,
-            request_payload,
-            0x3334,
-            64,
-        )
-        .expect("TCP GET N-PDU should build");
-
-        let response = build_wap_status_response_npdu_optional_with_npdu_budget(&get, endpoint, &policy(), &snapshot(), Some(576))
-            .expect("TCP GET response should build")
-            .expect("TCP GET should require a response");
-        let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
-        let response_tcp = parse_tcp_segment(response_ip.payload).expect("response TCP should parse");
-        let http = std::str::from_utf8(response_tcp.payload).expect("HTTP response should be UTF-8");
-
-        assert_eq!(response_ip.source, endpoint.address);
-        assert_eq!(response_ip.destination, [10, 0, 0, 2]);
-        assert_eq!(response_tcp.source_port, endpoint.port);
-        assert_eq!(response_tcp.destination_port, 49152);
-        assert_eq!(response_tcp.sequence_number, syn_ack_tcp.sequence_number.wrapping_add(1));
-        assert_eq!(
-            response_tcp.acknowledgement_number,
-            0x1000_0001u32.wrapping_add(request_payload.len() as u32)
-        );
-        assert_eq!(response_tcp.flags, TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN);
-        assert!(http.starts_with("HTTP/1.0 200 OK\r\n"));
-        assert!(http.contains("Content-Type: application/vnd.wap.xhtml+xml\r\n"));
-        assert!(http.contains("Content-Length: "));
-        assert!(http.contains("Connection: close\r\n"));
-        assert!(http.contains("http://www.w3.org/1999/xhtml"));
-        assert!(http.contains("Welcome to Nexus-BS"));
-        assert!(
-            response.len() <= 576,
-            "TCP HTTP response should respect the negotiated N-PDU budget"
-        );
-    }
-
-    #[test]
-    fn wap_status_response_repeats_tcp_responses_for_duplicate_segments() {
-        let endpoint = WapIpEndpoint {
-            address: [10, 0, 0, 1],
-            port: 9200,
-            response_ttl: 32,
-        };
-        let syn = build_ipv4_tcp_npdu(
-            [10, 0, 0, 2],
-            endpoint.address,
-            49152,
-            endpoint.port,
-            0x1000_0000,
-            0,
-            TCP_FLAG_SYN,
-            2048,
-            b"",
-            0x3333,
-            64,
-        )
-        .expect("TCP SYN N-PDU should build");
-
-        let first_syn_ack = build_wap_status_response_npdu_optional_with_npdu_budget(&syn, endpoint, &policy(), &snapshot(), Some(576))
-            .expect("first TCP SYN response should build")
-            .expect("TCP SYN should require a response");
-        let duplicate_syn_ack = build_wap_status_response_npdu_optional_with_npdu_budget(&syn, endpoint, &policy(), &snapshot(), Some(576))
-            .expect("duplicate TCP SYN response should build")
-            .expect("duplicate TCP SYN should require a response");
-        assert_eq!(duplicate_syn_ack, first_syn_ack);
-
-        let syn_ack_ip = parse_ipv4_packet(&first_syn_ack).expect("SYN-ACK IPv4 should parse");
-        let syn_ack_tcp = parse_tcp_segment(syn_ack_ip.payload).expect("SYN-ACK TCP should parse");
-        assert_eq!(syn_ack_tcp.flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
-        assert_eq!(syn_ack_tcp.acknowledgement_number, 0x1000_0001);
-
-        let request_payload = b"GET /status.xhtml HTTP/1.1\r\nHost: 10.0.0.1:9200\r\nConnection: close\r\n\r\n";
-        let get = build_ipv4_tcp_npdu(
-            [10, 0, 0, 2],
-            endpoint.address,
-            49152,
-            endpoint.port,
-            0x1000_0001,
-            syn_ack_tcp.sequence_number.wrapping_add(1),
-            TCP_FLAG_ACK | TCP_FLAG_PSH,
-            2048,
-            request_payload,
-            0x3334,
-            64,
-        )
-        .expect("TCP GET N-PDU should build");
-
-        let first_get_response =
-            build_wap_status_response_npdu_optional_with_npdu_budget(&get, endpoint, &policy(), &snapshot(), Some(576))
-                .expect("first TCP GET response should build")
-                .expect("TCP GET should require a response");
-        let duplicate_get_response =
-            build_wap_status_response_npdu_optional_with_npdu_budget(&get, endpoint, &policy(), &snapshot(), Some(576))
-                .expect("duplicate TCP GET response should build")
-                .expect("duplicate TCP GET should require a response");
-        assert_eq!(duplicate_get_response, first_get_response);
-        assert!(
-            first_get_response.len() <= 576,
-            "duplicate-safe TCP HTTP response should respect the negotiated N-PDU budget"
-        );
-
-        let response_ip = parse_ipv4_packet(&first_get_response).expect("HTTP response IPv4 should parse");
-        let response_tcp = parse_tcp_segment(response_ip.payload).expect("HTTP response TCP should parse");
-        assert_eq!(response_tcp.sequence_number, syn_ack_tcp.sequence_number.wrapping_add(1));
-        assert_eq!(
-            response_tcp.acknowledgement_number,
-            0x1000_0001u32.wrapping_add(request_payload.len() as u32)
-        );
-        assert_eq!(response_tcp.flags, TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN);
     }
 
     #[test]
@@ -1516,7 +1098,7 @@ mod tests {
         assert_eq!(
             &response_udp.payload[5..],
             &[
-                0x10,
+                0x08,
                 0x00,
                 0x03,
                 WSP_CAP_CLIENT_SDU_SIZE,
@@ -1525,15 +1107,7 @@ mod tests {
                 0x03,
                 WSP_CAP_SERVER_SDU_SIZE,
                 0x8a,
-                0x78,
-                0x02,
-                WSP_CAP_PROTOCOL_OPTIONS,
-                0x00,
-                0x02,
-                WSP_CAP_METHOD_MOR,
-                0x01,
-                0x01,
-                WSP_CAP_HEADER_CODE_PAGES,
+                0x78
             ]
         );
     }
@@ -1595,29 +1169,32 @@ mod tests {
                 .iter()
                 .find(|cap| cap.id == WSP_CAP_PROTOCOL_OPTIONS)
                 .map(|cap| cap.parameters.as_slice()),
-            Some(&[0x00][..])
+            None,
+            "ConnectReply must not synthesize protocol options"
         );
         assert_eq!(
             negotiated
                 .iter()
                 .find(|cap| cap.id == WSP_CAP_METHOD_MOR)
                 .map(|cap| cap.parameters.as_slice()),
-            Some(&[0x01][..])
+            None,
+            "ConnectReply must not synthesize method MOR"
         );
         assert_eq!(
             negotiated
                 .iter()
                 .find(|cap| cap.id == WSP_CAP_EXTENDED_METHODS)
                 .map(|cap| cap.parameters.as_slice()),
-            Some(&[0x50][..])
+            None,
+            "ConnectReply must not synthesize extended methods"
         );
         assert_eq!(
             negotiated
                 .iter()
                 .find(|cap| cap.id == WSP_CAP_HEADER_CODE_PAGES)
                 .map(|cap| cap.parameters.as_slice()),
-            Some(&[][..]),
-            "ConnectReply should explicitly decline requested extension header code pages"
+            None,
+            "ConnectReply must not synthesize extension header code pages"
         );
     }
 

@@ -45,7 +45,7 @@ const T252_AL_ACK_WAITING_SIGNALLING_FRAMES: u32 = T252_ACK_WAITING_TIMER / TDMA
 const INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES: u32 =
     (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as u32 + 1) * T251_SENDER_RETRY_SIGNALLING_FRAMES;
 const CHANNEL_ALLOCATION_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 18;
-const AL_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 18;
+const AL_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 72;
 const N253_MAX_REQUESTED_TLSDU_REPEATS: u8 = 5;
 const TMA_HIGHEST_PDU_PRIORITY: Todo = 7;
 const COMMON_CONTROL_TIMESLOT: u8 = 1;
@@ -963,6 +963,26 @@ impl Llc {
             al.t_retransmissions_exhausted = None;
         }
         Ok(retry_segments)
+    }
+
+    fn find_outbound_al_ack_match(&self, prim: &TmaUnitdataInd, ack: &AlAck) -> (Option<usize>, usize) {
+        let mut exact_idx = None;
+        let mut exact_matches = 0usize;
+
+        for (idx, outbound) in self.outbound_al_messages.iter().enumerate() {
+            if outbound.key.addr != prim.main_address || outbound.key.endpoint_id != prim.endpoint_id {
+                continue;
+            }
+            if outbound.ns == ack.nr {
+                exact_matches += 1;
+                exact_idx = Some(idx);
+            }
+        }
+
+        if exact_matches == 1 {
+            return (exact_idx, exact_matches);
+        }
+        (None, exact_matches)
     }
 
     fn lowest_priority_unsubmitted_udata_below(messages: &VecDeque<QueuedUdata>, incoming_pdu_prio: Todo) -> Option<usize> {
@@ -2340,7 +2360,7 @@ impl Llc {
         let key = Self::advanced_link_key_from_setup(prim.main_address, prim.endpoint_id, &setup);
         if setup.setup_report == AlSetup::SETUP_REPORT_SUCCESS {
             self.establish_advanced_link(key, setup);
-            tracing::debug!(
+            tracing::info!(
                 "LLC: AL-SETUP success accepted for SSI {} endpoint {} link {}",
                 key.addr.ssi,
                 key.endpoint_id,
@@ -2520,25 +2540,17 @@ impl Llc {
         };
         tracing::debug!(ts=%self.dltime, "<- {}", ack);
 
-        let mut match_idx = None;
-        let mut matches = 0;
-        for (idx, outbound) in self.outbound_al_messages.iter().enumerate() {
-            if outbound.key.addr == prim.main_address && outbound.key.endpoint_id == prim.endpoint_id && outbound.ns == ack.nr {
-                matches += 1;
-                match_idx = Some(idx);
-            }
-        }
-        if matches != 1 {
+        let (match_idx, exact_matches) = self.find_outbound_al_ack_match(prim, &ack);
+        let Some(idx) = match_idx else {
             tracing::warn!(
                 "LLC: AL-ACK/RNR for SSI {} endpoint {} N(R)={} matched {} outstanding AL transfers; ignoring",
                 prim.main_address.ssi,
                 prim.endpoint_id,
                 ack.nr,
-                matches
+                exact_matches
             );
             return;
-        }
-        let idx = match_idx.expect("matches == 1 must set match_idx");
+        };
 
         if ack.acknowledges_complete_tl_sdu() {
             let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {

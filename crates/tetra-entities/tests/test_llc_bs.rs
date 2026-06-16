@@ -1352,7 +1352,7 @@ fn test_outbound_nonzero_link_al_reports_failed_after_late_ack_grace_expires() {
     let grace_msgs = test.dump_sinks();
     assert!(!find_tla_report(&grace_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER));
 
-    test.run_stack(Some((18 * 4 + 8) as usize));
+    test.run_stack(Some((72 * 4 + 8) as usize));
     let failed_msgs = test.dump_sinks();
     assert!(
         find_tla_report(&failed_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
@@ -1363,6 +1363,59 @@ fn test_outbound_nonzero_link_al_reports_failed_after_late_ack_grace_expires() {
         "late-ACK grace expiry must not queue retransmissions after N.273=0"
     );
     assert_eq!(service_reporter.get_state(), TxState::Lost);
+}
+
+#[test]
+fn test_outbound_nonzero_link_al_accepts_delayed_ack_inside_extended_grace() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let endpoint_id = 1;
+    let req_handle = 7113;
+    let service_reporter = TxReporter::new();
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    test.submit_message(build_al_setup_ind_with_setup(addr, endpoint_id, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 2);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.endpoint_id = endpoint_id;
+    prim.link_id = 1;
+    prim.tx_reporter = Some(service_reporter.clone());
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let mut first_msgs = test.dump_sinks();
+    let reporter = take_first_tma_req_reporter(&mut first_msgs);
+    reporter.mark_transmitted();
+
+    test.run_stack(Some(T252_ACK_WAITING_TIMER as usize));
+    test.dump_sinks();
+    test.run_stack(Some((18 * 4 + 8) as usize));
+    let delayed_window_msgs = test.dump_sinks();
+    assert!(
+        !find_tla_report(&delayed_window_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "AL late-ACK grace must cover delayed terminal ACKs observed on WAP PDCH without RF retransmission"
+    );
+    assert!(
+        delayed_window_msgs
+            .iter()
+            .all(|msg| !matches!(&msg.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "extended late-ACK grace must not queue additional data retransmissions"
+    );
+
+    test.submit_message(build_al_ack_ind(addr, endpoint_id, 0));
+    test.deliver_all_messages();
+    let complete_msgs = test.dump_sinks();
+    assert!(find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER));
+    assert_eq!(service_reporter.get_state(), TxState::Acknowledged);
 }
 
 #[test]

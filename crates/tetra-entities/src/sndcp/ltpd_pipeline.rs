@@ -729,7 +729,7 @@ mod tests {
         let allocation = req.chan_alloc.expect("PDCH allocation should be present");
         assert_eq!(allocation.usage, None);
         assert_eq!(allocation.carrier, None);
-        assert_eq!(allocation.timeslots, [false, true, true, true]);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
         assert_eq!(allocation.alloc_type, tetra_saps::lcmc::enums::alloc_type::ChanAllocType::Replace);
         assert_eq!(
             allocation.ul_dl_assigned,

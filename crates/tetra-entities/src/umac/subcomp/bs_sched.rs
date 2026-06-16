@@ -962,7 +962,21 @@ impl BsChannelScheduler {
     }
 
     fn packet_data_assignment_for_timeslot(&self, ts: TdmaTime) -> Option<PacketDataAssignment> {
+        self.packet_data_assignment_for_timeslot_with_allocator(ts, None)
+    }
+
+    fn packet_data_assignment_for_timeslot_with_allocator(
+        &self,
+        ts: TdmaTime,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> Option<PacketDataAssignment> {
         if !(2..=NUM_TIMESLOTS as u8).contains(&ts.t) || ts.f == 18 {
+            return None;
+        }
+        if timeslot_alloc
+            .and_then(|allocator| allocator.owner(ts.t))
+            .is_some_and(|owner| owner != TimeslotOwner::PacketData)
+        {
             return None;
         }
         if self.packet_data_slot_has_voice_circuit(ts.t) {
@@ -3664,7 +3678,9 @@ impl BsChannelScheduler {
 
         let dl_circuit_active = self.circuits.is_active(Direction::Dl, ts.t) && ts.f != 18;
         let ul_circuit_active = self.circuits.is_active(Direction::Ul, ts.t) && ts.f != 18;
-        let packet_data_assignment_active = self.packet_data_assignment_for_timeslot(ts).is_some();
+        let packet_data_assignment_active = self
+            .packet_data_assignment_for_timeslot_with_allocator(ts, timeslot_alloc.as_deref())
+            .is_some();
 
         // During hangtime we stop sending traffic frames and switch to signalling mode.
         // Keep traffic mode while FACCH/stealing is still queued for delivery.
@@ -3866,7 +3882,7 @@ impl BsChannelScheduler {
 
         // Construct the BBK block to reflect UL/DL usage
         assert!(elem.bbk.is_none(), "BBK block already set");
-        elem.bbk = Some(self.generate_bbk_block_with_group_floor_grant(ts, group_positive_floor_grant_pending));
+        elem.bbk = Some(self.generate_bbk_block_with_group_floor_grant(ts, group_positive_floor_grant_pending, timeslot_alloc.as_deref()));
 
         // tracing::trace!("finalize_ts_for_tick: have {}{}{}",
         //     if elem.bbk.is_some() { "bbk " } else { "" },
@@ -3891,8 +3907,8 @@ impl BsChannelScheduler {
 
             let mut buf = BitBuffer::new(124);
 
-            // Write MAC-SYSINFO (alternating sysinfo1/sysinfo2), followed by MLE-SYSINFO
-            if ts.t % 2 == 1 {
+            // Write MAC-SYSINFO (alternating sysinfo1/sysinfo2 over time), followed by MLE-SYSINFO.
+            if ts.f % 2 == 1 {
                 self.precomps.mac_sysinfo1.to_bitbuf(&mut buf);
             } else {
                 self.precomps.mac_sysinfo2.to_bitbuf(&mut buf);
@@ -3948,10 +3964,15 @@ impl BsChannelScheduler {
 
     fn generate_bbk_block(&self, ts: TdmaTime) -> TmvUnitdataReq {
         let group_positive_floor_grant_pending = (2..=4).contains(&ts.t) && self.has_pending_group_positive_floor_grant_stealing(ts.t);
-        self.generate_bbk_block_with_group_floor_grant(ts, group_positive_floor_grant_pending)
+        self.generate_bbk_block_with_group_floor_grant(ts, group_positive_floor_grant_pending, None)
     }
 
-    fn generate_bbk_block_with_group_floor_grant(&self, ts: TdmaTime, group_positive_floor_grant_pending: bool) -> TmvUnitdataReq {
+    fn generate_bbk_block_with_group_floor_grant(
+        &self,
+        ts: TdmaTime,
+        group_positive_floor_grant_pending: bool,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> TmvUnitdataReq {
         let (ul_traffic_usage, dl_traffic_usage) = if ts.f == 18 {
             (None, None)
         } else {
@@ -4035,7 +4056,7 @@ impl BsChannelScheduler {
                         });
                     } else if dl_traffic_usage.is_none()
                         && ul_traffic_usage.is_none()
-                        && let Some(packet_data_assignment) = self.packet_data_assignment_for_timeslot(ts)
+                        && let Some(packet_data_assignment) = self.packet_data_assignment_for_timeslot_with_allocator(ts, timeslot_alloc)
                     {
                         aach.dl_usage = AccessAssignDlUsage::AssignedControl;
                         aach.ul_usage = if matches!(packet_data_assignment.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both) {
@@ -5415,6 +5436,73 @@ mod tests {
             "TS2 must not remain data-assigned after CMCE reserved it"
         );
         assert!(sched.packet_data_assignments[2].is_some());
+    }
+
+    #[test]
+    fn test_idle_pdch_maintenance_respects_cmce_reserved_slot_before_voice_open() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress::issi(0x5116);
+        let now = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        let mut timeslot_alloc = TimeslotAllocator::default();
+        sched.set_dl_time(now);
+
+        {
+            let mut allocator_ref = Some(&mut timeslot_alloc);
+            sched.apply_packet_data_assignment_update_with_allocator(
+                PacketDataAssignmentUpdate::Replace {
+                    addr,
+                    ts_assigned: [false, true, true, true],
+                    ul_dl_assigned: UlDlAssignment::Both,
+                    carrier_num: 1001,
+                },
+                now,
+                &mut allocator_ref,
+            );
+        }
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert!(
+            sched
+                .packet_data_assignment_for_timeslot(TdmaTime { t: 2, f: 2, m: 1, h: 0 })
+                .is_some(),
+            "test setup should have an idle PDCH assignment on TS2"
+        );
+
+        let voice_ts = timeslot_alloc
+            .allocate_any_preempting(TimeslotOwner::Cmce, TimeslotOwner::PacketData)
+            .expect("voice must be able to reserve a packet-data slot when no free traffic slot remains");
+        assert_eq!(voice_ts, 2);
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+        assert!(
+            sched
+                .packet_data_assignment_for_timeslot_with_allocator(TdmaTime { t: 2, f: 2, m: 1, h: 0 }, Some(&timeslot_alloc),)
+                .is_none(),
+            "central CMCE reservation must suppress stale PDCH ownership before circuit-open"
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let reserved_voice_slot = sched.finalize_ts_for_tick_with_timeslot_allocator(&subscribers, &mut energy_saving, &mut timeslot_alloc);
+        assert_eq!(reserved_voice_slot.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+        assert_ne!(
+            reserved_voice_slot.blk1.as_ref().map(|block| block.logical_channel),
+            Some(LogicalChannel::SchF),
+            "CMCE-reserved TS2 must not transmit idle assigned-PDCH SCH/F maintenance"
+        );
+        let mut aach = reserved_voice_slot.bbk.expect("reserved voice slot should carry AACH").mac_block;
+        aach.seek(0);
+        let aach = AccessAssign::from_bitbuf(&mut aach).expect("reserved voice slot AACH should parse");
+        assert_eq!(
+            aach.dl_usage,
+            AccessAssignDlUsage::Unallocated,
+            "until the voice circuit opens, TS2 must stop advertising assigned-PDCH downlink usage"
+        );
+        assert_eq!(
+            aach.ul_usage,
+            AccessAssignUlUsage::Unallocated,
+            "until the voice circuit opens, TS2 must stop advertising assigned-PDCH uplink usage"
+        );
     }
 
     #[test]
@@ -8547,6 +8635,31 @@ mod tests {
                         && debt.res_req == ReservationRequirement::Req51Slots)),
             "large reservation must keep debt for the remaining WAP/AL fragments"
         );
+    }
+
+    #[test]
+    fn test_ts1_bnch_alternates_sysinfo1_and_sysinfo2_over_frames() {
+        let mut sched = get_testing_slotter();
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+
+        for (ts, expect_extended_services) in [
+            (TdmaTime { t: 1, f: 1, m: 1, h: 0 }, false),
+            (TdmaTime { t: 1, f: 2, m: 1, h: 0 }, true),
+        ] {
+            sched.set_dl_time(ts);
+            let slot = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+            let mut bnch = slot.blk2.expect("TS1 SCH/HD half-slot should carry BNCH in second half-slot");
+            assert_eq!(bnch.logical_channel, LogicalChannel::Bnch);
+
+            let decoded_sysinfo = MacSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should start with MAC-SYSINFO");
+            let _decoded_mle = DMleSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should carry D-MLE-SYSINFO after MAC-SYSINFO");
+            assert_eq!(
+                decoded_sysinfo.ext_services.is_some(),
+                expect_extended_services,
+                "TS1 BNCH at {ts} should alternate SYSINFO1/SYSINFO2 over frames"
+            );
+        }
     }
 
     #[test]

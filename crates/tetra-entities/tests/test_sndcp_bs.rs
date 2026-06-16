@@ -14,10 +14,7 @@ use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Direction, Layer2Service, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, debug};
 use tetra_entities::cmce::cmce_bs::CmceBs;
 use tetra_entities::llc::components::fcs;
-use tetra_entities::sndcp::ip::{
-    TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN, bitbuffer_npdu_octets, build_ipv4_tcp_npdu, build_ipv4_udp_npdu,
-    parse_ipv4_packet, parse_tcp_segment, parse_udp_datagram,
-};
+use tetra_entities::sndcp::ip::{bitbuffer_npdu_octets, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use tetra_entities::sndcp::pdch::{
     SndcpPacketDataPlanInput, SndcpPacketDataResourceRequest, SndcpPdchAllocationPolicy, SndcpPdchManager,
     SndcpPhaseModulationResourceRequest, packet_data_plan_to_lower_channel_allocation,
@@ -405,32 +402,6 @@ fn build_wap_status_sn_data_from(nsapi: u8, source: [u8; 4], payload: &[u8]) -> 
     build_sn_data(nsapi, 0, 0, &n_pdu)
 }
 
-fn build_wap_status_sn_data_tcp_from(
-    nsapi: u8,
-    source: [u8; 4],
-    source_port: u16,
-    sequence_number: u32,
-    acknowledgement_number: u32,
-    flags: u16,
-    payload: &[u8],
-) -> BitBuffer {
-    let n_pdu = build_ipv4_tcp_npdu(
-        source,
-        [10, 0, 0, 1],
-        source_port,
-        9200,
-        sequence_number,
-        acknowledgement_number,
-        flags,
-        2048,
-        payload,
-        0x2260,
-        32,
-    )
-    .expect("WAP IPv4/TCP N-PDU should build");
-    build_sn_data(nsapi, 0, 0, &n_pdu)
-}
-
 fn build_wtp_wsp_get_payload(transaction_id: u16, uri: &str) -> Vec<u8> {
     assert!(uri.len() < 128, "test WSP GET URI should fit one uintvar octet");
     let mut payload = Vec::with_capacity(5 + uri.len());
@@ -674,10 +645,17 @@ fn build_mxp600_specific_four_slot_reconnect(nsapi: u8) -> BitBuffer {
 }
 
 fn assert_default_dynamic_pdch_channel_allocation(allocation: &CmceChanAllocReq) {
+    assert_single_slot_pdch_channel_allocation(allocation);
+}
+
+fn assert_multi_slot_pdch_channel_allocation(allocation: &CmceChanAllocReq) {
     assert_eq!(allocation.usage, None);
     assert_eq!(allocation.carrier, None);
     assert_eq!(allocation.timeslots, [false, true, true, true]);
-    assert!(!allocation.timeslots[0], "default SNDCP PDCH allocation must not include MCCH TS1");
+    assert!(
+        !allocation.timeslots[0],
+        "multi-slot SNDCP PDCH allocation must not include MCCH TS1"
+    );
     assert_eq!(allocation.alloc_type, ChanAllocType::Replace);
     assert_eq!(allocation.ul_dl_assigned, UlDlAssignment::Both);
 }
@@ -1230,10 +1208,8 @@ fn sndcp_wap_al_connect_reply_e2e_acknowledges_segmented_response() {
     );
     assert_eq!(
         &response_udp.payload[5..],
-        &[
-            0x10, 0x00, 0x03, 0x80, 0x8a, 0x78, 0x03, 0x81, 0x8a, 0x78, 0x02, 0x82, 0x00, 0x02, 0x83, 0x01, 0x01, 0x86,
-        ],
-        "ConnectReply should explicitly decline requested extension header code pages"
+        &[0x08, 0x00, 0x03, 0x80, 0x8a, 0x78, 0x03, 0x81, 0x8a, 0x78],
+        "ConnectReply should keep WSP negotiation to bounded SDU sizes"
     );
 
     for handle in response_msgs.iter().filter_map(tma_req_handle) {
@@ -1264,7 +1240,7 @@ fn sndcp_wap_al_connect_reply_e2e_acknowledges_segmented_response() {
 }
 
 #[test]
-fn sndcp_wap_al_tcp_http_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
+fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     enable_wap_ip_status_mvp(&mut config);
@@ -1283,8 +1259,6 @@ fn sndcp_wap_al_tcp_http_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() 
     let addr = TetraAddress::new(1000001, SsiType::Issi);
     let endpoint_id = 1;
     let client_ip = [10, 0, 0, 2];
-    let client_port = 49_152;
-    let client_seq = 0x1000_0000;
 
     test.submit_message(build_ltpd_ind_on_link(
         Sap::TlpdSap,
@@ -1334,94 +1308,35 @@ fn sndcp_wap_al_tcp_http_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() 
         setup_msgs
             .iter()
             .any(|msg| llc_pdu_type_from_tma_req(msg) == Some(LlcPduType::AlSetup)),
-        "AL-SETUP should be accepted before TCP browser traffic flows"
+        "AL-SETUP should be accepted before WAP/UDP browser traffic flows"
     );
 
-    let syn_sndcp = build_wap_status_sn_data_tcp_from(2, client_ip, client_port, client_seq, 0, TCP_FLAG_SYN, b"");
-    let syn_tl_sdu = build_mle_prefixed_sndcp_sdu(syn_sndcp);
-    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 0, &syn_tl_sdu));
-    test.run_stack(Some(1));
-    let syn_response_msgs = test.dump_sinks();
-    let syn_response =
-        sndcp_user_data_from_al_tma_reqs(&syn_response_msgs).expect("TCP SYN over AL should produce a SNDCP SYN-ACK response");
-    let syn_response_octets = bitbuffer_npdu_octets(&syn_response.n_pdu).expect("SYN-ACK N-PDU should be byte aligned");
-    let syn_response_ip = parse_ipv4_packet(&syn_response_octets).expect("SYN-ACK IPv4 should parse");
-    let syn_response_tcp = parse_tcp_segment(syn_response_ip.payload).expect("SYN-ACK TCP should parse");
-    let syn_response_al_ns = syn_response_msgs
-        .iter()
-        .find_map(al_data_ns_from_tma_req)
-        .expect("SYN-ACK should be carried by AL-DATA");
-
-    assert_eq!(syn_response_ip.source, [10, 0, 0, 1]);
-    assert_eq!(syn_response_ip.destination, client_ip);
-    assert_eq!(syn_response_tcp.source_port, 9200);
-    assert_eq!(syn_response_tcp.destination_port, client_port);
-    assert_eq!(syn_response_tcp.flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
-    assert_eq!(syn_response_tcp.acknowledgement_number, client_seq.wrapping_add(1));
-    assert!(syn_response_tcp.payload.is_empty());
-
-    test.submit_message(build_al_ack_ind(addr, endpoint_id, syn_response_al_ns));
-    test.deliver_all_messages();
-    let _syn_ack_drain = test.dump_sinks();
-
-    let ack_only_sndcp = build_wap_status_sn_data_tcp_from(
-        2,
-        client_ip,
-        client_port,
-        client_seq.wrapping_add(1),
-        syn_response_tcp.sequence_number.wrapping_add(1),
-        TCP_FLAG_ACK,
-        b"",
-    );
-    let ack_only_tl_sdu = build_mle_prefixed_sndcp_sdu(ack_only_sndcp);
-    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 1, &ack_only_tl_sdu));
-    test.run_stack(Some(1));
-    let ack_only_msgs = test.dump_sinks();
-    assert!(
-        ack_only_msgs
-            .iter()
-            .all(|msg| llc_pdu_type_from_tma_req(msg) != Some(LlcPduType::AlDataAlFinal)),
-        "TCP ACK-only must not synthesize a packet-data response"
-    );
-
-    let http_get = b"GET /status.xhtml HTTP/1.1\r\nHost: 10.0.0.1:9200\r\nConnection: close\r\n\r\n";
-    let get_sndcp = build_wap_status_sn_data_tcp_from(
-        2,
-        client_ip,
-        client_port,
-        client_seq.wrapping_add(1),
-        syn_response_tcp.sequence_number.wrapping_add(1),
-        TCP_FLAG_ACK | TCP_FLAG_PSH,
-        http_get,
-    );
+    let get_payload = build_wtp_wsp_get_payload(0x1235, "/status.xhtml");
+    let get_sndcp = build_wap_status_sn_data_from(2, client_ip, &get_payload);
     let get_tl_sdu = build_mle_prefixed_sndcp_sdu(get_sndcp);
-    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 2, &get_tl_sdu));
+    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 0, &get_tl_sdu));
     test.run_stack(Some(1));
     let response_msgs = test.dump_sinks();
-    let response = sndcp_user_data_from_al_tma_reqs(&response_msgs).expect("TCP HTTP GET over AL SN-DATA should produce a SNDCP response");
+    let response = sndcp_user_data_from_al_tma_reqs(&response_msgs).expect("WTP/WSP GET over AL SN-DATA should produce a SNDCP response");
     let response_octets = bitbuffer_npdu_octets(&response.n_pdu).expect("response N-PDU should be byte aligned");
     let response_ip = parse_ipv4_packet(&response_octets).expect("response IPv4 should parse");
-    let response_tcp = parse_tcp_segment(response_ip.payload).expect("response TCP should parse");
-    let http = std::str::from_utf8(response_tcp.payload).expect("HTTP XHTML response should be UTF-8");
+    let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
+    let response_payload = response_udp.payload;
+    let page = std::str::from_utf8(&response_payload[7..]).expect("WSP XHTML response should be UTF-8");
 
     assert_eq!(response_ip.source, [10, 0, 0, 1]);
     assert_eq!(response_ip.destination, client_ip);
-    assert_eq!(response_tcp.source_port, 9200);
-    assert_eq!(response_tcp.destination_port, client_port);
-    assert_eq!(response_tcp.sequence_number, syn_response_tcp.sequence_number.wrapping_add(1));
+    assert_eq!(response_udp.source_port, 9200);
+    assert_eq!(response_udp.destination_port, 49_152);
     assert_eq!(
-        response_tcp.acknowledgement_number,
-        client_seq.wrapping_add(1).wrapping_add(http_get.len() as u32)
+        &response_payload[..7],
+        &[0x16, 0x92, 0x35, 0x04, 0x20, 0x01, 0xc5],
+        "WSP GET should receive WTP Result + WSP Reply(application/vnd.wap.xhtml+xml)"
     );
-    assert_eq!(response_tcp.flags, TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN);
-    assert!(http.starts_with("HTTP/1.0 200 OK\r\n"));
-    assert!(http.contains("Content-Type: application/vnd.wap.xhtml+xml\r\n"));
-    assert!(http.contains("Content-Length: "));
-    assert!(http.contains("Connection: close\r\n"));
-    assert!(http.contains("http://www.w3.org/1999/xhtml"));
-    assert!(http.contains("Welcome to Nexus-BS"));
-    assert!(!http.contains("<wml"));
-    assert!(!http.contains("<card"));
+    assert!(page.contains("http://www.w3.org/1999/xhtml"));
+    assert!(page.contains("Welcome to Nexus-BS"));
+    assert!(!page.contains("<wml"));
+    assert!(!page.contains("<card"));
 }
 
 #[test]
@@ -1475,7 +1390,7 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         test.run_stack(Some(1));
         let _ = test.dump_sinks();
         let state = test.config.state_read();
-        if (2..=4).all(|ts| state.timeslot_alloc.owner(ts) == Some(TimeslotOwner::PacketData)) {
+        if state.timeslot_alloc.owner(2) == Some(TimeslotOwner::PacketData) {
             break;
         }
     }
@@ -1483,8 +1398,8 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
     {
         let state = test.config.state_read();
         assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
-        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
-        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(3), None);
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 
     // Do not deliver a TMA report/end-of-data back to SNDCP. This models a
@@ -1502,29 +1417,29 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
-            Some(TimeslotOwner::Cmce),
-            "one-slot group voice must reclaim exactly one stuck SNDCP PDCH slot"
+            Some(TimeslotOwner::PacketData),
+            "one-slot default WAP PDCH must stay on TS2 while free voice slots exist"
         );
         assert_eq!(
             state.timeslot_alloc.owner(3),
-            Some(TimeslotOwner::PacketData),
-            "voice must preserve remaining data capacity when one slot is enough"
+            Some(TimeslotOwner::Cmce),
+            "one-slot group voice must use the next free slot before preempting data"
         );
         assert_eq!(
             state.timeslot_alloc.owner(4),
-            Some(TimeslotOwner::PacketData),
-            "voice must preserve remaining data capacity when one slot is enough"
+            None,
+            "one free traffic slot should remain after default WAP PDCH plus one-slot voice"
         );
     }
     {
         let umac = umac_bs_mut(&mut test);
         assert!(
-            umac.channel_scheduler.circuit_is_active(Direction::Dl, 2),
-            "UMAC must open downlink voice on the reclaimed slot"
+            umac.channel_scheduler.circuit_is_active(Direction::Dl, 3),
+            "UMAC must open downlink voice on the free slot"
         );
         assert!(
-            umac.channel_scheduler.circuit_is_active(Direction::Ul, 2),
-            "UMAC must open uplink voice on the reclaimed slot"
+            umac.channel_scheduler.circuit_is_active(Direction::Ul, 3),
+            "UMAC must open uplink voice on the free slot"
         );
     }
 
@@ -1533,11 +1448,15 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
+            Some(TimeslotOwner::PacketData),
+            "stuck SNDCP must not expand into an active voice slot"
+        );
+        assert_eq!(
+            state.timeslot_alloc.owner(3),
             Some(TimeslotOwner::Cmce),
             "stuck SNDCP must not steal back an active voice slot"
         );
-        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
-        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 
     test.submit_message(build_group_u_disconnect_msg(data_issi, call_id));
@@ -1545,7 +1464,7 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         test.run_stack(Some(1));
         let _ = test.dump_sinks();
         let state = test.config.state_read();
-        if state.timeslot_alloc.owner(2).is_none() {
+        if state.timeslot_alloc.owner(3).is_none() {
             break;
         }
     }
@@ -1553,19 +1472,11 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
-            None,
-            "voice release must free reclaimed TS2 instead of restoring stale SNDCP ownership"
-        );
-        assert_eq!(
-            state.timeslot_alloc.owner(3),
             Some(TimeslotOwner::PacketData),
-            "voice release must not kill preserved data capacity"
+            "voice release must preserve default single-slot WAP PDCH on TS2"
         );
-        assert_eq!(
-            state.timeslot_alloc.owner(4),
-            Some(TimeslotOwner::PacketData),
-            "voice release must not kill preserved data capacity"
-        );
+        assert_eq!(state.timeslot_alloc.owner(3), None, "voice release must free TS3");
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 
     test.submit_message(build_group_u_setup_msg(data_issi, voice_gssi));
@@ -1575,11 +1486,15 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
-            Some(TimeslotOwner::Cmce),
-            "next one-slot group voice must reuse the released TS2 before preempting remaining PDCH"
+            Some(TimeslotOwner::PacketData),
+            "next one-slot group voice must preserve default WAP PDCH while TS3 is free"
         );
-        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
-        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(
+            state.timeslot_alloc.owner(3),
+            Some(TimeslotOwner::Cmce),
+            "next one-slot group voice must reuse the released free slot before preempting data"
+        );
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 }
 
@@ -1734,7 +1649,7 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_unspecified_four_slot_resource_request
         .chan_alloc
         .as_ref()
         .expect("accepted four-slot capability SN-DATA TRANSMIT RESPONSE should carry PDCH allocation");
-    assert_default_dynamic_pdch_channel_allocation(allocation);
+    assert_multi_slot_pdch_channel_allocation(allocation);
 }
 
 #[test]
@@ -1774,7 +1689,7 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_specific_four_slot_resource_request() 
         .chan_alloc
         .as_ref()
         .expect("accepted specific four-slot SN-DATA TRANSMIT RESPONSE should carry PDCH allocation");
-    assert_default_dynamic_pdch_channel_allocation(allocation);
+    assert_multi_slot_pdch_channel_allocation(allocation);
 }
 
 #[test]
@@ -1814,7 +1729,7 @@ fn sndcp_wap_ip_end_of_data_returns_common_control_after_pdch_assignment() {
 
     assert_eq!(ltpd_reqs.len(), 3);
     let ready_response = ltpd_reqs.remove(1);
-    assert_default_dynamic_pdch_channel_allocation(
+    assert_multi_slot_pdch_channel_allocation(
         ready_response
             .chan_alloc
             .as_ref()
@@ -1872,11 +1787,11 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_specific_four_slot_reconnect() {
         .chan_alloc
         .as_ref()
         .expect("accepted SN-RECONNECT response should carry the MVP PDCH allocation");
-    assert_default_dynamic_pdch_channel_allocation(allocation);
+    assert_multi_slot_pdch_channel_allocation(allocation);
 }
 
 #[test]
-fn sndcp_pdch_default_dynamic_policy_uses_ts2_to_ts4_and_keeps_ts1_common_control() {
+fn sndcp_pdch_default_dynamic_policy_uses_ts2_only_and_keeps_ts1_common_control() {
     let manager = SndcpPdchManager::new();
     let plan = manager
         .plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
@@ -1889,10 +1804,12 @@ fn sndcp_pdch_default_dynamic_policy_uses_ts2_to_ts4_and_keeps_ts1_common_contro
         })
         .expect("ready packet-data subscriber should produce a new PDCH allocation plan");
 
-    let allocation =
-        packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::timeslots([false, true, true, true], None))
-            .expect("TS2..TS4 default PDCH bitmap should be valid")
-            .expect("new PDCH plan should carry lower channel allocation");
+    let allocation = packet_data_plan_to_lower_channel_allocation(
+        &plan,
+        SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(SndcpPacketDataResourceRequest::None),
+    )
+    .expect("default single-slot PDCH bitmap should be valid")
+    .expect("new PDCH plan should carry lower channel allocation");
 
     assert_default_dynamic_pdch_channel_allocation(&allocation.chan_alloc);
 }
