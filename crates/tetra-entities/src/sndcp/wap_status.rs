@@ -101,7 +101,7 @@ fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusR
             snapshot.registered_ms, snapshot.active_calls, snapshot.queued_sds
         ),
         WapStatusRenderMode::Tiny => format!(
-            "<?xml version=\"1.0\"?>\n{XHTML_MP_DOCTYPE}\n<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>{title}</title><meta http-equiv=\"refresh\" content=\"15;url={refresh_path}\" /></head><body><p>Welcome {title}<br />{service_state}<br />MS:{} C:{} SDS:{}<br />Up:{uptime}{health_summary}</p></body></html>",
+            "<?xml version=\"1.0\"?>\n{XHTML_MP_DOCTYPE}\n<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>{title}</title><meta http-equiv=\"refresh\" content=\"15;url={refresh_path}\" /></head><body><p>Welcome to {title}<br />{service_state}<br />MS:{} C:{} SDS:{}<br />Up:{uptime}{health_summary}</p></body></html>",
             snapshot.registered_ms, snapshot.active_calls, snapshot.queued_sds
         ),
     }

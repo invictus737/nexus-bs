@@ -42,6 +42,7 @@ pub enum SndcpPdpActivationResult {
     Accepted {
         accept: SndcpActivatePdpContextAccept,
         context: SndcpPdpContext,
+        reused_existing: bool,
     },
     Rejected(SndcpActivatePdpContextReject),
 }
@@ -98,8 +99,8 @@ impl SndcpPdpPolicy {
             allow_static_ipv4: true,
             allow_secondary_contexts: false,
             accept_type_a_parallel: true,
-            accept_type_b_alternating: false,
-            accept_type_c_ip_single_mode: false,
+            accept_type_b_alternating: true,
+            accept_type_c_ip_single_mode: true,
             accept_type_d_restricted_ip_single_mode: false,
             maximum_transmission_unit: SndcpMaximumTransmissionUnit::Octets1500,
             ..Self::default()
@@ -136,7 +137,14 @@ impl SndcpPdpService {
             return self.reject(demand.nsapi, SndcpActivationRejectCause::PacketDataMsTypeNotSupported);
         }
 
-        if self.contexts.get_issi_nsapi(issi, demand.nsapi).ok().flatten().is_some() {
+        if let Some(existing_context) = self.contexts.get_issi_nsapi(issi, demand.nsapi).ok().flatten().cloned() {
+            if let Some(accept) = self.accept_for_existing_context(&demand, &existing_context) {
+                return SndcpPdpActivationResult::Accepted {
+                    accept,
+                    context: existing_context,
+                    reused_existing: true,
+                };
+            }
             return self.reject(demand.nsapi, SndcpActivationRejectCause::Undefined);
         }
 
@@ -154,7 +162,11 @@ impl SndcpPdpService {
         };
 
         match self.contexts.activate(context.clone()) {
-            Ok(()) => SndcpPdpActivationResult::Accepted { accept, context },
+            Ok(()) => SndcpPdpActivationResult::Accepted {
+                accept,
+                context,
+                reused_existing: false,
+            },
             Err(SndcpContextError::PrimaryContextMissing(_)) => {
                 self.reject(demand.nsapi, SndcpActivationRejectCause::PrimaryPdpContextDoesNotExist)
             }
@@ -276,6 +288,41 @@ impl SndcpPdpService {
         Ok((context, accept))
     }
 
+    fn accept_for_existing_context(
+        &self,
+        demand: &SndcpActivatePdpContextDemand,
+        context: &SndcpPdpContext,
+    ) -> Option<SndcpActivatePdpContextAccept> {
+        if context.packet_data_ms_type != demand.packet_data_ms_type {
+            return None;
+        }
+
+        let (type_identifier, assigned_address) = match (&demand.address, context.address) {
+            (SndcpActivateAddressDemand::Ipv4Dynamic, SnAddress::Ipv4(address)) => {
+                (SndcpTypeIdentifierInAccept::Ipv4DynamicAddress, Some(SnAddress::Ipv4(address)))
+            }
+            (SndcpActivateAddressDemand::Ipv4Static(requested), SnAddress::Ipv4(existing)) if *requested == existing => {
+                (SndcpTypeIdentifierInAccept::Ipv4StaticAddress, Some(SnAddress::Ipv4(existing)))
+            }
+            (SndcpActivateAddressDemand::SecondaryPdpContext { primary_nsapi }, _) if context.primary_nsapi == Some(*primary_nsapi) => {
+                (SndcpTypeIdentifierInAccept::NoAddress, None)
+            }
+            _ => return None,
+        };
+
+        Some(SndcpActivatePdpContextAccept {
+            nsapi: demand.nsapi,
+            pdu_priority_max: self.policy.pdu_priority_max,
+            ready_timer: self.policy.ready_timer,
+            standby_timer: self.policy.standby_timer,
+            response_wait_timer: self.policy.response_wait_timer,
+            type_identifier,
+            assigned_address,
+            pcomp_negotiation: 0,
+            maximum_transmission_unit: self.policy.maximum_transmission_unit,
+        })
+    }
+
     fn packet_data_ms_type_supported(&self, packet_data_ms_type: SnPacketDataMsType) -> bool {
         match packet_data_ms_type {
             SnPacketDataMsType::TypeAParallel => self.policy.accept_type_a_parallel,
@@ -350,6 +397,13 @@ mod tests {
         }
     }
 
+    fn dynamic_demand_with_ms_type(nsapi: u8, packet_data_ms_type: SnPacketDataMsType) -> SndcpActivatePdpContextDemand {
+        SndcpActivatePdpContextDemand {
+            packet_data_ms_type,
+            ..dynamic_demand(nsapi)
+        }
+    }
+
     fn static_demand(nsapi: u8, address: [u8; 4]) -> SndcpActivatePdpContextDemand {
         SndcpActivatePdpContextDemand {
             address: SndcpActivateAddressDemand::Ipv4Static(address),
@@ -381,9 +435,15 @@ mod tests {
 
         let result = service.handle_activate_demand(2260618, dynamic_demand(2));
 
-        let SndcpPdpActivationResult::Accepted { accept, context } = result else {
+        let SndcpPdpActivationResult::Accepted {
+            accept,
+            context,
+            reused_existing,
+        } = result
+        else {
             panic!("dynamic IPv4 demand should be accepted");
         };
+        assert!(!reused_existing);
         assert_eq!(accept.nsapi, 2);
         assert_eq!(accept.type_identifier, SndcpTypeIdentifierInAccept::Ipv4DynamicAddress);
         assert_eq!(accept.assigned_address, Some(SnAddress::Ipv4([10, 0, 0, 2])));
@@ -392,6 +452,45 @@ mod tests {
         assert_eq!(context.address, SnAddress::Ipv4([10, 0, 0, 2]));
         assert_eq!(context.max_npdu_len, Some(1500));
         assert!(service.contexts().get_issi_nsapi(2260618, 2).unwrap().is_some());
+    }
+
+    #[test]
+    fn wap_ipv4_policy_accepts_type_b_and_type_c_ms_profiles() {
+        for packet_data_ms_type in [SnPacketDataMsType::TypeBAlternating, SnPacketDataMsType::TypeCIpSingleMode] {
+            let mut service = service();
+
+            let result = service.handle_activate_demand(2260618, dynamic_demand_with_ms_type(2, packet_data_ms_type));
+
+            let SndcpPdpActivationResult::Accepted {
+                accept,
+                context,
+                reused_existing,
+            } = result
+            else {
+                panic!("dynamic IPv4 demand should accept {packet_data_ms_type:?}");
+            };
+            assert!(!reused_existing);
+            assert_eq!(accept.nsapi, 2);
+            assert_eq!(accept.assigned_address, Some(SnAddress::Ipv4([10, 0, 0, 2])));
+            assert_eq!(context.packet_data_ms_type, packet_data_ms_type);
+        }
+    }
+
+    #[test]
+    fn wap_ipv4_policy_keeps_restricted_type_d_fail_closed() {
+        let mut service = service();
+
+        assert_eq!(
+            service.handle_activate_demand(
+                2260618,
+                dynamic_demand_with_ms_type(2, SnPacketDataMsType::TypeDRestrictedIpSingleMode)
+            ),
+            SndcpPdpActivationResult::Rejected(SndcpActivatePdpContextReject {
+                nsapi: 2,
+                cause: SndcpActivationRejectCause::PacketDataMsTypeNotSupported
+            })
+        );
+        assert!(service.contexts().is_empty());
     }
 
     #[test]
@@ -416,18 +515,47 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_nsapi_activation_is_rejected_without_claiming_max_contexts() {
+    fn duplicate_dynamic_activation_reuses_existing_context() {
+        let mut service = service();
+        assert!(matches!(
+            service.handle_activate_demand(2260618, dynamic_demand_with_ms_type(1, SnPacketDataMsType::TypeBAlternating)),
+            SndcpPdpActivationResult::Accepted {
+                reused_existing: false,
+                ..
+            }
+        ));
+
+        let result = service.handle_activate_demand(2260618, dynamic_demand_with_ms_type(1, SnPacketDataMsType::TypeBAlternating));
+
+        let SndcpPdpActivationResult::Accepted {
+            accept,
+            context,
+            reused_existing,
+        } = result
+        else {
+            panic!("compatible duplicate dynamic activation should be accepted as a reactivation");
+        };
+        assert!(reused_existing);
+        assert_eq!(accept.nsapi, 1);
+        assert_eq!(accept.type_identifier, SndcpTypeIdentifierInAccept::Ipv4DynamicAddress);
+        assert_eq!(accept.assigned_address, Some(SnAddress::Ipv4([10, 0, 0, 2])));
+        assert_eq!(context.address, SnAddress::Ipv4([10, 0, 0, 2]));
+        assert_eq!(service.contexts().contexts_for_issi(2260618).count(), 1);
+    }
+
+    #[test]
+    fn incompatible_duplicate_nsapi_activation_is_rejected_without_claiming_max_contexts() {
         let mut service = SndcpPdpService::new(SndcpPdpPolicy {
             max_contexts_per_issi: 1,
             ..SndcpPdpPolicy::experimental_wap_ipv4()
         });
         assert!(matches!(
-            service.handle_activate_demand(2260618, static_demand(2, [10, 0, 0, 18])),
+            service.handle_activate_demand(2260618, dynamic_demand(2)),
             SndcpPdpActivationResult::Accepted { .. }
         ));
 
         assert_eq!(
-            service.handle_activate_demand(2260618, dynamic_demand(2)),
+            service.handle_activate_demand(2260618, static_demand(2, [10, 0, 0, 18])),
             SndcpPdpActivationResult::Rejected(SndcpActivatePdpContextReject {
                 nsapi: 2,
                 cause: SndcpActivationRejectCause::Undefined
@@ -439,7 +567,7 @@ mod tests {
                 .get_issi_nsapi(2260618, 2)
                 .unwrap()
                 .map(|context| context.address),
-            Some(SnAddress::Ipv4([10, 0, 0, 18]))
+            Some(SnAddress::Ipv4([10, 0, 0, 2]))
         );
     }
 
@@ -509,7 +637,7 @@ mod tests {
         ));
         let result = service.handle_activate_demand(2260618, secondary);
 
-        let SndcpPdpActivationResult::Accepted { accept, context } = result else {
+        let SndcpPdpActivationResult::Accepted { accept, context, .. } = result else {
             panic!("secondary PDP context should activate after primary exists");
         };
         assert_eq!(accept.type_identifier, SndcpTypeIdentifierInAccept::NoAddress);

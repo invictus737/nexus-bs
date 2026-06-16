@@ -5,12 +5,15 @@
 
 mod common;
 
-use tetra_config::bluestation::{CfgBrew, CfgWapIp, EnergySavingAssignment, SharedConfig, StackMode};
+use tetra_config::bluestation::{
+    CfgBrew, CfgWapIp, DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES, EnergySavingAssignment, SharedConfig, StackMode,
+};
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     BitBuffer, BurstType, Direction, Layer2Service, PhyBlockNum, PhyBlockType, PhysicalChannel, Sap, SsiType, TdmaTime, TetraAddress,
     TrainingSequence, TxReporter, TxState, debug,
 };
+use tetra_entities::llc::components::fcs;
 use tetra_entities::lmac::components::{errorcontrol, scrambler};
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::cmce::enums::{call_timeout::CallTimeout, transmission_grant::TransmissionGrant};
@@ -21,6 +24,9 @@ use tetra_pdus::cmce::pdus::d_setup::DSetup;
 use tetra_pdus::cmce::pdus::d_tx_ceased::DTxCeased;
 use tetra_pdus::cmce::pdus::d_tx_granted::DTxGranted;
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::al_ack::AlAck;
+use tetra_pdus::llc::pdus::al_data::AlData;
+use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
@@ -30,7 +36,10 @@ use tetra_pdus::mle::pdus::d_mle_sysinfo::DMleSysinfo;
 use tetra_pdus::umac::enums::basic_slotgrant_cap_alloc::BasicSlotgrantCapAlloc;
 use tetra_pdus::umac::enums::basic_slotgrant_granting_delay::BasicSlotgrantGrantingDelay;
 use tetra_pdus::umac::enums::reservation_requirement::ReservationRequirement;
+use tetra_pdus::umac::enums::{access_assign_dl_usage::AccessAssignDlUsage, access_assign_ul_usage::AccessAssignUlUsage};
+use tetra_pdus::umac::pdus::access_assign::AccessAssign;
 use tetra_pdus::umac::pdus::mac_access::MacAccess;
+use tetra_pdus::umac::pdus::mac_data::MacData;
 use tetra_pdus::umac::pdus::mac_end_dl::MacEndDl;
 use tetra_pdus::umac::pdus::mac_frag_dl::MacFragDl;
 use tetra_pdus::umac::pdus::mac_resource::MacResource;
@@ -48,7 +57,7 @@ use tetra_saps::sapmsg::{SapMsg, SapMsgInner};
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
 use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaUnitdataReq};
 use tetra_saps::tmd::{TmdCircuitDataInd, TmdCircuitDataReq};
-use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq, enums::logical_chans::LogicalChannel};
+use tetra_saps::tmv::{TmvUnitdataInd, TmvUnitdataReq, TmvUnitdataReqSlot, enums::logical_chans::LogicalChannel};
 use tetra_saps::tp::TpUnitdataInd;
 
 use crate::common::ComponentTest;
@@ -193,7 +202,7 @@ fn enable_wap_ip_status_mvp_for_sysinfo(config: &mut tetra_config::bluestation::
         accept_root_path: true,
         accept_status_path: true,
         accept_status_wml_path: true,
-        max_request_payload_bytes: 128,
+        max_request_payload_bytes: DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES,
         assume_pdch_ready_after_data_transmit: true,
     });
 }
@@ -286,16 +295,25 @@ fn test_wap_ip_bnch_advertises_packet_data_even_before_brew_connects() {
 
     // EN 300 392-2 clauses 18.5.2.1/table 18.26, 21.4.4.1/tables
     // 21.67-21.68 and 28.2: a CA MS may start SNDCP packet data only when
-    // the serving cell advertises SNDCP service availability. Nexus-BS
-    // advertises original advanced link only; QoS negotiation, D8PSK and
-    // extended advanced links remain false until their procedures are present.
+    // the serving cell advertises SNDCP service availability. Nexus-BS now
+    // advertises original acknowledged LLC advanced link only under the local
+    // WAP/IP SNDCP profile whose AL-SETUP/AL-FINAL/AL-ACK path is wired.
     assert!(decoded_mle.bs_service_details.system_wide_services);
     assert!(decoded_mle.bs_service_details.sndcp_service);
     assert!(decoded_mle.bs_service_details.advanced_link);
     assert!(!decoded_mle.bs_service_details.circuit_mode_data_service);
     assert!(!decoded_mle.bs_service_details.aie_service);
     assert_eq!(ext_services.section, 0);
-    assert_eq!(ext_services.section_data, 0);
+    assert_eq!(
+        ext_services.section_data & 0b100_0000,
+        0b100_0000,
+        "WAP/IP SNDCP profile should advertise data priority support in extended services section 1"
+    );
+    assert_eq!(
+        ext_services.section_data & 0b011_1111,
+        0,
+        "WAP/IP SNDCP profile must not advertise extended AL, QoS negotiation, D8PSK, or extra sections yet"
+    );
 }
 
 #[test]
@@ -486,6 +504,21 @@ fn mac_u_blck_pdu_with_event_label(event_label: u16, reservation_req: u8) -> Bit
     pdu
 }
 
+fn mac_u_blck_pdu_with_event_label_and_payload(event_label: u16, reservation_req: u8, mut payload: BitBuffer) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(268);
+    MacUBlck {
+        fill_bits: false,
+        encrypted: false,
+        event_label,
+        reservation_req,
+    }
+    .to_bitbuf(&mut pdu);
+    let payload_bits = payload.get_len();
+    pdu.copy_bits(&mut payload, payload_bits);
+    pdu.seek(0);
+    pdu
+}
+
 fn submit_mac_u_blck_with_event_label(test: &mut ComponentTest, event_label: u16, reservation_req: u8) {
     test.submit_message(SapMsg {
         sap: Sap::TmvSap,
@@ -502,8 +535,110 @@ fn submit_mac_u_blck_with_event_label(test: &mut ComponentTest, event_label: u16
     });
 }
 
+fn submit_mac_u_blck_with_payload(test: &mut ComponentTest, event_label: u16, reservation_req: u8, payload: BitBuffer) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: mac_u_blck_pdu_with_event_label_and_payload(event_label, reservation_req, payload),
+            block_num: PhyBlockNum::Both,
+            logical_channel: LogicalChannel::SchF,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NAN,
+        }),
+    });
+}
+
 fn submit_mac_u_blck(test: &mut ComponentTest, reservation_req: u8) {
     submit_mac_u_blck_with_event_label(test, 17, reservation_req);
+}
+
+fn schf_mac_data_with_null_tail(issi: u32, mut payload: BitBuffer, length_octets: u8) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(268);
+    MacData {
+        fill_bits: false,
+        encrypted: false,
+        addr: Some(TetraAddress::issi(issi)),
+        event_label: None,
+        length_ind: Some(length_octets),
+        frag_flag: None,
+        reservation_req: None,
+    }
+    .to_bitbuf(&mut pdu);
+    let payload_bits = payload.get_len();
+    pdu.copy_bits(&mut payload, payload_bits);
+
+    MacData {
+        fill_bits: false,
+        encrypted: false,
+        addr: Some(TetraAddress::issi(issi)),
+        event_label: None,
+        length_ind: Some(0),
+        frag_flag: None,
+        reservation_req: None,
+    }
+    .to_bitbuf(&mut pdu);
+    if pdu.get_len_written() < 268 {
+        pdu.write_zeroes(268 - pdu.get_len_written());
+    }
+    pdu.seek(0);
+    pdu
+}
+
+fn submit_schf_mac_data(test: &mut ComponentTest, issi: u32, payload: BitBuffer, length_octets: u8) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: schf_mac_data_with_null_tail(issi, payload, length_octets),
+            block_num: PhyBlockNum::Both,
+            logical_channel: LogicalChannel::SchF,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NAN,
+        }),
+    });
+}
+
+fn mac_access_pdu_with_payload(issi: u32, mut payload: BitBuffer, length_octets: u8) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(96);
+    MacAccess {
+        fill_bits: false,
+        encrypted: false,
+        addr: Some(TetraAddress::issi(issi)),
+        event_label: None,
+        length_ind: Some(length_octets),
+        frag_flag: None,
+        reservation_req: None,
+    }
+    .to_bitbuf(&mut pdu);
+    let payload_bits = payload.get_len();
+    pdu.copy_bits(&mut payload, payload_bits);
+    let length_bits = length_octets as usize * 8;
+    if pdu.get_len_written() < length_bits {
+        pdu.write_zeroes(length_bits - pdu.get_len_written());
+    }
+    pdu.seek(0);
+    pdu
+}
+
+fn submit_mac_access_with_payload(test: &mut ComponentTest, issi: u32, payload: BitBuffer, length_octets: u8) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: mac_access_pdu_with_payload(issi, payload, length_octets),
+            block_num: PhyBlockNum::Block1,
+            logical_channel: LogicalChannel::SchHu,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NAN,
+        }),
+    });
 }
 
 fn mac_access_pdu_with_reservation(issi: u32, reservation_req: ReservationRequirement) -> BitBuffer {
@@ -2238,21 +2373,283 @@ fn test_stch_mac_u_signal_second_half_stolen_forwards_first_half_and_marks_lmac_
 }
 
 #[test]
-fn test_mac_u_blck_is_dropped_without_panic_until_tmsdu_delivery_is_implemented() {
+fn test_schf_mac_data_on_assigned_pdch_forwards_complete_tmsdu_to_llc() {
+    debug::setup_logging_verbose();
+
+    let issi = 2_260_618;
+    let start = TdmaTime::default().add_timeslots(2);
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc]);
+
+    let mut payload = BitBuffer::new_autoexpand(40);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut payload);
+    payload.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+    payload.write_zeroes(28);
+    payload.seek(0);
+    assert_eq!(
+        payload.get_len(),
+        35,
+        "test vector should leave a 35-bit TM-SDU inside a length_ind=9 MAC-DATA"
+    );
+
+    // EN 300 392-2 clauses 20.4.1.1.4, 21.4.2.3 and 23.4.3.1.2:
+    // full-slot SCH/F MAC-DATA on an assigned PDCH carries a complete TM-SDU.
+    // UMAC must deliver the TM-SDU to LLC and ignore only the following Null PDU.
+    submit_schf_mac_data(&mut test, issi, payload, 9);
+    test.run_stack(Some(1));
+
+    let sink_msgs = test.dump_sinks();
+    let delivered: Vec<_> = sink_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmaUnitdataInd(prim) => prim.pdu.as_ref().map(|pdu| (prim.main_address, pdu.clone())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        delivered.len(),
+        1,
+        "assigned PDCH MAC-DATA should deliver exactly one non-null TM-SDU"
+    );
+    assert_eq!(delivered[0].0, TetraAddress::issi(issi));
+    assert_eq!(delivered[0].1.get_len(), 35);
+
+    let mut sdu = delivered[0].1.clone();
+    assert_eq!(
+        sdu.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok()),
+        Some(LlcPduType::BlUdata)
+    );
+    BlUdata::from_bitbuf(&mut sdu).expect("delivered TM-SDU should start with BL-UDATA");
+    assert_eq!(
+        sdu.read_bits(3).and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok()),
+        Some(MleProtocolDiscriminator::Sndcp)
+    );
+}
+
+#[test]
+fn test_assigned_pdch_mac_u_blck_payload_reaches_llc_with_packet_data_owner() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 2_260_618;
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(3)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 52,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: TetraAddress::issi(target_issi),
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    let mut payload = BitBuffer::new_autoexpand(24);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut payload);
+    payload.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+    payload.write_bits(0b0100, 4);
+    payload.seek(0);
+
+    // EN 300 392-2 clauses 21.4.2.5 and 23.4.3.1.2: MAC-U-BLCK on
+    // assigned SCH/F carries a complete TM-SDU without an explicit ISSI.
+    // For SNDCP PDCH, the SwMI-owned channel allocation supplies that ISSI.
+    submit_mac_u_blck_with_payload(&mut test, 17, 15, payload);
+    test.run_stack(Some(1));
+
+    let delivered: Vec<_> = test
+        .dump_sinks()
+        .into_iter()
+        .filter_map(|msg| match msg.msg {
+            SapMsgInner::TmaUnitdataInd(prim) => prim.pdu.map(|pdu| (prim.main_address, prim.endpoint_id, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        delivered.len(),
+        1,
+        "assigned PDCH MAC-U-BLCK should deliver one complete TM-SDU to LLC"
+    );
+    assert_eq!(delivered[0].0, TetraAddress::issi(target_issi));
+    assert_eq!(delivered[0].1, 1, "assigned PDCH uplink must preserve the SNDCP endpoint context");
+    let mut sdu = delivered[0].2.clone();
+    BlUdata::from_bitbuf(&mut sdu).expect("delivered TM-SDU should start with BL-UDATA");
+    assert_eq!(
+        sdu.read_bits(3).and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok()),
+        Some(MleProtocolDiscriminator::Sndcp)
+    );
+}
+
+#[test]
+fn test_assigned_pdch_mac_data_al_ack_preserves_packet_data_endpoint() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 2_260_618;
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(3)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 53,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: TetraAddress::issi(target_issi),
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    let mut payload = BitBuffer::new_autoexpand(16);
+    AlAck::complete(0).to_bitbuf(&mut payload);
+    payload.seek(0);
+
+    // EN 300 392-2 clauses 21.2.3.1 and 23.4.3.1.2: an AL-ACK may arrive as
+    // the TM-SDU carried by uplink SCH/F MAC-DATA on the assigned PDCH. The
+    // MAC PDU carries the ISSI, but the SNDCP endpoint is SwMI context.
+    submit_schf_mac_data(&mut test, target_issi, payload, 7);
+    test.run_stack(Some(1));
+
+    let delivered: Vec<_> = test
+        .dump_sinks()
+        .into_iter()
+        .filter_map(|msg| match msg.msg {
+            SapMsgInner::TmaUnitdataInd(prim) => prim.pdu.map(|pdu| (prim.main_address, prim.endpoint_id, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(delivered.len(), 1, "assigned PDCH MAC-DATA should deliver the peer AL-ACK to LLC");
+    assert_eq!(delivered[0].0, TetraAddress::issi(target_issi));
+    assert_eq!(
+        delivered[0].1, 1,
+        "assigned PDCH MAC-DATA must preserve the SNDCP endpoint context for AL-ACK"
+    );
+    let mut sdu = delivered[0].2.clone();
+    let ack = AlAck::from_bitbuf(&mut sdu).expect("delivered TM-SDU should be AL-ACK");
+    assert!(ack.acknowledges_complete_tl_sdu());
+    assert_eq!(ack.nr, 0);
+}
+
+#[test]
+fn test_packet_data_mac_access_al_ack_preserves_advanced_link_endpoint() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 2_260_618;
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(3)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc, TetraEntity::Mm]);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 54,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: TetraAddress::issi(target_issi),
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    let mut payload = BitBuffer::new_autoexpand(16);
+    AlAck::complete(0).to_bitbuf(&mut payload);
+    payload.seek(0);
+
+    // EN 300 392-2 clauses 21.2.3.1 and 23.5.2.1: AL acknowledgement is LLC
+    // C-plane signalling. If the terminal returns it on MAC-ACCESS/reserved
+    // access instead of the assigned PDCH slot, UMAC must still recover the
+    // SNDCP endpoint from the SwMI-maintained packet-data link context.
+    submit_mac_access_with_payload(&mut test, target_issi, payload, 7);
+    test.run_stack(Some(1));
+
+    let delivered: Vec<_> = test
+        .dump_sinks()
+        .into_iter()
+        .filter_map(|msg| match msg.msg {
+            SapMsgInner::TmaUnitdataInd(prim) => prim.pdu.map(|pdu| (prim.main_address, prim.endpoint_id, pdu)),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(delivered.len(), 1, "packet-data MAC-ACCESS should deliver the peer AL-ACK to LLC");
+    assert_eq!(delivered[0].0, TetraAddress::issi(target_issi));
+    assert_eq!(
+        delivered[0].1, 1,
+        "packet-data MAC-ACCESS AL-ACK must preserve the SNDCP endpoint context"
+    );
+    let mut sdu = delivered[0].2.clone();
+    let ack = AlAck::from_bitbuf(&mut sdu).expect("delivered TM-SDU should be AL-ACK");
+    assert!(ack.acknowledges_complete_tl_sdu());
+    assert_eq!(ack.nr, 0);
+}
+
+#[test]
+fn test_mac_u_blck_without_owner_or_payload_is_dropped_without_panic() {
     debug::setup_logging_verbose();
 
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Llc, TetraEntity::Mle]);
 
     // EN 300 392-2 clause 21.4.2.5 allows MAC-U-BLCK on SCH/F with an
-    // implicit TM-SDU. Until the UMAC model carries that TM-SDU and maps the
-    // event label, the BS should drop it explicitly rather than aborting.
+    // implicit TM-SDU. Without reserved-access or assigned-PDCH ownership,
+    // the BS must drop it explicitly rather than fabricating an ISSI.
     submit_mac_u_blck(&mut test, 1);
     test.run_stack(Some(1));
 
     assert!(
         test.dump_sinks().is_empty(),
-        "MAC-U-BLCK TM-SDU delivery is intentionally not emitted until event-label handling is implemented"
+        "MAC-U-BLCK without an owner or payload must not emit a TM-SDU"
     );
 }
 
@@ -2280,7 +2677,7 @@ fn test_mac_u_blck_reservation_requirement_enqueues_grant_for_known_slot_owner()
     assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
     assert!(
         !sink_msgs.iter().any(|msg| matches!(msg.msg, SapMsgInner::TmaUnitdataInd(_))),
-        "MAC-U-BLCK TM-SDU payload remains blocked until event-label delivery is implemented"
+        "header-only MAC-U-BLCK must not emit an empty TM-SDU"
     );
 }
 
@@ -2352,7 +2749,7 @@ fn test_stale_frame_18_energy_saving_assignment_does_not_starve_private_reservat
     assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
     assert!(
         !sink_msgs.iter().any(|msg| matches!(msg.msg, SapMsgInner::TmaUnitdataInd(_))),
-        "MAC-U-BLCK TM-SDU payload remains blocked until event-label delivery is implemented"
+        "header-only MAC-U-BLCK must not emit an empty TM-SDU"
     );
 }
 
@@ -2406,7 +2803,7 @@ fn test_mac_u_blck_no_reservation_requirement_does_not_enqueue_grant() {
     );
     assert!(
         !sink_msgs.iter().any(|msg| matches!(msg.msg, SapMsgInner::TmaUnitdataInd(_))),
-        "MAC-U-BLCK TM-SDU payload remains blocked until event-label delivery is implemented"
+        "header-only MAC-U-BLCK must not emit an empty TM-SDU"
     );
 }
 
@@ -2926,6 +3323,357 @@ fn build_tma_unitdata_req_with_payload(req_handle: i32, target_issi: u32, pdu: B
             tx_reporter,
         }),
     }
+}
+
+fn build_sndcp_bl_udata_sdu() -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(24);
+    BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
+    sdu.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+    sdu.write_bits(0b0100, 4);
+    sdu.seek(0);
+    sdu
+}
+
+fn build_sndcp_al_final_ar_sdu() -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(64);
+    AlData {
+        final_segment: true,
+        acknowledgement_requested: true,
+        ns: 0,
+        ss: 0,
+    }
+    .to_bitbuf(&mut sdu);
+    let payload_start = sdu.get_len();
+    sdu.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+    sdu.write_bits(0b0100, 4);
+    let fcs_value = fcs::compute_fcs(&sdu, payload_start, sdu.get_len());
+    sdu.write_bits(fcs_value as u64, 32);
+    sdu.seek(0);
+    sdu
+}
+
+fn build_al_setup_sdu() -> BitBuffer {
+    let mut sdu = BitBuffer::new_autoexpand(32);
+    AlSetup {
+        acknowledged_service: true,
+        advanced_link_number: 0,
+        max_tl_sdu_len_code: 0,
+        connection_width: false,
+        advanced_link_symmetry: false,
+        uplink_timeslots: None,
+        downlink_timeslots: None,
+        throughput_code: 0,
+        window_size_code: 1,
+        max_tl_sdu_retransmissions: 3,
+        max_segment_retransmissions: 0,
+        setup_report: AlSetup::SETUP_REPORT_SUCCESS,
+        ns: None,
+        augmented: None,
+    }
+    .to_bitbuf(&mut sdu);
+    sdu.seek(0);
+    sdu
+}
+
+fn access_assign_for_slot(slot: &TmvUnitdataReqSlot) -> Option<AccessAssign> {
+    let mut bbk = slot.bbk.as_ref()?.mac_block.clone();
+    bbk.seek(0);
+    AccessAssign::from_bitbuf(&mut bbk).ok()
+}
+
+fn has_assigned_schf_slot(slot: &TmvUnitdataReqSlot) -> bool {
+    access_assign_for_slot(slot)
+        .is_some_and(|aach| aach.dl_usage == AccessAssignDlUsage::AssignedControl && aach.ul_usage == AccessAssignUlUsage::AssignedOnly)
+        && slot
+            .blk1
+            .as_ref()
+            .is_some_and(|block| block.logical_channel == LogicalChannel::SchF)
+}
+
+fn slot_carries_mac_resource_for_addr(slot: &TmvUnitdataReqSlot, target_addr: TetraAddress) -> bool {
+    [&slot.blk1, &slot.blk2].into_iter().flatten().any(|block| {
+        parse_downlink_mac_pdus_from_block(block).into_iter().any(|pdu| {
+            matches!(
+                pdu,
+                DownlinkMacPdu::Resource(_, resource)
+                    if resource
+                        .addr
+                        .is_some_and(|resource_addr| mac_resource_matches_addr(resource_addr, target_addr))
+            )
+        })
+    })
+}
+
+fn block_mac_resource_payloads_for_addr(block: &TmvUnitdataReq, target_addr: TetraAddress) -> Vec<BitBuffer> {
+    let mut payloads = Vec::new();
+    if block.logical_channel != LogicalChannel::SchF && block.logical_channel != LogicalChannel::Stch {
+        return payloads;
+    }
+
+    let mut mac_block = block.mac_block.clone();
+    mac_block.seek(0);
+    while mac_block.get_len_remaining() >= 2 {
+        let start_pos = mac_block.get_pos();
+        let Some(mac_pdu_type) = mac_block.peek_bits(2) else {
+            break;
+        };
+        if mac_pdu_type != 0 {
+            break;
+        }
+
+        let Ok(resource) = MacResource::from_bitbuf(&mut mac_block) else {
+            break;
+        };
+        let length_bits = resource.length_ind as usize * 8;
+        let payload_start = mac_block.get_pos();
+        let next_pos = start_pos + length_bits;
+        if length_bits == 0 || next_pos <= payload_start || next_pos > mac_block.get_len() {
+            break;
+        }
+
+        if resource
+            .addr
+            .is_some_and(|resource_addr| mac_resource_matches_addr(resource_addr, target_addr))
+        {
+            let mut payload_reader = mac_block.clone();
+            payload_reader.seek(payload_start);
+            let mut payload = BitBuffer::new_autoexpand(next_pos - payload_start);
+            payload.copy_bits(&mut payload_reader, next_pos - payload_start);
+            payload.seek(0);
+            payloads.push(payload);
+        }
+        mac_block.seek(next_pos);
+    }
+
+    payloads
+}
+
+fn slot_carries_al_setup_for_addr_with_report(slot: &TmvUnitdataReqSlot, target_addr: TetraAddress, expected_report: u8) -> bool {
+    [&slot.blk1, &slot.blk2].into_iter().flatten().any(|block| {
+        block_mac_resource_payloads_for_addr(block, target_addr)
+            .into_iter()
+            .any(|mut payload| AlSetup::from_bitbuf(&mut payload).is_ok_and(|setup| setup.setup_report == expected_report))
+    })
+}
+
+#[test]
+fn test_sndcp_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to_ts4_without_traffic_circuit() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 0x5106;
+    let assigned = [false, true, true, true];
+    let test_prim = TmaUnitdataReq {
+        req_handle: 51,
+        pdu: build_sndcp_bl_udata_sdu(),
+        main_address: TetraAddress::issi(target_issi),
+        endpoint_id: 1,
+        pdu_prio: 4,
+        stealing_permission: false,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: None,
+            timeslots: assigned,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: None,
+        }),
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(test_prim),
+    });
+    test.run_stack(Some(32));
+
+    let sink_msgs = test.dump_sinks();
+    let mac_resource =
+        first_mac_resource_for_addr(&sink_msgs, TetraAddress::issi(target_issi)).expect("SNDCP allocation should emit MAC-RESOURCE");
+    let chan_alloc = mac_resource
+        .chan_alloc_element
+        .as_ref()
+        .expect("SNDCP MAC-RESOURCE should carry channel allocation");
+    assert_eq!(chan_alloc.ts_assigned, assigned);
+    assert!(!chan_alloc.ts_assigned[0], "default packet-data allocation must not assign TS1");
+
+    for ts in [2, 3, 4] {
+        assert!(
+            sink_msgs.iter().any(|msg| {
+                matches!(
+                    &msg.msg,
+                    SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == ts && has_assigned_schf_slot(slot)
+                )
+            }),
+            "assigned packet-data TS{ts} should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+        );
+    }
+
+    assert!(
+        sink_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::TmvUnitdataReq(slot)
+                    if slot.ts.t == 1
+                        && access_assign_for_slot(slot)
+                            .is_some_and(|aach| aach.dl_usage == AccessAssignDlUsage::AssignedControl)
+            )
+        }),
+        "packet-data maintenance must leave TS1 as common control"
+    );
+}
+
+#[test]
+fn test_sndcp_al_final_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to_ts4() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 0x5107;
+    let assigned = [false, true, true, true];
+    let test_prim = TmaUnitdataReq {
+        req_handle: 52,
+        pdu: build_sndcp_al_final_ar_sdu(),
+        main_address: TetraAddress::issi(target_issi),
+        endpoint_id: 1,
+        pdu_prio: 4,
+        stealing_permission: false,
+        subscriber_class: 0,
+        air_interface_encryption: None,
+        stealing_repeats_flag: None,
+        data_category: None,
+        chan_alloc: Some(CmceChanAllocReq {
+            usage: None,
+            timeslots: assigned,
+            alloc_type: ChanAllocType::Replace,
+            ul_dl_assigned: UlDlAssignment::Both,
+            carrier: None,
+        }),
+        tx_reporter: None,
+    };
+
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(test_prim),
+    });
+    test.run_stack(Some(32));
+
+    let sink_msgs = test.dump_sinks();
+    let mac_resource =
+        first_mac_resource_for_addr(&sink_msgs, TetraAddress::issi(target_issi)).expect("SNDCP AL allocation should emit MAC-RESOURCE");
+    let chan_alloc = mac_resource
+        .chan_alloc_element
+        .as_ref()
+        .expect("SNDCP AL MAC-RESOURCE should carry channel allocation");
+    assert_eq!(chan_alloc.ts_assigned, assigned);
+    assert!(!chan_alloc.ts_assigned[0], "packet-data AL allocation must not assign TS1");
+
+    for ts in [2, 3, 4] {
+        assert!(
+            sink_msgs.iter().any(|msg| {
+                matches!(
+                    &msg.msg,
+                    SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == ts && has_assigned_schf_slot(slot)
+                )
+            }),
+            "assigned packet-data AL TS{ts} should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+        );
+    }
+}
+
+#[test]
+fn test_advanced_link_control_after_pdch_allocation_uses_assigned_packet_data_slot() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 0x5108;
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 53,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: TetraAddress::issi(target_issi),
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 54,
+            pdu: build_al_setup_sdu(),
+            main_address: TetraAddress::issi(target_issi),
+            endpoint_id: 1,
+            pdu_prio: 5,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: None,
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(16));
+
+    let sink_msgs = test.dump_sinks();
+    assert!(
+        sink_msgs.iter().any(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::TmvUnitdataReq(slot)
+                    if (2..=4).contains(&slot.ts.t)
+                        && slot_carries_al_setup_for_addr_with_report(
+                            slot,
+                            TetraAddress::issi(target_issi),
+                            AlSetup::SETUP_REPORT_SUCCESS
+                        )
+            )
+        }),
+        "AL-SETUP success after PDCH assignment must be sent with its LLC payload on the active assigned packet-data slot"
+    );
+    assert!(
+        sink_msgs.iter().all(|msg| {
+            !matches!(
+                &msg.msg,
+                SapMsgInner::TmvUnitdataReq(slot)
+                    if slot.ts.t == 1
+                        && slot_carries_mac_resource_for_addr(slot, TetraAddress::issi(target_issi))
+            )
+        }),
+        "AL control for an active PDCH must not fall back to TS1 common control"
+    );
 }
 
 fn build_p2p_d_setup_tma_req(req_handle: i32, calling_issi: u32, called_issi: u32, tx_reporter: TxReporter) -> SapMsg {

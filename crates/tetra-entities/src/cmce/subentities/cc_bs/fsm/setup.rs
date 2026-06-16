@@ -808,6 +808,22 @@ impl CcBsSubentity {
         let occupied_call_ids = self.occupied_call_ids();
         let (circuit_calling, circuit_called) = {
             let mut state = self.config.state_write();
+            if pdu.simplex_duplex_selection && !state.timeslot_alloc.can_allocate_preempting(2, TimeslotOwner::PacketData) {
+                tracing::info!(
+                    "CMCE: rejecting U-SETUP P2P from ISSI {} to ISSI {}, local duplex needs two traffic slots and not enough free/packet-data-preemptible capacity is available",
+                    calling_party.ssi,
+                    called_addr.ssi
+                );
+                Self::reject_u_setup_before_call_id(
+                    queue,
+                    calling_party,
+                    prim.handle,
+                    prim.link_id,
+                    prim.endpoint_id,
+                    DisconnectCause::CongestionInInfrastructure,
+                );
+                return;
+            }
             let circuit_calling = match self.circuits.allocate_circuit_with_allocator_duplex_avoiding(
                 Direction::Both,
                 pdu.basic_service_information.communication_type,

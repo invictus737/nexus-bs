@@ -5,18 +5,22 @@
 
 use super::bearer::{SndcpBearerActivationOutcome, SndcpBearerError, SndcpBearerManager};
 use super::pdp::{
-    SndcpPdpError, decode_activate_pdp_context_demand, decode_deactivate_pdp_context_demand, encode_activate_pdp_context_accept,
-    encode_activate_pdp_context_reject, encode_deactivate_pdp_context_accept,
+    SndcpActivateAddressDemand, SndcpActivatePdpContextDemand, SndcpPdpError, decode_activate_pdp_context_demand,
+    decode_deactivate_pdp_context_demand, encode_activate_pdp_context_accept, encode_activate_pdp_context_reject,
+    encode_deactivate_pdp_context_accept,
 };
 use super::pdp_service::{SndcpPdpPolicy, SndcpPdpService};
 use super::state::SwmiSndcpState;
-use super::transfer::{SN_PDU_TYPE_DATA_TRANSMIT_REQUEST, SndcpTransferError, decode_data_transmit_request};
-use super::unitdata::{SndcpEncodeError, SndcpUnitdataError, sn_unitdata_ind_from_pdu, sn_unitdata_req_to_pdu};
-use super::wap_gateway::{WapGatewayError, WapStatusUnitdataResponse, build_wap_status_unitdata_response};
+use super::transfer::{
+    SN_PDU_TYPE_DATA, SN_PDU_TYPE_DATA_TRANSMIT_REQUEST, SN_PDU_TYPE_END_OF_DATA, SN_PDU_TYPE_RECONNECT, SndcpTransferError,
+    decode_data_transmit_request, decode_end_of_data, decode_reconnect,
+};
+use super::unitdata::{SndcpEncodeError, SndcpUnitdataError, sn_unitdata_req_to_pdu, sn_user_data_ind_from_pdu};
+use super::wap_gateway::{WapGatewayError, WapStatusUnitdataResponse, build_wap_status_unitdata_response_optional};
 use super::wap_ip::{WapIpEndpoint, WapIpServicePolicy};
 use super::wap_status::WapStatusSnapshot;
 use tetra_core::{BitBuffer, MleHandle};
-use tetra_saps::sn::SnUnitdataReq;
+use tetra_saps::sn::{SnPacketDataMsType, SnUnitdataReq};
 
 const SN_PDU_TYPE_ACTIVATE_PDP_CONTEXT_DEMAND: u8 = 0;
 const SN_PDU_TYPE_DEACTIVATE_PDP_CONTEXT_DEMAND: u8 = 2;
@@ -46,6 +50,7 @@ pub enum SndcpWapSessionError {
 pub enum SndcpWapSessionResponse {
     Control(BitBuffer),
     Unitdata(WapStatusUnitdataResponse),
+    NoResponse,
 }
 
 impl From<SndcpPdpError> for SndcpWapSessionError {
@@ -113,6 +118,17 @@ impl SndcpWapSession {
         self.bearer.state_for_issi(issi)
     }
 
+    pub fn deregister_issi(&mut self, issi: u32) -> Result<(), SndcpWapSessionError> {
+        let transition = self.bearer.deregister_issi(issi)?;
+        tracing::info!(
+            "SNDCP/WAP-IP: deregistered issi={} state={:?}->{:?}",
+            issi,
+            transition.previous_state,
+            transition.new_state
+        );
+        Ok(())
+    }
+
     pub fn endpoint(&self) -> WapIpEndpoint {
         self.endpoint
     }
@@ -146,9 +162,9 @@ impl SndcpWapSession {
                 .handle_deactivate_pdp_context_demand(issi, pdu)
                 .map(SndcpWapSessionResponse::Control),
             SN_PDU_TYPE_DATA_TRANSMIT_REQUEST => self.handle_data_transmit_request(issi, pdu).map(SndcpWapSessionResponse::Control),
-            SN_PDU_TYPE_UNITDATA => self
-                .handle_unitdata_response(issi, handle, pdu, snapshot)
-                .map(SndcpWapSessionResponse::Unitdata),
+            SN_PDU_TYPE_END_OF_DATA => self.handle_end_of_data_response(issi, pdu),
+            SN_PDU_TYPE_RECONNECT => self.handle_reconnect_response(issi, pdu),
+            SN_PDU_TYPE_UNITDATA | SN_PDU_TYPE_DATA => self.handle_unitdata_session_response(issi, handle, pdu, snapshot),
             other => Err(SndcpWapSessionError::UnsupportedInboundPduType(other)),
         }
     }
@@ -157,8 +173,24 @@ impl SndcpWapSession {
         let demand = decode_activate_pdp_context_demand(pdu)?;
 
         match self.bearer.handle_activate_demand(issi, demand)? {
-            SndcpBearerActivationOutcome::Accepted { accept, .. } => Ok(encode_activate_pdp_context_accept(&accept)?),
-            SndcpBearerActivationOutcome::Rejected(reject) => Ok(encode_activate_pdp_context_reject(&reject)?),
+            SndcpBearerActivationOutcome::Accepted { accept, .. } => {
+                tracing::info!(
+                    "SNDCP/WAP-IP: PDP activation accepted issi={} nsapi={} assigned_address={:?}",
+                    issi,
+                    accept.nsapi,
+                    accept.assigned_address
+                );
+                Ok(encode_activate_pdp_context_accept(&accept)?)
+            }
+            SndcpBearerActivationOutcome::Rejected(reject) => {
+                tracing::info!(
+                    "SNDCP/WAP-IP: PDP activation rejected issi={} nsapi={} cause={:?}",
+                    issi,
+                    reject.nsapi,
+                    reject.cause
+                );
+                Ok(encode_activate_pdp_context_reject(&reject)?)
+            }
         }
     }
 
@@ -170,10 +202,101 @@ impl SndcpWapSession {
 
     pub fn handle_data_transmit_request(&mut self, issi: u32, pdu: &BitBuffer) -> Result<BitBuffer, SndcpWapSessionError> {
         let request = decode_data_transmit_request(pdu)?;
+        let _ = self.recover_missing_wap_ipv4_context_for_ms_transfer(issi, request.nsapi)?;
         let outcome = self.bearer.handle_ms_data_transmit_request(issi, request)?;
         outcome
             .control_pdu
             .ok_or(SndcpWapSessionError::MissingControlPdu("sn_data_transmit_response"))
+    }
+
+    pub fn handle_end_of_data_response(&mut self, issi: u32, pdu: &BitBuffer) -> Result<SndcpWapSessionResponse, SndcpWapSessionError> {
+        let end_of_data = decode_end_of_data(pdu)?;
+        let outcome = self.bearer.handle_end_of_data_received(issi, end_of_data, false)?;
+        Ok(match outcome.control_pdu {
+            Some(pdu) => SndcpWapSessionResponse::Control(pdu),
+            None => SndcpWapSessionResponse::NoResponse,
+        })
+    }
+
+    pub fn handle_reconnect(&mut self, issi: u32, pdu: &BitBuffer) -> Result<BitBuffer, SndcpWapSessionError> {
+        self.handle_reconnect_response(issi, pdu)?.into_pdu()
+    }
+
+    pub fn handle_reconnect_response(&mut self, issi: u32, pdu: &BitBuffer) -> Result<SndcpWapSessionResponse, SndcpWapSessionError> {
+        let reconnect = decode_reconnect(pdu)?;
+        if reconnect.nsapi.is_none()
+            && self.bearer.state_for_issi(issi) == SwmiSndcpState::Idle
+            && self.bearer.pdp().contexts().contexts_for_issi(issi).next().is_none()
+        {
+            tracing::info!(
+                "SNDCP/WAP-IP: ignoring SN-RECONNECT without data for issi={} because no local PDP context survived",
+                issi
+            );
+            return Ok(SndcpWapSessionResponse::NoResponse);
+        }
+        if let Some(nsapi) = reconnect.nsapi {
+            let recovered = self.recover_missing_wap_ipv4_context_for_ms_transfer(issi, nsapi)?;
+            if recovered {
+                let outcome = self.bearer.handle_ms_data_transmit_request(
+                    issi,
+                    super::transfer::SndcpDataTransmitRequest {
+                        nsapi,
+                        logical_link_status: false,
+                        resource_request: reconnect.resource_request,
+                    },
+                )?;
+                return Ok(match outcome.control_pdu {
+                    Some(pdu) => SndcpWapSessionResponse::Control(pdu),
+                    None => SndcpWapSessionResponse::NoResponse,
+                });
+            }
+        }
+        let outcome = self.bearer.handle_reconnect_received(issi, reconnect)?;
+        Ok(match outcome.control_pdu {
+            Some(pdu) => SndcpWapSessionResponse::Control(pdu),
+            None => SndcpWapSessionResponse::NoResponse,
+        })
+    }
+
+    fn recover_missing_wap_ipv4_context_for_ms_transfer(&mut self, issi: u32, nsapi: u8) -> Result<bool, SndcpWapSessionError> {
+        if self.bearer.pdp().contexts().get_issi_nsapi(issi, nsapi).ok().flatten().is_some() {
+            return Ok(false);
+        }
+
+        // Clause 28.2.1 requires PDP activation before normal SNDCP data, but
+        // after a SwMI restart a terminal can still believe its previously
+        // activated PDP context exists and immediately request data transfer.
+        // Keep this recovery local to the WAP/IP endpoint and reconstruct the
+        // minimal dynamic IPv4 primary context needed to answer or reject the
+        // following SN-DATA TRANSMIT REQUEST through the normal bearer path.
+        let demand = SndcpActivatePdpContextDemand {
+            sndcp_version: 1,
+            nsapi,
+            address: SndcpActivateAddressDemand::Ipv4Dynamic,
+            packet_data_ms_type: SnPacketDataMsType::TypeAParallel,
+            pcomp_negotiation: 0,
+        };
+
+        match self.bearer.handle_activate_demand(issi, demand)? {
+            SndcpBearerActivationOutcome::Accepted { accept, .. } => {
+                tracing::warn!(
+                    "SNDCP/WAP-IP: recovered missing dynamic IPv4 PDP context for issi={} nsapi={} assigned_address={:?} before MS data transfer",
+                    issi,
+                    nsapi,
+                    accept.assigned_address
+                );
+            }
+            SndcpBearerActivationOutcome::Rejected(reject) => {
+                tracing::warn!(
+                    "SNDCP/WAP-IP: unable to recover missing PDP context for issi={} nsapi={} before MS data transfer: {:?}",
+                    issi,
+                    nsapi,
+                    reject.cause
+                );
+            }
+        }
+
+        Ok(true)
     }
 
     pub fn handle_unitdata(
@@ -203,8 +326,22 @@ impl SndcpWapSession {
         pdu: &BitBuffer,
         snapshot: &WapStatusSnapshot,
     ) -> Result<WapStatusUnitdataResponse, SndcpWapSessionError> {
-        let unitdata = sn_unitdata_ind_from_pdu(pdu)?;
-        let response = build_wap_status_unitdata_response(
+        match self.handle_unitdata_session_response(issi, handle, pdu, snapshot)? {
+            SndcpWapSessionResponse::Unitdata(response) => Ok(response),
+            SndcpWapSessionResponse::NoResponse => Err(SndcpWapSessionError::MissingControlPdu("no_response")),
+            SndcpWapSessionResponse::Control(_) => Err(SndcpWapSessionError::MissingControlPdu("unitdata_response")),
+        }
+    }
+
+    fn handle_unitdata_session_response(
+        &mut self,
+        issi: u32,
+        handle: MleHandle,
+        pdu: &BitBuffer,
+        snapshot: &WapStatusSnapshot,
+    ) -> Result<SndcpWapSessionResponse, SndcpWapSessionError> {
+        let unitdata = sn_user_data_ind_from_pdu(pdu)?;
+        let Some(response) = build_wap_status_unitdata_response_optional(
             self.bearer.pdp().contexts(),
             issi,
             handle,
@@ -212,9 +349,12 @@ impl SndcpWapSession {
             self.endpoint,
             &self.wap_policy,
             snapshot,
-        )?;
+        )?
+        else {
+            return Ok(SndcpWapSessionResponse::NoResponse);
+        };
         self.bearer.prepare_swmi_unitdata_transfer(issi, unitdata.nsapi)?;
-        Ok(response)
+        Ok(SndcpWapSessionResponse::Unitdata(response))
     }
 }
 
@@ -223,6 +363,7 @@ impl SndcpWapSessionResponse {
         match self {
             SndcpWapSessionResponse::Control(pdu) => Ok(pdu),
             SndcpWapSessionResponse::Unitdata(response) => Ok(sn_unitdata_req_to_pdu(&response.unitdata)?),
+            SndcpWapSessionResponse::NoResponse => Err(SndcpWapSessionError::MissingControlPdu("no_response")),
         }
     }
 }
@@ -239,6 +380,7 @@ fn sn_pdu_type(pdu: &BitBuffer) -> Result<u8, SndcpWapSessionError> {
 mod tests {
     use super::*;
     use crate::sndcp::ip::{bitbuffer_npdu_octets, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
+    use crate::sndcp::pdch::SndcpPacketDataResourceRequest;
     use crate::sndcp::pdp::{
         SndcpActivateAddressDemand, SndcpActivatePdpContextDemand, SndcpActivationRejectCause, SndcpDeactivation,
         SndcpMaximumTransmissionUnit, decode_activate_pdp_context_accept, decode_activate_pdp_context_reject,
@@ -246,9 +388,10 @@ mod tests {
     };
     use crate::sndcp::state::SwmiSndcpState;
     use crate::sndcp::transfer::{
-        SndcpDataTransmitRequest, SndcpDataTransmitResponseResult, decode_data_transmit_response, encode_data_transmit_request,
+        SndcpDataTransmitRequest, SndcpDataTransmitResponseResult, SndcpEndOfData, SndcpReconnect, decode_data_transmit_response,
+        decode_end_of_data, encode_data_transmit_request, encode_end_of_data, encode_reconnect,
     };
-    use crate::sndcp::unitdata::{decode_sn_unitdata_pdu, encode_sn_unitdata};
+    use crate::sndcp::unitdata::{decode_sn_unitdata_pdu, encode_sn_data, encode_sn_unitdata};
     use tetra_saps::sn::{SnAddress, SnPacketDataMsType};
 
     const ISSI: u32 = 2_260_618;
@@ -302,8 +445,25 @@ mod tests {
         encode_data_transmit_request(&SndcpDataTransmitRequest {
             nsapi,
             logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::None,
         })
         .expect("SN-DATA TRANSMIT REQUEST should encode")
+    }
+
+    fn reconnect(nsapi: u8) -> BitBuffer {
+        encode_reconnect(&SndcpReconnect {
+            nsapi: Some(nsapi),
+            resource_request: SndcpPacketDataResourceRequest::None,
+        })
+        .expect("SN-RECONNECT should encode")
+    }
+
+    fn reconnect_without_data() -> BitBuffer {
+        encode_reconnect(&SndcpReconnect {
+            nsapi: None,
+            resource_request: SndcpPacketDataResourceRequest::None,
+        })
+        .expect("SN-RECONNECT without data should encode")
     }
 
     fn activate_context(session: &mut SndcpWapSession, nsapi: u8) {
@@ -357,11 +517,124 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_pdp_ready_then_wap_sn_data_returns_status_pdu() {
+        let mut session = session();
+        activate_context(&mut session, 2);
+        enter_ready(&mut session, 2);
+
+        let request_npdu = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint().address, 49_152, endpoint().port, b"GET /", 0x2222, 64)
+            .expect("request N-PDU should build");
+        let data_pdu = encode_sn_data(2, 0, 0, &BitBuffer::from_bytes(&request_npdu)).expect("SN-DATA should encode");
+
+        let response_pdu = session
+            .handle_inbound_pdu(ISSI, HANDLE, &data_pdu, &snapshot())
+            .expect("active PDP context should serve WAP status from SN-DATA");
+        let response_unitdata = decode_sn_unitdata_pdu(&response_pdu).expect("response SN-UNITDATA should decode");
+        assert_eq!(response_unitdata.nsapi, 2);
+
+        let response_npdu = bitbuffer_npdu_octets(&response_unitdata.n_pdu).expect("response N-PDU should be byte aligned");
+        let response_ip = parse_ipv4_packet(&response_npdu).expect("response IPv4 should parse");
+        assert_eq!(response_ip.source, endpoint().address);
+        assert_eq!(response_ip.destination, [10, 0, 0, 2]);
+    }
+
+    #[test]
     fn data_transmit_request_after_activation_enters_ready() {
         let mut session = session();
         activate_context(&mut session, 2);
 
         enter_ready(&mut session, 2);
+    }
+
+    #[test]
+    fn data_transmit_request_without_local_context_recovers_wap_ipv4_context_and_enters_ready() {
+        let mut session = session();
+
+        let response = session
+            .handle_inbound_pdu(ISSI, HANDLE, &data_transmit_request(1), &snapshot())
+            .expect("WAP/IP recovery should accept MS data-transfer request after local PDP loss");
+        let response = decode_data_transmit_response(&response).expect("SN-DATA TRANSMIT RESPONSE should decode");
+
+        assert_eq!(response.nsapi, 1);
+        assert_eq!(response.result, SndcpDataTransmitResponseResult::Accepted);
+        assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Ready);
+        let context = session
+            .pdp()
+            .contexts()
+            .get_issi_nsapi(ISSI, 1)
+            .expect("recovered NSAPI should be valid")
+            .expect("missing WAP/IP context should be rebuilt for the ISSI");
+        assert_eq!(context.address, SnAddress::Ipv4([10, 0, 0, 2]));
+    }
+
+    #[test]
+    fn reconnect_with_data_without_local_context_recovers_wap_ipv4_context_and_enters_ready() {
+        let mut session = session();
+
+        let response = session
+            .handle_inbound_pdu(ISSI, HANDLE, &reconnect(1), &snapshot())
+            .expect("WAP/IP recovery should accept SN-RECONNECT with data after local PDP loss");
+        let response = decode_data_transmit_response(&response).expect("SN-DATA TRANSMIT RESPONSE should decode");
+
+        assert_eq!(response.nsapi, 1);
+        assert_eq!(response.result, SndcpDataTransmitResponseResult::Accepted);
+        assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Ready);
+    }
+
+    #[test]
+    fn reconnect_with_data_to_send_after_ready_returns_data_transmit_response() {
+        let mut session = session();
+        activate_context(&mut session, 2);
+        enter_ready(&mut session, 2);
+
+        let response = session
+            .handle_inbound_pdu(ISSI, HANDLE, &reconnect(2), &snapshot())
+            .expect("SN-RECONNECT with data to send should produce response");
+        let response = decode_data_transmit_response(&response).expect("SN-DATA TRANSMIT RESPONSE should decode");
+
+        assert_eq!(response.nsapi, 2);
+        assert_eq!(response.result, SndcpDataTransmitResponseResult::Accepted);
+        assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Ready);
+    }
+
+    #[test]
+    fn end_of_data_after_ready_is_valid_and_returns_standby() {
+        let mut session = session();
+        activate_context(&mut session, 2);
+        enter_ready(&mut session, 2);
+        let end_of_data = encode_end_of_data(&SndcpEndOfData {
+            immediate_service_change: false,
+        })
+        .expect("SN-END OF DATA should encode");
+
+        let response = session
+            .handle_inbound_pdu(ISSI, HANDLE, &end_of_data, &snapshot())
+            .expect("SN-END OF DATA should be handled as a valid transfer-control PDU");
+        let response = decode_end_of_data(&response).expect("SwMI SN-END OF DATA echo should decode");
+
+        assert!(!response.immediate_service_change);
+        assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Standby);
+    }
+
+    #[test]
+    fn reconnect_without_data_after_end_of_data_is_no_response_in_standby() {
+        let mut session = session();
+        activate_context(&mut session, 2);
+        enter_ready(&mut session, 2);
+        let end_of_data = encode_end_of_data(&SndcpEndOfData {
+            immediate_service_change: false,
+        })
+        .expect("SN-END OF DATA should encode");
+        session
+            .handle_inbound_pdu(ISSI, HANDLE, &end_of_data, &snapshot())
+            .expect("SN-END OF DATA should return to STANDBY");
+
+        let response = session
+            .handle_inbound_pdu_response(ISSI, HANDLE, &reconnect_without_data(), &snapshot())
+            .expect("SN-RECONNECT without data should be accepted in STANDBY");
+
+        assert!(matches!(response, SndcpWapSessionResponse::NoResponse));
+        assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Standby);
     }
 
     #[test]
@@ -469,14 +742,14 @@ mod tests {
     fn unsupported_inbound_pdu_type_is_rejected_without_mutation() {
         let mut session = session();
         let mut pdu = BitBuffer::new(4);
-        pdu.write_bits(9, 4);
+        pdu.write_bits(12, 4);
         pdu.seek(0);
 
         assert_eq!(
             session
                 .handle_inbound_pdu(ISSI, HANDLE, &pdu, &snapshot())
                 .expect_err("unsupported inbound PDU type should reject"),
-            SndcpWapSessionError::UnsupportedInboundPduType(9)
+            SndcpWapSessionError::UnsupportedInboundPduType(12)
         );
         assert_eq!(session.pdp().contexts().contexts_for_issi(ISSI).count(), 0);
         assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Idle);

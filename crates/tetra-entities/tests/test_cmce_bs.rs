@@ -1541,6 +1541,32 @@ fn count_umac_close_direction(msgs: &[SapMsg], direction: Direction, ts: u8) -> 
         .count()
 }
 
+fn count_umac_call_ended_for(msgs: &[SapMsg], call_id: u16, ts: u8) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            msg.dest == TetraEntity::Umac
+                && matches!(
+                    &msg.msg,
+                    SapMsgInner::CmceCallControl(CallControl::CallEnded { call_id: got_call_id, ts: got_ts })
+                        if *got_call_id == call_id && *got_ts == ts
+                )
+        })
+        .count()
+}
+
+fn count_umac_close_or_call_ended_for_ts(msgs: &[SapMsg], ts: u8) -> usize {
+    msgs.iter()
+        .filter(|msg| {
+            msg.dest == TetraEntity::Umac
+                && matches!(
+                    &msg.msg,
+                    SapMsgInner::CmceCallControl(CallControl::Close(_, got_ts))
+                        | SapMsgInner::CmceCallControl(CallControl::CallEnded { ts: got_ts, .. }) if *got_ts == ts
+                )
+        })
+        .count()
+}
+
 fn assert_chan_alloc_matches_circuit(chan_alloc: &CmceChanAllocReq, ts: u8, usage: u8, context: &str) {
     assert_eq!(
         chan_alloc.usage,
@@ -2832,6 +2858,45 @@ fn test_brew_external_affiliate_counts_as_listener_without_shared_rf_registratio
         count_d_releases(&setup_msgs),
         0,
         "external Brew listener accounting must prevent a false no-listener rejection"
+    );
+}
+
+#[test]
+fn test_non_brew_external_subscriber_update_does_not_create_listener() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    submit_subscriber_update(&mut test, TEST_ISSI, Vec::new(), BrewSubscriberAction::Register);
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    submit_subscriber_update_from(
+        &mut test,
+        TetraEntity::User,
+        2_261_313,
+        vec![TEST_GSSI],
+        BrewSubscriberAction::Affiliate,
+    );
+    test.run_stack(Some(1));
+    test.dump_sinks();
+
+    test.submit_message(build_u_setup_msg(TEST_ISSI, TEST_GSSI));
+    test.run_stack(Some(1));
+    let setup_msgs = test.dump_sinks();
+    assert_eq!(
+        count_umac_open(&setup_msgs),
+        0,
+        "subscriber updates from non-MM/non-Brew sources must not create external listeners"
+    );
+    assert!(
+        count_d_releases(&setup_msgs) >= 1,
+        "group setup without a real local or Brew listener should be released"
     );
 }
 
@@ -10563,6 +10628,217 @@ fn test_group_release_waits_for_release_reporter_before_circuit_close() {
         count_umac_call_ended_or_close(&closed_msgs) >= 2,
         "Reporter completion should close the circuit and signal CallEnded"
     );
+}
+
+#[test]
+fn test_stuck_sndcp_pdch_bearer_cannot_block_voice_timeslot_allocation_or_release() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    {
+        let mut state = test.config.state_write();
+        for ts in 2..=4 {
+            state
+                .timeslot_alloc
+                .reserve(TimeslotOwner::PacketData, ts)
+                .expect("test PDCH reservation should start as stale packet data");
+        }
+    }
+
+    let (call_id, voice_ts, _voice_usage) = start_group_call_with_circuit(&mut test);
+    assert_eq!(voice_ts, 2, "one-slot group voice should reclaim exactly the first stale PDCH slot");
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+        assert_eq!(
+            state.timeslot_alloc.owner(3),
+            Some(TimeslotOwner::PacketData),
+            "voice must not kill extra data slots when one slot is enough"
+        );
+        assert_eq!(
+            state.timeslot_alloc.owner(4),
+            Some(TimeslotOwner::PacketData),
+            "voice must preserve remaining PDCH capacity for data coexistence"
+        );
+    }
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut release_msgs = test.dump_sinks();
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(
+        reporters.len(),
+        1,
+        "group D-RELEASE should be reporter-tracked before local cleanup"
+    );
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "voice timeslot must remain allocated until D-RELEASE delivery is known"
+    );
+    {
+        let state = test.config.state_read();
+        assert_eq!(
+            state.timeslot_alloc.owner(voice_ts),
+            Some(TimeslotOwner::Cmce),
+            "pending D-RELEASE delivery must keep the reclaimed voice slot reserved"
+        );
+    }
+
+    reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
+    assert_eq!(
+        count_umac_close_direction(&closed_msgs, Direction::Both, voice_ts),
+        1,
+        "reported D-RELEASE delivery should close the reclaimed voice timeslot"
+    );
+    assert_eq!(
+        count_umac_call_ended_for(&closed_msgs, call_id, voice_ts),
+        1,
+        "reported D-RELEASE delivery should signal CallEnded on the reclaimed voice timeslot"
+    );
+    for data_ts in [3, 4] {
+        assert_eq!(
+            count_umac_close_or_call_ended_for_ts(&closed_msgs, data_ts),
+            0,
+            "voice cleanup must not close preserved SNDCP/PDCH TS{data_ts}"
+        );
+    }
+    {
+        let state = test.config.state_read();
+        assert_eq!(
+            state.timeslot_alloc.owner(voice_ts),
+            None,
+            "voice release must return the reclaimed TS to free, not back to stale SNDCP"
+        );
+        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+    }
+
+    let (_second_call_id, second_voice_ts, _second_usage) = start_group_call_with_circuit(&mut test);
+    assert_eq!(
+        second_voice_ts, 2,
+        "next one-slot voice call must reuse freed TS2 before preempting remaining PDCH"
+    );
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+    }
+}
+
+#[test]
+fn test_stuck_sndcp_pdch_bearer_does_not_preempt_data_when_free_voice_slot_exists() {
+    debug::setup_logging_verbose();
+
+    let dltime = TdmaTime { h: 0, m: 1, f: 1, t: 1 };
+    let mut test = ComponentTest::new(StackMode::Bs, Some(dltime));
+
+    test.populate_entities(
+        vec![TetraEntity::Cmce],
+        vec![TetraEntity::Mle, TetraEntity::Umac, TetraEntity::Brew],
+    );
+
+    register_subscriber(&mut test, TEST_ISSI, TEST_GSSI);
+    {
+        let mut state = test.config.state_write();
+        state
+            .timeslot_alloc
+            .reserve(TimeslotOwner::PacketData, 2)
+            .expect("test PDCH reservation should model a stuck SNDCP bearer on TS2");
+    }
+
+    let (call_id, voice_ts, _voice_usage) = start_group_call_with_circuit(&mut test);
+    assert_eq!(
+        voice_ts, 3,
+        "one-slot group voice must use TS3 while TS2 is held by stale packet data"
+    );
+    {
+        let state = test.config.state_read();
+        assert_eq!(
+            state.timeslot_alloc.owner(2),
+            Some(TimeslotOwner::PacketData),
+            "voice must not reclaim a stuck SNDCP PDCH while a free traffic slot exists"
+        );
+        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
+        assert_eq!(state.timeslot_alloc.owner(4), None);
+    }
+
+    test.submit_message(build_u_disconnect_msg(TEST_ISSI, call_id));
+    test.run_stack(Some(1));
+    let mut release_msgs = test.dump_sinks();
+    let reporters = extract_d_release_reporters(&mut release_msgs);
+    assert_eq!(reporters.len(), 1);
+    assert_eq!(
+        count_umac_call_ended_or_close(&release_msgs),
+        0,
+        "voice TS3 must stay allocated until D-RELEASE is reported"
+    );
+    {
+        let state = test.config.state_read();
+        assert_eq!(
+            state.timeslot_alloc.owner(voice_ts),
+            Some(TimeslotOwner::Cmce),
+            "pending D-RELEASE delivery must keep the free-slot voice bearer reserved"
+        );
+    }
+
+    reporters[0].mark_transmitted();
+    test.run_stack(Some(1));
+    let closed_msgs = test.dump_sinks();
+    assert_eq!(
+        count_umac_close_direction(&closed_msgs, Direction::Both, voice_ts),
+        1,
+        "reported D-RELEASE delivery should close only the voice timeslot"
+    );
+    assert_eq!(
+        count_umac_call_ended_for(&closed_msgs, call_id, voice_ts),
+        1,
+        "reported D-RELEASE delivery should signal CallEnded on only the voice timeslot"
+    );
+    for non_voice_ts in [2, 4] {
+        assert_eq!(
+            count_umac_close_or_call_ended_for_ts(&closed_msgs, non_voice_ts),
+            0,
+            "voice cleanup must not close unrelated TS{non_voice_ts}"
+        );
+    }
+    {
+        let state = test.config.state_read();
+        assert_eq!(
+            state.timeslot_alloc.owner(2),
+            Some(TimeslotOwner::PacketData),
+            "voice release must preserve unrelated stuck SNDCP data capacity"
+        );
+        assert_eq!(
+            state.timeslot_alloc.owner(voice_ts),
+            None,
+            "voice release must deallocate the scheduler slot it used"
+        );
+        assert_eq!(state.timeslot_alloc.owner(4), None);
+    }
+
+    let (_second_call_id, second_voice_ts, _second_usage) = start_group_call_with_circuit(&mut test);
+    assert_eq!(
+        second_voice_ts, 3,
+        "next one-slot voice call must reuse freed TS3 and still avoid stuck TS2 data while TS4 is free"
+    );
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
+        assert_eq!(state.timeslot_alloc.owner(4), None);
+    }
 }
 
 #[test]

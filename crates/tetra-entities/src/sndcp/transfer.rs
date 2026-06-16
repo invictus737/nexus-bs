@@ -6,6 +6,8 @@
 use tetra_core::BitBuffer;
 use tetra_saps::sn::validate_nsapi;
 
+use super::pdch::{SndcpPacketDataResourceRequest, SndcpPhaseModulationResourceRequest};
+
 pub const SN_PDU_TYPE_DATA: u8 = 5;
 pub const SN_PDU_TYPE_DATA_TRANSMIT_REQUEST: u8 = 6;
 pub const SN_PDU_TYPE_DATA_TRANSMIT_RESPONSE: u8 = 7;
@@ -30,6 +32,7 @@ pub enum SndcpTransferRejectCause {
 pub struct SndcpDataTransmitRequest {
     pub nsapi: u8,
     pub logical_link_status: bool,
+    pub resource_request: SndcpPacketDataResourceRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +55,17 @@ pub struct SndcpEndOfData {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SndcpReconnect {
     pub nsapi: Option<u8>,
+    pub resource_request: SndcpPacketDataResourceRequest,
+}
+
+impl SndcpReconnect {
+    pub fn data_transmit_request(&self) -> Option<SndcpDataTransmitRequest> {
+        self.nsapi.map(|nsapi| SndcpDataTransmitRequest {
+            nsapi,
+            logical_link_status: false,
+            resource_request: self.resource_request,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,12 +99,14 @@ pub enum SndcpTransferError {
 
 pub fn encode_data_transmit_request(request: &SndcpDataTransmitRequest) -> Result<BitBuffer, SndcpTransferError> {
     validate_nsapi_for_transfer(request.nsapi)?;
+    let resource_bits = resource_request_len(request.resource_request)?;
 
-    let mut pdu = BitBuffer::new(4 + 4 + 1 + 1 + 1);
+    let mut pdu = BitBuffer::new(4 + 4 + 1 + 1 + resource_bits + 1);
     pdu.write_bits(SN_PDU_TYPE_DATA_TRANSMIT_REQUEST as u64, 4);
     pdu.write_bits(request.nsapi as u64, 4);
     pdu.write_bits(request.logical_link_status as u64, 1);
-    pdu.write_bits(0, 1);
+    pdu.write_bits((request.resource_request != SndcpPacketDataResourceRequest::None) as u64, 1);
+    write_resource_request(&mut pdu, request.resource_request)?;
     write_no_optional_elements(&mut pdu);
     pdu.seek(0);
     Ok(pdu)
@@ -103,13 +119,16 @@ pub fn decode_data_transmit_request(pdu: &BitBuffer) -> Result<SndcpDataTransmit
     validate_nsapi_for_transfer(nsapi)?;
     let logical_link_status = read_bool(&mut pdu, "logical_link_status")?;
     let enhanced_pi4dqpsk_service = read_bool(&mut pdu, "enhanced_pi4dqpsk_service")?;
-    if enhanced_pi4dqpsk_service {
-        return Err(SndcpTransferError::UnsupportedResourceRequest);
-    }
+    let resource_request = if enhanced_pi4dqpsk_service {
+        decode_resource_request(&mut pdu)?
+    } else {
+        SndcpPacketDataResourceRequest::None
+    };
     read_no_optional_tail(&mut pdu)?;
     Ok(SndcpDataTransmitRequest {
         nsapi,
         logical_link_status,
+        resource_request,
     })
 }
 
@@ -174,13 +193,15 @@ pub fn encode_reconnect(reconnect: &SndcpReconnect) -> Result<BitBuffer, SndcpTr
     }
 
     let nsapi_bits = if reconnect.nsapi.is_some() { 4 } else { 0 };
-    let mut pdu = BitBuffer::new(4 + 1 + nsapi_bits + 1 + 1);
+    let resource_bits = resource_request_len(reconnect.resource_request)?;
+    let mut pdu = BitBuffer::new(4 + 1 + nsapi_bits + 1 + resource_bits + 1);
     pdu.write_bits(SN_PDU_TYPE_RECONNECT as u64, 4);
     pdu.write_bits(reconnect.nsapi.is_some() as u64, 1);
     if let Some(nsapi) = reconnect.nsapi {
         pdu.write_bits(nsapi as u64, 4);
     }
-    pdu.write_bits(0, 1);
+    pdu.write_bits((reconnect.resource_request != SndcpPacketDataResourceRequest::None) as u64, 1);
+    write_resource_request(&mut pdu, reconnect.resource_request)?;
     write_no_optional_elements(&mut pdu);
     pdu.seek(0);
     Ok(pdu)
@@ -198,11 +219,13 @@ pub fn decode_reconnect(pdu: &BitBuffer) -> Result<SndcpReconnect, SndcpTransfer
         None
     };
     let enhanced_pi4dqpsk_service = read_bool(&mut pdu, "enhanced_pi4dqpsk_service")?;
-    if enhanced_pi4dqpsk_service {
-        return Err(SndcpTransferError::UnsupportedResourceRequest);
-    }
+    let resource_request = if enhanced_pi4dqpsk_service {
+        decode_resource_request(&mut pdu)?
+    } else {
+        SndcpPacketDataResourceRequest::None
+    };
     read_no_optional_tail(&mut pdu)?;
-    Ok(SndcpReconnect { nsapi })
+    Ok(SndcpReconnect { nsapi, resource_request })
 }
 
 pub fn encode_not_supported(not_supported: &SndcpNotSupported) -> Result<BitBuffer, SndcpTransferError> {
@@ -284,6 +307,110 @@ fn reject_trailing_bits(pdu: &BitBuffer) -> Result<(), SndcpTransferError> {
     }
 }
 
+fn resource_request_len(resource_request: SndcpPacketDataResourceRequest) -> Result<usize, SndcpTransferError> {
+    match resource_request {
+        SndcpPacketDataResourceRequest::None => Ok(0),
+        SndcpPacketDataResourceRequest::PhaseModulation(request) => {
+            validate_phase_modulation_resource_request(request)?;
+            Ok(if request.uplink_timeslots == request.downlink_timeslots {
+                10
+            } else {
+                12
+            })
+        }
+    }
+}
+
+fn write_resource_request(pdu: &mut BitBuffer, resource_request: SndcpPacketDataResourceRequest) -> Result<(), SndcpTransferError> {
+    let SndcpPacketDataResourceRequest::PhaseModulation(request) = resource_request else {
+        return Ok(());
+    };
+    validate_phase_modulation_resource_request(request)?;
+    let asymmetric = request.uplink_timeslots != request.downlink_timeslots;
+    pdu.write_bits(asymmetric as u64, 1);
+
+    pdu.write_bits(
+        if request.unspecified_phase_modulation_resource {
+            0b110
+        } else {
+            0b000
+        },
+        3,
+    );
+    pdu.write_bits(timeslot_count_code(request.uplink_timeslots)? as u64, 2);
+    if asymmetric {
+        pdu.write_bits(timeslot_count_code(request.downlink_timeslots)? as u64, 2);
+    }
+    pdu.write_bits(timeslot_count_code(request.full_phase_modulation_capability_timeslots)? as u64, 2);
+    pdu.write_bits(0b11, 2);
+    Ok(())
+}
+
+fn decode_resource_request(pdu: &mut BitBuffer) -> Result<SndcpPacketDataResourceRequest, SndcpTransferError> {
+    let asymmetric = read_bool(pdu, "resource_request_connection_symmetry")?;
+    let mean_throughput = read_u8(pdu, 3, "resource_request_mean_throughput")?;
+    let uplink_timeslots = timeslot_count_from_code(read_u8(pdu, 2, "resource_request_uplink_timeslots")?);
+    let downlink_timeslots = if asymmetric {
+        timeslot_count_from_code(read_u8(pdu, 2, "resource_request_downlink_timeslots")?)
+    } else {
+        uplink_timeslots
+    };
+    let full_phase_modulation_capability_timeslots =
+        timeslot_count_from_code(read_u8(pdu, 2, "resource_request_full_phase_modulation_capability")?);
+    let reserved = read_u8(pdu, 2, "resource_request_reserved")?;
+    if reserved != 0b11 {
+        return Err(SndcpTransferError::UnsupportedResourceRequest);
+    }
+    let unspecified_phase_modulation_resource = mean_throughput == 0b110;
+    if unspecified_phase_modulation_resource && (asymmetric || uplink_timeslots != full_phase_modulation_capability_timeslots) {
+        return Err(SndcpTransferError::UnsupportedResourceRequest);
+    }
+
+    let request = SndcpPhaseModulationResourceRequest {
+        uplink_timeslots,
+        downlink_timeslots,
+        full_phase_modulation_capability_timeslots,
+        unspecified_phase_modulation_resource,
+    };
+    validate_phase_modulation_resource_request(request)?;
+    Ok(SndcpPacketDataResourceRequest::PhaseModulation(request))
+}
+
+fn validate_phase_modulation_resource_request(request: SndcpPhaseModulationResourceRequest) -> Result<(), SndcpTransferError> {
+    for timeslots in [
+        request.uplink_timeslots,
+        request.downlink_timeslots,
+        request.full_phase_modulation_capability_timeslots,
+    ] {
+        if !(1..=4).contains(&timeslots) {
+            return Err(SndcpTransferError::UnsupportedResourceRequest);
+        }
+    }
+    if request.uplink_timeslots > request.full_phase_modulation_capability_timeslots
+        || request.downlink_timeslots > request.full_phase_modulation_capability_timeslots
+    {
+        return Err(SndcpTransferError::UnsupportedResourceRequest);
+    }
+    if request.unspecified_phase_modulation_resource
+        && (request.uplink_timeslots != request.downlink_timeslots
+            || request.uplink_timeslots != request.full_phase_modulation_capability_timeslots)
+    {
+        return Err(SndcpTransferError::UnsupportedResourceRequest);
+    }
+    Ok(())
+}
+
+fn timeslot_count_from_code(code: u8) -> u8 {
+    code + 1
+}
+
+fn timeslot_count_code(timeslots: u8) -> Result<u8, SndcpTransferError> {
+    match timeslots {
+        1..=4 => Ok(timeslots - 1),
+        _ => Err(SndcpTransferError::UnsupportedResourceRequest),
+    }
+}
+
 fn validate_nsapi_for_transfer(nsapi: u8) -> Result<(), SndcpTransferError> {
     validate_nsapi(nsapi)
         .map(|_| ())
@@ -329,12 +456,53 @@ mod tests {
         let request = SndcpDataTransmitRequest {
             nsapi: 2,
             logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::None,
         };
 
         let encoded = encode_data_transmit_request(&request).expect("request should encode");
         let decoded = decode_data_transmit_request(&encoded).expect("request should decode");
 
         assert_eq!(encoded.get_len(), 11);
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn data_transmit_request_decodes_single_slot_phase_modulation_resource_request() {
+        let request = SndcpDataTransmitRequest {
+            nsapi: 1,
+            logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+                uplink_timeslots: 1,
+                downlink_timeslots: 1,
+                full_phase_modulation_capability_timeslots: 1,
+                unspecified_phase_modulation_resource: false,
+            }),
+        };
+
+        let encoded = encode_data_transmit_request(&request).expect("resource request should encode");
+        let decoded = decode_data_transmit_request(&encoded).expect("single-slot resource request should decode");
+
+        assert_eq!(encoded.get_len(), 21);
+        assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn data_transmit_request_decodes_unspecified_phase_modulation_resource_request() {
+        let request = SndcpDataTransmitRequest {
+            nsapi: 1,
+            logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+                uplink_timeslots: 4,
+                downlink_timeslots: 4,
+                full_phase_modulation_capability_timeslots: 4,
+                unspecified_phase_modulation_resource: true,
+            }),
+        };
+
+        let encoded = encode_data_transmit_request(&request).expect("unspecified resource request should encode");
+        let decoded = decode_data_transmit_request(&encoded).expect("unspecified resource request should decode");
+
+        assert_eq!(encoded.get_len(), 21);
         assert_eq!(decoded, request);
     }
 
@@ -374,13 +542,46 @@ mod tests {
 
     #[test]
     fn reconnect_round_trips_with_and_without_data_to_send() {
-        let no_data = SndcpReconnect { nsapi: None };
-        let data = SndcpReconnect { nsapi: Some(2) };
+        let no_data = SndcpReconnect {
+            nsapi: None,
+            resource_request: SndcpPacketDataResourceRequest::None,
+        };
+        let data = SndcpReconnect {
+            nsapi: Some(2),
+            resource_request: SndcpPacketDataResourceRequest::None,
+        };
 
         assert_eq!(decode_reconnect(&encode_reconnect(&no_data).unwrap()).unwrap(), no_data);
         assert_eq!(decode_reconnect(&encode_reconnect(&data).unwrap()).unwrap(), data);
         assert_eq!(encode_reconnect(&no_data).unwrap().get_len(), 7);
         assert_eq!(encode_reconnect(&data).unwrap().get_len(), 11);
+    }
+
+    #[test]
+    fn reconnect_decodes_specific_phase_modulation_resource_request() {
+        let reconnect = SndcpReconnect {
+            nsapi: Some(1),
+            resource_request: SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+                uplink_timeslots: 4,
+                downlink_timeslots: 4,
+                full_phase_modulation_capability_timeslots: 4,
+                unspecified_phase_modulation_resource: false,
+            }),
+        };
+
+        let encoded = encode_reconnect(&reconnect).expect("SN-RECONNECT with resource request should encode");
+        let decoded = decode_reconnect(&encoded).expect("SN-RECONNECT with resource request should decode");
+
+        assert_eq!(encoded.get_len(), 21);
+        assert_eq!(decoded, reconnect);
+        assert_eq!(
+            decoded.data_transmit_request(),
+            Some(SndcpDataTransmitRequest {
+                nsapi: 1,
+                logical_link_status: false,
+                resource_request: reconnect.resource_request,
+            })
+        );
     }
 
     #[test]
@@ -407,6 +608,7 @@ mod tests {
         let request = encode_data_transmit_request(&SndcpDataTransmitRequest {
             nsapi: 2,
             logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::None,
         })
         .unwrap();
         let end = encode_end_of_data(&SndcpEndOfData {
@@ -426,6 +628,7 @@ mod tests {
         let mut reserved_nsapi = encode_data_transmit_request(&SndcpDataTransmitRequest {
             nsapi: 2,
             logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::None,
         })
         .unwrap();
         reserved_nsapi.seek(4);
@@ -436,13 +639,17 @@ mod tests {
             Err(SndcpTransferError::ReservedNsapi(15))
         );
 
-        let mut resource = encode_data_transmit_request(&SndcpDataTransmitRequest {
-            nsapi: 2,
-            logical_link_status: false,
-        })
-        .unwrap();
-        resource.seek(9);
+        let mut resource = BitBuffer::new(21);
+        resource.write_bits(SN_PDU_TYPE_DATA_TRANSMIT_REQUEST as u64, 4);
+        resource.write_bits(2, 4);
+        resource.write_bits(0, 1);
         resource.write_bits(1, 1);
+        resource.write_bits(0, 1);
+        resource.write_bits(0b110, 3);
+        resource.write_bits(0, 2);
+        resource.write_bits(0, 2);
+        resource.write_bits(0, 2);
+        resource.write_bits(0, 1);
         resource.seek(0);
         assert_eq!(
             decode_data_transmit_request(&resource),

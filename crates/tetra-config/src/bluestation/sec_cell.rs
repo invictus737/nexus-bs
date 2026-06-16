@@ -33,7 +33,7 @@ pub const DEFAULT_WAP_IP_RESPONSE_TTL: u8 = 32;
 pub const DEFAULT_WAP_IP_DYNAMIC_POOL_PREFIX: [u8; 3] = [10, 0, 0];
 pub const DEFAULT_WAP_IP_DYNAMIC_POOL_FIRST_HOST: u8 = 2;
 pub const DEFAULT_WAP_IP_DYNAMIC_POOL_LAST_HOST: u8 = 254;
-pub const DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES: usize = 128;
+pub const DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES: usize = 1024;
 
 /// Local support predicate for SDS-TL transport PIDs used by SDS-TRANSFER.
 ///
@@ -452,10 +452,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         .sds_broadcast
         .map(|h| home_mode_display_dto_to_cfg("cell_info.sds_broadcast", h))
         .transpose()?;
-    let wap_ip = ci
-        .wap_ip
-        .map(|w| wap_ip_dto_to_cfg("cell_info.wap_ip", w))
-        .transpose()?;
+    let wap_ip = ci.wap_ip.map(|w| wap_ip_dto_to_cfg("cell_info.wap_ip", w)).transpose()?;
     let wap_ip_enabled = wap_ip.as_ref().is_some_and(|w| w.enabled);
     match ci.sndcp_service {
         Some(true) if !wap_ip_enabled => {
@@ -469,7 +466,11 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         }
         _ => {}
     }
+    if ci.advanced_link == Some(false) && wap_ip_enabled {
+        return Err("cell_info.wap_ip.enabled=true conflicts with cell_info.advanced_link=false".into());
+    }
     let sndcp_service = ci.sndcp_service.unwrap_or(wap_ip_enabled);
+    let advanced_link = ci.advanced_link.unwrap_or(wap_ip_enabled);
     let wap_ip = wap_ip.filter(|w| w.enabled);
 
     let local_ssi_ranges = ci
@@ -499,7 +500,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         circuit_mode_data_service: ci.circuit_mode_data_service.unwrap_or(false),
         sndcp_service,
         aie_service: ci.aie_service.unwrap_or(false),
-        advanced_link: ci.advanced_link.unwrap_or(false),
+        advanced_link,
         system_code: ci.system_code.unwrap_or(3), // 3 = ETSI EN 300 392-2 V3.1.1
         colour_code: ci.colour_code.unwrap_or(0),
         sharing_mode: ci.sharing_mode.unwrap_or(0),
@@ -615,7 +616,13 @@ fn wap_ip_dto_to_cfg(section: &str, dto: WapIpDto) -> Result<CfgWapIp, String> {
     )?;
     let dynamic_pool_first_host = dto.dynamic_pool_first_host.unwrap_or(DEFAULT_WAP_IP_DYNAMIC_POOL_FIRST_HOST);
     let dynamic_pool_last_host = dto.dynamic_pool_last_host.unwrap_or(DEFAULT_WAP_IP_DYNAMIC_POOL_LAST_HOST);
-    validate_wap_ip_pool(section, address, dynamic_pool_prefix, dynamic_pool_first_host, dynamic_pool_last_host)?;
+    validate_wap_ip_pool(
+        section,
+        address,
+        dynamic_pool_prefix,
+        dynamic_pool_first_host,
+        dynamic_pool_last_host,
+    )?;
 
     let max_request_payload_bytes = dto.max_request_payload_bytes.unwrap_or(DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES);
     if !(1..=1024).contains(&max_request_payload_bytes) {
@@ -636,7 +643,7 @@ fn wap_ip_dto_to_cfg(section: &str, dto: WapIpDto) -> Result<CfgWapIp, String> {
         accept_status_path: dto.accept_status_path.unwrap_or(true),
         accept_status_wml_path: dto.accept_status_wml_path.unwrap_or(true),
         max_request_payload_bytes,
-        assume_pdch_ready_after_data_transmit: dto.assume_pdch_ready_after_data_transmit.unwrap_or(true),
+        assume_pdch_ready_after_data_transmit: dto.assume_pdch_ready_after_data_transmit.unwrap_or(false),
     })
 }
 
@@ -680,7 +687,9 @@ fn validate_wap_ip_pool(section: &str, endpoint: [u8; 4], prefix: [u8; 3], first
         ));
     }
     if endpoint[..3] == prefix[..] && (first_host..=last_host).contains(&endpoint[3]) {
-        return Err(format!("{section} endpoint address must not be inside the dynamic terminal address pool"));
+        return Err(format!(
+            "{section} endpoint address must not be inside the dynamic terminal address pool"
+        ));
     }
     Ok(())
 }

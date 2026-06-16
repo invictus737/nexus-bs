@@ -245,8 +245,12 @@ impl CircuitMgr {
         owner: TimeslotOwner,
         occupied_call_ids: &HashSet<u16>,
     ) -> Result<&CmceCircuit, CircuitErr> {
-        // Get timeslot from centralized allocator
-        let ts = timeslot_alloc.allocate_any(owner).ok_or(CircuitErr::NoCircuitFree)?;
+        // Voice/circuit service is SwMI-critical. Keep packet data alive when
+        // any real free traffic slot exists; reclaim PDCH capacity only on
+        // demand and only for this bearer.
+        let ts = timeslot_alloc
+            .allocate_any_preempting(owner, TimeslotOwner::PacketData)
+            .ok_or(CircuitErr::NoCircuitFree)?;
 
         let call_id = match self.get_next_call_id_avoiding(occupied_call_ids) {
             Ok(call_id) => call_id,
@@ -292,7 +296,9 @@ impl CircuitMgr {
         timeslot_alloc: &mut TimeslotAllocator,
         owner: TimeslotOwner,
     ) -> Result<&CmceCircuit, CircuitErr> {
-        let ts = timeslot_alloc.allocate_any(owner).ok_or(CircuitErr::NoCircuitFree)?;
+        let ts = timeslot_alloc
+            .allocate_any_preempting(owner, TimeslotOwner::PacketData)
+            .ok_or(CircuitErr::NoCircuitFree)?;
         let usage = self.get_next_usage_number();
 
         let circuit = CmceCircuit {
@@ -308,7 +314,13 @@ impl CircuitMgr {
             etee_encrypted: false,
         };
 
-        Ok(self.open_circuit(dir, circuit)?)
+        match self.open_circuit(dir, circuit) {
+            Ok(circuit) => Ok(circuit),
+            Err(err) => {
+                let _ = timeslot_alloc.release(owner, ts);
+                Err(err)
+            }
+        }
     }
 
     /// Closes any active circuits for given timeslot and direction.
@@ -541,5 +553,39 @@ mod tests {
         let occupied: HashSet<_> = (1..=MAX_CALL_IDENTIFIER).collect();
 
         assert_eq!(mgr.get_next_call_id_avoiding(&occupied), Err(CircuitErr::CallIdentifierExhausted));
+    }
+
+    #[test]
+    fn second_leg_allocator_rolls_back_when_circuit_open_fails() {
+        let mut mgr = CircuitMgr::new();
+        let existing = mgr
+            .allocate_circuit(Direction::Dl, CommunicationType::P2Mp)
+            .expect("test setup should create an existing circuit")
+            .clone();
+        assert_eq!(existing.ts, 2);
+
+        let mut timeslot_alloc = TimeslotAllocator::default();
+        let err = mgr
+            .allocate_circuit_for_call_with_allocator(
+                existing.call_id,
+                Direction::Dl,
+                CommunicationType::P2Mp,
+                false,
+                &mut timeslot_alloc,
+                TimeslotOwner::Cmce,
+            )
+            .expect_err("opening a second DL circuit on the already-active TS2 should fail");
+
+        assert_eq!(err, CircuitErr::CircuitAlreadyInUse);
+        assert_eq!(
+            timeslot_alloc.owner(2),
+            None,
+            "failed second-leg open must not leave a stale CMCE reservation in the central allocator"
+        );
+        assert_eq!(
+            mgr.dl[1].as_ref().map(|circuit| circuit.call_id),
+            Some(existing.call_id),
+            "rollback must preserve the original live circuit"
+        );
     }
 }

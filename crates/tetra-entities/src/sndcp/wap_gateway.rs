@@ -7,10 +7,7 @@ use super::bearer_policy::SndcpPacketDataBearerProfile;
 use super::context::{SndcpContextKey, SndcpContextTable};
 use super::ip::{IpPrimitiveError, bitbuffer_npdu_octets, parse_ipv4_packet};
 use super::priority::SndcpDataScheduling;
-use super::wap_ip::{
-    IPV4_UDP_HEADER_BYTES, WapIpEndpoint, WapIpError, WapIpServicePolicy, build_wap_status_response_npdu,
-    build_wap_status_response_npdu_with_wml2_budget,
-};
+use super::wap_ip::{WapIpEndpoint, WapIpError, WapIpServicePolicy, build_wap_status_response_npdu_optional_with_npdu_budget};
 use super::wap_status::{WapStatusError, WapStatusSnapshot};
 use tetra_core::MleHandle;
 use tetra_saps::sn::{SnAddress, SnPdpType, SnPrimitiveError, SnUnitdataInd, SnUnitdataReq, sn_unitdata_req};
@@ -28,6 +25,7 @@ pub enum WapGatewayError {
     Wap(WapIpError),
     ResponseNpduTooLarge { len: usize, max: u16 },
     MissingPduPriorityMax(SndcpContextKey),
+    NoResponseRequired,
     Sn(SnPrimitiveError),
 }
 
@@ -68,6 +66,19 @@ pub fn build_wap_status_unitdata_response(
     policy: &WapIpServicePolicy,
     snapshot: &WapStatusSnapshot,
 ) -> Result<WapStatusUnitdataResponse, WapGatewayError> {
+    build_wap_status_unitdata_response_optional(contexts, issi, handle, unitdata, endpoint, policy, snapshot)?
+        .ok_or(WapGatewayError::NoResponseRequired)
+}
+
+pub fn build_wap_status_unitdata_response_optional(
+    contexts: &SndcpContextTable,
+    issi: u32,
+    handle: MleHandle,
+    unitdata: &SnUnitdataInd,
+    endpoint: WapIpEndpoint,
+    policy: &WapIpServicePolicy,
+    snapshot: &WapStatusSnapshot,
+) -> Result<Option<WapStatusUnitdataResponse>, WapGatewayError> {
     // EN 300 392-2 clause 28 maps each user N-PDU to an active PDP context
     // selected by NSAPI. Keep this as a pure SN-SAP primitive until the SNDCP
     // bearer state machine and MLE handoff are fully implemented.
@@ -103,21 +114,20 @@ pub fn build_wap_status_unitdata_response(
         });
     }
 
-    let response_npdu = match context.max_npdu_len {
-        Some(max) => {
-            let max_wml2_bytes = usize::from(max).saturating_sub(IPV4_UDP_HEADER_BYTES);
-            match build_wap_status_response_npdu_with_wml2_budget(&request_npdu, endpoint, policy, snapshot, max_wml2_bytes) {
-                Ok(response_npdu) => response_npdu,
-                Err(WapIpError::Status(WapStatusError::RenderedTooLarge { len, .. })) => {
-                    return Err(WapGatewayError::ResponseNpduTooLarge {
-                        len: len.saturating_add(IPV4_UDP_HEADER_BYTES),
-                        max,
-                    });
-                }
-                Err(err) => return Err(WapGatewayError::Wap(err)),
-            }
+    let response_npdu = match build_wap_status_response_npdu_optional_with_npdu_budget(
+        &request_npdu,
+        endpoint,
+        policy,
+        snapshot,
+        context.max_npdu_len.map(usize::from),
+    ) {
+        Ok(Some(response_npdu)) => response_npdu,
+        Ok(None) => return Ok(None),
+        Err(WapIpError::Status(WapStatusError::RenderedTooLarge { len, .. })) => {
+            let max = context.max_npdu_len.unwrap_or(u16::MAX);
+            return Err(WapGatewayError::ResponseNpduTooLarge { len, max });
         }
-        None => build_wap_status_response_npdu(&request_npdu, endpoint, policy, snapshot)?,
+        Err(err) => return Err(WapGatewayError::Wap(err)),
     };
     if let Some(max) = context.max_npdu_len {
         if response_npdu.len() > max as usize {
@@ -128,7 +138,7 @@ pub fn build_wap_status_unitdata_response(
         }
     }
 
-    Ok(WapStatusUnitdataResponse {
+    Ok(Some(WapStatusUnitdataResponse {
         unitdata: sn_unitdata_req(
             unitdata.nsapi,
             handle,
@@ -141,7 +151,7 @@ pub fn build_wap_status_unitdata_response(
         ms_default_data_priority: None,
         scheduling: SndcpDataScheduling::NonScheduled,
         bearer_profile: context.bearer_profile,
-    })
+    }))
 }
 
 fn is_fragmented_ipv4(flags_fragment: u16) -> bool {

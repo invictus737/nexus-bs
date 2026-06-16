@@ -3418,7 +3418,7 @@ fn test_u_itsi_detach_deaffiliates_deregisters_and_clears_energy_saving() {
     config.cell.energy_saving_mode = EnergySavingMode::Eg1 as u8;
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
-    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
+    test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Sndcp]);
 
     submit_location_update_with_groups(&mut test, issi, LocationUpdateType::ItsiAttach, vec![gssi]);
     test.run_stack(Some(1));
@@ -3446,7 +3446,15 @@ fn test_u_itsi_detach_deaffiliates_deregisters_and_clears_energy_saving() {
     // assignment instead of leaving stale routing/listen-window state.
     submit_u_itsi_detach(&mut test, issi);
     test.run_stack(Some(1));
-    let _ = test.dump_sinks();
+    test.deliver_all_messages();
+    let detach_msgs = test.dump_sinks();
+    let sndcp_updates = subscriber_updates_to(&detach_msgs, TetraEntity::Sndcp);
+    assert!(
+        sndcp_updates
+            .iter()
+            .any(|update| update.issi == issi && update.action == BrewSubscriberAction::Deregister && update.groups.is_empty()),
+        "U-ITSI DETACH must notify SNDCP to delete stale PDP/PDCH state: {detach_msgs:#?}"
+    );
 
     let state = test.config.state_read();
     assert!(!state.subscribers.is_registered(issi));

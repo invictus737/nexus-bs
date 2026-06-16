@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
@@ -18,15 +18,18 @@ use tetra_saps::tla::{
     TLA_REPORT_FAILED_TRANSFER, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION, TLA_REPORT_NO_SPECIFIC_REPORT, TLA_REPORT_SUCCESSFUL_TRANSFER,
     TlDataConfBl, TlaTlDataIndBl, TlaTlDataReqBl, TlaTlReportInd, TlaTlUnitdataIndBl, TlaTlUnitdataReqBl,
 };
-use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaReportInd, TmaUnitdataReq};
+use tetra_saps::tma::{TmaCancelReq, TmaReport, TmaReportInd, TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::{
     N251_BL_MAX_TLSDU_LEN_BITS, N252_BL_MAX_TLSDU_RETRANSMITS_ACKED, N253_BL_MAX_TLSDU_REPETITIONS_UNACKED,
 };
-use tetra_pdus::llc::consts::timers::T251_SENDER_RETRY_TIMER;
+use tetra_pdus::llc::consts::timers::{T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
+use tetra_pdus::llc::pdus::al_ack::AlAck;
+use tetra_pdus::llc::pdus::al_data::AlData;
+use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
 use tetra_pdus::llc::pdus::bl_adata::BlAdata;
 use tetra_pdus::llc::pdus::bl_data::BlData;
@@ -38,21 +41,33 @@ use crate::umac::subcomp::bs_sched::SCH_F_CAP;
 
 const TDMA_TIMESLOTS_PER_FRAME: u32 = 4;
 const T251_SENDER_RETRY_SIGNALLING_FRAMES: u32 = T251_SENDER_RETRY_TIMER / TDMA_TIMESLOTS_PER_FRAME;
+const T252_AL_ACK_WAITING_SIGNALLING_FRAMES: u32 = T252_ACK_WAITING_TIMER / TDMA_TIMESLOTS_PER_FRAME;
 const INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES: u32 =
     (N252_BL_MAX_TLSDU_RETRANSMITS_ACKED as u32 + 1) * T251_SENDER_RETRY_SIGNALLING_FRAMES;
 const CHANNEL_ALLOCATION_LATE_ACK_GRACE_SIGNALLING_FRAMES: u32 = 18;
 const N253_MAX_REQUESTED_TLSDU_REPEATS: u8 = 5;
 const TMA_HIGHEST_PDU_PRIORITY: Todo = 7;
 const COMMON_CONTROL_TIMESLOT: u8 = 1;
+const AL_SETUP_PHASE_MOD_PDCH_MAX_TIMESLOTS: u8 = 3;
+const AL_ORIGINAL_DATA_HEADER_BITS: usize = 17;
+const AL_ORIGINAL_SEGMENTS_PER_ACK_REQUEST: usize = 16;
 pub const LLC_MAX_OUTBOUND_ACKED_MESSAGES: usize = 8192;
 pub const LLC_MAX_OUTBOUND_UDATA_MESSAGES: usize = 8192;
 
 const _: () = assert!(T251_SENDER_RETRY_TIMER % TDMA_TIMESLOTS_PER_FRAME == 0);
+const _: () = assert!(T252_ACK_WAITING_TIMER % TDMA_TIMESLOTS_PER_FRAME == 0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct BasicLinkKey {
     addr: TetraAddress,
     endpoint_id: EndpointId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct AdvancedLinkKey {
+    addr: TetraAddress,
+    endpoint_id: EndpointId,
+    link_id: LinkId,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -66,12 +81,59 @@ struct ReceiveSeqState {
 enum TmaReportOwner {
     BlData(usize),
     BlUdata(usize),
+    AlData(usize, usize),
 }
 
 struct RebuildableAckTransfer {
     has_fcs: bool,
     tl_sdu: BitBuffer,
     embedded_nr: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct AdvancedLinkSession {
+    key: AdvancedLinkKey,
+    al_number: u8,
+    max_tl_sdu_retransmissions: u8,
+    max_segment_retransmissions: u8,
+    tx_next_ns: u8,
+    last_delivered_ns: Option<u8>,
+}
+
+#[derive(Debug, Clone)]
+struct AdvancedLinkReceiveAssembly {
+    key: AdvancedLinkKey,
+    ns: u8,
+    segments: BTreeMap<u8, BitBuffer>,
+    final_ss: Option<u8>,
+}
+
+struct ExpectedAlSegment {
+    ss: u8,
+    req_handle: Todo,
+    t_submitted_to_umac: Option<TdmaTime>,
+    t_umac_done: Option<TdmaTime>,
+    current_mac_reporter: Option<TxReporter>,
+    acknowledged: bool,
+    retransmit_count: u8,
+    retransmission_buf: SapMsg,
+}
+
+struct ExpectedAlAck {
+    key: AdvancedLinkKey,
+    ns: u8,
+    req_handle: Todo,
+    pdu_prio: Todo,
+    fcs_flag: bool,
+    air_interface_encryption: Todo,
+    t_first: TdmaTime,
+    t_submitted_to_umac: Option<TdmaTime>,
+    t_umac_done: Option<TdmaTime>,
+    tx_reporter: TxReporter,
+    current_mac_reporter: Option<TxReporter>,
+    segments: Vec<ExpectedAlSegment>,
+    retransmit_count: u8,
+    first_complete_report_sent: bool,
 }
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
@@ -173,12 +235,16 @@ pub struct Llc {
     /// endpoint.
     outbound_messages: VecDeque<ExpectedInAck>,
     outbound_udata_messages: VecDeque<QueuedUdata>,
+    outbound_al_messages: VecDeque<ExpectedAlAck>,
 
     /// Per-link send sequence variable per basic-link endpoint. Alternates between 0 and 1.
     link_send_seq: HashMap<BasicLinkKey, u8>,
 
     /// Last valid inbound acknowledged DATA sequence per basic-link endpoint.
     inbound_receive_seq: HashMap<BasicLinkKey, ReceiveSeqState>,
+    advanced_links: HashMap<AdvancedLinkKey, AdvancedLinkSession>,
+    pending_advanced_link_setups: HashMap<AdvancedLinkKey, AlSetup>,
+    advanced_link_rx: HashMap<AdvancedLinkKey, AdvancedLinkReceiveAssembly>,
 
     /// LLC-generated handles for acknowledged TL-DATA.ind primitives. Keep
     /// them negative so they do not collide with local MLE request handles.
@@ -193,8 +259,12 @@ impl Llc {
             scheduled_out_acks: VecDeque::new(),
             outbound_messages: VecDeque::new(),
             outbound_udata_messages: VecDeque::new(),
+            outbound_al_messages: VecDeque::new(),
             link_send_seq: HashMap::new(),
             inbound_receive_seq: HashMap::new(),
+            advanced_links: HashMap::new(),
+            pending_advanced_link_setups: HashMap::new(),
+            advanced_link_rx: HashMap::new(),
             next_tl_data_ind_req_handle: -1,
         }
     }
@@ -405,6 +475,206 @@ impl Llc {
         BasicLinkKey { addr, endpoint_id }
     }
 
+    fn advanced_link_key(addr: TetraAddress, endpoint_id: EndpointId, link_id: LinkId) -> AdvancedLinkKey {
+        AdvancedLinkKey {
+            addr,
+            endpoint_id,
+            link_id,
+        }
+    }
+
+    fn advanced_link_key_from_setup(addr: TetraAddress, endpoint_id: EndpointId, setup: &AlSetup) -> AdvancedLinkKey {
+        Self::advanced_link_key(addr, endpoint_id, setup.link_id())
+    }
+
+    fn negotiate_inbound_al_setup_response(setup: &AlSetup) -> AlSetup {
+        let response = setup.response_with_lower_phase_mod_timeslots(AL_SETUP_PHASE_MOD_PDCH_MAX_TIMESLOTS);
+        if response.setup_report == AlSetup::SETUP_REPORT_SERVICE_CHANGE {
+            return response;
+        }
+        setup.response_success()
+    }
+
+    fn clear_other_original_advanced_links(&mut self, key: AdvancedLinkKey) {
+        self.advanced_links.retain(|existing, _| {
+            !(existing.addr == key.addr && existing.endpoint_id == key.endpoint_id && existing.link_id != key.link_id)
+        });
+        self.pending_advanced_link_setups.retain(|existing, _| {
+            !(existing.addr == key.addr && existing.endpoint_id == key.endpoint_id && existing.link_id != key.link_id)
+        });
+        self.advanced_link_rx.retain(|existing, _| {
+            !(existing.addr == key.addr && existing.endpoint_id == key.endpoint_id && existing.link_id != key.link_id)
+        });
+        self.outbound_al_messages.retain(|outbound| {
+            !(outbound.key.addr == key.addr && outbound.key.endpoint_id == key.endpoint_id && outbound.key.link_id != key.link_id)
+        });
+    }
+
+    fn establish_advanced_link(&mut self, key: AdvancedLinkKey, setup: AlSetup) {
+        self.clear_other_original_advanced_links(key);
+        self.pending_advanced_link_setups.remove(&key);
+        self.advanced_links.insert(
+            key,
+            AdvancedLinkSession {
+                key,
+                al_number: setup.advanced_link_number,
+                max_tl_sdu_retransmissions: setup.max_tl_sdu_retransmissions,
+                max_segment_retransmissions: setup.max_segment_retransmissions,
+                tx_next_ns: 0,
+                last_delivered_ns: None,
+            },
+        );
+        self.advanced_link_rx.remove(&key);
+    }
+
+    fn resolve_original_advanced_link_key(&self, addr: TetraAddress, endpoint_id: EndpointId) -> Option<AdvancedLinkKey> {
+        let mut matches = self
+            .advanced_links
+            .keys()
+            .copied()
+            .filter(|key| key.addr == addr && key.endpoint_id == endpoint_id);
+        let first = matches.next()?;
+        if matches.next().is_some() {
+            tracing::warn!(
+                "LLC: ambiguous original AL PDU for SSI {} endpoint {}; more than one advanced link is active",
+                addr.ssi,
+                endpoint_id
+            );
+            return None;
+        }
+        Some(first)
+    }
+
+    fn al_tl_sdu_with_fcs(tl_sdu: &mut BitBuffer) -> BitBuffer {
+        let mut tl_sdu_with_fcs = BitBuffer::new_autoexpand(tl_sdu.get_len_remaining() + 32);
+        let sdu_len = tl_sdu.get_len_remaining();
+        tl_sdu_with_fcs.copy_bits(tl_sdu, sdu_len);
+        let fcs_value = fcs::compute_fcs(&tl_sdu_with_fcs, 0, tl_sdu_with_fcs.get_len());
+        tl_sdu_with_fcs.write_bits(fcs_value as u64, 32);
+        tl_sdu_with_fcs.seek(0);
+        tl_sdu_with_fcs
+    }
+
+    fn al_original_segment_payload_bits(main_carrier: u16, addr: TetraAddress, chan_alloc: Option<&CmceChanAllocReq>) -> usize {
+        // EN 300 392-2 clauses 21.1.4.2 and 22.3.3.2.1: the LLC segment is
+        // the selective-retransmission unit, while MAC should not fragment
+        // normal pi/4-DQPSK advanced-link data. Use the full SCH/F TM-SDU
+        // capacity left after the original AL-DATA/AL-FINAL header.
+        Self::sch_f_mac_resource_tm_sdu_capacity_bits(main_carrier, addr, chan_alloc)
+            .saturating_sub(AL_ORIGINAL_DATA_HEADER_BITS)
+            .max(1)
+    }
+
+    fn split_al_tl_sdu_segments(tl_sdu_with_fcs: &mut BitBuffer, segment_payload_bits: usize) -> Option<Vec<BitBuffer>> {
+        let total_bits = tl_sdu_with_fcs.get_len_remaining();
+        if total_bits == 0 {
+            return None;
+        }
+        let segment_count = total_bits.div_ceil(segment_payload_bits);
+        if segment_count > (u8::MAX as usize + 1) {
+            return None;
+        }
+
+        let mut segments = Vec::with_capacity(segment_count);
+        for idx in 0..segment_count {
+            let remaining = tl_sdu_with_fcs.get_len_remaining();
+            let chunk_bits = remaining.min(segment_payload_bits);
+            let mut segment = BitBuffer::new_autoexpand(chunk_bits);
+            segment.copy_bits(tl_sdu_with_fcs, chunk_bits);
+            segment.seek(0);
+            debug_assert!(idx <= u8::MAX as usize);
+            segments.push(segment);
+        }
+        Some(segments)
+    }
+
+    fn push_al_setup_response_to_umac(
+        queue: &mut MessageQueue,
+        addr: TetraAddress,
+        endpoint_id: EndpointId,
+        response: AlSetup,
+        req_handle: Todo,
+        air_interface_encryption: Todo,
+    ) {
+        let mut pdu_buf = BitBuffer::new_autoexpand(32);
+        response.to_bitbuf(&mut pdu_buf);
+        pdu_buf.seek(0);
+        tracing::debug!("-> {} {}", response, pdu_buf.dump_bin());
+
+        queue.push_back(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle,
+                pdu: pdu_buf,
+                main_address: addr,
+                endpoint_id,
+                pdu_prio: 5,
+                stealing_permission: false,
+                subscriber_class: 0,
+                air_interface_encryption: Some(air_interface_encryption),
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    fn push_al_ack_to_umac(queue: &mut MessageQueue, key: AdvancedLinkKey, ack: AlAck, req_handle: Todo, air_interface_encryption: Todo) {
+        let mut pdu_buf = BitBuffer::new_autoexpand(16);
+        ack.to_bitbuf(&mut pdu_buf);
+        pdu_buf.seek(0);
+        tracing::debug!("-> {} {}", ack, pdu_buf.dump_bin());
+
+        queue.push_back(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Umac,
+            msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                req_handle,
+                pdu: pdu_buf,
+                main_address: key.addr,
+                endpoint_id: key.endpoint_id,
+                // EN 300 392-2 clause 22.3.3.2.2: AL-DATA-AR and
+                // AL-FINAL-AR responses use priority level 5 and permit
+                // stealing. UMAC may still put packet data on reserved PDCH.
+                pdu_prio: 5,
+                stealing_permission: true,
+                subscriber_class: 0,
+                air_interface_encryption: Some(air_interface_encryption),
+                stealing_repeats_flag: None,
+                data_category: None,
+                chan_alloc: None,
+                tx_reporter: None,
+            }),
+        });
+    }
+
+    fn concatenate_al_segments(assembly: &AdvancedLinkReceiveAssembly) -> Option<BitBuffer> {
+        let final_ss = assembly.final_ss?;
+        for ss in 0..=final_ss {
+            if !assembly.segments.contains_key(&ss) {
+                return None;
+            }
+        }
+
+        let total_bits = (0..=final_ss)
+            .filter_map(|ss| assembly.segments.get(&ss))
+            .map(BitBuffer::get_len)
+            .sum();
+        let mut out = BitBuffer::new_autoexpand(total_bits);
+        for ss in 0..=final_ss {
+            let mut segment = BitBuffer::from_bitbuffer(assembly.segments.get(&ss)?);
+            segment.seek(0);
+            let segment_len = segment.get_len_remaining();
+            out.copy_bits(&mut segment, segment_len);
+        }
+        out.seek(0);
+        Some(out)
+    }
+
     fn inbound_duplicate_state_expired(state: ReceiveSeqState, now: TdmaTime) -> bool {
         Self::downlink_signalling_frames_elapsed(state.received_at, now, state.ack_timeslot)
             > INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES
@@ -468,6 +738,10 @@ impl Llc {
         Self::basic_link_key(udata.addr, udata.endpoint_id)
     }
 
+    fn expected_al_key(al: &ExpectedAlAck) -> AdvancedLinkKey {
+        al.key
+    }
+
     fn queued_udata_tx_state(udata: &QueuedUdata) -> Option<TxState> {
         udata.current_mac_reporter.as_ref().map(TxReporter::get_state)
     }
@@ -508,9 +782,50 @@ impl Llc {
         ack.current_mac_reporter.as_ref().map(TxReporter::get_state)
     }
 
+    fn al_current_mac_state(al: &ExpectedAlAck) -> Option<TxState> {
+        if al.segments.is_empty() {
+            return None;
+        }
+
+        let mut any_unacknowledged = false;
+        let mut all_transmitted = true;
+        for segment in &al.segments {
+            if segment.acknowledged {
+                continue;
+            }
+            any_unacknowledged = true;
+            let Some(state) = segment.current_mac_reporter.as_ref().map(TxReporter::get_state) else {
+                return None;
+            };
+            match state {
+                TxState::Pending => return None,
+                TxState::Transmitted | TxState::Acknowledged => {}
+                TxState::Discarded | TxState::Lost => return Some(TxState::Discarded),
+            }
+            all_transmitted &= matches!(state, TxState::Transmitted | TxState::Acknowledged);
+        }
+
+        if !any_unacknowledged {
+            return Some(TxState::Transmitted);
+        }
+
+        all_transmitted.then_some(TxState::Transmitted)
+    }
+
     fn mark_ack_current_mac_transmitted(ack: &mut ExpectedInAck) {
         if let Some(reporter) = &ack.current_mac_reporter {
             reporter.try_mark_transmitted();
+        }
+    }
+
+    fn mark_al_current_mac_transmitted(al: &mut ExpectedAlAck) {
+        for segment in &al.segments {
+            if segment.acknowledged {
+                continue;
+            }
+            if let Some(reporter) = &segment.current_mac_reporter {
+                reporter.try_mark_transmitted();
+            }
         }
     }
 
@@ -520,8 +835,23 @@ impl Llc {
         }
     }
 
+    fn mark_al_current_mac_discarded(al: &mut ExpectedAlAck) {
+        for segment in &al.segments {
+            if segment.acknowledged {
+                continue;
+            }
+            if let Some(reporter) = &segment.current_mac_reporter {
+                reporter.try_mark_discarded();
+            }
+        }
+    }
+
     fn mark_ack_service_first_complete(ack: &mut ExpectedInAck) {
         ack.tx_reporter.try_mark_transmitted();
+    }
+
+    fn mark_al_service_first_complete(al: &mut ExpectedAlAck) {
+        al.tx_reporter.try_mark_transmitted();
     }
 
     fn mark_ack_service_failed(ack: &ExpectedInAck) {
@@ -538,6 +868,31 @@ impl Llc {
                 ack.tx_reporter.try_mark_lost();
             }
             TxState::Discarded | TxState::Lost | TxState::Acknowledged => {}
+        }
+    }
+
+    fn mark_al_service_failed(al: &ExpectedAlAck) {
+        match al.tx_reporter.get_state() {
+            TxState::Pending => {
+                al.tx_reporter.try_mark_discarded();
+            }
+            TxState::Transmitted => {
+                al.tx_reporter.try_mark_lost();
+            }
+            TxState::Discarded | TxState::Lost | TxState::Acknowledged => {}
+        }
+    }
+
+    fn reset_al_transmission_attempt(al: &mut ExpectedAlAck) {
+        al.t_submitted_to_umac = None;
+        al.t_umac_done = None;
+        al.current_mac_reporter = None;
+        for segment in &mut al.segments {
+            segment.t_submitted_to_umac = None;
+            segment.t_umac_done = None;
+            segment.current_mac_reporter = None;
+            segment.acknowledged = false;
+            segment.retransmit_count = 0;
         }
     }
 
@@ -668,6 +1023,15 @@ impl Llc {
             if udata.req_handle == req_handle && udata.submitted {
                 matches += 1;
                 found = Some(TmaReportOwner::BlUdata(idx));
+            }
+        }
+
+        for (idx, al) in self.outbound_al_messages.iter().enumerate() {
+            for (segment_idx, segment) in al.segments.iter().enumerate() {
+                if segment.req_handle == req_handle && segment.t_submitted_to_umac.is_some() {
+                    matches += 1;
+                    found = Some(TmaReportOwner::AlData(idx, segment_idx));
+                }
             }
         }
 
@@ -909,6 +1273,17 @@ impl Llc {
             return;
         };
 
+        if prim.link_id != 0 {
+            tracing::warn!(
+                "LLC: rejecting TL-UNITDATA.req for advanced link {} on SSI {} endpoint {}; AL-UDATA is not implemented",
+                prim.link_id,
+                prim.main_address.ssi,
+                prim.endpoint_id
+            );
+            Self::reject_tl_unitdata_backlog_full(queue, &mut prim);
+            return;
+        }
+
         if Self::tl_sdu_exceeds_n251(&prim.tl_sdu, prim.fcs_flag) {
             tracing::warn!(
                 "LLC: rejecting oversized TL-UNITDATA.req TL-SDU bits={} fcs={} max_bits={}",
@@ -1031,6 +1406,174 @@ impl Llc {
         queue.push_back(sapmsg);
     }
 
+    fn submit_for_al_transmission(queue: &mut MessageQueue, al: &mut ExpectedAlAck, dltime: TdmaTime) {
+        let mut submitted_any = false;
+        for segment in &mut al.segments {
+            if segment.acknowledged || segment.t_submitted_to_umac.is_some() {
+                continue;
+            }
+            let mut sapmsg = segment.retransmission_buf.clone();
+            let mac_reporter = TxReporter::new_unacked();
+            if let SapMsgInner::TmaUnitdataReq(prim) = &mut sapmsg.msg {
+                prim.tx_reporter = Some(mac_reporter.clone());
+            } else {
+                tracing::warn!(
+                    "LLC: cannot attach MAC reporter for AL SSI {} endpoint {} link {} segment {}; retransmission buffer is not TMA-UNITDATA",
+                    al.key.addr.ssi,
+                    al.key.endpoint_id,
+                    al.key.link_id,
+                    segment.ss
+                );
+            }
+            segment.t_submitted_to_umac = Some(dltime);
+            segment.t_umac_done = None;
+            segment.current_mac_reporter = Some(mac_reporter);
+            queue.push_back(sapmsg);
+            submitted_any = true;
+        }
+        if submitted_any {
+            al.t_submitted_to_umac = Some(dltime);
+        }
+        al.t_umac_done = None;
+        al.current_mac_reporter = None;
+    }
+
+    fn rx_tla_tldata_req_al(&mut self, queue: &mut MessageQueue, mut prim: TlaTlDataReqBl) {
+        tracing::trace!("rx_tla_tldata_req_al");
+
+        if prim.main_address.ssi_type == SsiType::Gssi {
+            tracing::error!("LLC: AL-DATA requested for GSSI-addressed message; dropping");
+            Self::reject_tldata_backlog_full(queue, &mut prim);
+            return;
+        }
+
+        if self.outbound_al_messages.len() >= LLC_MAX_OUTBOUND_ACKED_MESSAGES {
+            tracing::warn!(
+                "LLC: rejecting AL TL-DATA.req req_handle={} prio={} after AL backlog reached {}",
+                prim.req_handle,
+                prim.pdu_prio,
+                LLC_MAX_OUTBOUND_ACKED_MESSAGES
+            );
+            Self::reject_tldata_backlog_full(queue, &mut prim);
+            return;
+        }
+
+        let key = Self::advanced_link_key(prim.main_address, prim.endpoint_id, prim.link_id);
+        let Some(session) = self.advanced_links.get_mut(&key) else {
+            tracing::warn!(
+                "LLC: rejecting AL TL-DATA.req for SSI {} endpoint {} link {}; no established original acknowledged AL",
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                prim.link_id
+            );
+            Self::reject_tldata_backlog_full(queue, &mut prim);
+            return;
+        };
+
+        let ns = session.tx_next_ns;
+        session.tx_next_ns = (session.tx_next_ns + 1) & 0b111;
+
+        let segment_payload_bits =
+            Self::al_original_segment_payload_bits(self.config.config().cell.main_carrier, prim.main_address, prim.chan_alloc.as_ref());
+        let mut tl_sdu_with_fcs = Self::al_tl_sdu_with_fcs(&mut prim.tl_sdu);
+        let Some(payload_segments) = Self::split_al_tl_sdu_segments(&mut tl_sdu_with_fcs, segment_payload_bits) else {
+            tracing::warn!(
+                "LLC: rejecting AL TL-DATA.req for SSI {} endpoint {} link {}; TL-SDU needs more than 256 AL segments",
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                prim.link_id
+            );
+            Self::reject_tldata_backlog_full(queue, &mut prim);
+            return;
+        };
+        let segment_count = payload_segments.len();
+        let last_segment_idx = segment_count.saturating_sub(1);
+        let mut segments = Vec::with_capacity(segment_count);
+
+        for (idx, mut payload_segment) in payload_segments.into_iter().enumerate() {
+            let final_segment = idx == last_segment_idx;
+            let acknowledgement_requested = final_segment || (idx + 1) % AL_ORIGINAL_SEGMENTS_PER_ACK_REQUEST == 0;
+            let ss = idx as u8;
+            let pdu = AlData {
+                final_segment,
+                acknowledgement_requested,
+                ns,
+                ss,
+            };
+            let mut pdu_buf = BitBuffer::new_autoexpand(17 + payload_segment.get_len_remaining());
+            pdu.to_bitbuf(&mut pdu_buf);
+            let payload_bits = payload_segment.get_len_remaining();
+            pdu_buf.copy_bits(&mut payload_segment, payload_bits);
+            pdu_buf.seek(0);
+            tracing::debug!(
+                ts=%self.dltime,
+                "-> queued {} SSI {} endpoint {} link {} segment {}/{} bits={}",
+                pdu,
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id,
+                idx + 1,
+                segment_count,
+                pdu_buf.get_len()
+            );
+
+            let segment_req_handle = if segment_count == 1 {
+                prim.req_handle
+            } else {
+                self.next_tl_data_ind_req_handle()
+            };
+            segments.push(ExpectedAlSegment {
+                ss,
+                req_handle: segment_req_handle,
+                t_submitted_to_umac: None,
+                t_umac_done: None,
+                current_mac_reporter: None,
+                acknowledged: false,
+                retransmit_count: 0,
+                retransmission_buf: SapMsg {
+                    sap: Sap::TmaSap,
+                    src: self.entity(),
+                    dest: TetraEntity::Umac,
+                    msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+                        req_handle: segment_req_handle,
+                        pdu: pdu_buf,
+                        main_address: prim.main_address,
+                        endpoint_id: prim.endpoint_id,
+                        pdu_prio: prim.pdu_prio,
+                        stealing_permission: prim.stealing_permission,
+                        subscriber_class: prim.subscriber_class,
+                        air_interface_encryption: prim.air_interface_encryption,
+                        stealing_repeats_flag: prim.stealing_repeats_flag,
+                        data_category: prim.data_class_info,
+                        chan_alloc: prim.chan_alloc.clone(),
+                        tx_reporter: None,
+                    }),
+                },
+            });
+        }
+
+        let tx_reporter = prim.tx_reporter.take().unwrap_or_else(TxReporter::new);
+
+        self.outbound_al_messages.push_back(ExpectedAlAck {
+            key,
+            ns,
+            req_handle: prim.req_handle,
+            pdu_prio: prim.pdu_prio,
+            fcs_flag: true,
+            air_interface_encryption: prim.air_interface_encryption.unwrap_or(0),
+            t_first: self.dltime,
+            t_submitted_to_umac: None,
+            t_umac_done: None,
+            tx_reporter,
+            current_mac_reporter: None,
+            segments,
+            retransmit_count: 0,
+            first_complete_report_sent: false,
+        });
+
+        Self::push_tla_report(queue, prim.req_handle, TLA_REPORT_NO_SPECIFIC_REPORT, Some(prim.endpoint_id));
+    }
+
     /// See Clause 22.3.2.3 for Acknowledged data transmission in basic link
     fn rx_tla_tldata_req_bl(&mut self, queue: &mut MessageQueue, message: SapMsg) {
         tracing::trace!("rx_tla_tldata_req_bl");
@@ -1038,6 +1581,11 @@ impl Llc {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
         };
+
+        if prim.link_id != 0 {
+            self.rx_tla_tldata_req_al(queue, prim);
+            return;
+        }
 
         if prim.main_address.ssi_type == SsiType::Gssi {
             tracing::error!("LLC: BL-DATA requested for GSSI-addressed message — not supported, dropping");
@@ -1343,6 +1891,10 @@ impl Llc {
                 self.handle_udata_tma_report_at_index(queue, &prim, idx);
                 return;
             }
+            Ok(Some(TmaReportOwner::AlData(idx, segment_idx))) => {
+                self.handle_al_tma_report_at_index(queue, &prim, idx, segment_idx);
+                return;
+            }
             Ok(None) => {
                 if self.handle_udata_tma_report(queue, &prim) {
                     return;
@@ -1458,6 +2010,53 @@ impl Llc {
         };
 
         self.handle_udata_tma_report_at_index(queue, prim, idx)
+    }
+
+    fn handle_al_tma_report_at_index(&mut self, queue: &mut MessageQueue, prim: &TmaReportInd, idx: usize, segment_idx: usize) -> bool {
+        if matches!(prim.report, TmaReport::ConfirmHandle) {
+            tracing::trace!("LLC: AL-DATA TMA-REPORT confirm handle for req_handle={}", prim.req_handle);
+            return true;
+        }
+
+        match prim.report {
+            TmaReport::SuccessRandomAccess | TmaReport::SuccessReservedOrStealing => {
+                let al = &mut self.outbound_al_messages[idx];
+                let Some(segment) = al.segments.get_mut(segment_idx) else {
+                    tracing::warn!(
+                        "LLC: AL TMA-REPORT req_handle={} matched missing segment index {}",
+                        prim.req_handle,
+                        segment_idx
+                    );
+                    return true;
+                };
+                if let Some(reporter) = &segment.current_mac_reporter {
+                    reporter.try_mark_transmitted();
+                }
+                segment.t_umac_done = Some(self.dltime);
+                if al.t_umac_done.is_none() && Self::al_current_mac_state(al) == Some(TxState::Transmitted) {
+                    al.t_umac_done = Some(self.dltime);
+                    Self::mark_al_service_first_complete(al);
+                    Self::push_tla_report(
+                        queue,
+                        al.req_handle,
+                        TLA_REPORT_FIRST_COMPLETE_TRANSMISSION,
+                        Some(al.key.endpoint_id),
+                    );
+                    al.first_complete_report_sent = true;
+                }
+            }
+            TmaReport::FailedTransfer | TmaReport::FragmentationFailure | TmaReport::RandomAccessFailure => {
+                let Some(mut al) = self.outbound_al_messages.remove(idx) else {
+                    return true;
+                };
+                Self::mark_al_current_mac_discarded(&mut al);
+                Self::mark_al_service_failed(&al);
+                Self::push_tla_report(queue, al.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(al.key.endpoint_id));
+            }
+            TmaReport::ConfirmHandle => unreachable!("handled above"),
+        }
+
+        true
     }
 
     fn handle_udata_tma_report_at_index(&mut self, queue: &mut MessageQueue, prim: &TmaReportInd, idx: usize) -> bool {
@@ -1583,13 +2182,12 @@ impl Llc {
                 self.rx_tma_unitdata_ind_bl(queue, message);
             }
 
-            LlcPduType::AlSetup
-            | LlcPduType::AlDataAlFinal
-            | LlcPduType::AlAlUdataAlUfinal
-            | LlcPduType::AlAckAlRnr
-            | LlcPduType::AlReconnect
-            | LlcPduType::AlDisc => {
-                unimplemented_log!("LlcPduType Advanced Link: {}", pdu_type);
+            LlcPduType::AlSetup | LlcPduType::AlDataAlFinal | LlcPduType::AlAckAlRnr => {
+                self.rx_tma_unitdata_ind_al(queue, message);
+            }
+
+            LlcPduType::AlAlUdataAlUfinal | LlcPduType::AlReconnect | LlcPduType::AlDisc => {
+                unimplemented_log!("LlcPduType unsupported Advanced Link PDU: {}", pdu_type);
             }
 
             _ => {
@@ -1597,6 +2195,410 @@ impl Llc {
                 return;
             }
         }
+    }
+
+    fn rx_tma_unitdata_ind_al(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
+        tracing::trace!("rx_tma_unitdata_ind_al");
+        let SapMsgInner::TmaUnitdataInd(prim) = &mut message.msg else {
+            tracing::error!("BUG: unexpected message or state -- routing error");
+            return;
+        };
+        let Some(pdu) = prim.pdu.take() else {
+            tracing::warn!("LLC: rx_tma_unitdata_ind_al received message with no pdu, ignoring");
+            return;
+        };
+        let Some(bits) = pdu.peek_bits(4) else {
+            tracing::warn!("insufficient AL bits: {}", pdu.dump_bin());
+            return;
+        };
+        let Ok(pdu_type) = LlcPduType::try_from(bits) else {
+            tracing::warn!("invalid AL pdu type: {} in {}", bits, pdu.dump_bin());
+            return;
+        };
+
+        match pdu_type {
+            LlcPduType::AlSetup => self.rx_al_setup(queue, prim, pdu),
+            LlcPduType::AlDataAlFinal => self.rx_al_data_final(queue, prim, pdu),
+            LlcPduType::AlAckAlRnr => self.rx_al_ack(queue, prim, pdu),
+            _ => {
+                tracing::error!("BUG: unexpected AL handler dispatch {}", pdu_type);
+            }
+        }
+    }
+
+    fn rx_al_setup(&mut self, queue: &mut MessageQueue, prim: &TmaUnitdataInd, mut pdu: BitBuffer) {
+        let setup = match AlSetup::from_bitbuf(&mut pdu) {
+            Ok(setup) => setup,
+            Err(err) => {
+                tracing::warn!("LLC: failed parsing AL-SETUP {:?} {}", err, pdu.dump_bin());
+                return;
+            }
+        };
+        tracing::debug!(ts=%self.dltime, "<- {}", setup);
+
+        if !setup.is_original_acknowledged_non_augmented() {
+            tracing::warn!(
+                "LLC: unsupported AL-SETUP from SSI {} endpoint {}: acknowledged={} augmented={}",
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                setup.acknowledged_service,
+                setup.augmented.is_some()
+            );
+            return;
+        }
+
+        let key = Self::advanced_link_key_from_setup(prim.main_address, prim.endpoint_id, &setup);
+        if setup.setup_report == AlSetup::SETUP_REPORT_SUCCESS {
+            self.establish_advanced_link(key, setup);
+            tracing::debug!(
+                "LLC: AL-SETUP success accepted for SSI {} endpoint {} link {}",
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id
+            );
+            return;
+        }
+
+        let response = Self::negotiate_inbound_al_setup_response(&setup);
+        if response.setup_report == AlSetup::SETUP_REPORT_SERVICE_CHANGE {
+            self.clear_other_original_advanced_links(key);
+            self.pending_advanced_link_setups.insert(key, response);
+            self.advanced_links.remove(&key);
+            self.advanced_link_rx.remove(&key);
+            tracing::info!(
+                "LLC: AL-SETUP for SSI {} endpoint {} link {} negotiated lower QoS {:?} -> {:?}",
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id,
+                setup,
+                response
+            );
+        } else {
+            self.establish_advanced_link(key, setup);
+        }
+
+        let req_handle = self.next_tl_data_ind_req_handle();
+        Self::push_al_setup_response_to_umac(
+            queue,
+            prim.main_address,
+            prim.endpoint_id,
+            response,
+            req_handle,
+            prim.air_interface_encryption,
+        );
+    }
+
+    fn rx_al_data_final(&mut self, queue: &mut MessageQueue, prim: &TmaUnitdataInd, mut pdu: BitBuffer) {
+        let header = match AlData::from_bitbuf(&mut pdu) {
+            Ok(header) => header,
+            Err(err) => {
+                tracing::warn!("LLC: failed parsing AL-DATA/FINAL {:?} {}", err, pdu.dump_bin());
+                return;
+            }
+        };
+        tracing::debug!(ts=%self.dltime, "<- {}", header);
+
+        let Some(key) = self.resolve_original_advanced_link_key(prim.main_address, prim.endpoint_id) else {
+            tracing::warn!(
+                "LLC: dropping original {} for SSI {} endpoint {}; no unambiguous established AL",
+                header,
+                prim.main_address.ssi,
+                prim.endpoint_id
+            );
+            return;
+        };
+
+        let duplicate_delivered = self
+            .advanced_links
+            .get(&key)
+            .and_then(|session| session.last_delivered_ns)
+            .is_some_and(|last_ns| last_ns == header.ns);
+        if duplicate_delivered {
+            tracing::debug!(
+                "LLC: re-ACKing duplicate delivered AL TL-SDU N(S)={} for SSI {} endpoint {} link {}",
+                header.ns,
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id
+            );
+            Self::push_al_ack_to_umac(
+                queue,
+                key,
+                AlAck::complete(header.ns),
+                self.next_tl_data_ind_req_handle(),
+                prim.air_interface_encryption,
+            );
+            return;
+        }
+
+        let segment = BitBuffer::from_bitbuffer_pos(&pdu);
+        let replace_assembly = self.advanced_link_rx.get(&key).is_some_and(|assembly| assembly.ns != header.ns);
+        if replace_assembly {
+            tracing::warn!(
+                "LLC: replacing incomplete AL receive assembly for SSI {} endpoint {} link {} old N(S) with new N(S)={}",
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id,
+                header.ns
+            );
+            self.advanced_link_rx.remove(&key);
+        }
+
+        let assembly = self.advanced_link_rx.entry(key).or_insert_with(|| AdvancedLinkReceiveAssembly {
+            key,
+            ns: header.ns,
+            segments: BTreeMap::new(),
+            final_ss: None,
+        });
+        assembly.segments.entry(header.ss).or_insert(segment);
+        if header.final_segment {
+            assembly.final_ss = Some(header.ss);
+        }
+
+        let Some(mut complete) = self.advanced_link_rx.get(&key).and_then(Self::concatenate_al_segments) else {
+            if header.acknowledgement_requested {
+                Self::push_al_ack_to_umac(
+                    queue,
+                    key,
+                    AlAck::repeat_entire(header.ns),
+                    self.next_tl_data_ind_req_handle(),
+                    prim.air_interface_encryption,
+                );
+            }
+            return;
+        };
+
+        if complete.get_len_remaining() < 32 || !fcs::check_fcs(&complete) {
+            tracing::warn!(
+                "LLC: AL TL-SDU FCS failed for SSI {} endpoint {} link {} N(S)={}",
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id,
+                header.ns
+            );
+            self.advanced_link_rx.remove(&key);
+            Self::push_al_ack_to_umac(
+                queue,
+                key,
+                AlAck::repeat_entire(header.ns),
+                self.next_tl_data_ind_req_handle(),
+                prim.air_interface_encryption,
+            );
+            return;
+        }
+
+        let payload_end = complete.get_raw_end() - 32;
+        complete.set_raw_end(payload_end);
+        complete.seek(0);
+        self.advanced_link_rx.remove(&key);
+        if let Some(session) = self.advanced_links.get_mut(&key) {
+            session.last_delivered_ns = Some(header.ns);
+        }
+
+        let req_handle = self.next_tl_data_ind_req_handle();
+        queue.push_back(SapMsg {
+            sap: Sap::TlaSap,
+            src: TetraEntity::Llc,
+            dest: TetraEntity::Mle,
+            msg: SapMsgInner::TlaTlDataIndBl(TlaTlDataIndBl {
+                main_address: prim.main_address,
+                link_id: key.link_id,
+                endpoint_id: prim.endpoint_id,
+                new_endpoint_id: prim.new_endpoint_id,
+                css_endpoint_id: prim.css_endpoint_id,
+                tl_sdu: if complete.get_len_remaining() > 0 { Some(complete) } else { None },
+                scrambling_code: prim.scrambling_code,
+                fcs_flag: true,
+                air_interface_encryption: prim.air_interface_encryption,
+                chan_change_resp_req: prim.chan_change_response_req,
+                chan_change_handle: prim.chan_change_handle,
+                chan_info: prim.chan_info,
+                req_handle,
+            }),
+        });
+
+        Self::push_al_ack_to_umac(queue, key, AlAck::complete(header.ns), req_handle, prim.air_interface_encryption);
+    }
+
+    fn rx_al_ack(&mut self, queue: &mut MessageQueue, prim: &TmaUnitdataInd, mut pdu: BitBuffer) {
+        let ack = match AlAck::from_bitbuf(&mut pdu) {
+            Ok(ack) => ack,
+            Err(err) => {
+                tracing::warn!("LLC: failed parsing AL-ACK/RNR {:?} {}", err, pdu.dump_bin());
+                return;
+            }
+        };
+        tracing::debug!(ts=%self.dltime, "<- {}", ack);
+
+        let mut match_idx = None;
+        let mut matches = 0;
+        for (idx, outbound) in self.outbound_al_messages.iter().enumerate() {
+            if outbound.key.addr == prim.main_address && outbound.key.endpoint_id == prim.endpoint_id && outbound.ns == ack.nr {
+                matches += 1;
+                match_idx = Some(idx);
+            }
+        }
+        if matches != 1 {
+            tracing::warn!(
+                "LLC: AL-ACK/RNR for SSI {} endpoint {} N(R)={} matched {} outstanding AL transfers; ignoring",
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                ack.nr,
+                matches
+            );
+            return;
+        }
+        let idx = match_idx.expect("matches == 1 must set match_idx");
+
+        if ack.acknowledges_complete_tl_sdu() {
+            let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {
+                return;
+            };
+            if !outbound.first_complete_report_sent {
+                Self::mark_al_current_mac_transmitted(&mut outbound);
+                outbound.t_umac_done = Some(self.dltime);
+                Self::mark_al_service_first_complete(&mut outbound);
+                Self::push_tla_report(
+                    queue,
+                    outbound.req_handle,
+                    TLA_REPORT_FIRST_COMPLETE_TRANSMISSION,
+                    Some(outbound.key.endpoint_id),
+                );
+            }
+            outbound.tx_reporter.mark_acknowledged();
+            Self::push_tla_report(
+                queue,
+                outbound.req_handle,
+                TLA_REPORT_SUCCESSFUL_TRANSFER,
+                Some(outbound.key.endpoint_id),
+            );
+            return;
+        }
+
+        if ack.requests_repeat_entire_tl_sdu() {
+            let max_retransmissions = self
+                .advanced_links
+                .get(&self.outbound_al_messages[idx].key)
+                .map(|session| session.max_tl_sdu_retransmissions)
+                .unwrap_or(0);
+            let outbound = &mut self.outbound_al_messages[idx];
+            if outbound.retransmit_count < max_retransmissions {
+                outbound.retransmit_count += 1;
+                Self::reset_al_transmission_attempt(outbound);
+                tracing::info!(
+                    "LLC: AL peer requested whole TL-SDU repeat for SSI {} endpoint {} link {} N(S)={} attempt {}",
+                    outbound.key.addr.ssi,
+                    outbound.key.endpoint_id,
+                    outbound.key.link_id,
+                    outbound.ns,
+                    outbound.retransmit_count
+                );
+            } else {
+                let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {
+                    return;
+                };
+                Self::mark_al_current_mac_discarded(&mut outbound);
+                Self::mark_al_service_failed(&outbound);
+                Self::push_tla_report(
+                    queue,
+                    outbound.req_handle,
+                    TLA_REPORT_FAILED_TRANSFER,
+                    Some(outbound.key.endpoint_id),
+                );
+            }
+            return;
+        }
+
+        if ack.is_selective_segment_ack() {
+            let max_segment_retransmissions = self
+                .advanced_links
+                .get(&self.outbound_al_messages[idx].key)
+                .map(|session| session.max_segment_retransmissions)
+                .unwrap_or(0);
+            let mut acknowledged_segments = 0usize;
+            let mut retransmit_segments = 0usize;
+            let mut exhausted_segment = None;
+            {
+                let outbound = &mut self.outbound_al_messages[idx];
+                for segment in &mut outbound.segments {
+                    match ack.segment_acknowledged_in_first_block(segment.ss) {
+                        Some(true) => {
+                            if !segment.acknowledged {
+                                acknowledged_segments += 1;
+                            }
+                            segment.acknowledged = true;
+                            if let Some(reporter) = &segment.current_mac_reporter {
+                                reporter.try_mark_transmitted();
+                            }
+                        }
+                        Some(false) => {
+                            if segment.retransmit_count < max_segment_retransmissions {
+                                segment.retransmit_count += 1;
+                                segment.acknowledged = false;
+                                segment.t_submitted_to_umac = None;
+                                segment.t_umac_done = None;
+                                segment.current_mac_reporter = None;
+                                retransmit_segments += 1;
+                            } else {
+                                exhausted_segment = Some(segment.ss);
+                                break;
+                            }
+                        }
+                        None => {}
+                    }
+                }
+
+                if retransmit_segments > 0 {
+                    outbound.t_submitted_to_umac = None;
+                    outbound.t_umac_done = None;
+                    outbound.current_mac_reporter = None;
+                }
+            }
+
+            if let Some(ss) = exhausted_segment {
+                let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {
+                    return;
+                };
+                tracing::warn!(
+                    "LLC: AL selective ACK exhausted N.274 for SSI {} endpoint {} link {} N(S)={} S(S)={}",
+                    outbound.key.addr.ssi,
+                    outbound.key.endpoint_id,
+                    outbound.key.link_id,
+                    outbound.ns,
+                    ss
+                );
+                Self::mark_al_current_mac_discarded(&mut outbound);
+                Self::mark_al_service_failed(&outbound);
+                Self::push_tla_report(
+                    queue,
+                    outbound.req_handle,
+                    TLA_REPORT_FAILED_TRANSFER,
+                    Some(outbound.key.endpoint_id),
+                );
+                return;
+            }
+
+            tracing::info!(
+                "LLC: AL selective {} for SSI {} endpoint {} N(R)={} sr={:?} ack_len={} acknowledged_segments={} retransmit_segments={}",
+                if ack.receiver_ready { "ACK" } else { "RNR" },
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                ack.nr,
+                ack.sr,
+                ack.acknowledgement_length,
+                acknowledged_segments,
+                retransmit_segments
+            );
+            return;
+        }
+
+        tracing::debug!(
+            "LLC: AL-RNR/unknown AL-ACK for SSI {} endpoint {} N(R)={} ack_len={} is not actionable; waiting for retry/complete ACK",
+            prim.main_address.ssi,
+            prim.endpoint_id,
+            ack.nr,
+            ack.acknowledgement_length
+        );
     }
 
     fn rx_tma_unitdata_ind_bl(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
@@ -1908,6 +2910,123 @@ impl Llc {
         };
 
         queue.push_back(s);
+    }
+
+    fn highest_priority_unsubmitted_al_index(&self, link_blocked: &HashSet<AdvancedLinkKey>) -> Option<usize> {
+        let mut selected: Option<(usize, Todo)> = None;
+        for (idx, al) in self.outbound_al_messages.iter().enumerate() {
+            if al.t_submitted_to_umac.is_some() || link_blocked.contains(&Self::expected_al_key(al)) {
+                continue;
+            }
+            match selected {
+                Some((_, selected_prio)) if selected_prio >= al.pdu_prio => {}
+                _ => selected = Some((idx, al.pdu_prio)),
+            }
+        }
+        selected.map(|(idx, _)| idx)
+    }
+
+    fn submit_free_al_messages_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let mut had_activity = false;
+        let mut link_blocked: HashSet<AdvancedLinkKey> = self
+            .outbound_al_messages
+            .iter()
+            .filter(|al| al.t_submitted_to_umac.is_some())
+            .map(Self::expected_al_key)
+            .collect();
+
+        while let Some(idx) = self.highest_priority_unsubmitted_al_index(&link_blocked) {
+            let key = Self::expected_al_key(&self.outbound_al_messages[idx]);
+            let al = &mut self.outbound_al_messages[idx];
+            tracing::debug!(
+                "submitting AL TL-SDU for SSI {} endpoint {} link {} N(S) {} segments {} pdu_prio {} to umac",
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id,
+                al.ns,
+                al.segments.len(),
+                al.pdu_prio
+            );
+            Self::submit_for_al_transmission(queue, al, self.dltime.forward_to_timeslot(al.t_first.t));
+            link_blocked.insert(key);
+            had_activity = true;
+        }
+
+        had_activity
+    }
+
+    fn submit_al_retransmissions_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
+        let mut had_activity = false;
+        let dltime = self.dltime;
+        let mut removals: Vec<usize> = Vec::new();
+
+        for idx in 0..self.outbound_al_messages.len() {
+            let al = &mut self.outbound_al_messages[idx];
+            let mac_state = Self::al_current_mac_state(al);
+            if al.t_umac_done.is_none() && matches!(mac_state, Some(TxState::Transmitted | TxState::Discarded)) {
+                al.t_umac_done = Some(dltime);
+                if mac_state == Some(TxState::Transmitted) && !al.first_complete_report_sent {
+                    Self::mark_al_service_first_complete(al);
+                    Self::push_tla_report(
+                        queue,
+                        al.req_handle,
+                        TLA_REPORT_FIRST_COMPLETE_TRANSMISSION,
+                        Some(al.key.endpoint_id),
+                    );
+                    al.first_complete_report_sent = true;
+                    had_activity = true;
+                }
+            }
+
+            let Some(t_umac_done) = al.t_umac_done else {
+                continue;
+            };
+            let target_ts = u8::try_from(al.key.endpoint_id).ok().filter(|ts| (1..=4).contains(ts)).unwrap_or(1);
+            let age = Self::t251_downlink_frames_elapsed(t_umac_done, dltime, target_ts, None);
+            if age < T252_AL_ACK_WAITING_SIGNALLING_FRAMES {
+                continue;
+            }
+
+            let max_retransmissions = self
+                .advanced_links
+                .get(&al.key)
+                .map(|session| session.max_tl_sdu_retransmissions)
+                .unwrap_or(0);
+            if al.retransmit_count < max_retransmissions {
+                al.retransmit_count += 1;
+                Self::reset_al_transmission_attempt(al);
+                tracing::info!(
+                    "LLC: retransmitting AL TL-SDU SSI {} endpoint {} link {} N(S) {} attempt {}",
+                    al.key.addr.ssi,
+                    al.key.endpoint_id,
+                    al.key.link_id,
+                    al.ns,
+                    al.retransmit_count
+                );
+                had_activity = true;
+            } else {
+                removals.push(idx);
+            }
+        }
+
+        for idx in removals.into_iter().rev() {
+            let Some(mut al) = self.outbound_al_messages.remove(idx) else {
+                continue;
+            };
+            tracing::warn!(
+                "LLC: AL TL-SDU SSI {} endpoint {} link {} N(S) {} exhausted retransmissions",
+                al.key.addr.ssi,
+                al.key.endpoint_id,
+                al.key.link_id,
+                al.ns
+            );
+            Self::mark_al_current_mac_discarded(&mut al);
+            Self::mark_al_service_failed(&al);
+            Self::push_tla_report(queue, al.req_handle, TLA_REPORT_FAILED_TRANSFER, Some(al.key.endpoint_id));
+            had_activity = true;
+        }
+
+        had_activity
     }
 
     fn submit_retransmissions_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
@@ -2497,6 +3616,11 @@ impl TetraEntityTrait for Llc {
 
     fn tick_end(&mut self, queue: &mut MessageQueue, _ts: TdmaTime) -> bool {
         let mut had_activity = false;
+
+        // AL runs before BL so established packet-data advanced links do not
+        // fall back onto the basic-link service while XHTML is active.
+        had_activity |= self.submit_al_retransmissions_to_umac(queue);
+        had_activity |= self.submit_free_al_messages_to_umac(queue);
 
         // Step 1 / 4: Check if we have any transmitted messages that were not acked within the expected window
         // Schedule a retransmission if appropriate.

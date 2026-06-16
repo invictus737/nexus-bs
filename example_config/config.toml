@@ -343,7 +343,7 @@ energy_saving_mode = "auto"
 # accept_root_path = true
 # accept_status_path = true
 # accept_status_wml_path = true
-# max_request_payload_bytes = 128
+# max_request_payload_bytes = 1024
 # assume_pdch_ready_after_data_transmit = true
 ###############################################################################
 

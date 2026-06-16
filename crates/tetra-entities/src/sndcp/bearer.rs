@@ -5,6 +5,7 @@
 
 use std::collections::BTreeMap;
 
+use super::pdch::SndcpPacketDataResourceRequest;
 use super::pdp::{SndcpActivatePdpContextAccept, SndcpActivatePdpContextDemand, SndcpActivatePdpContextReject, SndcpDeactivation};
 use super::pdp_service::{SndcpPdpActivationResult, SndcpPdpDeactivationResult, SndcpPdpPolicy, SndcpPdpService};
 use super::state::{SwmiSndcpAction, SwmiSndcpState, SwmiSndcpStateError, SwmiSndcpStateMachine, SwmiSndcpTransition};
@@ -74,11 +75,21 @@ impl SndcpBearerManager {
         demand: SndcpActivatePdpContextDemand,
     ) -> Result<SndcpBearerActivationOutcome, SndcpBearerError> {
         match self.pdp.handle_activate_demand(issi, demand) {
-            SndcpPdpActivationResult::Accepted { accept, .. } => {
-                let transition = self
-                    .state_for_issi_mut(issi)
-                    .activate_pdp_context()
-                    .map_err(SndcpBearerError::State)?;
+            SndcpPdpActivationResult::Accepted {
+                accept, reused_existing, ..
+            } => {
+                let transition = if reused_existing {
+                    let state = self.state_for_issi(issi);
+                    SwmiSndcpTransition {
+                        previous_state: state,
+                        new_state: state,
+                        actions: Vec::new(),
+                    }
+                } else {
+                    self.state_for_issi_mut(issi)
+                        .activate_pdp_context()
+                        .map_err(SndcpBearerError::State)?
+                };
                 Ok(SndcpBearerActivationOutcome::Accepted { accept, transition })
             }
             SndcpPdpActivationResult::Rejected(reject) => Ok(SndcpBearerActivationOutcome::Rejected(reject)),
@@ -146,6 +157,7 @@ impl SndcpBearerManager {
             control_pdu: Some(encode_data_transmit_request(&SndcpDataTransmitRequest {
                 nsapi,
                 logical_link_status: false,
+                resource_request: SndcpPacketDataResourceRequest::None,
             })?),
         })
     }
@@ -201,6 +213,17 @@ impl SndcpBearerManager {
         issi: u32,
         reconnect: SndcpReconnect,
     ) -> Result<SndcpBearerControlOutcome, SndcpBearerError> {
+        if reconnect.nsapi.is_none() {
+            let transition = self
+                .state_for_issi_mut(issi)
+                .reconnect_without_data_received()
+                .map_err(SndcpBearerError::State)?;
+            return Ok(SndcpBearerControlOutcome {
+                transition: Some(transition),
+                control_pdu: None,
+            });
+        }
+
         if let Some(nsapi) = reconnect.nsapi {
             if self.context_missing(issi, nsapi) {
                 return Ok(SndcpBearerControlOutcome {
@@ -214,6 +237,19 @@ impl SndcpBearerManager {
             .state_for_issi_mut(issi)
             .reconnect_received()
             .map_err(SndcpBearerError::State)?;
+        if let Some(nsapi) = reconnect.nsapi {
+            let ready_transition = self
+                .state_for_issi_mut(issi)
+                .data_transmit_request_received()
+                .map_err(SndcpBearerError::State)?;
+            return Ok(SndcpBearerControlOutcome {
+                transition: Some(ready_transition),
+                control_pdu: Some(encode_data_transmit_response(&SndcpDataTransmitResponse {
+                    nsapi,
+                    result: SndcpDataTransmitResponseResult::Accepted,
+                })?),
+            });
+        }
         Ok(SndcpBearerControlOutcome {
             transition: Some(transition),
             control_pdu: None,
@@ -346,6 +382,27 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_pdp_activation_reuses_existing_context_without_incrementing_count() {
+        let mut manager = activated_manager();
+
+        let outcome = manager
+            .handle_activate_demand(ISSI, demand(NSAPI))
+            .expect("compatible duplicate activation should be accepted");
+
+        let SndcpBearerActivationOutcome::Accepted { accept, transition } = outcome else {
+            panic!("duplicate activation should reuse the existing context");
+        };
+        assert_eq!(accept.nsapi, NSAPI);
+        assert_eq!(transition.previous_state, SwmiSndcpState::Standby);
+        assert_eq!(transition.new_state, SwmiSndcpState::Standby);
+        assert!(transition.actions.is_empty());
+
+        let deactivation = manager.handle_deactivate_demand(ISSI, SndcpDeactivation::Nsapi(NSAPI));
+        assert_eq!(deactivation.deactivation.removed_contexts, 1);
+        assert_eq!(manager.state_for_issi(ISSI), SwmiSndcpState::Idle);
+    }
+
+    #[test]
     fn ms_data_transmit_request_for_active_context_returns_accept_and_enters_ready() {
         let mut manager = activated_manager();
 
@@ -355,6 +412,7 @@ mod tests {
                 SndcpDataTransmitRequest {
                     nsapi: NSAPI,
                     logical_link_status: false,
+                    resource_request: SndcpPacketDataResourceRequest::None,
                 },
             )
             .expect("MS data transmit request should be handled");
@@ -393,6 +451,7 @@ mod tests {
                 SndcpDataTransmitRequest {
                     nsapi: 3,
                     logical_link_status: false,
+                    resource_request: SndcpPacketDataResourceRequest::None,
                 },
             )
             .expect("unknown NSAPI should produce reject response");
@@ -421,7 +480,8 @@ mod tests {
             request,
             SndcpDataTransmitRequest {
                 nsapi: NSAPI,
-                logical_link_status: false
+                logical_link_status: false,
+                resource_request: SndcpPacketDataResourceRequest::None,
             }
         );
         let transition = outcome.transition.expect("request should change state");
@@ -489,6 +549,7 @@ mod tests {
                 SndcpDataTransmitRequest {
                     nsapi: NSAPI,
                     logical_link_status: false,
+                    resource_request: SndcpPacketDataResourceRequest::None,
                 },
             )
             .expect("MS request should enter READY");
@@ -530,7 +591,13 @@ mod tests {
             .expect("SwMI request should enter READY");
 
         let outcome = manager
-            .handle_reconnect_received(ISSI, SndcpReconnect { nsapi: Some(3) })
+            .handle_reconnect_received(
+                ISSI,
+                SndcpReconnect {
+                    nsapi: Some(3),
+                    resource_request: SndcpPacketDataResourceRequest::None,
+                },
+            )
             .expect("unknown NSAPI reconnect should reject");
         assert!(outcome.transition.is_none());
         assert!(matches!(
@@ -540,6 +607,62 @@ mod tests {
                 ..
             })
         ));
+        assert_eq!(manager.state_for_issi(ISSI), SwmiSndcpState::Ready);
+    }
+
+    #[test]
+    fn reconnect_without_data_in_standby_refreshes_standby_without_response() {
+        let mut manager = activated_manager();
+
+        let outcome = manager
+            .handle_reconnect_received(
+                ISSI,
+                SndcpReconnect {
+                    nsapi: None,
+                    resource_request: SndcpPacketDataResourceRequest::None,
+                },
+            )
+            .expect("no-data reconnect in STANDBY should be accepted as a no-op");
+
+        assert!(outcome.control_pdu.is_none());
+        let transition = outcome.transition.expect("standby timer should be refreshed");
+        assert_eq!(transition.previous_state, SwmiSndcpState::Standby);
+        assert_eq!(transition.new_state, SwmiSndcpState::Standby);
+        assert_eq!(transition.actions, vec![SwmiSndcpAction::StartStandbyTimer]);
+        assert_eq!(manager.state_for_issi(ISSI), SwmiSndcpState::Standby);
+    }
+
+    #[test]
+    fn reconnect_with_data_to_send_returns_accept_and_remains_ready() {
+        let mut manager = activated_manager();
+        manager
+            .handle_ms_data_transmit_request(
+                ISSI,
+                SndcpDataTransmitRequest {
+                    nsapi: NSAPI,
+                    logical_link_status: false,
+                    resource_request: SndcpPacketDataResourceRequest::None,
+                },
+            )
+            .expect("MS request should enter READY");
+
+        let outcome = manager
+            .handle_reconnect_received(
+                ISSI,
+                SndcpReconnect {
+                    nsapi: Some(NSAPI),
+                    resource_request: SndcpPacketDataResourceRequest::None,
+                },
+            )
+            .expect("known NSAPI reconnect should be accepted");
+        let response = decode_data_transmit_response(outcome.control_pdu.as_ref().expect("accept PDU should be present"))
+            .expect("accept should decode");
+
+        assert_eq!(response.nsapi, NSAPI);
+        assert_eq!(response.result, SndcpDataTransmitResponseResult::Accepted);
+        let transition = outcome.transition.expect("accepted reconnect should re-enter READY");
+        assert_eq!(transition.previous_state, SwmiSndcpState::Standby);
+        assert_eq!(transition.new_state, SwmiSndcpState::Ready);
         assert_eq!(manager.state_for_issi(ISSI), SwmiSndcpState::Ready);
     }
 

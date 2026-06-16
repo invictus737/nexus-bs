@@ -292,6 +292,22 @@ impl SwmiSndcpStateMachine {
         ))
     }
 
+    pub fn reconnect_without_data_received(&mut self) -> Result<SwmiSndcpTransition, SwmiSndcpStateError> {
+        if self.active_pdp_contexts == 0 {
+            return Err(SwmiSndcpStateError::NoActivePdpContext);
+        }
+        if self.state == SwmiSndcpState::Ready {
+            return self.reconnect_received();
+        }
+        if self.state != SwmiSndcpState::Standby {
+            return Err(invalid(self.state, SwmiSndcpEvent::ReconnectReceived));
+        }
+
+        let previous_state = self.state;
+        self.timers.standby = true;
+        Ok(transition(previous_state, self.state, vec![SwmiSndcpAction::StartStandbyTimer]))
+    }
+
     fn enter_idle(&mut self) {
         self.state = SwmiSndcpState::Idle;
         self.timers = SwmiSndcpTimers::default();

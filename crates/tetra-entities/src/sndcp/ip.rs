@@ -5,9 +5,17 @@
 
 use tetra_core::BitBuffer;
 
+pub const IPV4_PROTOCOL_TCP: u8 = 6;
 pub const IPV4_PROTOCOL_UDP: u8 = 17;
 const IPV4_MIN_HEADER_LEN: usize = 20;
+const TCP_MIN_HEADER_LEN: usize = 20;
 const UDP_HEADER_LEN: usize = 8;
+
+pub const TCP_FLAG_FIN: u16 = 0x001;
+pub const TCP_FLAG_SYN: u16 = 0x002;
+pub const TCP_FLAG_RST: u16 = 0x004;
+pub const TCP_FLAG_PSH: u16 = 0x008;
+pub const TCP_FLAG_ACK: u16 = 0x010;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpPrimitiveError {
@@ -17,6 +25,9 @@ pub enum IpPrimitiveError {
     Ipv4HeaderTooShort { ihl_words: u8 },
     Ipv4TotalLengthTooShort { total_length: usize, header_len: usize },
     Ipv4TotalLengthExceedsBuffer { total_length: usize, buffer_len: usize },
+    TcpTooShort { len: usize },
+    TcpHeaderTooShort { data_offset_words: u8 },
+    TcpHeaderExceedsPayload { header_len: usize, payload_len: usize },
     UdpTooShort { len: usize },
     UdpLengthTooShort { udp_length: usize },
     UdpLengthExceedsPayload { udp_length: usize, payload_len: usize },
@@ -40,6 +51,21 @@ pub struct UdpDatagram<'a> {
     pub source_port: u16,
     pub destination_port: u16,
     pub checksum: u16,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpSegment<'a> {
+    pub source_port: u16,
+    pub destination_port: u16,
+    pub sequence_number: u32,
+    pub acknowledgement_number: u32,
+    pub data_offset_words: u8,
+    pub flags: u16,
+    pub window_size: u16,
+    pub checksum: u16,
+    pub urgent_pointer: u16,
+    pub options: &'a [u8],
     pub payload: &'a [u8],
 }
 
@@ -126,6 +152,38 @@ pub fn parse_udp_datagram(payload: &[u8]) -> Result<UdpDatagram<'_>, IpPrimitive
     })
 }
 
+pub fn parse_tcp_segment(payload: &[u8]) -> Result<TcpSegment<'_>, IpPrimitiveError> {
+    if payload.len() < TCP_MIN_HEADER_LEN {
+        return Err(IpPrimitiveError::TcpTooShort { len: payload.len() });
+    }
+
+    let data_offset_words = payload[12] >> 4;
+    if data_offset_words < 5 {
+        return Err(IpPrimitiveError::TcpHeaderTooShort { data_offset_words });
+    }
+    let header_len = data_offset_words as usize * 4;
+    if header_len > payload.len() {
+        return Err(IpPrimitiveError::TcpHeaderExceedsPayload {
+            header_len,
+            payload_len: payload.len(),
+        });
+    }
+
+    Ok(TcpSegment {
+        source_port: u16::from_be_bytes([payload[0], payload[1]]),
+        destination_port: u16::from_be_bytes([payload[2], payload[3]]),
+        sequence_number: u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]),
+        acknowledgement_number: u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]),
+        data_offset_words,
+        flags: (((payload[12] & 0x01) as u16) << 8) | payload[13] as u16,
+        window_size: u16::from_be_bytes([payload[14], payload[15]]),
+        checksum: u16::from_be_bytes([payload[16], payload[17]]),
+        urgent_pointer: u16::from_be_bytes([payload[18], payload[19]]),
+        options: &payload[TCP_MIN_HEADER_LEN..header_len],
+        payload: &payload[header_len..],
+    })
+}
+
 pub fn build_ipv4_udp_npdu(
     source: [u8; 4],
     destination: [u8; 4],
@@ -170,15 +228,94 @@ pub fn build_ipv4_udp_npdu(
     Ok(packet)
 }
 
+pub fn build_ipv4_tcp_npdu(
+    source: [u8; 4],
+    destination: [u8; 4],
+    source_port: u16,
+    destination_port: u16,
+    sequence_number: u32,
+    acknowledgement_number: u32,
+    flags: u16,
+    window_size: u16,
+    payload: &[u8],
+    identification: u16,
+    ttl: u8,
+) -> Result<Vec<u8>, IpPrimitiveError> {
+    let tcp_len = TCP_MIN_HEADER_LEN
+        .checked_add(payload.len())
+        .ok_or(IpPrimitiveError::PayloadTooLarge { len: payload.len() })?;
+    let total_len = IPV4_MIN_HEADER_LEN
+        .checked_add(tcp_len)
+        .ok_or(IpPrimitiveError::PayloadTooLarge { len: payload.len() })?;
+    if tcp_len > u16::MAX as usize || total_len > u16::MAX as usize {
+        return Err(IpPrimitiveError::PayloadTooLarge { len: payload.len() });
+    }
+
+    let mut packet = Vec::with_capacity(total_len);
+    packet.push(0x45);
+    packet.push(0);
+    packet.extend_from_slice(&(total_len as u16).to_be_bytes());
+    packet.extend_from_slice(&identification.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.push(ttl);
+    packet.push(IPV4_PROTOCOL_TCP);
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&source);
+    packet.extend_from_slice(&destination);
+
+    let checksum = ipv4_header_checksum(&packet[..IPV4_MIN_HEADER_LEN]);
+    packet[10..12].copy_from_slice(&checksum.to_be_bytes());
+
+    let tcp_start = packet.len();
+    packet.extend_from_slice(&source_port.to_be_bytes());
+    packet.extend_from_slice(&destination_port.to_be_bytes());
+    packet.extend_from_slice(&sequence_number.to_be_bytes());
+    packet.extend_from_slice(&acknowledgement_number.to_be_bytes());
+    packet.push((5 << 4) | (((flags >> 8) as u8) & 0x01));
+    packet.push((flags & 0xff) as u8);
+    packet.extend_from_slice(&window_size.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(&0u16.to_be_bytes());
+    packet.extend_from_slice(payload);
+
+    let tcp_checksum = ipv4_tcp_checksum(source, destination, &packet[tcp_start..]);
+    packet[tcp_start + 16..tcp_start + 18].copy_from_slice(&tcp_checksum.to_be_bytes());
+    Ok(packet)
+}
+
 pub fn ipv4_header_checksum(header: &[u8]) -> u16 {
+    internet_checksum(header.iter().copied())
+}
+
+pub fn ipv4_tcp_checksum(source: [u8; 4], destination: [u8; 4], tcp_segment: &[u8]) -> u16 {
+    let tcp_len = tcp_segment.len() as u16;
+    internet_checksum(
+        source
+            .iter()
+            .copied()
+            .chain(destination.iter().copied())
+            .chain([0, IPV4_PROTOCOL_TCP])
+            .chain(tcp_len.to_be_bytes())
+            .chain(tcp_segment.iter().copied()),
+    )
+}
+
+fn internet_checksum(bytes: impl Iterator<Item = u8>) -> u16 {
     let mut sum = 0u32;
-    for chunk in header.chunks(2) {
-        let word = match chunk {
-            [hi, lo] => u16::from_be_bytes([*hi, *lo]) as u32,
-            [hi] => (*hi as u32) << 8,
-            _ => 0,
+    let mut pending_hi = None;
+    for byte in bytes {
+        let Some(hi) = pending_hi.take() else {
+            pending_hi = Some(byte);
+            continue;
         };
+        let word = u16::from_be_bytes([hi, byte]) as u32;
         sum = sum.wrapping_add(word);
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+    }
+    if let Some(hi) = pending_hi {
+        sum = sum.wrapping_add((hi as u32) << 8);
         while sum > 0xffff {
             sum = (sum & 0xffff) + (sum >> 16);
         }
@@ -222,6 +359,44 @@ mod tests {
     }
 
     #[test]
+    fn ipv4_tcp_npdu_round_trips_syn_ack_and_payload_bytes() {
+        let packet = build_ipv4_tcp_npdu(
+            [10, 0, 0, 1],
+            [10, 0, 0, 226],
+            9200,
+            49152,
+            0x1122_3344,
+            0x5566_7788,
+            TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN,
+            4096,
+            b"HTTP/1.0 200 OK\r\n\r\n",
+            0x1234,
+            64,
+        )
+        .expect("IPv4/TCP N-PDU should build");
+
+        let ipv4 = parse_ipv4_packet(&packet).expect("IPv4 packet should parse");
+        assert_eq!(ipv4.source, [10, 0, 0, 1]);
+        assert_eq!(ipv4.destination, [10, 0, 0, 226]);
+        assert_eq!(ipv4.identification, 0x1234);
+        assert_eq!(ipv4.ttl, 64);
+        assert_eq!(ipv4.protocol, IPV4_PROTOCOL_TCP);
+        assert_eq!(ipv4_header_checksum(&packet[..IPV4_MIN_HEADER_LEN]), 0);
+        assert_eq!(ipv4_tcp_checksum(ipv4.source, ipv4.destination, ipv4.payload), 0);
+
+        let tcp = parse_tcp_segment(ipv4.payload).expect("TCP segment should parse");
+        assert_eq!(tcp.source_port, 9200);
+        assert_eq!(tcp.destination_port, 49152);
+        assert_eq!(tcp.sequence_number, 0x1122_3344);
+        assert_eq!(tcp.acknowledgement_number, 0x5566_7788);
+        assert_eq!(tcp.flags, TCP_FLAG_ACK | TCP_FLAG_PSH | TCP_FLAG_FIN);
+        assert_eq!(tcp.window_size, 4096);
+        assert_eq!(tcp.urgent_pointer, 0);
+        assert_eq!(tcp.options, b"");
+        assert_eq!(tcp.payload, b"HTTP/1.0 200 OK\r\n\r\n");
+    }
+
+    #[test]
     fn bitbuffer_npdu_octets_feeds_ipv4_parser() {
         let packet = build_ipv4_udp_npdu([192, 0, 2, 1], [192, 0, 2, 2], 49152, 9200, b"wap", 7, 32).expect("IPv4/UDP N-PDU should build");
         let mut n_pdu = BitBuffer::new(packet.len() * 8);
@@ -258,5 +433,26 @@ mod tests {
         let mut udp = vec![0u8; UDP_HEADER_LEN];
         udp[4..6].copy_from_slice(&7u16.to_be_bytes());
         assert_eq!(parse_udp_datagram(&udp), Err(IpPrimitiveError::UdpLengthTooShort { udp_length: 7 }));
+    }
+
+    #[test]
+    fn tcp_parser_rejects_invalid_lengths() {
+        assert_eq!(parse_tcp_segment(&[0u8; 19]), Err(IpPrimitiveError::TcpTooShort { len: 19 }));
+
+        let mut tcp = vec![0u8; TCP_MIN_HEADER_LEN];
+        tcp[12] = 4 << 4;
+        assert_eq!(
+            parse_tcp_segment(&tcp),
+            Err(IpPrimitiveError::TcpHeaderTooShort { data_offset_words: 4 })
+        );
+
+        tcp[12] = 6 << 4;
+        assert_eq!(
+            parse_tcp_segment(&tcp),
+            Err(IpPrimitiveError::TcpHeaderExceedsPayload {
+                header_len: 24,
+                payload_len: 20
+            })
+        );
     }
 }

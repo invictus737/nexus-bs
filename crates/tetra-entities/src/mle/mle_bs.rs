@@ -323,8 +323,25 @@ impl MleBs {
         };
 
         match prim.report {
-            TLA_REPORT_NO_SPECIFIC_REPORT | TLA_REPORT_FIRST_COMPLETE_TRANSMISSION => {
+            TLA_REPORT_NO_SPECIFIC_REPORT => {
                 tracing::trace!("MLE: TL-DATA progress report req_handle={} report={}", req_handle, prim.report);
+            }
+            TLA_REPORT_FIRST_COMPLETE_TRANSMISSION => {
+                let Some(pending) = self.pending_data_transfers.get(&req_handle).copied() else {
+                    tracing::warn!("MLE: first-complete TL-REPORT for unknown req_handle={}", req_handle);
+                    return;
+                };
+                if matches!(pending.user, MleSapUser::Sndcp) {
+                    Self::push_mle_report(
+                        queue,
+                        pending,
+                        prim.report,
+                        prim.chan_change_resp_req.unwrap_or(false),
+                        prim.chan_change_handle.unwrap_or_default(),
+                    );
+                } else {
+                    tracing::trace!("MLE: TL-DATA progress report req_handle={} report={}", req_handle, prim.report);
+                }
             }
             TLA_REPORT_FAILED_TRANSFER | TLA_REPORT_SUCCESSFUL_TRANSFER => {
                 let Some(pending) = self.pending_data_transfers.remove(&req_handle) else {

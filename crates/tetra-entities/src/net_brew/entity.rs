@@ -205,6 +205,10 @@ pub struct BrewEntity {
     /// Registered subscriber groups (ISSI -> set of GSSIs)
     subscriber_groups: HashMap<u32, HashSet<u32>>,
 
+    /// Brew-origin external subscriber groups accepted since the current login.
+    /// This is intentionally separate from local RF subscriber state.
+    active_external_subscriber_groups: HashMap<u32, HashSet<u32>>,
+
     /// Whether the worker is connected
     connected: bool,
     /// Last Brew protocol version reported by the transport or inferred from messages.
@@ -275,6 +279,7 @@ impl BrewEntity {
             hanging_calls: HashMap::new(),
             ul_forwarded: HashMap::new(),
             subscriber_groups: HashMap::new(),
+            active_external_subscriber_groups: HashMap::new(),
             connected: false,
             server_version: 0,
             telemetry_sink: None,
@@ -383,6 +388,7 @@ impl BrewEntity {
                     let was_connected = self.connected;
                     self.connected = true;
                     self.server_version = server_version;
+                    self.clear_active_external_subscribers(queue, "new Brew login");
                     self.resync_subscribers();
                     self.set_network_connected(true, server_version);
                     if !was_connected {
@@ -401,6 +407,7 @@ impl BrewEntity {
                     tracing::warn!("BrewEntity: Brew backhaul disconnected: {} — releasing all active calls", reason);
                     self.server_version = 0;
                     self.set_network_connected(false, 0);
+                    self.clear_active_external_subscribers(queue, "backhaul disconnected");
                     // ETSI EN 300 392-2 §14.9.4: BS must release all circuits immediately
                     // when backhaul connection is lost. MS will receive D-RELEASE.
                     self.release_all_calls(queue);
@@ -435,56 +442,7 @@ impl BrewEntity {
                 }
                 BrewEvent::SubscriberEvent { msg_type, issi, groups } => {
                     tracing::debug!("BrewEntity: subscriber event type={} issi={} groups={:?}", msg_type, issi, groups);
-                    // External subscriber (e.g. SvxLink gateway) affiliated/deaffiliated on Brew server.
-                    // Notify CMCE so it updates group_listeners — without this, has_listener()
-                    // returns false for GSSIs where only external subscribers are present,
-                    // causing BS to reject U-SETUP with "no listeners".
-                    match msg_type {
-                        crate::net_brew::protocol::BREW_SUBSCRIBER_AFFILIATE => {
-                            if !groups.is_empty() {
-                                tracing::info!("BrewEntity: external subscriber issi={} → AFFILIATE groups={:?}", issi, groups);
-                                queue.push_back(SapMsg {
-                                    sap: tetra_core::Sap::Control,
-                                    src: TetraEntity::Brew,
-                                    dest: TetraEntity::Cmce,
-                                    msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
-                                        issi,
-                                        groups: groups.clone(),
-                                        action: BrewSubscriberAction::Affiliate,
-                                    }),
-                                });
-                            }
-                        }
-                        crate::net_brew::protocol::BREW_SUBSCRIBER_DEAFFILIATE => {
-                            if !groups.is_empty() {
-                                tracing::info!("BrewEntity: external subscriber issi={} → DEAFFILIATE groups={:?}", issi, groups);
-                                queue.push_back(SapMsg {
-                                    sap: tetra_core::Sap::Control,
-                                    src: TetraEntity::Brew,
-                                    dest: TetraEntity::Cmce,
-                                    msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
-                                        issi,
-                                        groups: groups.clone(),
-                                        action: BrewSubscriberAction::Deaffiliate,
-                                    }),
-                                });
-                            }
-                        }
-                        crate::net_brew::protocol::BREW_SUBSCRIBER_DEREGISTER => {
-                            tracing::info!("BrewEntity: external subscriber issi={} → DEREGISTER", issi);
-                            queue.push_back(SapMsg {
-                                sap: tetra_core::Sap::Control,
-                                src: TetraEntity::Brew,
-                                dest: TetraEntity::Cmce,
-                                msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
-                                    issi,
-                                    groups: Vec::new(),
-                                    action: BrewSubscriberAction::Deregister,
-                                }),
-                            });
-                        }
-                        _ => {}
-                    }
+                    self.handle_external_subscriber_event(queue, msg_type, issi, groups);
                 }
                 BrewEvent::ServerError { error_type, data } => {
                     tracing::error!("BrewEntity: server error type={} data={} bytes", error_type, data.len());
@@ -766,6 +724,100 @@ impl BrewEntity {
                     issi
                 );
             }
+        }
+    }
+
+    fn is_local_subscriber_known(&self, issi: u32) -> bool {
+        self.subscriber_groups.contains_key(&issi) || self.config.state_read().subscribers.is_registered(issi)
+    }
+
+    fn push_external_subscriber_update(queue: &mut MessageQueue, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
+        queue.push_back(SapMsg {
+            sap: tetra_core::Sap::Control,
+            src: TetraEntity::Brew,
+            dest: TetraEntity::Cmce,
+            msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate { issi, groups, action }),
+        });
+    }
+
+    fn handle_external_subscriber_event(&mut self, queue: &mut MessageQueue, msg_type: u8, issi: u32, groups: Vec<u32>) {
+        // Brew subscriber events are interconnect state, not EN 300 392-2 MM
+        // registration. Treat server-side history as relevant only after this
+        // BS has accepted an active external affiliation in the current login.
+        if self.is_local_subscriber_known(issi) {
+            tracing::debug!(
+                "BrewEntity: ignoring external subscriber event type={} for local/RF ISSI {} groups={:?}",
+                msg_type,
+                issi,
+                groups
+            );
+            return;
+        }
+
+        match msg_type {
+            crate::net_brew::protocol::BREW_SUBSCRIBER_AFFILIATE => {
+                let routable_groups = self.brew_routable_groups(groups);
+                if routable_groups.is_empty() {
+                    return;
+                }
+
+                let entry = self.active_external_subscriber_groups.entry(issi).or_insert_with(HashSet::new);
+                let mut new_groups = Vec::new();
+                for gssi in routable_groups {
+                    if entry.insert(gssi) {
+                        new_groups.push(gssi);
+                    }
+                }
+
+                if !new_groups.is_empty() {
+                    tracing::info!("BrewEntity: external subscriber issi={} → AFFILIATE groups={:?}", issi, new_groups);
+                    Self::push_external_subscriber_update(queue, issi, new_groups, BrewSubscriberAction::Affiliate);
+                }
+            }
+            crate::net_brew::protocol::BREW_SUBSCRIBER_DEAFFILIATE => {
+                let routable_groups = self.brew_routable_groups(groups);
+                let mut removed_groups = Vec::new();
+                if let Some(entry) = self.active_external_subscriber_groups.get_mut(&issi) {
+                    for gssi in routable_groups {
+                        if entry.remove(&gssi) {
+                            removed_groups.push(gssi);
+                        }
+                    }
+                    if entry.is_empty() {
+                        self.active_external_subscriber_groups.remove(&issi);
+                    }
+                }
+
+                if removed_groups.is_empty() {
+                    tracing::debug!("BrewEntity: ignoring stale external deaffiliate issi={}", issi);
+                    return;
+                }
+
+                tracing::info!(
+                    "BrewEntity: external subscriber issi={} → DEAFFILIATE groups={:?}",
+                    issi,
+                    removed_groups
+                );
+                Self::push_external_subscriber_update(queue, issi, removed_groups, BrewSubscriberAction::Deaffiliate);
+            }
+            crate::net_brew::protocol::BREW_SUBSCRIBER_DEREGISTER => {
+                if self.active_external_subscriber_groups.remove(&issi).is_none() {
+                    tracing::debug!("BrewEntity: ignoring stale external deregister issi={}", issi);
+                    return;
+                }
+
+                tracing::info!("BrewEntity: external subscriber issi={} → DEREGISTER", issi);
+                Self::push_external_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
+            }
+            _ => {}
+        }
+    }
+
+    fn clear_active_external_subscribers(&mut self, queue: &mut MessageQueue, reason: &str) {
+        let external = std::mem::take(&mut self.active_external_subscriber_groups);
+        for issi in external.keys().copied() {
+            tracing::info!("BrewEntity: external subscriber issi={} → DEREGISTER ({})", issi, reason);
+            Self::push_external_subscriber_update(queue, issi, Vec::new(), BrewSubscriberAction::Deregister);
         }
     }
 
@@ -2189,6 +2241,7 @@ mod tests {
         BREW_STE_FRAME_BITS, BREW_STE_FRAME_BYTES, BREW_STE_HEADER_NORMAL_SPEECH, BREW_STE_UNUSED_TAIL_MASK, BrewEntity,
         NETWORK_GROUP_ZERO_MEDIA_GUARD, UlForwardKind, UlForwardedCall,
     };
+    use crate::net_brew::protocol::{BREW_SUBSCRIBER_AFFILIATE, BREW_SUBSCRIBER_DEAFFILIATE, BREW_SUBSCRIBER_DEREGISTER};
     use crate::net_brew::worker::{BrewCommand, BrewEvent};
     use crate::{MessageQueue, TetraEntityTrait};
 
@@ -2234,6 +2287,7 @@ mod tests {
                 hanging_calls: HashMap::new(),
                 ul_forwarded: HashMap::new(),
                 subscriber_groups: HashMap::new(),
+                active_external_subscriber_groups: HashMap::new(),
                 connected: true,
                 server_version: 1,
                 telemetry_sink: None,
@@ -2784,6 +2838,16 @@ mod tests {
         }
     }
 
+    fn cmce_subscriber_updates(msgs: &[tetra_saps::SapMsg]) -> Vec<&MmSubscriberUpdate> {
+        msgs.iter()
+            .filter(|msg| msg.src == TetraEntity::Brew && msg.dest == TetraEntity::Cmce)
+            .filter_map(|msg| match &msg.msg {
+                SapMsgInner::MmSubscriberUpdate(update) => Some(update),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn sds_type4_rejects_length_indicator_above_etsi_limit() {
         // EN 300 392-2 clauses 14.7.2.8 note 5 and 14.8.52 limit
@@ -2928,9 +2992,283 @@ mod tests {
     }
 
     #[test]
+    fn external_deregister_for_unknown_or_duplicate_issi_is_ignored() {
+        let (mut entity, _rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        let external_issi = 4_501_103;
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEREGISTER,
+                issi: external_issi,
+                groups: Vec::new(),
+            })
+            .expect("stale deregister event should queue");
+        entity.process_events(&mut queue);
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "unknown external DEREGISTER must not reach CMCE"
+        );
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_AFFILIATE,
+                issi: external_issi,
+                groups: vec![91],
+            })
+            .expect("affiliate event should queue");
+        entity.process_events(&mut queue);
+        let affiliate_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&affiliate_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].action, BrewSubscriberAction::Affiliate);
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEREGISTER,
+                issi: external_issi,
+                groups: Vec::new(),
+            })
+            .expect("deregister event should queue");
+        entity.process_events(&mut queue);
+        let deregister_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&deregister_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].action, BrewSubscriberAction::Deregister);
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEREGISTER,
+                issi: external_issi,
+                groups: Vec::new(),
+            })
+            .expect("duplicate deregister event should queue");
+        entity.process_events(&mut queue);
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "duplicate external DEREGISTER must be ignored after cleanup"
+        );
+    }
+
+    #[test]
+    fn external_affiliate_then_deaffiliate_forwards_cleanup_once() {
+        let (mut entity, _rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        let external_issi = 2_190_554;
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_AFFILIATE,
+                issi: external_issi,
+                groups: vec![91],
+            })
+            .expect("affiliate event should queue");
+        entity.process_events(&mut queue);
+        let affiliate_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&affiliate_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].issi, external_issi);
+        assert_eq!(updates[0].groups, vec![91]);
+        assert_eq!(updates[0].action, BrewSubscriberAction::Affiliate);
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_AFFILIATE,
+                issi: external_issi,
+                groups: vec![91],
+            })
+            .expect("duplicate affiliate event should queue");
+        entity.process_events(&mut queue);
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "duplicate external AFFILIATE must not double-count CMCE listeners"
+        );
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEAFFILIATE,
+                issi: external_issi,
+                groups: vec![91],
+            })
+            .expect("deaffiliate event should queue");
+        entity.process_events(&mut queue);
+        let deaffiliate_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&deaffiliate_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].issi, external_issi);
+        assert_eq!(updates[0].groups, vec![91]);
+        assert_eq!(updates[0].action, BrewSubscriberAction::Deaffiliate);
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEAFFILIATE,
+                issi: external_issi,
+                groups: vec![91],
+            })
+            .expect("duplicate deaffiliate event should queue");
+        entity.process_events(&mut queue);
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "duplicate external DEAFFILIATE must be ignored after cleanup"
+        );
+    }
+
+    #[test]
+    fn external_affiliate_for_local_issi_is_ignored() {
+        let (mut entity, _rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        entity.subscriber_groups.insert(2260616, HashSet::from([91]));
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_AFFILIATE,
+                issi: 2260616,
+                groups: vec![91],
+            })
+            .expect("local echo affiliate event should queue");
+        entity.process_events(&mut queue);
+
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "Brew external echo for a local RF ISSI must not reach CMCE external state"
+        );
+    }
+
+    #[test]
+    fn external_subscriber_events_for_local_issi_all_lifecycle_edges_are_ignored() {
+        let (mut entity, _rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        entity.subscriber_groups.insert(2260616, HashSet::from([91]));
+
+        for msg_type in [BREW_SUBSCRIBER_AFFILIATE, BREW_SUBSCRIBER_DEAFFILIATE, BREW_SUBSCRIBER_DEREGISTER] {
+            event_tx
+                .send(BrewEvent::SubscriberEvent {
+                    msg_type,
+                    issi: 2260616,
+                    groups: vec![91],
+                })
+                .expect("local echo lifecycle event should queue");
+            entity.process_events(&mut queue);
+            assert!(
+                drain_queue(&mut queue).is_empty(),
+                "Brew external lifecycle echo type={msg_type} for local RF ISSI must not reach CMCE"
+            );
+        }
+    }
+
+    #[test]
+    fn external_subscriber_event_for_shared_rf_registered_issi_is_ignored() {
+        let (mut entity, _rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        entity.config.state_write().subscribers.register(2260616);
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_AFFILIATE,
+                issi: 2260616,
+                groups: vec![91],
+            })
+            .expect("shared RF registry echo affiliate event should queue");
+        entity.process_events(&mut queue);
+
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "Brew external event for a shared-registry RF ISSI must not reach CMCE"
+        );
+    }
+
+    #[test]
+    fn external_active_subscribers_are_deregistered_on_disconnect() {
+        let (mut entity, _rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        let external_issi = 4_501_103;
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_AFFILIATE,
+                issi: external_issi,
+                groups: vec![91],
+            })
+            .expect("affiliate event should queue");
+        entity.process_events(&mut queue);
+        let affiliate_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&affiliate_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].action, BrewSubscriberAction::Affiliate);
+
+        event_tx
+            .send(BrewEvent::Disconnected("test disconnect".to_string()))
+            .expect("disconnect event should queue");
+        entity.process_events(&mut queue);
+        let disconnect_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&disconnect_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].issi, external_issi);
+        assert_eq!(updates[0].groups, Vec::<u32>::new());
+        assert_eq!(updates[0].action, BrewSubscriberAction::Deregister);
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEREGISTER,
+                issi: external_issi,
+                groups: Vec::new(),
+            })
+            .expect("stale post-disconnect deregister event should queue");
+        entity.process_events(&mut queue);
+        assert!(
+            drain_queue(&mut queue).is_empty(),
+            "post-disconnect external DEREGISTER must be stale after cleanup"
+        );
+    }
+
+    #[test]
+    fn connected_resync_replays_only_local_subscribers_and_clears_external_active_state() {
+        let (mut entity, rx, event_tx) = brew_entity_with_event_sender();
+        let mut queue = MessageQueue::new();
+        entity.subscriber_groups.insert(2260616, HashSet::from([91]));
+        entity.active_external_subscriber_groups.insert(4_501_103, HashSet::from([91]));
+
+        event_tx
+            .send(BrewEvent::Connected { server_version: 1 })
+            .expect("connected event should queue");
+        entity.process_events(&mut queue);
+        let connected_msgs = drain_queue(&mut queue);
+        let updates = cmce_subscriber_updates(&connected_msgs);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].issi, 4_501_103);
+        assert_eq!(updates[0].groups, Vec::<u32>::new());
+        assert_eq!(updates[0].action, BrewSubscriberAction::Deregister);
+
+        assert_register(rx.try_recv().expect("connected resync register"), 2260616);
+        assert_affiliate(rx.try_recv().expect("connected resync affiliate"), 2260616, &[91]);
+        assert!(
+            rx.try_recv().is_err(),
+            "external active state must not be exported during connected resync"
+        );
+        assert!(
+            entity.active_external_subscriber_groups.is_empty(),
+            "connected event must start a fresh external subscriber epoch"
+        );
+
+        event_tx
+            .send(BrewEvent::SubscriberEvent {
+                msg_type: BREW_SUBSCRIBER_DEREGISTER,
+                issi: 4_501_103,
+                groups: Vec::new(),
+            })
+            .expect("stale deregister event should queue");
+        entity.process_events(&mut queue);
+        assert!(
+            cmce_subscriber_updates(&drain_queue(&mut queue)).is_empty(),
+            "stale external cleanup after reconnect must not reach CMCE"
+        );
+    }
+
+    #[test]
     fn resync_replays_runtime_issi_group_subscription() {
         let (mut entity, rx) = brew_entity_without_worker();
         entity.subscriber_groups.insert(2260616, HashSet::from([91]));
+        entity.active_external_subscriber_groups.insert(4_501_103, HashSet::from([91]));
 
         entity.resync_subscribers();
 

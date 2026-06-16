@@ -6,6 +6,8 @@
 use tetra_core::BitBuffer;
 use tetra_saps::sn::{SnPrimitiveError, SnUnitdataInd, SnUnitdataReq, sn_unitdata_ind};
 
+use super::transfer::SN_PDU_TYPE_DATA;
+
 pub const SN_PDU_TYPE_UNITDATA: u8 = 4;
 pub const SNDCP_NO_COMPRESSION: u8 = 0;
 
@@ -53,6 +55,14 @@ impl From<SnPrimitiveError> for SndcpUnitdataError {
 }
 
 pub fn decode_sn_unitdata_pdu(sdu: &BitBuffer) -> Result<SnUnitdata, SndcpUnitdataError> {
+    decode_sn_user_data_pdu_of_type(sdu, SN_PDU_TYPE_UNITDATA)
+}
+
+pub fn decode_sn_data_pdu(sdu: &BitBuffer) -> Result<SnUnitdata, SndcpUnitdataError> {
+    decode_sn_user_data_pdu_of_type(sdu, SN_PDU_TYPE_DATA)
+}
+
+pub fn decode_sn_user_data_pdu(sdu: &BitBuffer) -> Result<SnUnitdata, SndcpUnitdataError> {
     let mut sdu = BitBuffer::from_bitbuffer(sdu);
     if sdu.get_pos() != 0 {
         sdu.seek(0);
@@ -62,7 +72,24 @@ pub fn decode_sn_unitdata_pdu(sdu: &BitBuffer) -> Result<SnUnitdata, SndcpUnitda
         return Err(SndcpUnitdataError::Malformed("sn_pdu_type"));
     };
     let sn_pdu_type = sn_pdu_type as u8;
-    if sn_pdu_type != SN_PDU_TYPE_UNITDATA {
+    if sn_pdu_type != SN_PDU_TYPE_UNITDATA && sn_pdu_type != SN_PDU_TYPE_DATA {
+        return Err(SndcpUnitdataError::UnsupportedPduType(sn_pdu_type));
+    }
+
+    decode_sn_unitdata_body(&sdu)
+}
+
+fn decode_sn_user_data_pdu_of_type(sdu: &BitBuffer, expected_type: u8) -> Result<SnUnitdata, SndcpUnitdataError> {
+    let mut sdu = BitBuffer::from_bitbuffer(sdu);
+    if sdu.get_pos() != 0 {
+        sdu.seek(0);
+    }
+
+    let Some(sn_pdu_type) = sdu.read_bits(4) else {
+        return Err(SndcpUnitdataError::Malformed("sn_pdu_type"));
+    };
+    let sn_pdu_type = sn_pdu_type as u8;
+    if sn_pdu_type != expected_type {
         return Err(SndcpUnitdataError::UnsupportedPduType(sn_pdu_type));
     }
 
@@ -112,9 +139,17 @@ pub fn decode_sn_unitdata_body(sdu: &BitBuffer) -> Result<SnUnitdata, SndcpUnitd
 }
 
 pub fn encode_sn_unitdata(nsapi: u8, pcomp: u8, dcomp: u8, n_pdu: &BitBuffer) -> Result<BitBuffer, SndcpEncodeError> {
-    // EN 300 392-2 clause 28.4.4.14/table 28.43: SN-UNITDATA is
-    // SN PDU type(4), NSAPI(4), PCOMP(4), DCOMP(4), then a variable N-PDU
-    // whose length is defined by the lower layer PDU length.
+    encode_sn_user_data(SN_PDU_TYPE_UNITDATA, nsapi, pcomp, dcomp, n_pdu)
+}
+
+pub fn encode_sn_data(nsapi: u8, pcomp: u8, dcomp: u8, n_pdu: &BitBuffer) -> Result<BitBuffer, SndcpEncodeError> {
+    encode_sn_user_data(SN_PDU_TYPE_DATA, nsapi, pcomp, dcomp, n_pdu)
+}
+
+fn encode_sn_user_data(sn_pdu_type: u8, nsapi: u8, pcomp: u8, dcomp: u8, n_pdu: &BitBuffer) -> Result<BitBuffer, SndcpEncodeError> {
+    // EN 300 392-2 clauses 28.4.4.4 and 28.4.4.14 define SN-DATA and
+    // SN-UNITDATA with the same NSAPI/PCOMP/DCOMP/N-PDU body. Only the
+    // SN PDU type selects acknowledged versus unacknowledged service.
     if !(1..=14).contains(&nsapi) {
         return Err(SndcpEncodeError::UnsupportedNsapi(nsapi));
     }
@@ -126,7 +161,7 @@ pub fn encode_sn_unitdata(nsapi: u8, pcomp: u8, dcomp: u8, n_pdu: &BitBuffer) ->
     }
 
     let mut pdu = BitBuffer::new(16 + n_pdu.get_len());
-    pdu.write_bits(SN_PDU_TYPE_UNITDATA as u64, 4);
+    pdu.write_bits(sn_pdu_type as u64, 4);
     pdu.write_bits(nsapi as u64, 4);
     pdu.write_bits(pcomp as u64, 4);
     pdu.write_bits(dcomp as u64, 4);
@@ -145,12 +180,21 @@ pub fn sn_unitdata_ind_from_pdu(sdu: &BitBuffer) -> Result<SnUnitdataInd, SndcpU
     sn_unitdata_ind_from_decoded(unitdata)
 }
 
+pub fn sn_user_data_ind_from_pdu(sdu: &BitBuffer) -> Result<SnUnitdataInd, SndcpUnitdataError> {
+    let unitdata = decode_sn_user_data_pdu(sdu)?;
+    sn_unitdata_ind_from_decoded(unitdata)
+}
+
 pub fn sn_unitdata_ind_from_decoded(unitdata: SnUnitdata) -> Result<SnUnitdataInd, SndcpUnitdataError> {
     Ok(sn_unitdata_ind(unitdata.nsapi, unitdata.n_pdu)?)
 }
 
 pub fn sn_unitdata_req_to_pdu(req: &SnUnitdataReq) -> Result<BitBuffer, SndcpEncodeError> {
     encode_sn_unitdata(req.nsapi, SNDCP_NO_COMPRESSION, SNDCP_NO_COMPRESSION, &req.n_pdu)
+}
+
+pub fn sn_data_req_to_pdu(req: &SnUnitdataReq) -> Result<BitBuffer, SndcpEncodeError> {
+    encode_sn_data(req.nsapi, SNDCP_NO_COMPRESSION, SNDCP_NO_COMPRESSION, &req.n_pdu)
 }
 
 fn classify_network_pdu(n_pdu: &BitBuffer) -> NetworkPduKind {

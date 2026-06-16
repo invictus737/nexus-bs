@@ -28,6 +28,8 @@ pub const LTPD_CONFIG_REASON_LOSS_OF_RADIO_RESOURCES: Todo = 3;
 pub const LTPD_CONFIG_REASON_RECOVERY_OF_RADIO_RESOURCES: Todo = 4;
 pub const SNDCP_PDCH_TIMESLOT_MIN: u8 = 1;
 pub const SNDCP_PDCH_TIMESLOT_MAX: u8 = 4;
+pub const SNDCP_PDCH_ASSIGNED_SCCH_TIMESLOTS: [bool; 4] = [false, true, true, true];
+pub const SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT: [bool; 4] = [false, true, false, false];
 pub const SNDCP_TRAFFIC_USAGE_MARKER_MIN: u8 = 4;
 pub const SNDCP_TRAFFIC_USAGE_MARKER_MAX: u8 = 62;
 
@@ -108,6 +110,7 @@ pub struct SndcpPhaseModulationResourceRequest {
     pub uplink_timeslots: u8,
     pub downlink_timeslots: u8,
     pub full_phase_modulation_capability_timeslots: u8,
+    pub unspecified_phase_modulation_resource: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -180,7 +183,10 @@ pub struct SndcpEndOfDataChannelPlan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SndcpPdchAllocationPolicy {
-    pub timeslot: u8,
+    pub timeslots: [bool; 4],
+    /// Packet-data PDCH is an assigned SCCH. ETSI traffic usage markers are
+    /// not required for assigned control, but this stays optional so callers
+    /// that deliberately test legacy marker-bearing allocations still validate.
     pub usage_marker: Option<u8>,
     pub carrier: Option<Todo>,
     pub ul_dl_assignment: UlDlAssignment,
@@ -383,6 +389,17 @@ impl SndcpPdchManager {
         Ok(())
     }
 
+    pub fn mark_common_control_on_link(&mut self, issi: u32, endpoint_id: EndpointId, link_id: LinkId) {
+        let session = self.ensure_session(issi, endpoint_id, link_id);
+        session.endpoint_id = endpoint_id;
+        session.link_id = link_id;
+        session.state = SndcpPdchState::CommonControl;
+    }
+
+    pub fn deregister_issi(&mut self, issi: u32) {
+        self.sessions.remove(&issi);
+    }
+
     pub fn ensure_packet_data_ready(&self, issi: u32, endpoint_id: EndpointId, link_id: LinkId) -> Result<(), SndcpPdchError> {
         let session = self.sessions.get(&issi).ok_or(SndcpPdchError::PacketDataBearerNotReady {
             issi,
@@ -515,13 +532,25 @@ impl Default for SndcpPacketDataPlanInput {
 
 impl SndcpPdchAllocationPolicy {
     pub fn single_slot(timeslot: u8, usage_marker: Option<u8>) -> Self {
+        let mut timeslots = [false; 4];
+        if (SNDCP_PDCH_TIMESLOT_MIN..=SNDCP_PDCH_TIMESLOT_MAX).contains(&timeslot) {
+            timeslots[(timeslot - 1) as usize] = true;
+        }
+        Self::timeslots(timeslots, usage_marker)
+    }
+
+    pub fn timeslots(timeslots: [bool; 4], usage_marker: Option<u8>) -> Self {
         Self {
-            timeslot,
+            timeslots,
             usage_marker,
             carrier: None,
             ul_dl_assignment: UlDlAssignment::Both,
             allow_mcch_timeslot: false,
         }
+    }
+
+    pub fn assigned_scch_for_resource_request(resource_request: SndcpPacketDataResourceRequest) -> Self {
+        Self::timeslots(assigned_scch_pdch_timeslots_for_resource_request(resource_request), None)
     }
 
     pub fn with_allow_mcch_timeslot(mut self, allow_mcch_timeslot: bool) -> Self {
@@ -582,8 +611,6 @@ pub fn packet_data_plan_to_lower_channel_allocation(
         SndcpPacketDataAllocationDecision::NewPdchAllocation => {
             validate_pdch_allocation_policy(policy)?;
             let placement = validate_new_allocation_placement(plan.mac_channel_allocation_placement)?;
-            let mut timeslots = [false; 4];
-            timeslots[(policy.timeslot - 1) as usize] = true;
 
             Ok(Some(SndcpLowerChannelAllocation {
                 issi: plan.issi,
@@ -592,7 +619,7 @@ pub fn packet_data_plan_to_lower_channel_allocation(
                 chan_alloc: CmceChanAllocReq {
                     usage: policy.usage_marker,
                     carrier: policy.carrier,
-                    timeslots,
+                    timeslots: policy.timeslots,
                     alloc_type: ChanAllocType::Replace,
                     ul_dl_assigned: policy.ul_dl_assignment,
                 },
@@ -638,13 +665,17 @@ pub fn validate_lower_channel_allocation(allocation: &SndcpLowerChannelAllocatio
 
     match allocation.allocation {
         SndcpPacketDataAllocationDecision::NewPdchAllocation => {
-            let usage_marker = allocation.chan_alloc.usage.ok_or(SndcpPdchError::MissingPdchUsageMarker)?;
-            if !(SNDCP_TRAFFIC_USAGE_MARKER_MIN..=SNDCP_TRAFFIC_USAGE_MARKER_MAX).contains(&usage_marker) {
+            if let Some(usage_marker) = allocation.chan_alloc.usage
+                && !(SNDCP_TRAFFIC_USAGE_MARKER_MIN..=SNDCP_TRAFFIC_USAGE_MARKER_MAX).contains(&usage_marker)
+            {
                 return Err(SndcpPdchError::InvalidPdchUsageMarker(usage_marker));
             }
             let timeslot_count = allocation.chan_alloc.timeslots.iter().filter(|assigned| **assigned).count();
-            if timeslot_count != 1 {
+            if timeslot_count == 0 || timeslot_count > SNDCP_PDCH_TIMESLOT_MAX.saturating_sub(1) as usize {
                 return Err(SndcpPdchError::InvalidPdchTimeslotSelection(timeslot_count));
+            }
+            if allocation.chan_alloc.timeslots[0] {
+                return Err(SndcpPdchError::McchTimeslotRequiresExplicitPolicy(1));
             }
             if allocation.chan_alloc.alloc_type != ChanAllocType::Replace {
                 return Err(SndcpPdchError::UnsupportedPdchAllocationType(allocation.chan_alloc.alloc_type));
@@ -696,16 +727,25 @@ pub fn build_ltpd_configure_req(
 }
 
 fn validate_pdch_allocation_policy(policy: SndcpPdchAllocationPolicy) -> Result<(), SndcpPdchError> {
-    if !(SNDCP_PDCH_TIMESLOT_MIN..=SNDCP_PDCH_TIMESLOT_MAX).contains(&policy.timeslot) {
-        return Err(SndcpPdchError::InvalidPdchTimeslot(policy.timeslot));
+    let timeslot_count = policy.timeslots.iter().filter(|assigned| **assigned).count();
+    if timeslot_count == 0 || timeslot_count > SNDCP_PDCH_TIMESLOT_MAX.saturating_sub(1) as usize {
+        return Err(SndcpPdchError::InvalidPdchTimeslotSelection(timeslot_count));
     }
-    if policy.timeslot == 1 && !policy.allow_mcch_timeslot {
-        return Err(SndcpPdchError::McchTimeslotRequiresExplicitPolicy(policy.timeslot));
+    for (idx, assigned) in policy.timeslots.iter().enumerate() {
+        if !*assigned {
+            continue;
+        }
+        let timeslot = (idx + 1) as u8;
+        if !(SNDCP_PDCH_TIMESLOT_MIN..=SNDCP_PDCH_TIMESLOT_MAX).contains(&timeslot) {
+            return Err(SndcpPdchError::InvalidPdchTimeslot(timeslot));
+        }
     }
-    let Some(usage_marker) = policy.usage_marker else {
-        return Err(SndcpPdchError::MissingPdchUsageMarker);
-    };
-    if !(SNDCP_TRAFFIC_USAGE_MARKER_MIN..=SNDCP_TRAFFIC_USAGE_MARKER_MAX).contains(&usage_marker) {
+    if policy.timeslots[0] && !policy.allow_mcch_timeslot {
+        return Err(SndcpPdchError::McchTimeslotRequiresExplicitPolicy(1));
+    }
+    if let Some(usage_marker) = policy.usage_marker
+        && !(SNDCP_TRAFFIC_USAGE_MARKER_MIN..=SNDCP_TRAFFIC_USAGE_MARKER_MAX).contains(&usage_marker)
+    {
         return Err(SndcpPdchError::InvalidPdchUsageMarker(usage_marker));
     }
     if let Some(carrier) = policy.carrier {
@@ -730,8 +770,11 @@ fn validate_packet_data_plan_input(input: SndcpPacketDataPlanInput) -> Result<()
     if validate_nsapi(input.nsapi).is_err() {
         return Err(SndcpPdchError::ReservedNsapi(input.nsapi));
     }
-    if input.packet_data_ms_type != SnPacketDataMsType::TypeAParallel {
-        return Err(SndcpPdchError::UnsupportedPacketDataMsType(input.packet_data_ms_type));
+    match input.packet_data_ms_type {
+        SnPacketDataMsType::TypeAParallel | SnPacketDataMsType::TypeBAlternating | SnPacketDataMsType::TypeCIpSingleMode => {}
+        SnPacketDataMsType::TypeDRestrictedIpSingleMode => {
+            return Err(SndcpPdchError::UnsupportedPacketDataMsType(input.packet_data_ms_type));
+        }
     }
     validate_channel_advice_and_resource_request(input.channel_advice_request, input.resource_request)?;
     match input.layer2service {
@@ -783,10 +826,54 @@ fn validate_channel_advice_and_resource_request(
                 return Err(SndcpPdchError::ResourceRequestTimeslotsOutOfRange(timeslots));
             }
         }
+        if request.uplink_timeslots > request.full_phase_modulation_capability_timeslots
+            || request.downlink_timeslots > request.full_phase_modulation_capability_timeslots
+        {
+            return Err(SndcpPdchError::UnsupportedResourceRequest(resource_request));
+        }
+        if request.uplink_timeslots == 1 && request.downlink_timeslots == 1 {
+            return Ok(());
+        }
+        // Keep asymmetric or impossible phase-modulation requests fail-closed;
+        // symmetric multi-slot requests are then scaled by the lower allocation
+        // policy to non-MCCH assigned-SCCH slots.
+        if request.uplink_timeslots == request.downlink_timeslots {
+            return Ok(());
+        }
+        if request.unspecified_phase_modulation_resource
+            && request.uplink_timeslots == request.downlink_timeslots
+            && request.uplink_timeslots == request.full_phase_modulation_capability_timeslots
+        {
+            return Ok(());
+        }
         return Err(SndcpPdchError::UnsupportedResourceRequest(resource_request));
     }
 
     Ok(())
+}
+
+fn assigned_scch_pdch_timeslots_for_resource_request(resource_request: SndcpPacketDataResourceRequest) -> [bool; 4] {
+    let requested_slots = match resource_request {
+        SndcpPacketDataResourceRequest::None => SNDCP_PDCH_TIMESLOT_MAX,
+        SndcpPacketDataResourceRequest::PhaseModulation(request) => {
+            if request.uplink_timeslots == 1 && request.downlink_timeslots == 1 {
+                1
+            } else if request.unspecified_phase_modulation_resource {
+                request.full_phase_modulation_capability_timeslots
+            } else {
+                request
+                    .uplink_timeslots
+                    .max(request.downlink_timeslots)
+                    .min(request.full_phase_modulation_capability_timeslots)
+            }
+        }
+    };
+    let assigned_slots = usize::from(requested_slots.clamp(1, SNDCP_PDCH_TIMESLOT_MAX - 1));
+    let mut timeslots = [false; 4];
+    for idx in 1..=assigned_slots {
+        timeslots[idx] = true;
+    }
+    timeslots
 }
 
 fn packet_data_channel_plan(
@@ -855,7 +942,19 @@ fn channel_change_decision_to_ltpd(decision: SndcpChannelChangeDecision) -> Opti
 }
 
 fn validate_endpoint_link(issi: u32, session: &SndcpPdchSession, endpoint_id: EndpointId, link_id: LinkId) -> Result<(), SndcpPdchError> {
-    if session.state == SndcpPdchState::PdchReady && (session.endpoint_id != endpoint_id || session.link_id != link_id) {
+    if session.state == SndcpPdchState::PdchReady && session.endpoint_id != endpoint_id {
+        return Err(SndcpPdchError::EndpointLinkMismatch {
+            issi,
+            expected_endpoint_id: session.endpoint_id,
+            expected_link_id: session.link_id,
+            actual_endpoint_id: endpoint_id,
+            actual_link_id: link_id,
+        });
+    }
+    if session.state == SndcpPdchState::PdchReady {
+        return Ok(());
+    }
+    if session.endpoint_id != endpoint_id || session.link_id != link_id {
         return Err(SndcpPdchError::EndpointLinkMismatch {
             issi,
             expected_endpoint_id: session.endpoint_id,
@@ -900,7 +999,7 @@ mod tests {
     }
 
     fn pdch_policy() -> SndcpPdchAllocationPolicy {
-        SndcpPdchAllocationPolicy::single_slot(2, Some(4))
+        SndcpPdchAllocationPolicy::timeslots([false, true, true, true], None)
     }
 
     fn end_of_data_input() -> SndcpEndOfDataPlanInput {
@@ -979,6 +1078,28 @@ mod tests {
     }
 
     #[test]
+    fn packet_data_ready_bearer_accepts_advanced_link_data_on_same_endpoint() {
+        let mut manager = SndcpPdchManager::new();
+        manager.mark_pdch_ready(ISSI, 3, SNDCP_BASIC_LINK_ID);
+
+        assert!(
+            manager.ensure_packet_data_ready(ISSI, 3, 1).is_ok(),
+            "SN-DATA TRANSMIT REQUEST establishes the RF PDCH bearer on basic link, but SN-UNITDATA arrives on the negotiated AL link"
+        );
+        assert_eq!(
+            manager.ensure_packet_data_ready(ISSI, 4, 1),
+            Err(SndcpPdchError::EndpointLinkMismatch {
+                issi: ISSI,
+                expected_endpoint_id: 3,
+                expected_link_id: SNDCP_BASIC_LINK_ID,
+                actual_endpoint_id: 4,
+                actual_link_id: 1,
+            }),
+            "PDCH bearer readiness is endpoint-scoped, not globally shared"
+        );
+    }
+
+    #[test]
     fn packet_data_plan_uses_existing_pdch_only_after_pdch_ready_fact() {
         let mut manager = SndcpPdchManager::new();
         manager.mark_pdch_ready(ISSI, 3, 7);
@@ -1011,12 +1132,27 @@ mod tests {
                 state: SwmiSndcpState::Standby
             })
         );
+        for packet_data_ms_type in [SnPacketDataMsType::TypeBAlternating, SnPacketDataMsType::TypeCIpSingleMode] {
+            assert!(matches!(
+                manager.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+                    packet_data_ms_type,
+                    pdch_available: true,
+                    ..packet_plan_input()
+                }),
+                Ok(SndcpPacketDataChannelPlan {
+                    allocation: SndcpPacketDataAllocationDecision::NewPdchAllocation,
+                    ..
+                })
+            ));
+        }
         assert_eq!(
             manager.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
-                packet_data_ms_type: SnPacketDataMsType::TypeBAlternating,
+                packet_data_ms_type: SnPacketDataMsType::TypeDRestrictedIpSingleMode,
                 ..packet_plan_input()
             }),
-            Err(SndcpPdchError::UnsupportedPacketDataMsType(SnPacketDataMsType::TypeBAlternating))
+            Err(SndcpPdchError::UnsupportedPacketDataMsType(
+                SnPacketDataMsType::TypeDRestrictedIpSingleMode
+            ))
         );
     }
 
@@ -1088,19 +1224,81 @@ mod tests {
             ))
         );
 
-        let resource_request = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+        let single_slot_resource_request = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
             uplink_timeslots: 1,
             downlink_timeslots: 1,
             full_phase_modulation_capability_timeslots: 1,
+            unspecified_phase_modulation_resource: false,
+        });
+        assert!(matches!(
+            manager.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+                resource_request: single_slot_resource_request,
+                current_channel_packet_data_suitable: false,
+                allow_common_control_packet_data: false,
+                pdch_available: true,
+                ..packet_plan_input()
+            }),
+            Ok(SndcpPacketDataChannelPlan {
+                allocation: SndcpPacketDataAllocationDecision::NewPdchAllocation,
+                ..
+            })
+        ));
+
+        let unspecified_four_slot_capability_request =
+            SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+                uplink_timeslots: 4,
+                downlink_timeslots: 4,
+                full_phase_modulation_capability_timeslots: 4,
+                unspecified_phase_modulation_resource: true,
+            });
+        assert!(matches!(
+            manager.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+                resource_request: unspecified_four_slot_capability_request,
+                current_channel_packet_data_suitable: false,
+                allow_common_control_packet_data: false,
+                pdch_available: true,
+                ..packet_plan_input()
+            }),
+            Ok(SndcpPacketDataChannelPlan {
+                allocation: SndcpPacketDataAllocationDecision::NewPdchAllocation,
+                ..
+            })
+        ));
+
+        let specific_four_slot_symmetric_request = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+            uplink_timeslots: 4,
+            downlink_timeslots: 4,
+            full_phase_modulation_capability_timeslots: 4,
+            unspecified_phase_modulation_resource: false,
+        });
+        assert!(matches!(
+            manager.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+                resource_request: specific_four_slot_symmetric_request,
+                current_channel_packet_data_suitable: false,
+                allow_common_control_packet_data: false,
+                pdch_available: true,
+                ..packet_plan_input()
+            }),
+            Ok(SndcpPacketDataChannelPlan {
+                allocation: SndcpPacketDataAllocationDecision::NewPdchAllocation,
+                ..
+            })
+        ));
+
+        let multi_slot_resource_request = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+            uplink_timeslots: 2,
+            downlink_timeslots: 1,
+            full_phase_modulation_capability_timeslots: 2,
+            unspecified_phase_modulation_resource: false,
         });
         assert_eq!(
             manager.plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
-                resource_request,
+                resource_request: multi_slot_resource_request,
                 current_channel_packet_data_suitable: true,
                 allow_common_control_packet_data: true,
                 ..packet_plan_input()
             }),
-            Err(SndcpPdchError::UnsupportedResourceRequest(resource_request))
+            Err(SndcpPdchError::UnsupportedResourceRequest(multi_slot_resource_request))
         );
 
         assert_eq!(
@@ -1109,6 +1307,7 @@ mod tests {
                     uplink_timeslots: 0,
                     downlink_timeslots: 1,
                     full_phase_modulation_capability_timeslots: 1,
+                    unspecified_phase_modulation_resource: false,
                 }),
                 current_channel_packet_data_suitable: true,
                 allow_common_control_packet_data: true,
@@ -1273,11 +1472,52 @@ mod tests {
         assert_eq!(lower.issi, ISSI);
         assert_eq!(lower.allocation, SndcpPacketDataAllocationDecision::NewPdchAllocation);
         assert_eq!(lower.placement, SndcpMacChannelAllocationPlacement::MacResource);
-        assert_eq!(lower.chan_alloc.usage, Some(4));
+        assert_eq!(lower.chan_alloc.usage, None);
         assert_eq!(lower.chan_alloc.carrier, None);
-        assert_eq!(lower.chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(lower.chan_alloc.timeslots, [false, true, true, true]);
         assert_eq!(lower.chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(lower.chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    }
+
+    #[test]
+    fn resource_aware_assigned_scch_policy_maps_single_slot_and_four_slot_requests() {
+        let single_slot = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+            uplink_timeslots: 1,
+            downlink_timeslots: 1,
+            full_phase_modulation_capability_timeslots: 1,
+            unspecified_phase_modulation_resource: false,
+        });
+        let single_policy = SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(single_slot);
+
+        assert_eq!(single_policy.usage_marker, None);
+        assert_eq!(single_policy.timeslots, SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT);
+        assert!(!single_policy.timeslots[0], "single-slot PDCH must not allocate MCCH TS1");
+        assert!(
+            !single_policy.timeslots[2] && !single_policy.timeslots[3],
+            "single-slot phase-modulation capability must not expand to TS3/TS4"
+        );
+
+        let unspecified_four_slot = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+            uplink_timeslots: 4,
+            downlink_timeslots: 4,
+            full_phase_modulation_capability_timeslots: 4,
+            unspecified_phase_modulation_resource: true,
+        });
+        let unspecified_policy = SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(unspecified_four_slot);
+
+        assert_eq!(unspecified_policy.usage_marker, None);
+        assert_eq!(unspecified_policy.timeslots, SNDCP_PDCH_ASSIGNED_SCCH_TIMESLOTS);
+
+        let specific_four_slot = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
+            uplink_timeslots: 4,
+            downlink_timeslots: 4,
+            full_phase_modulation_capability_timeslots: 4,
+            unspecified_phase_modulation_resource: false,
+        });
+        let specific_policy = SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(specific_four_slot);
+
+        assert_eq!(specific_policy.usage_marker, None);
+        assert_eq!(specific_policy.timeslots, SNDCP_PDCH_ASSIGNED_SCCH_TIMESLOTS);
     }
 
     #[test]
@@ -1320,7 +1560,7 @@ mod tests {
         assert_eq!(
             packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::single_slot(0, Some(4)))
                 .expect_err("timeslot 0 is invalid"),
-            SndcpPdchError::InvalidPdchTimeslot(0)
+            SndcpPdchError::InvalidPdchTimeslotSelection(0)
         );
         assert_eq!(
             packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::single_slot(1, Some(4)))
@@ -1335,11 +1575,10 @@ mod tests {
         .expect("explicit MCCH opt-in should still produce allocation");
         assert_eq!(ts1.chan_alloc.timeslots, [true, false, false, false]);
 
-        assert_eq!(
-            packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::single_slot(2, None))
-                .expect_err("PDCH allocation without a usage marker should fail closed"),
-            SndcpPdchError::MissingPdchUsageMarker
-        );
+        let no_marker = packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::single_slot(2, None))
+            .expect("PDCH allocation does not require a traffic usage marker")
+            .expect("valid PDCH policy should produce allocation");
+        assert_eq!(no_marker.chan_alloc.usage, None);
         assert_eq!(
             packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::single_slot(2, Some(3)))
                 .expect_err("reserved usage marker should reject"),

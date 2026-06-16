@@ -176,9 +176,9 @@ fn build_ltpd_req_with_chan_alloc(layer2service: Layer2Service, chan_alloc: Opti
 
 fn pdch_chan_alloc() -> CmceChanAllocReq {
     CmceChanAllocReq {
-        usage: Some(4),
+        usage: None,
         carrier: None,
-        timeslots: [false, true, false, false],
+        timeslots: [false, true, true, true],
         alloc_type: ChanAllocType::Replace,
         ul_dl_assigned: UlDlAssignment::Both,
     }
@@ -444,9 +444,9 @@ fn test_sndcp_unacknowledged_request_preserves_pdch_channel_allocation() {
     // channel allocation when accepting packet-data transfer. MLE must carry
     // this SNDCP-owned allocation without changing CMCE/SDS service routing.
     let chan_alloc = prim.chan_alloc.as_ref().expect("SNDCP PDCH allocation should reach LLC");
-    assert_eq!(chan_alloc.usage, Some(4));
+    assert_eq!(chan_alloc.usage, None);
     assert_eq!(chan_alloc.carrier, None);
-    assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+    assert_eq!(chan_alloc.timeslots, [false, true, true, true]);
     assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
     assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Sndcp);

@@ -594,7 +594,7 @@ call_preemptive = false
     }
 
     #[test]
-    fn test_wap_ip_profile_enables_serving_cell_sndcp_service() {
+    fn test_wap_ip_profile_enables_serving_cell_sndcp_service_and_advanced_link() {
         let toml = minimal_toml(
             r#"
 [cell_info.wap_ip]
@@ -610,13 +610,15 @@ dynamic_pool_last_host = 254
         let cfg = from_toml_str(&toml).expect("explicit WAP/IP profile should parse");
         let wap = cfg.cell.wap_ip.as_ref().expect("WAP/IP profile should be present");
         assert!(cfg.cell.sndcp_service);
+        assert!(cfg.cell.advanced_link);
         assert!(wap.enabled);
         assert_eq!(wap.address, [10, 0, 0, 1]);
         assert_eq!(wap.port, 9200);
         assert_eq!(wap.dynamic_pool_prefix, [10, 0, 0]);
         assert_eq!(wap.dynamic_pool_first_host, 2);
         assert_eq!(wap.dynamic_pool_last_host, 254);
-        assert!(wap.assume_pdch_ready_after_data_transmit);
+        assert_eq!(wap.max_request_payload_bytes, 1024);
+        assert!(!wap.assume_pdch_ready_after_data_transmit);
     }
 
     #[test]
@@ -634,6 +636,25 @@ enabled = true
         assert!(
             err.to_string()
                 .contains("cell_info.wap_ip.enabled=true conflicts with cell_info.sndcp_service=false"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_wap_ip_profile_rejects_conflicting_advanced_link_false() {
+        let toml = minimal_toml(
+            r#"
+advanced_link = false
+
+[cell_info.wap_ip]
+enabled = true
+"#,
+        );
+
+        let err = from_toml_str(&toml).expect_err("WAP/IP enabled cannot conflict with advanced link disabled");
+        assert!(
+            err.to_string()
+                .contains("cell_info.wap_ip.enabled=true conflicts with cell_info.advanced_link=false"),
             "unexpected error: {err}"
         );
     }

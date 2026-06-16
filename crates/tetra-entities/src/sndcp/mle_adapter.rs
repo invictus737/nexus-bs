@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 use super::pdch::{SndcpLowerChannelAllocation, SndcpPdchError, validate_lower_channel_allocation};
 use super::priority::{SndcpDataScheduling, SndcpPriorityError, SndcpPriorityPolicy};
-use super::unitdata::{SndcpEncodeError, sn_unitdata_req_to_pdu};
+use super::unitdata::{SndcpEncodeError, sn_data_req_to_pdu, sn_unitdata_req_to_pdu};
 use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, MleHandle, SsiType, TetraAddress, Todo};
 use tetra_pdus::mle::enums::mle_protocol_discriminator::MleProtocolDiscriminator;
 use tetra_saps::ltpd::{LtpdMleReportInd, LtpdMleUnitdataReq};
@@ -265,7 +265,12 @@ pub fn sn_unitdata_req_to_ltpd_mle_unitdata_req(
     options.data_priority = resolved.data_priority;
     options.mle_data_priority_signalling_required = false;
 
-    sndcp_pdu_to_ltpd_mle_unitdata_req(sn_unitdata_req_to_pdu(req)?, handle, options)
+    let pdu = if options.layer2service == Layer2Service::Acknowledged {
+        sn_data_req_to_pdu(req)?
+    } else {
+        sn_unitdata_req_to_pdu(req)?
+    };
+    sndcp_pdu_to_ltpd_mle_unitdata_req(pdu, handle, options)
 }
 
 pub fn ltpd_unitdata_req_to_tla_unitdata_req_with_allocation(
@@ -540,9 +545,9 @@ mod tests {
             allocation: SndcpPacketDataAllocationDecision::NewPdchAllocation,
             placement: SndcpMacChannelAllocationPlacement::MacResource,
             chan_alloc: CmceChanAllocReq {
-                usage: Some(4),
+                usage: None,
                 carrier: None,
-                timeslots: [false, true, false, false],
+                timeslots: [false, true, true, true],
                 alloc_type: ChanAllocType::Replace,
                 ul_dl_assigned: UlDlAssignment::Both,
             },
@@ -734,9 +739,9 @@ mod tests {
         assert!(tla.tx_reporter.is_none());
 
         let chan_alloc = tla.chan_alloc.expect("PDCH allocation should be passed to lower layers");
-        assert_eq!(chan_alloc.usage, Some(4));
+        assert_eq!(chan_alloc.usage, None);
         assert_eq!(chan_alloc.carrier, None);
-        assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(chan_alloc.timeslots, [false, true, true, true]);
         assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
 
@@ -756,9 +761,10 @@ mod tests {
         let plan = manager
             .plan_swmi_unitdata_channel(packet_plan_input())
             .expect("READY packet-data context should produce a PDCH plan");
-        let allocation = packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::single_slot(2, Some(4)))
-            .expect("PDCH plan should validate lower allocation policy")
-            .expect("new PDCH plan should carry lower allocation");
+        let allocation =
+            packet_data_plan_to_lower_channel_allocation(&plan, SndcpPdchAllocationPolicy::timeslots([false, true, true, true], None))
+                .expect("PDCH plan should validate lower allocation policy")
+                .expect("new PDCH plan should carry lower allocation");
 
         let tla = ltpd_unitdata_req_to_tla_unitdata_req_with_allocation(&req, 93, 6, Some(&allocation))
             .expect("planned lower allocation should map to TLA");
@@ -772,9 +778,9 @@ mod tests {
         assert_mle_sndcp_prefix(&tla.tl_sdu, &req.sdu);
 
         let chan_alloc = tla.chan_alloc.expect("planned PDCH allocation should reach the pure TLA primitive");
-        assert_eq!(chan_alloc.usage, Some(4));
+        assert_eq!(chan_alloc.usage, None);
         assert_eq!(chan_alloc.carrier, None);
-        assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(chan_alloc.timeslots, [false, true, true, true]);
         assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     }
@@ -834,12 +840,12 @@ mod tests {
     fn packet_data_ltpd_to_tla_rejects_invalid_lower_allocation() {
         let req = packet_ltpd_req();
         let mut allocation = lower_pdch_allocation(ISSI);
-        allocation.chan_alloc.usage = None;
+        allocation.chan_alloc.timeslots = [true, false, false, false];
 
         assert_eq!(
             ltpd_unitdata_req_to_tla_unitdata_req_with_allocation(&req, 91, 6, Some(&allocation))
                 .expect_err("lower allocation must validate before handoff"),
-            SndcpMleAdapterError::LowerAllocation(SndcpPdchError::MissingPdchUsageMarker)
+            SndcpMleAdapterError::LowerAllocation(SndcpPdchError::McchTimeslotRequiresExplicitPolicy(1))
         );
     }
 

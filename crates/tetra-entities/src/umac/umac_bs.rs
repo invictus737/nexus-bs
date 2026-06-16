@@ -8,7 +8,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
 use tetra_core::freqs::FreqInfo;
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Direction, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, Todo, TxReporter, TxState, unimplemented_log};
+use tetra_core::{
+    BitBuffer, Direction, EndpointId, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, Todo, TxReporter, TxState,
+    unimplemented_log,
+};
 use tetra_pdus::cmce::{
     enums::{cmce_pdu_type_dl::CmcePduTypeDl, transmission_grant::TransmissionGrant},
     pdus::{d_info::DInfo, d_tx_granted::DTxGranted},
@@ -90,7 +93,16 @@ pub struct UmacBs {
     /// only in timeout logs so RF tests can distinguish "no uplink decoded" from
     /// "uplink decoded but later not routed".
     ul_media_events_since_floor: [u16; 4],
+    /// Local endpoint context for SNDCP assigned-PDCH uplink. The endpoint is
+    /// not encoded in MAC-U-BLCK/MAC-END, so UMAC must carry the endpoint from
+    /// the downlink channel allocation that created the PDCH.
+    packet_data_link_contexts: HashMap<TetraAddress, PacketDataLinkContext>,
     active_energy_saving_suspensions: HashMap<EnergySavingSuspensionKey, Vec<u32>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PacketDataLinkContext {
+    endpoint_id: EndpointId,
 }
 
 struct PendingStch {
@@ -248,6 +260,7 @@ impl UmacBs {
             pending_private_ul_media: std::array::from_fn(|_| VecDeque::new()),
             current_ul_speaker: [None; 4],
             ul_media_events_since_floor: [0; 4],
+            packet_data_link_contexts: HashMap::new(),
             active_energy_saving_suspensions: HashMap::new(),
         }
     }
@@ -443,6 +456,81 @@ impl UmacBs {
             return None;
         }
         self.current_ul_speaker[ts as usize - 1]
+    }
+
+    fn scheduled_or_packet_data_uplink_context(&self, msg_dltime: TdmaTime, block_num: PhyBlockNum) -> Option<(TetraAddress, EndpointId)> {
+        if let Some(addr) = self
+            .channel_scheduler
+            .ul_get_slot_owner(msg_dltime, block_num)
+            .map(TetraAddress::issi)
+        {
+            return Some((addr, 0));
+        }
+
+        let addr = self.channel_scheduler.packet_data_uplink_owner(msg_dltime, block_num)?;
+        let endpoint_id = self
+            .packet_data_link_contexts
+            .get(&addr)
+            .map(|context| context.endpoint_id)
+            .unwrap_or(0);
+        Some((addr, endpoint_id))
+    }
+
+    fn llc_sdu_is_original_advanced_link(sdu: &BitBuffer) -> bool {
+        matches!(
+            sdu.peek_bits(4).and_then(|bits| LlcPduType::try_from(bits).ok()),
+            Some(LlcPduType::AlSetup | LlcPduType::AlDataAlFinal | LlcPduType::AlAckAlRnr | LlcPduType::AlReconnect | LlcPduType::AlDisc)
+        )
+    }
+
+    fn packet_data_context_endpoint_id(&self, addr: TetraAddress) -> EndpointId {
+        self.packet_data_link_contexts
+            .get(&addr)
+            .map(|context| context.endpoint_id)
+            .unwrap_or(0)
+    }
+
+    fn packet_data_advanced_link_endpoint_id(&self, addr: TetraAddress, sdu: Option<&BitBuffer>) -> EndpointId {
+        if addr.ssi_type != SsiType::Issi || !sdu.is_some_and(Self::llc_sdu_is_original_advanced_link) {
+            return 0;
+        }
+        self.packet_data_context_endpoint_id(addr)
+    }
+
+    fn packet_data_mac_data_endpoint_id(
+        &self,
+        addr: TetraAddress,
+        msg_dltime: TdmaTime,
+        block_num: PhyBlockNum,
+        sdu: Option<&BitBuffer>,
+    ) -> EndpointId {
+        match self.channel_scheduler.packet_data_uplink_owner(msg_dltime, block_num) {
+            Some(owner) if owner == addr => self.packet_data_context_endpoint_id(addr),
+            _ => self.packet_data_advanced_link_endpoint_id(addr, sdu),
+        }
+    }
+
+    fn remember_packet_data_link_context_from_tma_req(&mut self, prim: &TmaUnitdataReq) {
+        let Some(chan_alloc) = prim.chan_alloc.as_ref() else {
+            return;
+        };
+        if prim.main_address.ssi_type != SsiType::Issi || !BsChannelScheduler::sdu_is_sndcp_packet_data(&prim.pdu) {
+            return;
+        }
+
+        if matches!(chan_alloc.alloc_type, ChanAllocType::QuitAndGo) || !chan_alloc.timeslots.iter().any(|assigned| *assigned) {
+            self.packet_data_link_contexts.remove(&prim.main_address);
+            return;
+        }
+
+        if matches!(chan_alloc.alloc_type, ChanAllocType::Replace | ChanAllocType::Additional) {
+            self.packet_data_link_contexts.insert(
+                prim.main_address,
+                PacketDataLinkContext {
+                    endpoint_id: prim.endpoint_id,
+                },
+            );
+        }
     }
 
     fn reset_ul_media_diagnostic(&mut self, ts: u8) {
@@ -990,6 +1078,15 @@ impl UmacBs {
         // information by reference to EN 300 392-7 A.8.77. Nexus-BS does not
         // implement air-interface encryption yet, so keep the broadcast
         // fail-closed even if a direct StackConfig requests AIE.
+        let wap_ip_sndcp_profile_enabled = Self::local_wap_ip_sndcp_profile_enabled(config);
+        let mut section1_services = 0;
+        if wap_ip_sndcp_profile_enabled {
+            // EN 300 392-2 clause 21.4.4.1 table 21.68: this stack resolves
+            // SNDCP data priority through LTPD/MLE, but does not yet advertise
+            // extended AL, QoS scheduled access, D8PSK, or extra sections.
+            section1_services |= 0b100_0000;
+        }
+
         let ext_services = SysinfoExtendedServices {
             auth_required: false,
             class1_supported: false,
@@ -1003,7 +1100,7 @@ impl UmacBs {
             sdstl_addressing_method: 2,
             gck_supported: false,
             section: 0,
-            section_data: 0,
+            section_data: section1_services,
         };
 
         let def_access = SysinfoDefaultDefForAccessCodeA {
@@ -1077,9 +1174,11 @@ impl UmacBs {
                 sndcp_service: c.cell.sndcp_service && c.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled),
                 // Same fail-closed rule for air-interface encryption: do not
                 // advertise AIE until EN 300 392-7 security procedures are
-                // implemented and tested.
+                // implemented and tested. Advanced link is advertised only for
+                // the local SNDCP/WAP profile whose LLC AL-SETUP/AL-FINAL path
+                // is implemented and test-backed.
                 aie_service: false,
-                advanced_link: c.cell.advanced_link,
+                advanced_link: c.cell.advanced_link && c.cell.sndcp_service && c.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled),
             },
         };
 
@@ -1900,7 +1999,21 @@ impl UmacBs {
             };
 
             if sdu.is_some() {
+                let endpoint_id = self.packet_data_mac_data_endpoint_id(addr, msg_dltime, prim.block_num, sdu.as_ref());
                 // We have an SDU for the LLC, deliver it.
+                if self.wap_ip_diag_enabled() {
+                    if let Some(sdu) = &sdu {
+                        tracing::info!(
+                            "WAP/IP diag: UMAC MAC-DATA delivering TM-SDU addr={:?} endpoint={} sdu_bits={} llc_prefix={:?} fill_bits={} stripped_fill_bits={}",
+                            addr,
+                            endpoint_id,
+                            sdu.get_len(),
+                            sdu.peek_bits(4),
+                            pdu.fill_bits,
+                            num_fill_bits
+                        );
+                    }
+                }
                 let m = SapMsg {
                     sap: Sap::TmaSap,
                     src: TetraEntity::Umac,
@@ -1910,7 +2023,7 @@ impl UmacBs {
                         pdu: sdu,
                         main_address: addr,
                         scrambling_code: prim.scrambling_code,
-                        endpoint_id: 0,        // TODO FIXME
+                        endpoint_id,
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
                         air_interface_encryption: pdu.encrypted as Todo,
@@ -2084,7 +2197,21 @@ impl UmacBs {
             };
 
             if sdu.is_some() {
+                let endpoint_id = self.packet_data_advanced_link_endpoint_id(addr, sdu.as_ref());
                 // We have an SDU for the LLC, deliver it.
+                if self.wap_ip_diag_enabled() {
+                    if let Some(sdu) = &sdu {
+                        tracing::info!(
+                            "WAP/IP diag: UMAC MAC-ACCESS delivering TM-SDU addr={:?} endpoint={} sdu_bits={} llc_prefix={:?} fill_bits={} stripped_fill_bits={}",
+                            addr,
+                            endpoint_id,
+                            sdu.get_len(),
+                            sdu.peek_bits(4),
+                            pdu.fill_bits,
+                            num_fill_bits
+                        );
+                    }
+                }
                 let m = SapMsg {
                     sap: Sap::TmaSap,
                     src: TetraEntity::Umac,
@@ -2093,7 +2220,7 @@ impl UmacBs {
                         pdu: sdu,
                         main_address: addr,
                         scrambling_code: prim.scrambling_code,
-                        endpoint_id: 0,        // TODO FIXME
+                        endpoint_id,
                         new_endpoint_id: None, // TODO FIXME
                         css_endpoint_id: None, // TODO FIXME
                         air_interface_encryption: pdu.encrypted as Todo,
@@ -2152,12 +2279,12 @@ impl UmacBs {
 
         // Get slot owner from schedule
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
+        let Some((slot_owner_addr, _slot_owner_endpoint_id)) = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num)
+        else {
             tracing::warn!("rx_mac_frag_ul: Received MAC-FRAG-UL for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
-        let slot_owner_addr = TetraAddress::issi(slot_owner);
         self.mark_ms_signalling_activity(slot_owner_addr, msg_dltime);
 
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner_addr, msg_dltime) {
@@ -2222,12 +2349,12 @@ impl UmacBs {
 
         // Get slot owner from schedule, decrypt if needed
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) else {
+        let Some((slot_owner_addr, slot_owner_endpoint_id)) = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num)
+        else {
             // Common with scan-list terminals that transmit on UL without waiting for a grant
             tracing::debug!("rx_mac_end_ul: Received MAC-END-UL for unassigned block {:?}", prim.block_num);
             return;
         };
-        let slot_owner_addr = TetraAddress::issi(slot_owner);
         self.mark_ms_signalling_activity(slot_owner_addr, msg_dltime);
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner_addr, msg_dltime) {
             // EN 300 392-2 air-interface encryption is not implemented in
@@ -2262,7 +2389,7 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: 0,              // TODO FIXME
+                endpoint_id: slot_owner_endpoint_id,
                 new_endpoint_id: None,       // TODO FIXME
                 css_endpoint_id: None,       // TODO FIXME
                 air_interface_encryption: 0, // TODO FIXME implement
@@ -2493,7 +2620,7 @@ impl UmacBs {
     }
 
     /// TMA-SAP MAC-U-BLCK
-    fn rx_ul_mac_u_blck(&mut self, _queue: &mut MessageQueue, message: &mut SapMsg) {
+    fn rx_ul_mac_u_blck(&mut self, queue: &mut MessageQueue, message: &mut SapMsg) {
         tracing::trace!("rx_ul_mac_u_blck");
 
         // Extract sdu and parse pdu
@@ -2526,9 +2653,11 @@ impl UmacBs {
         }
 
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        if let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, prim.block_num) {
+        let slot_owner_context = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num);
+        if let Some((slot_owner_addr, _slot_owner_endpoint_id)) = slot_owner_context {
             self.defrag
-                .discard_incomplete_for_addr(msg_dltime, TetraAddress::issi(slot_owner), "new MAC-U-BLCK before MAC-END");
+                .discard_incomplete_for_addr(msg_dltime, slot_owner_addr, "new MAC-U-BLCK before MAC-END");
+            self.mark_ms_signalling_activity(slot_owner_addr, msg_dltime);
         }
 
         if let Some(res_req) = pdu.reservation_requirement() {
@@ -2540,18 +2669,70 @@ impl UmacBs {
             );
         }
 
-        // EN 300 392-2 clause 21.4.2.5 defines MAC-U-BLCK as full-slot
-        // uplink C-plane signalling with an event label and implicit TM-SDU
-        // length. Clause 23.4.3.1.2 says the received TM-SDU is complete.
-        // The current implementation handles the visible reservation header
-        // above, but still drops TM-SDU delivery until event-label address
-        // mapping is implemented end-to-end.
-        tracing::warn!(
-            "MAC-U-BLCK event_label={} reservation_req={} encrypted={} has no TM-SDU delivery until event-label mapping is implemented; dropping payload",
-            pdu.event_label,
-            pdu.reservation_req,
-            pdu.encrypted
-        );
+        if pdu.encrypted {
+            unimplemented_log!("rx_ul_mac_u_blck: Encryption mode > 0");
+            return;
+        }
+
+        let Some((slot_owner_addr, slot_owner_endpoint_id)) = slot_owner_context else {
+            tracing::warn!(
+                "MAC-U-BLCK event_label={} reservation_req={} has no scheduled or assigned-PDCH uplink owner; dropping TM-SDU",
+                pdu.event_label,
+                pdu.reservation_req
+            );
+            return;
+        };
+
+        let mut pdu_len_bits = prim.pdu.get_len();
+        let num_fill_bits = if pdu.fill_bits {
+            fillbits::removal::get_num_fill_bits(&prim.pdu, pdu_len_bits, false)
+        } else {
+            0
+        };
+        pdu_len_bits -= num_fill_bits;
+        let orig_end = prim.pdu.get_raw_end();
+        prim.pdu.set_raw_end(prim.pdu.get_raw_start() + pdu_len_bits);
+        if prim.pdu.get_len_remaining() == 0 {
+            prim.pdu.set_raw_end(orig_end);
+            tracing::debug!(
+                "MAC-U-BLCK event_label={} reservation_req={} carried no TM-SDU payload",
+                pdu.event_label,
+                pdu.reservation_req
+            );
+            return;
+        }
+
+        let sdu = BitBuffer::from_bitbuffer_pos(&prim.pdu);
+        if self.wap_ip_diag_enabled() {
+            tracing::info!(
+                "WAP/IP diag: UMAC MAC-U-BLCK delivering TM-SDU addr={:?} event_label={} reservation_req={} sdu_bits={} llc_prefix={:?} fill_bits={} stripped_fill_bits={}",
+                slot_owner_addr,
+                pdu.event_label,
+                pdu.reservation_req,
+                sdu.get_len(),
+                sdu.peek_bits(4),
+                pdu.fill_bits,
+                num_fill_bits
+            );
+        }
+        queue.push_back(SapMsg {
+            sap: Sap::TmaSap,
+            src: TetraEntity::Umac,
+            dest: TetraEntity::Llc,
+            msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+                pdu: Some(sdu),
+                main_address: slot_owner_addr,
+                scrambling_code: prim.scrambling_code,
+                endpoint_id: slot_owner_endpoint_id,
+                new_endpoint_id: None,
+                css_endpoint_id: None,
+                air_interface_encryption: pdu.encrypted as Todo,
+                chan_change_response_req: false,
+                chan_change_handle: None,
+                chan_info: None,
+            }),
+        });
+        prim.pdu.set_raw_end(orig_end);
     }
 
     fn enqueue_mac_u_blck_reservation(
@@ -2561,16 +2742,15 @@ impl UmacBs {
         res_req: ReservationRequirement,
         event_label: u16,
     ) {
-        let Some(slot_owner) = self.channel_scheduler.ul_get_slot_owner(msg_dltime, block_num) else {
+        let Some((addr, _endpoint_id)) = self.scheduled_or_packet_data_uplink_context(msg_dltime, block_num) else {
             tracing::warn!(
-                "MAC-U-BLCK event_label={} requested {:?}, but no uplink slot owner is known; dropping reservation until event-label mapping is implemented",
+                "MAC-U-BLCK event_label={} requested {:?}, but no reserved-access or assigned-PDCH uplink owner is known; dropping reservation",
                 event_label,
                 res_req
             );
             return;
         };
 
-        let addr = TetraAddress::issi(slot_owner);
         self.mark_ms_signalling_activity(addr, msg_dltime);
         self.channel_scheduler.dl_enqueue_reservation_grant(msg_dltime.t, addr, res_req);
     }
@@ -2790,6 +2970,7 @@ impl UmacBs {
         }
 
         // ── Normal signaling path (MCCH / SCH/F) ────────────────────────
+        self.remember_packet_data_link_context_from_tma_req(&prim);
         let (usage_marker, mac_chan_alloc) = if let Some(chan_alloc) = prim.chan_alloc {
             (
                 chan_alloc.usage,
@@ -3626,6 +3807,7 @@ impl TetraEntityTrait for UmacBs {
         if self.channel_scheduler.cur_dltime != ts && self.channel_scheduler.cur_dltime == (TdmaTime { t: 0, f: 0, m: 0, h: 0 }) {
             // Upon start of the system, we need to set the dl time for the channel scheduler
             self.channel_scheduler.set_dl_time(ts);
+            self.config.state_write().timeslot_alloc.release_all(TimeslotOwner::PacketData);
         } else {
             // When running, we adopt the new time and check for desync
             self.channel_scheduler.tick_start(ts);
@@ -3643,9 +3825,11 @@ impl TetraEntityTrait for UmacBs {
             let tetra_config::bluestation::StackState {
                 subscribers,
                 energy_saving,
+                timeslot_alloc,
                 ..
             } = &mut *state;
-            self.channel_scheduler.finalize_ts_for_tick(subscribers, energy_saving)
+            self.channel_scheduler
+                .finalize_ts_for_tick_with_timeslot_allocator(subscribers, energy_saving, timeslot_alloc)
         };
         let s = SapMsg {
             sap: Sap::TmvSap,

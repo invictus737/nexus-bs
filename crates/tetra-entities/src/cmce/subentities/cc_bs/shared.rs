@@ -959,11 +959,22 @@ impl CcBsSubentity {
 
     pub fn handle_subscriber_update(&mut self, queue: &mut MessageQueue, update: MmSubscriberUpdate, source: TetraEntity) {
         let issi = update.issi;
-        self.sync_shared_subscribers_from_mm_update(issi, &update.groups, update.action, source);
-        if source != TetraEntity::Mm {
+        if source == TetraEntity::Brew {
             self.handle_external_subscriber_update(queue, update, source);
             return;
         }
+        if source != TetraEntity::Mm {
+            tracing::warn!(
+                "CMCE: ignoring subscriber update from unexpected source={:?} issi={} action={:?} groups={:?}",
+                source,
+                issi,
+                update.action,
+                update.groups
+            );
+            return;
+        }
+
+        self.sync_shared_subscribers_from_mm_update(issi, &update.groups, update.action, source);
 
         let groups = update.groups;
 

@@ -1786,6 +1786,19 @@ impl MmBs {
             msg: SapMsgInner::MmSubscriberUpdate(mm_update),
         };
         queue.push_back(msg);
+
+        if action == BrewSubscriberAction::Deregister {
+            queue.push_back(SapMsg {
+                sap: Sap::Control,
+                src: TetraEntity::Mm,
+                dest: TetraEntity::Sndcp,
+                msg: SapMsgInner::MmSubscriberUpdate(MmSubscriberUpdate {
+                    issi,
+                    groups: Vec::new(),
+                    action,
+                }),
+            });
+        }
     }
 
     fn rx_u_itsi_detach(&mut self, _queue: &mut MessageQueue, mut message: SapMsg) {

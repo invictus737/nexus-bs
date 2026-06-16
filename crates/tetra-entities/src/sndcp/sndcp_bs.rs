@@ -4,6 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use super::ltpd_pipeline::{SndcpWapLtpdPipeline, SndcpWapLtpdPipelineError, issi_from_ltpd_ind};
@@ -13,9 +14,9 @@ use super::pdp::{
 };
 use super::pdp_service::{SndcpIpv4Pool, SndcpPdpPolicy};
 use super::transfer::{
-    SN_PDU_TYPE_DATA_TRANSMIT_REQUEST, SN_PDU_TYPE_DATA_TRANSMIT_RESPONSE, SN_PDU_TYPE_END_OF_DATA, SN_PDU_TYPE_NOT_SUPPORTED,
-    SN_PDU_TYPE_RECONNECT, SndcpDataTransmitResponseResult, SndcpTransferControl, SndcpTransferError, decode_data_transmit_response,
-    decode_transfer_control_pdu,
+    SN_PDU_TYPE_DATA, SN_PDU_TYPE_DATA_TRANSMIT_REQUEST, SN_PDU_TYPE_DATA_TRANSMIT_RESPONSE, SN_PDU_TYPE_END_OF_DATA,
+    SN_PDU_TYPE_NOT_SUPPORTED, SN_PDU_TYPE_RECONNECT, SndcpDataTransmitRequest, SndcpDataTransmitResponseResult, SndcpTransferControl,
+    SndcpTransferError, decode_data_transmit_response, decode_transfer_control_pdu,
 };
 use super::unitdata::{SN_PDU_TYPE_UNITDATA, SndcpUnitdataError, decode_sn_unitdata_body};
 use super::wap_ip::{WapIpEndpoint, WapIpServicePolicy};
@@ -24,7 +25,12 @@ use super::wap_status::WapStatusSnapshot;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::{CfgWapIp, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, Layer2Service, Sap};
+use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, Sap, TimeslotOwner, Todo};
+use tetra_saps::control::brew::BrewSubscriberAction;
+use tetra_saps::ltpd::LtpdMleReportInd;
+use tetra_saps::tla::{
+    TLA_REPORT_FAILED_TRANSFER, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION, TLA_REPORT_NO_SPECIFIC_REPORT, TLA_REPORT_SUCCESSFUL_TRANSFER,
+};
 use tetra_saps::{SapMsg, SapMsgInner};
 
 pub use super::unitdata::{NetworkPduKind, SnUnitdata, SndcpEncodeError, encode_sn_unitdata};
@@ -82,7 +88,15 @@ pub struct Sndcp {
     config: SharedConfig,
     runtime_handoff: SndcpRuntimeHandoffPolicy,
     wap_pipeline: Option<SndcpWapLtpdPipeline>,
+    pending_pdch_handoffs: HashMap<Todo, PendingPacketDataHandoff>,
     started_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PendingPacketDataHandoff {
+    issi: u32,
+    endpoint_id: EndpointId,
+    link_id: LinkId,
 }
 
 impl Default for SndcpRuntimeHandoffPolicy {
@@ -160,6 +174,7 @@ impl Sndcp {
             config,
             runtime_handoff,
             wap_pipeline,
+            pending_pdch_handoffs: HashMap::new(),
             started_at: Instant::now(),
         }
     }
@@ -169,6 +184,7 @@ impl Sndcp {
             config,
             runtime_handoff,
             wap_pipeline: None,
+            pending_pdch_handoffs: HashMap::new(),
             started_at: Instant::now(),
         }
     }
@@ -230,7 +246,7 @@ impl Sndcp {
             }
             SndcpDecode::Unitdata(unitdata) => {
                 tracing::warn!(
-                    "SNDCP: decoded SN-UNITDATA nsapi={} pcomp={} dcomp={} n_pdu_bits={} kind={:?}; no SN-SAP/IP/WAP handoff is implemented, dropping fail-closed",
+                    "SNDCP: decoded SN-DATA/UNITDATA nsapi={} pcomp={} dcomp={} n_pdu_bits={} kind={:?}; no SN-SAP/IP/WAP handoff is implemented, dropping fail-closed",
                     unitdata.nsapi,
                     unitdata.pcomp,
                     unitdata.dcomp,
@@ -248,11 +264,11 @@ impl Sndcp {
                 tracing::warn!("SNDCP: unsupported SN PDU type {}, dropping", sn_pdu_type);
             }
             SndcpDecode::UnsupportedNsapi(nsapi) => {
-                tracing::warn!("SNDCP: unsupported/reserved NSAPI {}, dropping SN-UNITDATA", nsapi);
+                tracing::warn!("SNDCP: unsupported/reserved NSAPI {}, dropping SN-DATA/UNITDATA", nsapi);
             }
             SndcpDecode::UnsupportedCompression { pcomp, dcomp } => {
                 tracing::warn!(
-                    "SNDCP: unsupported SN-UNITDATA compression pcomp={} dcomp={}, dropping",
+                    "SNDCP: unsupported SN-DATA/UNITDATA compression pcomp={} dcomp={}, dropping",
                     pcomp,
                     dcomp
                 );
@@ -277,45 +293,87 @@ impl Sndcp {
     ) {
         let snapshot = self.wap_status_snapshot();
         let response = match self.wap_pipeline.as_mut() {
-            Some(pipeline) => pipeline.handle_ltpd_mle_unitdata_ind_allocating(&prim, &snapshot),
+            Some(pipeline) => pipeline.handle_ltpd_mle_unitdata_ind_allocating_optional(&prim, &snapshot),
             None => {
                 tracing::warn!("SNDCP/WAP-IP runtime is enabled but no WAP/IP pipeline is configured; dropping");
                 return;
             }
         };
 
-        let mut response = match response {
+        let Some(mut response) = (match response {
             Ok(response) => response,
             Err(err) => {
                 self.log_wap_pipeline_drop(&err);
                 return;
             }
+        }) else {
+            tracing::debug!("SNDCP/WAP-IP: handled inbound SNDCP PDU with no response required");
+            return;
         };
 
-        if self.should_mark_pdch_ready_after_response(decode, &response)
-            && let SndcpDecode::TransferControl(SndcpTransferControl::DataTransmitRequest(data_transmit)) = decode
+        if self.is_accepted_packet_data_handoff_response(decode, &response)
+            && let Some(data_transmit) = data_transmit_request_for_packet_data_handoff(decode)
+            && let Ok(issi) = issi_from_ltpd_ind(&prim)
+        {
+            let active_circuit_mode_service = snapshot.active_calls > 0;
+            let parallel_voice_data_permitted = active_circuit_mode_service && self.packet_data_parallel_voice_capacity_available();
+            {
+                let Some(pipeline) = self.wap_pipeline.as_mut() else {
+                    tracing::warn!("SNDCP/WAP-IP runtime is enabled but no WAP/IP pipeline is configured; dropping PDCH handoff");
+                    return;
+                };
+                if matches!(decode, SndcpDecode::TransferControl(SndcpTransferControl::Reconnect(_))) {
+                    pipeline
+                        .pdch_mut()
+                        .mark_common_control_on_link(issi, prim.endpoint_id, prim.link_id);
+                }
+                if let Err(err) = pipeline.attach_mvp_pdch_allocation_for_data_transmit_response(
+                    &mut response,
+                    &prim,
+                    issi,
+                    &data_transmit,
+                    active_circuit_mode_service,
+                    parallel_voice_data_permitted,
+                ) {
+                    self.log_wap_pipeline_drop(&err);
+                    return;
+                }
+            }
+            self.track_pending_pdch_handoff(response.handle, issi, prim.endpoint_id, prim.link_id);
+            if self.runtime_handoff.assume_pdch_ready_after_data_transmit() {
+                tracing::warn!(
+                    "SNDCP/WAP-IP: unsafe compatibility mode marks PDCH ready before lower MLE-REPORT handle={} issi={} endpoint={} link={}",
+                    response.handle,
+                    issi,
+                    prim.endpoint_id,
+                    prim.link_id
+                );
+                if let Some(pipeline) = self.wap_pipeline.as_mut() {
+                    pipeline.mark_pdch_ready(issi, prim.endpoint_id, prim.link_id);
+                }
+            }
+        }
+
+        if matches!(decode, SndcpDecode::TransferControl(SndcpTransferControl::EndOfData(_)))
             && let Ok(issi) = issi_from_ltpd_ind(&prim)
             && let Some(pipeline) = self.wap_pipeline.as_mut()
         {
-            let active_circuit_mode_service = snapshot.active_calls > 0;
-            if let Err(err) = pipeline.attach_mvp_pdch_allocation_for_data_transmit_response(
-                &mut response,
-                &prim,
-                issi,
-                data_transmit,
-                active_circuit_mode_service,
-            ) {
-                self.log_wap_pipeline_drop(&err);
-                return;
+            match pipeline.attach_common_control_allocation_for_end_of_data_response(&mut response, &prim, issi) {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::debug!(
+                        "SNDCP/WAP-IP: SN-END OF DATA response for issi={} had no active PDCH allocation to release",
+                        issi
+                    );
+                }
+                Err(err) => {
+                    self.log_wap_pipeline_drop(&err);
+                    return;
+                }
             }
-            // MVP-local state transition after the SwMI accepts an MS
-            // SN-DATA TRANSMIT REQUEST and attaches a single-slot PDCH channel
-            // allocation to the lower MAC-RESOURCE. The lower confirmation
-            // primitive is still not wired into runtime SNDCP.
-            pipeline.mark_pdch_ready(issi, prim.endpoint_id, prim.link_id);
         }
 
-        tracing::debug!(
+        tracing::info!(
             "SNDCP/WAP-IP: emitting {:?} response bits={} endpoint={} link={}",
             response.layer2service,
             response.sdu.get_len(),
@@ -330,11 +388,8 @@ impl Sndcp {
         });
     }
 
-    fn should_mark_pdch_ready_after_response(&self, decode: &SndcpDecode, response: &tetra_saps::ltpd::LtpdMleUnitdataReq) -> bool {
-        if !self.runtime_handoff.assume_pdch_ready_after_data_transmit() {
-            return false;
-        }
-        if !matches!(decode, SndcpDecode::TransferControl(SndcpTransferControl::DataTransmitRequest(_))) {
+    fn is_accepted_packet_data_handoff_response(&self, decode: &SndcpDecode, response: &tetra_saps::ltpd::LtpdMleUnitdataReq) -> bool {
+        if data_transmit_request_for_packet_data_handoff(decode).is_none() {
             return false;
         }
         if response.layer2service != Layer2Service::Acknowledged || response.packet_data_flag {
@@ -347,8 +402,135 @@ impl Sndcp {
         }
     }
 
+    fn track_pending_pdch_handoff(&mut self, handle: Todo, issi: u32, endpoint_id: EndpointId, link_id: LinkId) {
+        if handle <= 0 {
+            tracing::warn!(
+                "SNDCP/WAP-IP: cannot track PDCH handoff with invalid MLE handle={} issi={} endpoint={} link={}",
+                handle,
+                issi,
+                endpoint_id,
+                link_id
+            );
+            return;
+        }
+        self.pending_pdch_handoffs.insert(
+            handle,
+            PendingPacketDataHandoff {
+                issi,
+                endpoint_id,
+                link_id,
+            },
+        );
+    }
+
+    fn mark_pending_pdch_ready(&mut self, handle: Todo, pending: PendingPacketDataHandoff, reason: Todo) {
+        let Some(pipeline) = self.wap_pipeline.as_mut() else {
+            tracing::warn!(
+                "SNDCP/WAP-IP: MLE-REPORT handle={} reason={} matched PDCH handoff, but WAP pipeline is disabled",
+                handle,
+                reason
+            );
+            return;
+        };
+        tracing::info!(
+            "SNDCP/WAP-IP: PDCH ready after lower MLE-REPORT handle={} report={} issi={} endpoint={} link={}",
+            handle,
+            reason,
+            pending.issi,
+            pending.endpoint_id,
+            pending.link_id
+        );
+        pipeline.mark_pdch_ready(pending.issi, pending.endpoint_id, pending.link_id);
+    }
+
+    fn rx_ltpd_mle_report_ind(&mut self, prim: LtpdMleReportInd) {
+        match prim.transfer_result {
+            TLA_REPORT_NO_SPECIFIC_REPORT => {
+                tracing::debug!(
+                    "SNDCP: received progress MLE-REPORT.ind handle={} transfer_result={}",
+                    prim.handle,
+                    prim.transfer_result
+                );
+            }
+            TLA_REPORT_FIRST_COMPLETE_TRANSMISSION => {
+                if let Some(pending) = self.pending_pdch_handoffs.get(&prim.handle).copied() {
+                    self.mark_pending_pdch_ready(prim.handle, pending, prim.transfer_result);
+                } else {
+                    tracing::debug!(
+                        "SNDCP: received first-complete MLE-REPORT.ind handle={} with no pending PDCH handoff",
+                        prim.handle
+                    );
+                }
+            }
+            TLA_REPORT_SUCCESSFUL_TRANSFER => {
+                if let Some(pending) = self.pending_pdch_handoffs.remove(&prim.handle) {
+                    self.mark_pending_pdch_ready(prim.handle, pending, prim.transfer_result);
+                } else {
+                    tracing::debug!(
+                        "SNDCP: received successful MLE-REPORT.ind handle={} with no pending PDCH handoff",
+                        prim.handle
+                    );
+                }
+            }
+            TLA_REPORT_FAILED_TRANSFER => {
+                if let Some(pending) = self.pending_pdch_handoffs.remove(&prim.handle) {
+                    tracing::warn!(
+                        "SNDCP/WAP-IP: PDCH handoff failed before lower completion handle={} issi={} endpoint={} link={}",
+                        prim.handle,
+                        pending.issi,
+                        pending.endpoint_id,
+                        pending.link_id
+                    );
+                } else {
+                    tracing::debug!(
+                        "SNDCP: received failed MLE-REPORT.ind handle={} with no pending PDCH handoff",
+                        prim.handle
+                    );
+                }
+            }
+            other => {
+                tracing::warn!("SNDCP: unsupported MLE-REPORT.ind handle={} transfer_result={}", prim.handle, other);
+            }
+        }
+    }
+
     fn log_wap_pipeline_drop(&self, err: &SndcpWapLtpdPipelineError) {
         tracing::warn!("SNDCP/WAP-IP: dropping inbound SNDCP PDU: {:?}", err);
+    }
+
+    fn rx_control(&mut self, message: SapMsg) {
+        match message.msg {
+            SapMsgInner::MmSubscriberUpdate(update) => {
+                if update.action != BrewSubscriberAction::Deregister {
+                    tracing::debug!(
+                        "SNDCP/WAP-IP: ignoring subscriber lifecycle action {:?} for issi={}",
+                        update.action,
+                        update.issi
+                    );
+                    return;
+                }
+
+                let Some(pipeline) = self.wap_pipeline.as_mut() else {
+                    tracing::debug!(
+                        "SNDCP/WAP-IP: received deregister for issi={} with WAP/IP pipeline disabled",
+                        update.issi
+                    );
+                    return;
+                };
+
+                if let Err(err) = pipeline.deregister_issi(update.issi) {
+                    self.log_wap_pipeline_drop(&err);
+                }
+            }
+            other => {
+                tracing::warn!("SNDCP: dropping unexpected Control primitive {:?}", other);
+            }
+        }
+    }
+
+    fn packet_data_parallel_voice_capacity_available(&self) -> bool {
+        let state = self.config.state_read();
+        (2..=4).any(|ts| matches!(state.timeslot_alloc.owner(ts), None | Some(TimeslotOwner::PacketData)))
     }
 
     fn wap_status_snapshot(&self) -> WapStatusSnapshot {
@@ -376,6 +558,14 @@ impl Sndcp {
             radio_lines: registered_issis.into_iter().take(3).map(|issi| format!("MS {issi}")).collect(),
             call_lines: call_lines_from_health(&health),
         }
+    }
+}
+
+fn data_transmit_request_for_packet_data_handoff(decode: &SndcpDecode) -> Option<SndcpDataTransmitRequest> {
+    match decode {
+        SndcpDecode::TransferControl(SndcpTransferControl::DataTransmitRequest(request)) => Some(request.clone()),
+        SndcpDecode::TransferControl(SndcpTransferControl::Reconnect(reconnect)) => reconnect.data_transmit_request(),
+        _ => None,
     }
 }
 
@@ -504,7 +694,7 @@ pub fn decode_ltpd_sdu(sdu: &BitBuffer) -> SndcpDecode {
                 .map(SndcpDecode::DeactivatePdpContextAccept)
                 .unwrap_or_else(SndcpDecode::MalformedPdpContext);
         }
-        SN_PDU_TYPE_UNITDATA => {}
+        SN_PDU_TYPE_UNITDATA | SN_PDU_TYPE_DATA => {}
         SN_PDU_TYPE_DATA_TRANSMIT_REQUEST
         | SN_PDU_TYPE_DATA_TRANSMIT_RESPONSE
         | SN_PDU_TYPE_END_OF_DATA
@@ -557,23 +747,16 @@ impl TetraEntityTrait for Sndcp {
         // LTPD-SAP. Clause 18.5.21 routes protocol discriminator 100b to
         // SNDCP before this point; table 18.26 service advertising remains
         // fail-closed unless this entity can serve the packet-data bearer.
-        if message.sap != Sap::TlpdSap {
-            tracing::warn!("SNDCP: dropping unexpected {:?} primitive", message.sap);
-            return;
-        }
-
-        match message.msg {
-            SapMsgInner::LtpdMleUnitdataInd(prim) => self.rx_ltpd_mle_unitdata_ind(_queue, prim),
-            SapMsgInner::LtpdMleReportInd(prim) => {
-                tracing::debug!(
-                    "SNDCP: received MLE-REPORT.ind handle={} transfer_result={} with no pending local SN request",
-                    prim.handle,
-                    prim.transfer_result
-                );
-            }
-            other => {
-                tracing::warn!("SNDCP: dropping unexpected LTPD primitive {:?}", other);
-            }
+        match message.sap {
+            Sap::TlpdSap => match message.msg {
+                SapMsgInner::LtpdMleUnitdataInd(prim) => self.rx_ltpd_mle_unitdata_ind(_queue, prim),
+                SapMsgInner::LtpdMleReportInd(prim) => self.rx_ltpd_mle_report_ind(prim),
+                other => {
+                    tracing::warn!("SNDCP: dropping unexpected LTPD primitive {:?}", other);
+                }
+            },
+            Sap::Control => self.rx_control(message),
+            other => tracing::warn!("SNDCP: dropping unexpected {:?} primitive", other),
         }
     }
 }
