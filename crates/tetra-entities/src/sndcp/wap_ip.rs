@@ -64,9 +64,25 @@ pub struct WapIpServicePolicy {
 pub enum WapUdpRequestKind {
     Empty,
     Status,
-    WtpWspConnect { transaction_id: u16, retransmission: bool },
-    WtpWspStatus { transaction_id: u16, retransmission: bool },
-    WtpControlNoResponse { transaction_id: u16, pdu_type: u8 },
+    WtpWspConnect {
+        transaction_id: u16,
+        retransmission: bool,
+    },
+    WtpWspStatus {
+        transaction_id: u16,
+        retransmission: bool,
+    },
+    WtpControlNoResponse {
+        transaction_id: u16,
+        pdu_type: u8,
+        abort: Option<WtpAbortInfo>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WtpAbortInfo {
+    pub abort_type: u8,
+    pub reason: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -264,11 +280,19 @@ fn build_udp_status_response(
             let page = render_wml2_status(snapshot, max_wsp_page_bytes)?;
             build_wtp_wsp_result(transaction_id, &build_wsp_reply(page.as_bytes()))
         }
-        WapUdpRequestKind::WtpControlNoResponse { transaction_id, pdu_type } => {
+        WapUdpRequestKind::WtpControlNoResponse {
+            transaction_id,
+            pdu_type,
+            abort,
+        } => {
             tracing::info!(
-                "WAP/IP diag: IPv4/UDP WTP control no-response transaction_id={} pdu_type={}",
+                "WAP/IP diag: IPv4/UDP WTP control no-response transaction_id={} pdu_type={} abort={:?} abort_type={} abort_reason={} abort_reason_name={}",
                 transaction_id,
-                pdu_type
+                pdu_type,
+                abort,
+                abort.map(|info| info.abort_type).unwrap_or_default(),
+                abort.map(|info| info.reason).unwrap_or_default(),
+                abort.map(wtp_abort_reason_name).unwrap_or("none")
             );
             return Ok(None);
         }
@@ -553,6 +577,7 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
         return Ok(Some(WapUdpRequestKind::WtpControlNoResponse {
             transaction_id,
             pdu_type: wtp_pdu_type,
+            abort: parse_wtp_abort_info(payload, wtp_pdu_type),
         }));
     }
     if wtp_pdu_type != WTP_PDU_INVOKE {
@@ -696,10 +721,34 @@ fn build_wsp_connect_reply_capabilities(connect: &WspConnectRequest) -> Vec<u8> 
             push_wsp_octets_capability(&mut capabilities, WSP_CAP_EXTENDED_METHODS, &accepted);
         }
     }
-    if wsp_capability(connect, WSP_CAP_HEADER_CODE_PAGES).is_some() {
-        push_wsp_octets_capability(&mut capabilities, WSP_CAP_HEADER_CODE_PAGES, &[]);
-    }
     capabilities
+}
+
+fn parse_wtp_abort_info(payload: &[u8], pdu_type: u8) -> Option<WtpAbortInfo> {
+    if pdu_type != WTP_PDU_ABORT || payload.len() < 4 {
+        return None;
+    }
+    let abort_type_and_reason = payload[3];
+    Some(WtpAbortInfo {
+        abort_type: abort_type_and_reason >> 5,
+        reason: abort_type_and_reason & 0x1f,
+    })
+}
+
+fn wtp_abort_reason_name(info: WtpAbortInfo) -> &'static str {
+    match (info.abort_type, info.reason) {
+        (0, 0) => "provider/UNKNOWN",
+        (0, 1) => "provider/PROTOERR",
+        (0, 2) => "provider/INVALIDTID",
+        (0, 3) => "provider/NOTIMPLEMENTEDCL2",
+        (0, 4) => "provider/NOTIMPLEMENTEDSAR",
+        (0, 5) => "provider/NOTIMPLEMENTEDUACK",
+        (0, 6) => "provider/WTPVERSIONONE",
+        (0, 7) => "provider/CAPTEMPEXCEEDED",
+        (0, 8) => "provider/NORESPONSE",
+        (1, _) => "user/WSP_OR_APPLICATION",
+        _ => "unknown",
+    }
 }
 
 fn wsp_capability(connect: &WspConnectRequest, id: u8) -> Option<&WspCapability> {
@@ -955,6 +1004,7 @@ mod tests {
             Ok(WapUdpRequestKind::WtpControlNoResponse {
                 transaction_id: 0x13cc,
                 pdu_type: WTP_PDU_ACK,
+                abort: None,
             })
         );
         assert_eq!(
@@ -962,13 +1012,15 @@ mod tests {
             Ok(WapUdpRequestKind::WtpControlNoResponse {
                 transaction_id: 0x13cc,
                 pdu_type: WTP_PDU_ACK,
+                abort: None,
             })
         );
         assert_eq!(
-            parse_wap_udp_request(&[0x20, 0x13, 0xcc, 0x00], &policy()),
+            parse_wap_udp_request(&[0x20, 0x13, 0xcc, 0x01], &policy()),
             Ok(WapUdpRequestKind::WtpControlNoResponse {
                 transaction_id: 0x13cc,
                 pdu_type: WTP_PDU_ABORT,
+                abort: Some(WtpAbortInfo { abort_type: 0, reason: 1 }),
             })
         );
         assert_eq!(
@@ -976,7 +1028,12 @@ mod tests {
             Ok(WapUdpRequestKind::WtpControlNoResponse {
                 transaction_id: 0x13cc,
                 pdu_type: WTP_PDU_ABORT,
+                abort: Some(WtpAbortInfo { abort_type: 7, reason: 0 }),
             })
+        );
+        assert_eq!(
+            wtp_abort_reason_name(WtpAbortInfo { abort_type: 0, reason: 1 }),
+            "provider/PROTOERR"
         );
     }
 
@@ -1312,7 +1369,7 @@ mod tests {
         assert_eq!(
             &response_udp.payload[5..],
             &[
-                0x10,
+                0x0e,
                 0x00,
                 0x03,
                 WSP_CAP_CLIENT_SDU_SIZE,
@@ -1328,8 +1385,6 @@ mod tests {
                 0x02,
                 WSP_CAP_METHOD_MOR,
                 0x01,
-                0x01,
-                WSP_CAP_HEADER_CODE_PAGES,
             ]
         );
     }
