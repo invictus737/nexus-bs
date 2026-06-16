@@ -117,6 +117,7 @@ struct ExpectedAlSegment {
     t_umac_done: Option<TdmaTime>,
     current_mac_reporter: Option<TxReporter>,
     acknowledged: bool,
+    retransmission_requested: bool,
     retransmit_count: u8,
     retransmission_buf: SapMsg,
 }
@@ -139,6 +140,7 @@ struct ExpectedAlAck {
     retransmit_count: u8,
     first_complete_report_sent: bool,
     t_retransmissions_exhausted: Option<TdmaTime>,
+    selective_segment_retry_pending: bool,
 }
 
 /// Struct that maintains state expected acknowledgement data for a transmitted message.
@@ -927,13 +929,41 @@ impl Llc {
         al.t_submitted_to_umac = None;
         al.t_umac_done = None;
         al.current_mac_reporter = None;
+        al.selective_segment_retry_pending = false;
         for segment in &mut al.segments {
             segment.t_submitted_to_umac = None;
             segment.t_umac_done = None;
             segment.current_mac_reporter = None;
             segment.acknowledged = false;
+            segment.retransmission_requested = false;
             segment.retransmit_count = 0;
         }
+    }
+
+    fn schedule_requested_al_segment_retries(al: &mut ExpectedAlAck, max_segment_retransmissions: u8) -> Result<usize, u8> {
+        let mut retry_segments = 0usize;
+        for segment in &mut al.segments {
+            if segment.acknowledged || !segment.retransmission_requested {
+                continue;
+            }
+            if segment.retransmit_count >= max_segment_retransmissions {
+                return Err(segment.ss);
+            }
+
+            segment.retransmit_count += 1;
+            segment.t_submitted_to_umac = None;
+            segment.t_umac_done = None;
+            segment.current_mac_reporter = None;
+            retry_segments += 1;
+        }
+
+        if retry_segments > 0 {
+            al.t_submitted_to_umac = None;
+            al.t_umac_done = None;
+            al.current_mac_reporter = None;
+            al.t_retransmissions_exhausted = None;
+        }
+        Ok(retry_segments)
     }
 
     fn lowest_priority_unsubmitted_udata_below(messages: &VecDeque<QueuedUdata>, incoming_pdu_prio: Todo) -> Option<usize> {
@@ -1569,6 +1599,7 @@ impl Llc {
                 t_umac_done: None,
                 current_mac_reporter: None,
                 acknowledged: false,
+                retransmission_requested: false,
                 retransmit_count: 0,
                 retransmission_buf: SapMsg {
                     sap: Sap::TmaSap,
@@ -1614,6 +1645,7 @@ impl Llc {
             retransmit_count: 0,
             first_complete_report_sent: false,
             t_retransmissions_exhausted: None,
+            selective_segment_retry_pending: false,
         });
 
         Self::push_tla_report(queue, prim.req_handle, TLA_REPORT_NO_SPECIFIC_REPORT, Some(prim.endpoint_id));
@@ -2560,6 +2592,11 @@ impl Llc {
                 .get(&self.outbound_al_messages[idx].key)
                 .map(|session| session.max_segment_retransmissions)
                 .unwrap_or(0);
+            let max_tl_sdu_retransmissions = self
+                .advanced_links
+                .get(&self.outbound_al_messages[idx].key)
+                .map(|session| session.max_tl_sdu_retransmissions)
+                .unwrap_or(0);
             let mut acknowledged_segments = 0usize;
             let mut retransmit_segments = 0usize;
             let mut exhausted_segment = None;
@@ -2572,6 +2609,7 @@ impl Llc {
                                 acknowledged_segments += 1;
                             }
                             segment.acknowledged = true;
+                            segment.retransmission_requested = false;
                             if let Some(reporter) = &segment.current_mac_reporter {
                                 reporter.try_mark_transmitted();
                             }
@@ -2580,6 +2618,7 @@ impl Llc {
                             if segment.retransmit_count < max_segment_retransmissions {
                                 segment.retransmit_count += 1;
                                 segment.acknowledged = false;
+                                segment.retransmission_requested = true;
                                 segment.t_submitted_to_umac = None;
                                 segment.t_umac_done = None;
                                 segment.current_mac_reporter = None;
@@ -2589,7 +2628,9 @@ impl Llc {
                                 break;
                             }
                         }
-                        None => {}
+                        None => {
+                            segment.retransmission_requested = false;
+                        }
                     }
                 }
 
@@ -2597,15 +2638,34 @@ impl Llc {
                     outbound.t_submitted_to_umac = None;
                     outbound.t_umac_done = None;
                     outbound.current_mac_reporter = None;
+                    outbound.selective_segment_retry_pending = true;
+                } else {
+                    outbound.selective_segment_retry_pending = false;
                 }
             }
 
             if let Some(ss) = exhausted_segment {
+                let outbound = &mut self.outbound_al_messages[idx];
+                if outbound.retransmit_count < max_tl_sdu_retransmissions {
+                    outbound.retransmit_count += 1;
+                    Self::reset_al_transmission_attempt(outbound);
+                    tracing::warn!(
+                        "LLC: AL selective ACK exhausted N.274 for SSI {} endpoint {} link {} N(S)={} S(S)={}; retransmitting complete TL-SDU attempt {} using N.273",
+                        outbound.key.addr.ssi,
+                        outbound.key.endpoint_id,
+                        outbound.key.link_id,
+                        outbound.ns,
+                        ss,
+                        outbound.retransmit_count
+                    );
+                    return;
+                }
+
                 let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {
                     return;
                 };
                 tracing::warn!(
-                    "LLC: AL selective ACK exhausted N.274 for SSI {} endpoint {} link {} N(S)={} S(S)={}",
+                    "LLC: AL selective ACK exhausted N.274 and N.273 for SSI {} endpoint {} link {} N(S)={} S(S)={}",
                     outbound.key.addr.ssi,
                     outbound.key.endpoint_id,
                     outbound.key.link_id,
@@ -3031,11 +3091,47 @@ impl Llc {
                 continue;
             }
 
+            let segment_retry_exhausted = if al.selective_segment_retry_pending {
+                let max_segment_retransmissions = self
+                    .advanced_links
+                    .get(&al.key)
+                    .map(|session| session.max_segment_retransmissions)
+                    .unwrap_or(0);
+                match Self::schedule_requested_al_segment_retries(al, max_segment_retransmissions) {
+                    Ok(retry_segments) if retry_segments > 0 => {
+                        tracing::info!(
+                            "LLC: AL TL-SDU SSI {} endpoint {} link {} N(S) {} retrying {} selectively requested segment(s) after T.252 using N.274",
+                            al.key.addr.ssi,
+                            al.key.endpoint_id,
+                            al.key.link_id,
+                            al.ns,
+                            retry_segments
+                        );
+                        had_activity = true;
+                        continue;
+                    }
+                    Ok(_) => None,
+                    Err(ss) => Some(ss),
+                }
+            } else {
+                None
+            };
+
             let max_retransmissions = self
                 .advanced_links
                 .get(&al.key)
                 .map(|session| session.max_tl_sdu_retransmissions)
                 .unwrap_or(0);
+            if let Some(ss) = segment_retry_exhausted {
+                tracing::warn!(
+                    "LLC: AL TL-SDU SSI {} endpoint {} link {} N(S) {} segment S(S) {} exhausted N.274; falling back to N.273 TL-SDU retransmission policy",
+                    al.key.addr.ssi,
+                    al.key.endpoint_id,
+                    al.key.link_id,
+                    al.ns,
+                    ss
+                );
+            }
             if al.retransmit_count < max_retransmissions {
                 al.retransmit_count += 1;
                 al.t_retransmissions_exhausted = None;
