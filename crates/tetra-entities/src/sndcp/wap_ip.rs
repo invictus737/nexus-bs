@@ -228,18 +228,18 @@ fn build_udp_status_response(
         }
         WapUdpRequestKind::WtpWspConnect {
             transaction_id,
-            retransmission,
-        } => build_wtp_wsp_result(transaction_id, retransmission, &build_wsp_connect_reply()),
+            retransmission: _,
+        } => build_wtp_wsp_result(transaction_id, &build_wsp_connect_reply()),
         WapUdpRequestKind::WtpWspStatus {
             transaction_id,
-            retransmission,
+            retransmission: _,
         } => {
             let max_wsp_page_bytes = max_npdu_bytes
                 .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES + 3 + WSP_REPLY_FIXED_HEADER_BYTES))
                 .unwrap_or(DEFAULT_WAP_WSP_STATUS_MAX_BYTES)
                 .min(DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
             let page = render_wml2_status(snapshot, max_wsp_page_bytes)?;
-            build_wtp_wsp_result(transaction_id, retransmission, &build_wsp_reply(page.as_bytes()))
+            build_wtp_wsp_result(transaction_id, &build_wsp_reply(page.as_bytes()))
         }
         WapUdpRequestKind::WtpControlNoResponse { transaction_id, pdu_type } => {
             tracing::info!(
@@ -568,10 +568,10 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
     }
 }
 
-fn build_wtp_wsp_result(transaction_id: u16, retransmission: bool, wsp_payload: &[u8]) -> Vec<u8> {
+fn build_wtp_wsp_result(transaction_id: u16, wsp_payload: &[u8]) -> Vec<u8> {
     let response_tid = (transaction_id & WTP_TID_VALUE_MASK) | WTP_TID_RESPONSE_FLAG;
     let mut payload = Vec::with_capacity(3 + wsp_payload.len());
-    payload.push(WTP_RESULT_GTR_TTR | if retransmission { WTP_RID_FLAG } else { 0 });
+    payload.push(WTP_RESULT_GTR_TTR);
     payload.extend_from_slice(&response_tid.to_be_bytes());
     payload.extend_from_slice(wsp_payload);
     payload
@@ -1192,7 +1192,7 @@ mod tests {
         assert_eq!(response_ip.destination, [10, 0, 0, 2]);
         assert_eq!(response_udp.source_port, endpoint.port);
         assert_eq!(response_udp.destination_port, 49152);
-        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR | WTP_RID_FLAG, 0x93, 0xcc]);
+        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR, 0x93, 0xcc]);
         assert_eq!(response_udp.payload[3], WSP_PDU_CONNECT_REPLY);
         assert_eq!(response_udp.payload[4], 0x01);
         assert_eq!(
@@ -1289,7 +1289,7 @@ mod tests {
     }
 
     #[test]
-    fn wap_status_response_echoes_wtp_rid_on_retransmitted_get() {
+    fn wap_status_response_keeps_wtp_result_rid_clear_for_retransmitted_get() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
             port: 9200,
@@ -1306,15 +1306,7 @@ mod tests {
 
         assert_eq!(
             &response_udp.payload[..7],
-            &[
-                WTP_RESULT_GTR_TTR | WTP_RID_FLAG,
-                0x92,
-                0x34,
-                WSP_PDU_REPLY,
-                WSP_STATUS_OK,
-                0x01,
-                0xc5
-            ]
+            &[WTP_RESULT_GTR_TTR, 0x92, 0x34, WSP_PDU_REPLY, WSP_STATUS_OK, 0x01, 0xc5]
         );
     }
 
