@@ -1149,6 +1149,40 @@ impl BsChannelScheduler {
         Some(timeslots)
     }
 
+    fn packet_data_resource_requires_packet_data_owner(pdu: &MacResource, sdu: &BitBuffer) -> bool {
+        pdu.chan_alloc_element.is_none()
+            && pdu.addr.is_some_and(|addr| addr.ssi_type == SsiType::Issi)
+            && (Self::sdu_is_sndcp_packet_data(sdu) || Self::sdu_is_llc_advanced_link(sdu))
+    }
+
+    fn packet_data_resource_allowed_on_allocated_slot(
+        ts: u8,
+        pdu: &MacResource,
+        sdu: &BitBuffer,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> bool {
+        if ts == 1 || !Self::packet_data_resource_requires_packet_data_owner(pdu, sdu) {
+            return true;
+        }
+
+        let Some(alloc) = timeslot_alloc else {
+            return true;
+        };
+
+        match alloc.owner(ts) {
+            Some(TimeslotOwner::PacketData) => true,
+            owner => {
+                tracing::info!(
+                    "packet-data resource for {:?} dropped on TS{} because allocator owner is {:?}",
+                    pdu.addr,
+                    ts,
+                    owner
+                );
+                false
+            }
+        }
+    }
+
     fn packet_data_channel_allocation(
         assignment: PacketDataAssignment,
         ts_assigned: [bool; NUM_TIMESLOTS],
@@ -2883,6 +2917,7 @@ impl BsChannelScheduler {
             return;
         }
 
+        self.dl_drop_all_except_stolen(circuit.ts);
         self.preempt_packet_data_assignment_for_voice(circuit.ts);
         self.clear_future_uplink_reservations_for_timeslot(circuit.ts, "voice circuit open");
 
@@ -3237,6 +3272,10 @@ impl BsChannelScheduler {
                         }
 
                         DlSchedElem::Resource(mut pdu, sdu, tx_reporter, group_state) => {
+                            if !Self::packet_data_resource_allowed_on_allocated_slot(ts.t, &pdu, &sdu, timeslot_alloc.as_deref()) {
+                                Self::mark_reporter_discarded_if_pending(tx_reporter);
+                                continue;
+                            }
                             if !self.adapt_packet_data_channel_allocation_for_voice_priority_with_allocator(
                                 &mut pdu,
                                 &sdu,
@@ -4485,6 +4524,12 @@ mod tests {
         sdu.write_bits(0b0100, 4);
         sdu.seek(0);
         sdu
+    }
+
+    fn queue_has_resource_for_addr_on_ts(sched: &BsChannelScheduler, ts: u8, addr: TetraAddress) -> bool {
+        sched.dltx_queues[ts as usize - 1]
+            .iter()
+            .any(|elem| matches!(elem, DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr)))
     }
 
     fn test_packet_data_channel_allocation_resource(
@@ -5742,6 +5787,10 @@ mod tests {
         assert_eq!(final_resize.alloc_type, ChanAllocType::Replace);
         assert_eq!(final_resize.ts_assigned, [false, false, false, true]);
         assert_eq!(final_resize.ul_dl_assigned, UlDlAssignment::Both);
+        assert!(
+            !queue_has_resource_for_addr_on_ts(&sched, 2, addr) && !queue_has_resource_for_addr_on_ts(&sched, 3, addr),
+            "voice-owned TS2/TS3 must not retain stale queued PDCH resources after duplex pre-emption"
+        );
 
         let subscribers = SubscriberRegistry::new();
         let mut energy_saving = HashMap::new();
@@ -5792,6 +5841,52 @@ mod tests {
             sched.packet_data_assignments[3].is_some(),
             "opening voice on a free slot must not kill unrelated stale PDCH"
         );
+    }
+
+    #[test]
+    fn test_packet_data_resource_does_not_transmit_on_cmce_reserved_slot_before_circuit_open() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress::issi(0x5114);
+        let now = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        let mut timeslot_alloc = TimeslotAllocator::default();
+        sched.set_dl_time(now);
+
+        sched.apply_packet_data_assignment_update(
+            PacketDataAssignmentUpdate::Replace {
+                addr,
+                ts_assigned: [false, true, false, false],
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier_num: 1001,
+            },
+            now,
+        );
+        timeslot_alloc
+            .reserve(TimeslotOwner::Cmce, 2)
+            .expect("CMCE may reserve TS2 before UMAC circuit state opens");
+
+        let (mut pdu, _) = test_resource_for_issi(addr.ssi, 0);
+        let sdu = test_sndcp_llc_sdu();
+        pdu.update_len_and_fill_ind(sdu.get_len());
+        sched.dl_enqueue_tma(pdu, sdu, None);
+        assert!(
+            queue_has_resource_for_addr_on_ts(&sched, 2, addr),
+            "test setup should queue ordinary packet-data resource on stale TS2 PDCH"
+        );
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let slot = sched.finalize_ts_for_tick_with_timeslot_allocator(&subscribers, &mut energy_saving, &mut timeslot_alloc);
+
+        assert_eq!(slot.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+        assert!(
+            !matches!(slot.blk1.as_ref().map(|block| block.logical_channel), Some(LogicalChannel::SchF)),
+            "packet data must not transmit SCH/F on a TS already reserved for CMCE"
+        );
+        assert!(
+            !queue_has_resource_for_addr_on_ts(&sched, 2, addr),
+            "reserved voice slot must not keep stale queued packet-data resources"
+        );
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
     }
 
     #[test]

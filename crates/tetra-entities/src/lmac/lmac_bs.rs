@@ -42,6 +42,7 @@ impl Default for LmacTrafficChan {
 
 const POST_GRANT_RX_DIAG_TIMESLOTS: i32 = 18 * 4;
 const POST_GRANT_RX_DIAG_MAX_EVENTS: u8 = 24;
+const CONTROL_RX_DIAG_MIN_AGE_TIMESLOTS: i32 = 4 * 18;
 
 #[derive(Debug, Clone, Copy)]
 struct PostGrantRxDiag {
@@ -74,6 +75,8 @@ pub struct LmacBs {
 
     /// Short RF diagnostic window after an uplink-capable STCH grant.
     post_grant_rx_diag: [Option<PostGrantRxDiag>; 4],
+    /// Rate-limit normal-level cold-attach/control diagnostics per UL slot.
+    control_rx_diag_last: [Option<TdmaTime>; 4],
     // Details about current burst, parsed from BBK broadcast block
     // cur_burst: CurBurst,
 }
@@ -105,6 +108,7 @@ impl LmacBs {
             uplink_phy_chan: [PhysicalChannel::Unallocated; 4],
             blk2_stolen_at: [None; 4],
             post_grant_rx_diag: [None; 4],
+            control_rx_diag_last: [None; 4],
         }
     }
 
@@ -306,6 +310,16 @@ impl LmacBs {
         }
     }
 
+    fn take_control_rx_diag_event(&mut self, ul_time: TdmaTime, ts_idx: usize) -> bool {
+        match self.control_rx_diag_last[ts_idx] {
+            Some(last) if last.age(ul_time) < CONTROL_RX_DIAG_MIN_AGE_TIMESLOTS => false,
+            _ => {
+                self.control_rx_diag_last[ts_idx] = Some(ul_time);
+                true
+            }
+        }
+    }
+
     fn rx_blk_traffic(
         &mut self,
         queue: &mut MessageQueue,
@@ -430,6 +444,19 @@ impl LmacBs {
 
         let block_num = blk.block_num;
         let rssi_dbfs = blk.rssi_dbfs;
+        let should_log_control_diag = diag.is_some() || self.take_control_rx_diag_event(ul_time, (ul_time.t - 1) as usize);
+        if should_log_control_diag {
+            tracing::info!(
+                "LMAC RF diag: UL control candidate ul_time={} lchan={:?} block={:?} burst={:?} train={:?} rssi_dbfs={:.1} bits={}",
+                ul_time,
+                lchan,
+                block_num,
+                blk.burst_type,
+                blk.train_type,
+                rssi_dbfs,
+                blk.block.get_len()
+            );
+        }
         let (type1bits, crc_pass) = errorcontrol::decode_cp(lchan, blk, Some(self.scrambling_code));
         // decode_cp only returns None when no scrambling code is available; we always pass
         // Some() here, so this is guaranteed. Use let-else instead of unwrap to stay
@@ -440,6 +467,14 @@ impl LmacBs {
                 lchan
             );
             Self::log_post_grant_result(diag, ul_time, "decode_none_control");
+            if should_log_control_diag {
+                tracing::info!(
+                    "LMAC RF diag: UL control result ul_time={} lchan={:?} block={:?} result=decode_none",
+                    ul_time,
+                    lchan,
+                    block_num
+                );
+            }
             return false;
         };
 
@@ -454,6 +489,14 @@ impl LmacBs {
         // If we see purpose, we may pass it up in the future
         if !crc_pass {
             Self::log_post_grant_result(diag, ul_time, "control_crc_fail");
+            if should_log_control_diag {
+                tracing::info!(
+                    "LMAC RF diag: UL control result ul_time={} lchan={:?} block={:?} result=crc_fail",
+                    ul_time,
+                    lchan,
+                    block_num
+                );
+            }
             return false;
         }
 
@@ -477,6 +520,14 @@ impl LmacBs {
         // We thus push this with prio, and the umac will signal with prio if blk2 is stolen too
         queue.push_prio(m, MessagePrio::Immediate);
         Self::log_post_grant_result(diag, ul_time, "forward_control");
+        if should_log_control_diag {
+            tracing::info!(
+                "LMAC RF diag: UL control result ul_time={} lchan={:?} block={:?} result=crc_ok",
+                ul_time,
+                lchan,
+                block_num
+            );
+        }
         true
     }
 

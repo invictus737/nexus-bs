@@ -1769,6 +1769,16 @@ impl UmacBs {
                 tracing::warn!("insufficient bits: {}", prim.pdu.dump_bin());
                 return;
             };
+            if self.wap_ip_diag_enabled() {
+                tracing::info!(
+                    "WAP/IP diag: UMAC pre-parse lchan={:?} block={:?} rssi_dbfs={:.1} bits_remaining={} first3=0b{:03b}",
+                    prim.logical_channel,
+                    prim.block_num,
+                    prim.rssi_dbfs,
+                    prim.pdu.get_len_remaining(),
+                    bits
+                );
+            }
             let orig_start = prim.pdu.get_raw_start();
             let lchan = prim.logical_channel;
 
