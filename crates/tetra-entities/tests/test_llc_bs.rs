@@ -1668,6 +1668,95 @@ fn test_outbound_segmented_al_t252_retries_selectively_requested_segments_before
 }
 
 #[test]
+fn test_outbound_segmented_al_selective_n274_exhaustion_waits_for_late_ack_without_resubmitting() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 7112;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    setup.max_segment_retransmissions = 1;
+    test.submit_message(build_al_setup_ind_with_setup(addr, 0, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let payload = [0x6b; 50];
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.link_id = 1;
+    prim.pdu_prio = 4;
+    prim.fcs_flag = false;
+    prim.tl_sdu = BitBuffer::from_bytes(&payload);
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&first_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "50-byte WAP-like AL payload should require three original AL segments"
+    );
+
+    for handle in first_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 1, 0, 1));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&retry_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "first selective ACK should spend the single allowed N.274 retry on the requested segment"
+    );
+
+    for handle in retry_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.run_stack(Some(T252_ACK_WAITING_TIMER as usize));
+    let grace_msgs = test.dump_sinks();
+    assert!(
+        !find_tla_report(&grace_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "N.273=0 must not fail a MAC-successful AL TL-SDU before late-ACK grace expires"
+    );
+    assert!(
+        al_segment_headers(&grace_msgs).is_empty(),
+        "N.274 exhaustion with N.273=0 must not resubmit AL segments while waiting for late AL-ACK"
+    );
+
+    test.run_stack(Some(8));
+    let quiet_grace_msgs = test.dump_sinks();
+    assert!(
+        quiet_grace_msgs.is_empty(),
+        "late-ACK grace must not re-run selective N.274 exhaustion on every scheduler tick"
+    );
+
+    test.submit_message(build_al_ack_ind(addr, 0, 0));
+    test.deliver_all_messages();
+    let complete_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
+        "complete AL-ACK inside late grace should still finish the WAP/SNDCP AL transfer"
+    );
+}
+
+#[test]
 fn test_outbound_segmented_al_t252_retries_only_segments_marked_bad_in_last_selective_ack() {
     debug::setup_logging_verbose();
 

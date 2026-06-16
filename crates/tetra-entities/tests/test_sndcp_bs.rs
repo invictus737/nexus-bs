@@ -315,6 +315,13 @@ fn al_data_ns_from_tma_req(msg: &SapMsg) -> Option<u8> {
     AlData::from_bitbuf(&mut pdu).ok().map(|pdu| pdu.ns)
 }
 
+fn tma_req_handle(msg: &SapMsg) -> Option<i32> {
+    let SapMsgInner::TmaUnitdataReq(prim) = &msg.msg else {
+        return None;
+    };
+    Some(prim.req_handle)
+}
+
 fn sndcp_user_data_from_al_tma_reqs(msgs: &[SapMsg]) -> Option<tetra_entities::sndcp::unitdata::SnUnitdata> {
     let mut ns = None;
     let mut final_ss = None;
@@ -433,6 +440,23 @@ fn build_wtp_wsp_get_payload(transaction_id: u16, uri: &str) -> Vec<u8> {
     payload.push(0x40);
     payload.push(uri.len() as u8);
     payload.extend_from_slice(uri.as_bytes());
+    payload
+}
+
+fn build_wtp_wsp_connect_payload(transaction_id: u16, capabilities: &[u8]) -> Vec<u8> {
+    assert!(
+        capabilities.len() < 128,
+        "test WSP Connect capabilities should fit one uintvar octet"
+    );
+    let mut payload = Vec::with_capacity(7 + capabilities.len());
+    payload.push(0x0a);
+    payload.extend_from_slice(&(transaction_id & 0x7fff).to_be_bytes());
+    payload.push(0x12);
+    payload.push(0x01);
+    payload.push(0x10);
+    payload.push(capabilities.len() as u8);
+    payload.push(0x00);
+    payload.extend_from_slice(capabilities);
     payload
 }
 
@@ -1094,6 +1118,149 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("Welcome to Nexus-BS"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
+}
+
+#[test]
+fn sndcp_wap_al_connect_reply_e2e_acknowledges_segmented_response() {
+    debug::setup_logging_verbose();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp(&mut config);
+    config
+        .cell
+        .wap_ip
+        .as_mut()
+        .expect("WAP/IP profile should be enabled")
+        .assume_pdch_ready_after_data_transmit = false;
+    let mut test = ComponentTest::from_config(config, None);
+    test.populate_entities(
+        vec![TetraEntity::Sndcp, TetraEntity::Mle, TetraEntity::Llc],
+        vec![TetraEntity::Umac],
+    );
+
+    let addr = TetraAddress::new(1000001, SsiType::Issi);
+    let endpoint_id = 1;
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_dynamic_ipv4_activation_demand(2),
+        endpoint_id,
+        0,
+    ));
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    let activation_ns = activation_msgs
+        .iter()
+        .find_map(bl_data_ns_from_tma_req)
+        .expect("activation accept should be sent as BL-DATA");
+    test.submit_message(build_bl_ack_ind(addr, endpoint_id, activation_ns));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        encode_data_transmit_request(&SndcpDataTransmitRequest {
+            nsapi: 2,
+            logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::None,
+        })
+        .expect("SN-DATA TRANSMIT REQUEST should encode"),
+        endpoint_id,
+        0,
+    ));
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    let ready_req_handle = ready_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::TmaUnitdataReq(req) if req.chan_alloc.is_some() => Some(req.req_handle),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("SN-DATA TRANSMIT RESPONSE should reach UMAC with PDCH allocation: {ready_msgs:#?}"));
+    test.submit_message(build_tma_report(ready_req_handle, TmaReport::SuccessReservedOrStealing));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_setup_ind(addr, endpoint_id, 0));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let capabilities = [
+        0x03, 0x80, 0x8a, 0x78, 0x03, 0x81, 0x8a, 0x78, 0x02, 0x82, 0xf0, 0x02, 0x83, 0x03, 0x09, 0x86, 0x10, b'x', b'-', b'u', b'p', b'-',
+        b'1', 0x00,
+    ];
+    let request_payload = build_wtp_wsp_connect_payload(0x1234, &capabilities);
+    let request_sndcp = build_wap_status_sn_data_from(2, [10, 0, 0, 2], &request_payload);
+    let request_tl_sdu = build_mle_prefixed_sndcp_sdu(request_sndcp);
+    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 0, &request_tl_sdu));
+    test.run_stack(Some(1));
+    let mut response_msgs = test.dump_sinks();
+
+    let al_response_segments: Vec<&SapMsg> = response_msgs
+        .iter()
+        .filter(|msg| llc_pdu_type_from_tma_req(msg) == Some(LlcPduType::AlDataAlFinal))
+        .collect();
+    assert!(
+        al_response_segments.len() > 1,
+        "WSP ConnectReply should be delivered as segmented AL-DATA/AL-FINAL-AR"
+    );
+    assert!(
+        al_response_segments.iter().all(|msg| match &msg.msg {
+            SapMsgInner::TmaUnitdataReq(req) => req.endpoint_id == endpoint_id,
+            _ => false,
+        }),
+        "ConnectReply AL segments must preserve the packet-data endpoint"
+    );
+    let response_ns = al_response_segments
+        .iter()
+        .find_map(|msg| al_data_ns_from_tma_req(msg))
+        .expect("ConnectReply AL response should have N(S)");
+    let response =
+        sndcp_user_data_from_al_tma_reqs(&response_msgs).expect("WAP Connect over AL SN-DATA should produce a segmented SNDCP response");
+    let response_octets = bitbuffer_npdu_octets(&response.n_pdu).expect("response N-PDU should be byte aligned");
+    let response_ip = parse_ipv4_packet(&response_octets).expect("response IPv4 should parse");
+    let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
+    assert_eq!(response_ip.source, [10, 0, 0, 1]);
+    assert_eq!(response_ip.destination, [10, 0, 0, 2]);
+    assert_eq!(response_udp.source_port, 9200);
+    assert_eq!(response_udp.destination_port, 49_152);
+    assert_eq!(
+        &response_udp.payload[..4],
+        &[0x16, 0x92, 0x34, 0x02],
+        "WSP Connect should receive WTP Result + WSP ConnectReply"
+    );
+    assert_eq!(
+        &response_udp.payload[5..],
+        &[
+            0x10, 0x00, 0x03, 0x80, 0x8a, 0x78, 0x03, 0x81, 0x8a, 0x78, 0x02, 0x82, 0x00, 0x02, 0x83, 0x01, 0x01, 0x86,
+        ],
+        "ConnectReply should explicitly decline requested extension header code pages"
+    );
+
+    for handle in response_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    response_msgs.clear();
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_ack_ind(addr, endpoint_id, response_ns));
+    test.deliver_all_messages();
+    let complete_msgs = test.dump_sinks();
+    assert!(
+        complete_msgs
+            .iter()
+            .all(|msg| llc_pdu_type_from_tma_req(msg) != Some(LlcPduType::AlDataAlFinal)),
+        "complete peer AL-ACK should not emit more ConnectReply segments"
+    );
+
+    test.run_stack(Some(20));
+    let post_ack_msgs = test.dump_sinks();
+    assert!(
+        post_ack_msgs
+            .iter()
+            .all(|msg| llc_pdu_type_from_tma_req(msg) != Some(LlcPduType::AlDataAlFinal)),
+        "completed ConnectReply must not be retried after scheduler ticks"
+    );
 }
 
 #[test]

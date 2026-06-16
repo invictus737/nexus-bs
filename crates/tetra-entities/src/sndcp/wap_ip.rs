@@ -782,6 +782,9 @@ fn build_wsp_connect_reply_capabilities(connect: &WspConnectRequest) -> Vec<u8> 
             push_wsp_octets_capability(&mut capabilities, WSP_CAP_EXTENDED_METHODS, &accepted);
         }
     }
+    if wsp_capability(connect, WSP_CAP_HEADER_CODE_PAGES).is_some() {
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_HEADER_CODE_PAGES, &[]);
+    }
     capabilities
 }
 
@@ -1513,7 +1516,7 @@ mod tests {
         assert_eq!(
             &response_udp.payload[5..],
             &[
-                0x0e,
+                0x10,
                 0x00,
                 0x03,
                 WSP_CAP_CLIENT_SDU_SIZE,
@@ -1529,6 +1532,8 @@ mod tests {
                 0x02,
                 WSP_CAP_METHOD_MOR,
                 0x01,
+                0x01,
+                WSP_CAP_HEADER_CODE_PAGES,
             ]
         );
     }
@@ -1606,9 +1611,13 @@ mod tests {
                 .map(|cap| cap.parameters.as_slice()),
             Some(&[0x50][..])
         );
-        assert!(
-            negotiated.iter().all(|cap| cap.id != WSP_CAP_HEADER_CODE_PAGES),
-            "ConnectReply must not advertise unsupported extension header code pages"
+        assert_eq!(
+            negotiated
+                .iter()
+                .find(|cap| cap.id == WSP_CAP_HEADER_CODE_PAGES)
+                .map(|cap| cap.parameters.as_slice()),
+            Some(&[][..]),
+            "ConnectReply should explicitly decline requested extension header code pages"
         );
     }
 

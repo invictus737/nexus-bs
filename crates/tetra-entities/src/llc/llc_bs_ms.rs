@@ -950,7 +950,6 @@ impl Llc {
                 return Err(segment.ss);
             }
 
-            segment.retransmit_count += 1;
             segment.t_submitted_to_umac = None;
             segment.t_umac_done = None;
             segment.current_mac_reporter = None;
@@ -1476,11 +1475,25 @@ impl Llc {
         queue.push_back(sapmsg);
     }
 
-    fn submit_for_al_transmission(queue: &mut MessageQueue, al: &mut ExpectedAlAck, dltime: TdmaTime) {
+    fn submit_for_al_transmission(queue: &mut MessageQueue, al: &mut ExpectedAlAck, dltime: TdmaTime, max_segment_retransmissions: u8) {
         let mut submitted_any = false;
         for segment in &mut al.segments {
             if segment.acknowledged || segment.t_submitted_to_umac.is_some() {
                 continue;
+            }
+            if segment.retransmission_requested {
+                if segment.retransmit_count >= max_segment_retransmissions {
+                    tracing::warn!(
+                        "LLC: AL TL-SDU SSI {} endpoint {} link {} N(S) {} segment S(S) {} reached N.274 before retransmission",
+                        al.key.addr.ssi,
+                        al.key.endpoint_id,
+                        al.key.link_id,
+                        al.ns,
+                        segment.ss
+                    );
+                    continue;
+                }
+                segment.retransmit_count += 1;
             }
             let mut sapmsg = segment.retransmission_buf.clone();
             let mac_reporter = TxReporter::new_unacked();
@@ -2616,7 +2629,6 @@ impl Llc {
                         }
                         Some(false) => {
                             if segment.retransmit_count < max_segment_retransmissions {
-                                segment.retransmit_count += 1;
                                 segment.acknowledged = false;
                                 segment.retransmission_requested = true;
                                 segment.t_submitted_to_umac = None;
@@ -3042,6 +3054,11 @@ impl Llc {
 
         while let Some(idx) = self.highest_priority_unsubmitted_al_index(&link_blocked) {
             let key = Self::expected_al_key(&self.outbound_al_messages[idx]);
+            let max_segment_retransmissions = self
+                .advanced_links
+                .get(&key)
+                .map(|session| session.max_segment_retransmissions)
+                .unwrap_or(0);
             let al = &mut self.outbound_al_messages[idx];
             tracing::debug!(
                 "submitting AL TL-SDU for SSI {} endpoint {} link {} N(S) {} segments {} pdu_prio {} to umac",
@@ -3052,7 +3069,12 @@ impl Llc {
                 al.segments.len(),
                 al.pdu_prio
             );
-            Self::submit_for_al_transmission(queue, al, self.dltime.forward_to_timeslot(al.t_first.t));
+            Self::submit_for_al_transmission(
+                queue,
+                al,
+                self.dltime.forward_to_timeslot(al.t_first.t),
+                max_segment_retransmissions,
+            );
             link_blocked.insert(key);
             had_activity = true;
         }
@@ -3067,6 +3089,13 @@ impl Llc {
 
         for idx in 0..self.outbound_al_messages.len() {
             let al = &mut self.outbound_al_messages[idx];
+            if al.t_retransmissions_exhausted.is_some() {
+                if Self::al_late_ack_grace_expired(al, dltime) {
+                    removals.push(idx);
+                }
+                continue;
+            }
+
             let mac_state = Self::al_current_mac_state(al);
             if al.t_umac_done.is_none() && matches!(mac_state, Some(TxState::Transmitted | TxState::Discarded)) {
                 al.t_umac_done = Some(dltime);
