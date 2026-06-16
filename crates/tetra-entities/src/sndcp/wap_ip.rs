@@ -36,9 +36,10 @@ const WSP_CAP_CLIENT_SDU_SIZE: u8 = 0x80;
 const WSP_CAP_SERVER_SDU_SIZE: u8 = 0x81;
 const WSP_CAP_PROTOCOL_OPTIONS: u8 = 0x82;
 const WSP_CAP_METHOD_MOR: u8 = 0x83;
+const WSP_CAP_EXTENDED_METHODS: u8 = 0x85;
 const WSP_CAP_HEADER_CODE_PAGES: u8 = 0x86;
 const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 1400;
-const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 1024;
+const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 1400;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +86,18 @@ pub enum WapIpError {
     UnsupportedTcpSegment { flags: u16, payload_len: usize },
     UnsupportedWapPath { path: String },
     NoResponseRequired,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WspCapability {
+    id: u8,
+    parameters: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WspConnectRequest {
+    version: u8,
+    capabilities: Vec<WspCapability>,
 }
 
 impl From<IpPrimitiveError> for WapIpError {
@@ -229,7 +242,17 @@ fn build_udp_status_response(
         WapUdpRequestKind::WtpWspConnect {
             transaction_id,
             retransmission: _,
-        } => build_wtp_wsp_result(transaction_id, &build_wsp_connect_reply()),
+        } => {
+            let connect = parse_wtp_wsp_connect_request(request_udp.payload)?.ok_or(WapIpError::UnsupportedWapUdpPayload {
+                len: request_udp.payload.len(),
+            })?;
+            tracing::info!(
+                "WAP/IP diag: WSP Connect version={:#x} requested_capabilities={:?}",
+                connect.version,
+                connect.capabilities
+            );
+            build_wtp_wsp_result(transaction_id, &build_wsp_connect_reply(&connect))
+        }
         WapUdpRequestKind::WtpWspStatus {
             transaction_id,
             retransmission: _,
@@ -568,6 +591,55 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
     }
 }
 
+fn parse_wtp_wsp_connect_request(payload: &[u8]) -> Result<Option<WspConnectRequest>, WapIpError> {
+    if payload.len() < 5 || ((payload[0] >> 3) & 0x0f) != WTP_PDU_INVOKE {
+        return Ok(None);
+    }
+    let wsp = &payload[4..];
+    if wsp.first().copied() != Some(WSP_PDU_CONNECT) {
+        return Ok(None);
+    }
+    parse_wsp_connect_request(wsp).map(Some)
+}
+
+fn parse_wsp_connect_request(wsp: &[u8]) -> Result<WspConnectRequest, WapIpError> {
+    if wsp.len() < 4 || wsp[0] != WSP_PDU_CONNECT {
+        return Err(WapIpError::UnsupportedWapUdpPayload { len: wsp.len() });
+    }
+
+    let version = wsp[1];
+    let (capabilities_len, cap_len_octets) = read_uintvar(&wsp[2..]).ok_or(WapIpError::UnsupportedWapUdpPayload { len: wsp.len() })?;
+    let headers_len_start = 2 + cap_len_octets;
+    let (headers_len, headers_len_octets) =
+        read_uintvar(&wsp[headers_len_start..]).ok_or(WapIpError::UnsupportedWapUdpPayload { len: wsp.len() })?;
+    let capabilities_start = headers_len_start + headers_len_octets;
+    let capabilities_end = capabilities_start + capabilities_len;
+    let headers_end = capabilities_end + headers_len;
+    if headers_end > wsp.len() {
+        return Err(WapIpError::UnsupportedWapUdpPayload { len: wsp.len() });
+    }
+
+    let capabilities = parse_wsp_capabilities(&wsp[capabilities_start..capabilities_end])?;
+    Ok(WspConnectRequest { version, capabilities })
+}
+
+fn parse_wsp_capabilities(mut buf: &[u8]) -> Result<Vec<WspCapability>, WapIpError> {
+    let mut capabilities = Vec::new();
+    while !buf.is_empty() {
+        let (len, len_octets) = read_uintvar(buf).ok_or(WapIpError::UnsupportedWapUdpPayload { len: buf.len() })?;
+        if len == 0 || len_octets + len > buf.len() {
+            return Err(WapIpError::UnsupportedWapUdpPayload { len: buf.len() });
+        }
+        let body = &buf[len_octets..len_octets + len];
+        capabilities.push(WspCapability {
+            id: body[0],
+            parameters: body[1..].to_vec(),
+        });
+        buf = &buf[len_octets + len..];
+    }
+    Ok(capabilities)
+}
+
 fn build_wtp_wsp_result(transaction_id: u16, wsp_payload: &[u8]) -> Vec<u8> {
     let response_tid = (transaction_id & WTP_TID_VALUE_MASK) | WTP_TID_RESPONSE_FLAG;
     let mut payload = Vec::with_capacity(3 + wsp_payload.len());
@@ -577,8 +649,8 @@ fn build_wtp_wsp_result(transaction_id: u16, wsp_payload: &[u8]) -> Vec<u8> {
     payload
 }
 
-fn build_wsp_connect_reply() -> Vec<u8> {
-    let capabilities = build_wsp_connect_reply_capabilities();
+fn build_wsp_connect_reply(connect: &WspConnectRequest) -> Vec<u8> {
+    let capabilities = build_wsp_connect_reply_capabilities(connect);
     let mut payload = Vec::with_capacity(4 + capabilities.len());
     payload.push(WSP_PDU_CONNECT_REPLY);
     payload.push(0x01); // Server session id.
@@ -588,14 +660,56 @@ fn build_wsp_connect_reply() -> Vec<u8> {
     payload
 }
 
-fn build_wsp_connect_reply_capabilities() -> Vec<u8> {
+fn build_wsp_connect_reply_capabilities(connect: &WspConnectRequest) -> Vec<u8> {
     let mut capabilities = Vec::new();
-    push_wsp_uintvar_capability(&mut capabilities, WSP_CAP_CLIENT_SDU_SIZE, WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES);
-    push_wsp_uintvar_capability(&mut capabilities, WSP_CAP_SERVER_SDU_SIZE, WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES);
-    push_wsp_octets_capability(&mut capabilities, WSP_CAP_PROTOCOL_OPTIONS, &[0x00]);
-    push_wsp_octets_capability(&mut capabilities, WSP_CAP_METHOD_MOR, &[0x01]);
-    push_wsp_octets_capability(&mut capabilities, WSP_CAP_HEADER_CODE_PAGES, &[]);
+    if let Some(requested) = wsp_capability_uintvar(connect, WSP_CAP_CLIENT_SDU_SIZE) {
+        push_wsp_uintvar_capability(
+            &mut capabilities,
+            WSP_CAP_CLIENT_SDU_SIZE,
+            requested.min(WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES),
+        );
+    }
+    if let Some(requested) = wsp_capability_uintvar(connect, WSP_CAP_SERVER_SDU_SIZE) {
+        push_wsp_uintvar_capability(
+            &mut capabilities,
+            WSP_CAP_SERVER_SDU_SIZE,
+            requested.min(WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES),
+        );
+    }
+    if wsp_capability(connect, WSP_CAP_PROTOCOL_OPTIONS).is_some() {
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_PROTOCOL_OPTIONS, &[0x00]);
+    }
+    if let Some(requested) = wsp_capability(connect, WSP_CAP_METHOD_MOR).and_then(|capability| capability.parameters.first().copied()) {
+        let accepted = requested.min(1);
+        if accepted > 0 {
+            push_wsp_octets_capability(&mut capabilities, WSP_CAP_METHOD_MOR, &[accepted]);
+        }
+    }
+    if let Some(requested) = wsp_capability(connect, WSP_CAP_EXTENDED_METHODS) {
+        let accepted: Vec<u8> = requested
+            .parameters
+            .split(|octet| *octet == 0)
+            .filter_map(|entry| entry.first().copied())
+            .filter(|pdu_type| (0x50..=0x5f).contains(pdu_type))
+            .collect();
+        if !accepted.is_empty() {
+            push_wsp_octets_capability(&mut capabilities, WSP_CAP_EXTENDED_METHODS, &accepted);
+        }
+    }
+    if wsp_capability(connect, WSP_CAP_HEADER_CODE_PAGES).is_some() {
+        push_wsp_octets_capability(&mut capabilities, WSP_CAP_HEADER_CODE_PAGES, &[]);
+    }
     capabilities
+}
+
+fn wsp_capability(connect: &WspConnectRequest, id: u8) -> Option<&WspCapability> {
+    connect.capabilities.iter().find(|capability| capability.id == id)
+}
+
+fn wsp_capability_uintvar(connect: &WspConnectRequest, id: u8) -> Option<usize> {
+    let capability = wsp_capability(connect, id)?;
+    let (value, len) = read_uintvar(&capability.parameters)?;
+    (len == capability.parameters.len()).then_some(value)
 }
 
 fn push_wsp_uintvar_capability(out: &mut Vec<u8>, capability_id: u8, value: usize) {
@@ -1206,8 +1320,8 @@ mod tests {
                 0x78,
                 0x03,
                 WSP_CAP_SERVER_SDU_SIZE,
-                0x88,
-                0x00,
+                0x8a,
+                0x78,
                 0x02,
                 WSP_CAP_PROTOCOL_OPTIONS,
                 0x00,
