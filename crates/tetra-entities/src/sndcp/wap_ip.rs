@@ -269,7 +269,8 @@ fn build_udp_status_response(
         WapUdpRequestKind::Empty | WapUdpRequestKind::Status => {
             let max_wml2_bytes = max_npdu_bytes
                 .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES))
-                .unwrap_or(DEFAULT_WAP_STATUS_MAX_BYTES);
+                .unwrap_or(DEFAULT_WAP_STATUS_MAX_BYTES)
+                .min(DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
             render_wml2_status(snapshot, max_wml2_bytes)?.into_bytes()
         }
         WapUdpRequestKind::WtpWspConnect {
@@ -1103,12 +1104,15 @@ mod tests {
         assert_eq!(response_udp.destination_port, 49152);
         let page = std::str::from_utf8(response_udp.payload).expect("WAP status page should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("<body text=\"#0f0\">"));
+        assert!(page.contains("<body>"));
+        assert!(!page.contains("text=\"#0f0\""));
         assert!(!page.contains("<wml"));
         assert!(!page.contains("<card"));
-        assert!(page.contains("Nexus OK"));
-        assert!(page.contains("M4 C0 S1"));
-        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(page.contains("Nexus-BS: Health OK"));
+        assert!(page.contains("Version: 0.1.69"));
+        assert!(page.contains("Uptime 2m"));
+        assert!(!page.contains("Voice"));
+        assert!((2..=3).contains(&page.matches("<br />").count()));
         assert!(!page.contains("<br/>"));
         assert!(page.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
     }
@@ -1447,9 +1451,13 @@ mod tests {
         );
         let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("<body text=\"#0f0\">"));
-        assert!(page.contains("Nexus OK"));
-        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(page.contains("<body>"));
+        assert!(!page.contains("text=\"#0f0\""));
+        assert!(page.contains("Nexus-BS: Health OK"));
+        assert!(page.contains("Version: 0.1.69"));
+        assert!(page.contains("Uptime 2m"));
+        assert!(!page.contains("Voice"));
+        assert!((2..=3).contains(&page.matches("<br />").count()));
         assert!(!page.contains("<br/>"));
         assert!(!page.contains("<wml"));
     }
@@ -1500,9 +1508,13 @@ mod tests {
         let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
         let page = std::str::from_utf8(response_udp.payload).unwrap();
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("<body text=\"#0f0\">"));
-        assert!(page.contains("Nexus OK"));
-        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(page.contains("<body>"));
+        assert!(!page.contains("text=\"#0f0\""));
+        assert!(page.contains("Nexus-BS: Health OK"));
+        assert!(page.contains("Version: 0.1.69"));
+        assert!(page.contains("Uptime 2m"));
+        assert!(!page.contains("Voice"));
+        assert!((2..=3).contains(&page.matches("<br />").count()));
         assert!(!page.contains("<br/>"));
     }
 

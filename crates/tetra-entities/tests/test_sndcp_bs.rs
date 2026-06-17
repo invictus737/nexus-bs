@@ -7,6 +7,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use common::ComponentTest;
 use tetra_config::bluestation::{CfgWapIp, DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES, StackMode};
@@ -432,6 +433,7 @@ fn build_wtp_wsp_connect_payload(transaction_id: u16, capabilities: &[u8]) -> Ve
 }
 
 fn enable_wap_ip_status_mvp(config: &mut tetra_config::bluestation::StackConfig) {
+    mark_wap_status_health_ok_for_test();
     config.cell.sndcp_service = true;
     config.cell.wap_ip = Some(CfgWapIp {
         enabled: true,
@@ -449,6 +451,12 @@ fn enable_wap_ip_status_mvp(config: &mut tetra_config::bluestation::StackConfig)
         max_request_payload_bytes: DEFAULT_WAP_IP_MAX_REQUEST_PAYLOAD_BYTES,
         assume_pdch_ready_after_data_transmit: true,
     });
+}
+
+fn mark_wap_status_health_ok_for_test() {
+    let registry = tetra_entities::health::registry();
+    registry.mark_router_tick(0, Duration::from_millis(1));
+    registry.set_brew_status(true, 1);
 }
 
 fn submit_voice_subscriber_update(test: &mut ComponentTest, issi: u32, groups: Vec<u32>, action: BrewSubscriberAction) {
@@ -974,12 +982,20 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
         "WAP status SN-UNITDATA response should fit the single-slot-safe SNDCP MTU: {} bytes",
         response_octets.len()
     );
+    assert!(
+        response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES,
+        "raw UDP /status.xhtml should use the terminal-safe tiny XHTML budget: {} bytes",
+        response_udp.payload.len()
+    );
     let page = std::str::from_utf8(response_udp.payload).unwrap();
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
-    assert!(page.contains("<body text=\"#0f0\">"));
-    assert!(page.contains("Nexus "));
-    assert!(page.contains("<br />M"));
-    assert_eq!(page.matches("<br />").count(), 3);
+    assert!(page.contains("<body>"));
+    assert!(!page.contains("text=\"#0f0\""));
+    assert!(page.contains("Nexus-BS: Health OK"), "page={page:?}");
+    assert!(page.contains("Version:"));
+    assert!(page.contains("Uptime"));
+    assert!(!page.contains("Voice"));
+    assert!((2..=3).contains(&page.matches("<br />").count()));
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
@@ -1106,10 +1122,13 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         response_octets.len()
     );
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
-    assert!(page.contains("<body text=\"#0f0\">"));
-    assert!(page.contains("Nexus "));
-    assert!(page.contains("<br />M"));
-    assert_eq!(page.matches("<br />").count(), 3);
+    assert!(page.contains("<body>"));
+    assert!(!page.contains("text=\"#0f0\""));
+    assert!(page.contains("Nexus-BS: Health OK"), "page={page:?}");
+    assert!(page.contains("Version:"));
+    assert!(page.contains("Uptime"));
+    assert!(!page.contains("Voice"));
+    assert!((2..=3).contains(&page.matches("<br />").count()));
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
@@ -1351,10 +1370,13 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         "WSP GET should receive WTP Result + WSP Reply(application/vnd.wap.xhtml+xml)"
     );
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
-    assert!(page.contains("<body text=\"#0f0\">"));
-    assert!(page.contains("Nexus "));
-    assert!(page.contains("<br />M"));
-    assert_eq!(page.matches("<br />").count(), 3);
+    assert!(page.contains("<body>"));
+    assert!(!page.contains("text=\"#0f0\""));
+    assert!(page.contains("Nexus-BS: Health OK"), "page={page:?}");
+    assert!(page.contains("Version:"));
+    assert!(page.contains("Uptime"));
+    assert!(!page.contains("Voice"));
+    assert!((2..=3).contains(&page.matches("<br />").count()));
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));

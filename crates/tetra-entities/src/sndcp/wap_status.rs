@@ -17,10 +17,10 @@ pub const WAP_STATUS_HEALTH_LINE_MAX_ESCAPED_BYTES: usize = 28;
 pub const WAP_STATUS_DETAIL_MAX_LINES: usize = 3;
 const XHTML_MP_DOCTYPE: &str =
     "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"http://www.wapforum.org/DTD/xhtml-mobile10.dtd\">";
-const TINY_XHTML_PREFIX: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body text=\"#0f0\">";
+const TINY_XHTML_PREFIX: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>";
 const TINY_XHTML_SUFFIX: &str = "</body></html>";
 const TINY_XHTML_BR: &str = "<br />";
-const TINY_LAST_PREFIX: &str = " L:";
+const TINY_LAST_PREFIX: &str = "Last ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WapStatusSnapshot {
@@ -109,13 +109,27 @@ fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusR
 }
 
 fn render_tiny_wml2_status_page(snapshot: &WapStatusSnapshot, max_bytes: usize) -> String {
-    let title = escape_xhtml_text_limited(snapshot.title.trim(), 5);
+    let title = escape_xhtml_text_limited(snapshot.title.trim(), 8);
     let state = compact_tiny_state(snapshot);
+    let version = compact_tiny_version(&snapshot.stack_version);
     let registered_ms = compact_count(snapshot.registered_ms);
     let active_calls = compact_count(snapshot.active_calls);
     let queued_sds = compact_count(snapshot.queued_sds);
     let uptime = compact_tiny_uptime(snapshot.uptime_secs);
-    let mut third_line = format!("U{uptime}");
+    let body_with_counts = format!(
+        "{title}: Health {state}{TINY_XHTML_BR}Version: {version}{TINY_XHTML_BR}MS {registered_ms} Calls {active_calls} SDS {queued_sds}{TINY_XHTML_BR}Uptime {uptime}"
+    );
+    let body_without_counts = format!("{title}: Health {state}{TINY_XHTML_BR}Version: {version}{TINY_XHTML_BR}Uptime {uptime}");
+    let mut body = if TINY_XHTML_PREFIX
+        .len()
+        .saturating_add(body_with_counts.len())
+        .saturating_add(TINY_XHTML_SUFFIX.len())
+        <= max_bytes
+    {
+        body_with_counts
+    } else {
+        body_without_counts
+    };
 
     if let Some(activity) = snapshot
         .last_activity
@@ -124,27 +138,23 @@ fn render_tiny_wml2_status_page(snapshot: &WapStatusSnapshot, max_bytes: usize) 
         .filter(|activity| !activity.is_empty())
         .map(compact_tiny_last_activity)
     {
-        let base_body = format!(
-            "{title} {state}{TINY_XHTML_BR}M{registered_ms} C{active_calls} S{queued_sds}{TINY_XHTML_BR}{third_line}{TINY_XHTML_BR}Voice"
-        );
         let used = TINY_XHTML_PREFIX
             .len()
-            .saturating_add(base_body.len())
+            .saturating_add(body.len())
+            .saturating_add(TINY_XHTML_BR.len())
             .saturating_add(TINY_LAST_PREFIX.len())
             .saturating_add(TINY_XHTML_SUFFIX.len());
         if used < max_bytes {
             let remaining = max_bytes - used;
             let activity = escape_xhtml_text_limited(&activity, remaining);
             if !activity.is_empty() {
-                third_line.push_str(TINY_LAST_PREFIX);
-                third_line.push_str(&activity);
+                body.push_str(TINY_XHTML_BR);
+                body.push_str(TINY_LAST_PREFIX);
+                body.push_str(&activity);
             }
         }
     }
 
-    let body = format!(
-        "{title} {state}{TINY_XHTML_BR}M{registered_ms} C{active_calls} S{queued_sds}{TINY_XHTML_BR}{third_line}{TINY_XHTML_BR}Voice"
-    );
     format!("{TINY_XHTML_PREFIX}{body}{TINY_XHTML_SUFFIX}")
 }
 
@@ -303,6 +313,16 @@ fn compact_tiny_uptime(uptime_secs: u64) -> String {
     }
 }
 
+fn compact_tiny_version(version: &str) -> String {
+    let version = version.trim().strip_prefix('v').unwrap_or(version.trim());
+    let version = version
+        .split(['-', '_'])
+        .next()
+        .filter(|version| !version.is_empty())
+        .unwrap_or("?");
+    escape_xhtml_text_limited(version, 12)
+}
+
 fn compact_tiny_last_activity(activity: &str) -> String {
     let activity = activity.trim();
     let compact = activity
@@ -442,13 +462,23 @@ mod tests {
         let page = render_wml2_status(&sample_snapshot(), 128).expect("tiny WML2 status should render");
 
         assert!(page.len() <= 128);
-        assert!(page.contains("<body text=\"#0f0\">"));
-        assert!(page.contains("Nexus OK"));
-        assert!(page.contains("M3 C1 S2<br />U1d"));
-        assert!(page.contains("L:S2260082"));
-        assert!(page.contains("<br />Voice"));
-        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(page.contains("http://www.w3.org/1999/xhtml"));
+        assert!(page.contains("Nexus-BS: Health OK"));
+        assert!(page.contains("Version: 0.1.69"));
+        assert!(page.contains("Uptime 1d"));
+        assert!(!page.contains("MS 3 Calls 1 SDS 2"));
+        assert!(!page.contains("Last S2260082"));
+        assert!(!page.contains("Voice"));
+        assert!(!page.contains("text=\"#0f0\""));
+        assert_eq!(page.matches("<br />").count(), 2);
         assert!(!page.contains("<br/>"));
+    }
+
+    #[test]
+    fn compact_tiny_version_strips_build_channel_suffix() {
+        assert_eq!(compact_tiny_version("v0.1.71_dev-4fc71583"), "0.1.71");
+        assert_eq!(compact_tiny_version("0.1.62"), "0.1.62");
+        assert_eq!(compact_tiny_version(""), "?");
     }
 
     #[test]
