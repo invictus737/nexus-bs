@@ -291,6 +291,10 @@ mod tests {
         let page = std::str::from_utf8(response_udp.payload).expect("WAP status page should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("Nexus-BS"));
+        assert!(
+            page.len() > 128,
+            "negotiated 576-byte N-PDU should not collapse to the legacy 128-byte tiny page"
+        );
     }
 
     #[test]

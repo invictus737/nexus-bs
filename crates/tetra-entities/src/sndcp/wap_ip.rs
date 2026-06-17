@@ -10,7 +10,7 @@ use super::wap_status::{
 };
 
 pub const DEFAULT_WAP_UDP_REQUEST_MAX_BYTES: usize = 1024;
-pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = 128;
+pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES - WSP_REPLY_FIXED_HEADER_BYTES;
 pub const IPV4_UDP_HEADER_BYTES: usize = 28;
 const WTP_CON_FLAG: u8 = 0x80;
 const WTP_RID_FLAG: u8 = 0x01;
@@ -270,7 +270,7 @@ fn build_udp_status_response(
             let max_wml2_bytes = max_npdu_bytes
                 .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES))
                 .unwrap_or(DEFAULT_WAP_STATUS_MAX_BYTES)
-                .min(DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
+                .min(DEFAULT_WAP_STATUS_MAX_BYTES);
             render_wml2_status(snapshot, max_wml2_bytes)?.into_bytes()
         }
         WapUdpRequestKind::WtpWspConnect {
@@ -1112,9 +1112,13 @@ mod tests {
         assert!(page.contains("Version: 0.1.69"));
         assert!(page.contains("Uptime 0d0h2m5s"));
         assert!(!page.contains("Voice"));
-        assert!((2..=3).contains(&page.matches("<br />").count()));
+        assert!(
+            page.matches("<br />").count() > 3,
+            "WSP status body should use the one-slot text budget, not the old tiny page: {page:?}"
+        );
         assert!(!page.contains("<br/>"));
-        assert!(page.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
+        assert!(page.len() <= DEFAULT_WAP_STATUS_MAX_BYTES);
+        assert!(page.len() > 128, "default WAP status body should exceed the legacy 128-byte cap");
     }
 
     #[test]
@@ -1441,7 +1445,7 @@ mod tests {
         );
         assert!(
             response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 3 + WSP_REPLY_FIXED_HEADER_BYTES,
-            "WSP response payload should fit current AL delivery budget: {} bytes",
+            "WSP response payload should fit the negotiated one-slot WAP budget: {} bytes",
             response_udp.payload.len()
         );
         assert!(
@@ -1457,7 +1461,11 @@ mod tests {
         assert!(page.contains("Version: 0.1.69"));
         assert!(page.contains("Uptime 0d0h2m5s"));
         assert!(!page.contains("Voice"));
-        assert!((2..=3).contains(&page.matches("<br />").count()));
+        assert!(
+            page.matches("<br />").count() > 3,
+            "WSP XHTML body should use the one-slot text budget, not the old tiny page: {page:?}"
+        );
+        assert!(page.len() > 128, "WSP XHTML body should exceed the legacy 128-byte cap");
         assert!(!page.contains("<br/>"));
         assert!(!page.contains("<wml"));
     }
@@ -1514,7 +1522,11 @@ mod tests {
         assert!(page.contains("Version: 0.1.69"));
         assert!(page.contains("Uptime 0d0h2m5s"));
         assert!(!page.contains("Voice"));
-        assert!((2..=3).contains(&page.matches("<br />").count()));
+        assert!(
+            page.matches("<br />").count() > 3,
+            "empty-probe status body should use the one-slot text budget, not the old tiny page: {page:?}"
+        );
+        assert!(page.len() > 128, "empty-probe status body should exceed the legacy 128-byte cap");
         assert!(!page.contains("<br/>"));
     }
 

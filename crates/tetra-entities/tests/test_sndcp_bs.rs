@@ -36,6 +36,7 @@ use tetra_entities::sndcp::transfer::{
 };
 use tetra_entities::sndcp::unitdata::decode_sn_user_data_pdu;
 use tetra_entities::sndcp::wap_ip::DEFAULT_WAP_WSP_STATUS_MAX_BYTES;
+use tetra_entities::sndcp::wap_status::DEFAULT_WAP_STATUS_MAX_BYTES;
 use tetra_entities::umac::umac_bs::UmacBs;
 use tetra_pdus::cmce::enums::disconnect_cause::DisconnectCause;
 use tetra_pdus::cmce::enums::party_type_identifier::PartyTypeIdentifier;
@@ -1006,9 +1007,13 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
         response_octets.len()
     );
     assert!(
-        response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES,
-        "raw UDP /status.xhtml should use the terminal-safe tiny XHTML budget: {} bytes",
+        response_udp.payload.len() <= DEFAULT_WAP_STATUS_MAX_BYTES,
+        "raw UDP /status.xhtml should use the one-slot WAP XHTML budget: {} bytes",
         response_udp.payload.len()
+    );
+    assert!(
+        response_udp.payload.len() > 128,
+        "raw UDP /status.xhtml should no longer be capped to the legacy 128-byte tiny page"
     );
     let page = std::str::from_utf8(response_udp.payload).unwrap();
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
@@ -1018,7 +1023,10 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     assert!(page.contains("Version:"));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
-    assert!((2..=3).contains(&page.matches("<br />").count()));
+    assert!(
+        page.matches("<br />").count() > 3,
+        "raw UDP /status.xhtml should carry a richer text-only page: {page:?}"
+    );
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
@@ -1140,6 +1148,10 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         response_udp.payload.len()
     );
     assert!(
+        response_udp.payload[7..].len() > 128,
+        "WSP GET body should no longer be capped to the legacy 128-byte tiny page"
+    );
+    assert!(
         response_octets.len() <= 576,
         "single-slot WAP/IP response N-PDU should fit the negotiated 576-octet SNDCP MTU: {} bytes",
         response_octets.len()
@@ -1151,7 +1163,10 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("Version:"));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
-    assert!((2..=3).contains(&page.matches("<br />").count()));
+    assert!(
+        page.matches("<br />").count() > 3,
+        "WSP GET response should carry a richer text-only page: {page:?}"
+    );
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
@@ -1399,7 +1414,11 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("Version:"));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
-    assert!((2..=3).contains(&page.matches("<br />").count()));
+    assert!(
+        page.matches("<br />").count() > 3,
+        "WSP XHTML response should carry a richer text-only page: {page:?}"
+    );
+    assert!(page.len() > 128, "WSP XHTML body should exceed the legacy 128-byte cap");
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
