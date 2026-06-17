@@ -875,6 +875,25 @@ fn al_segment_headers(msgs: &[SapMsg]) -> Vec<(bool, bool, u8, u8, usize)> {
         .collect()
 }
 
+fn al_segment_timeslots(msgs: &[SapMsg]) -> Vec<[bool; 4]> {
+    msgs.iter()
+        .filter_map(|msg| {
+            if llc_pdu_type(msg) != Some(LlcPduType::AlDataAlFinal) {
+                return None;
+            }
+            let SapMsgInner::TmaUnitdataReq(prim) = &msg.msg else {
+                return None;
+            };
+            Some(
+                prim.chan_alloc
+                    .as_ref()
+                    .expect("AL segment should preserve channel allocation")
+                    .timeslots,
+            )
+        })
+        .collect()
+}
+
 #[test]
 fn test_n251_oversized_bl_data_reports_failed_without_tma_req() {
     debug::setup_logging_verbose();
@@ -2115,6 +2134,94 @@ fn test_outbound_segmented_al_selective_retry_requests_ack_for_nonfinal_segment(
 }
 
 #[test]
+fn test_outbound_segmented_al_selective_retry_preserves_single_ts_channel_allocation() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 7120;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    setup.max_segment_retransmissions = 3;
+    test.submit_message(build_al_setup_ind_with_setup(addr, 0, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let payload = [0x52; 180];
+    let mut req = build_tl_data_req_with_handle_timeslot(addr, req_handle, 2);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.link_id = 1;
+    prim.pdu_prio = 4;
+    prim.fcs_flag = false;
+    prim.tl_sdu = BitBuffer::from_bytes(&payload);
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    let first_segments = al_segment_headers(&first_msgs);
+    assert!(
+        first_segments.len() > 4,
+        "test vector should create a multi-segment WAP-sized TL-SDU"
+    );
+    assert!(
+        first_segments.iter().all(|(_, _, _, _, payload_bits)| *payload_bits <= 208),
+        "one-TS AL segments should stay inside the SCH/F MAC-RESOURCE payload budget"
+    );
+    assert!(
+        al_segment_timeslots(&first_msgs)
+            .iter()
+            .all(|timeslots| *timeslots == [false, true, false, false]),
+        "initial AL data must stay on the single negotiated packet-data timeslot"
+    );
+
+    for handle in first_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 2, 0, 1));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&retry_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![2],
+        "selective AL-ACK should retry only the missing segment"
+    );
+    assert!(
+        al_segment_timeslots(&retry_msgs)
+            .iter()
+            .all(|timeslots| *timeslots == [false, true, false, false]),
+        "selective AL retry must preserve the same single packet-data timeslot"
+    );
+    assert!(
+        !find_tla_report(&retry_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
+        "partial AL-ACK must not complete the WAP TL-SDU"
+    );
+
+    for handle in retry_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_ack_ind(addr, 0, 0));
+    test.deliver_all_messages();
+    let complete_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
+        "complete AL-ACK should finish the multi-segment one-TS transfer"
+    );
+}
+
+#[test]
 fn test_outbound_segmented_al_t252_retries_selectively_requested_segments_before_n273_failure() {
     debug::setup_logging_verbose();
 
@@ -2291,6 +2398,96 @@ fn test_outbound_segmented_al_repeated_selective_ack_does_not_exhaust_n274_while
     assert!(
         find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
         "complete AL-ACK after a duplicate selective ACK should still finish the transfer"
+    );
+}
+
+#[test]
+fn test_outbound_segmented_al_duplicate_selective_ack_after_retry_mac_success_waits_t252() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 7119;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    setup.max_segment_retransmissions = 2;
+    test.submit_message(build_al_setup_ind_with_setup(addr, 0, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let payload = [0x4e; 50];
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.link_id = 1;
+    prim.pdu_prio = 4;
+    prim.fcs_flag = false;
+    prim.tl_sdu = BitBuffer::from_bytes(&payload);
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&first_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "test vector should create three original AL segments"
+    );
+
+    for handle in first_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 1, 0, 1));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&retry_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "first selective ACK should queue S(S)=1 once"
+    );
+
+    for handle in retry_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 1, 0, 1));
+    test.run_stack(Some(1));
+    let duplicate_ack_msgs = test.dump_sinks();
+    assert!(
+        al_segment_headers(&duplicate_ack_msgs).is_empty(),
+        "duplicate selective ACK after MAC success must wait for T.252 before spending another N.274 retry"
+    );
+    assert!(
+        !find_tla_report(&duplicate_ack_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "duplicate selective ACK after MAC success must not fail N.273=0 AL transfer"
+    );
+
+    test.run_stack(Some(T252_ACK_WAITING_TIMER as usize));
+    let t252_retry_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&t252_retry_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "T.252 should authorize the next N.274 retry for the still-missing segment"
+    );
+    assert!(
+        !find_tla_report(&t252_retry_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "second N.274 attempt must not fail before the negotiated segment retry limit is exhausted"
     );
 }
 
@@ -2499,6 +2696,14 @@ fn test_outbound_segmented_al_selective_n274_exhaustion_waits_for_late_ack_witho
     assert!(
         al_segment_headers(&grace_msgs).is_empty(),
         "N.274 exhaustion with N.273=0 must not resubmit AL segments while waiting for late AL-ACK"
+    );
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 1, 0, 1));
+    test.run_stack(Some(1));
+    let stale_grace_ack_msgs = test.dump_sinks();
+    assert!(
+        stale_grace_ack_msgs.is_empty(),
+        "stale selective AL-ACK during late-ACK grace must not fail or resubmit the transfer"
     );
 
     test.run_stack(Some(8));

@@ -1135,8 +1135,16 @@ impl Llc {
     }
 
     fn al_segment_retry_pending_or_inflight(segment: &ExpectedAlSegment) -> bool {
-        if segment.t_submitted_to_umac.is_none() || segment.t_umac_done.is_none() {
-            return segment.retransmission_requested || segment.t_submitted_to_umac.is_some();
+        // A selective retry remains outstanding after MAC reports success until
+        // the peer acknowledges it or T.252 authorizes the next N.274 attempt.
+        if segment.retransmission_requested || segment.ack_request_probe_pending {
+            return true;
+        }
+        if segment.t_submitted_to_umac.is_none() {
+            return false;
+        }
+        if segment.t_umac_done.is_none() {
+            return true;
         }
         matches!(
             segment.current_mac_reporter.as_ref().map(TxReporter::get_state),
@@ -2850,6 +2858,16 @@ impl Llc {
             return;
         }
 
+        if self.outbound_al_messages[idx].t_retransmissions_exhausted.is_some() {
+            tracing::debug!(
+                "LLC: ignoring non-complete AL-ACK/RNR for SSI {} endpoint {} N(R)={} during late-ACK grace",
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                block.nr
+            );
+            return;
+        }
+
         if block.requests_repeat_entire_tl_sdu() {
             let max_retransmissions = self
                 .advanced_links
@@ -2919,6 +2937,18 @@ impl Llc {
                             if segment.acknowledged {
                                 continue;
                             }
+                            if segment.retransmission_requested
+                                && segment.t_submitted_to_umac.is_some()
+                                && segment.t_umac_done.is_some()
+                                && segment.retransmit_count >= max_segment_retransmissions
+                            {
+                                if outbound.retransmit_count < max_tl_sdu_retransmissions {
+                                    exhausted_segment = Some(segment.ss);
+                                    break;
+                                }
+                                retransmit_segments += 1;
+                                continue;
+                            }
                             if Self::al_segment_retry_pending_or_inflight(segment) {
                                 segment.acknowledged = false;
                                 segment.retransmission_requested = true;
@@ -2974,6 +3004,23 @@ impl Llc {
                         ss,
                         outbound.retransmit_count
                     );
+                    return;
+                }
+
+                if self.outbound_al_messages[idx].first_complete_report_sent {
+                    let outbound = &mut self.outbound_al_messages[idx];
+                    if outbound.t_retransmissions_exhausted.is_none() {
+                        outbound.t_retransmissions_exhausted = Some(self.dltime);
+                        tracing::warn!(
+                            "LLC: AL selective ACK exhausted N.274 and N.273 for SSI {} endpoint {} link {} N(S)={} S(S)={}; waiting for late peer AL-ACK grace on TS{}",
+                            outbound.key.addr.ssi,
+                            outbound.key.endpoint_id,
+                            outbound.key.link_id,
+                            outbound.ns,
+                            ss,
+                            outbound.ack_timeslot
+                        );
+                    }
                     return;
                 }
 
