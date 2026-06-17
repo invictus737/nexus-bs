@@ -272,10 +272,10 @@ impl SdrSettings {
             rx_ant: Some("RX".to_string()),
             tx_ant: Some("TX".to_string()),
 
-            // Conservative field-proven SXceiver defaults. Higher RX/TX gain
-            // can look healthy in the local RF loop but prevent MS camping.
-            rx_gain: vec![("LNA".to_string(), 30.0), ("PGA".to_string(), 8.0)],
-            tx_gain: vec![("DAC".to_string(), 6.0), ("MIXER".to_string(), 30.0)],
+            // RF-good SXceiver defaults used by the last build that decoded
+            // terminal MAC-ACCESS on this site.
+            rx_gain: vec![("LNA".to_string(), 42.0), ("PGA".to_string(), 16.0)],
+            tx_gain: vec![("DAC".to_string(), 9.0), ("MIXER".to_string(), 30.0)],
 
             rx_args: vec![("period".to_string(), block_size(fs).to_string())],
             tx_args: vec![("period".to_string(), block_size(fs).to_string())],
@@ -295,10 +295,10 @@ impl SdrSettings {
             rx_ant: Some("RX".to_string()),
             tx_ant: Some("TX".to_string()),
 
-            // Keep µCell on the same conservative SXceiver baseline until it
-            // has separate hardware validation.
-            rx_gain: vec![("LNA".to_string(), 30.0), ("PGA".to_string(), 8.0)],
-            tx_gain: vec![("DAC".to_string(), 6.0), ("MIXER".to_string(), 30.0)],
+            // Keep µCell on the same RF-good baseline until it has separate
+            // hardware validation.
+            rx_gain: vec![("LNA".to_string(), 42.0), ("PGA".to_string(), 16.0)],
+            tx_gain: vec![("DAC".to_string(), 9.0), ("MIXER".to_string(), 30.0)],
 
             rx_args: vec![("period".to_string(), block_size(fs).to_string())],
             tx_args: vec![("period".to_string(), block_size(fs).to_string())],
@@ -389,13 +389,13 @@ mod tests {
     }
 
     #[test]
-    fn sxceiver_defaults_use_field_proven_gain_profile() {
+    fn sxceiver_defaults_use_rf_good_gain_profile() {
         let settings = match SdrSettings::get_settings(&minimal_soapy_cfg(), SupportedDevice::SXceiver, StackMode::Bs) {
             Ok(settings) => settings,
             Err(_) => panic!("SXceiver defaults must be valid"),
         };
 
-        assert_eq!(settings.rx_gain, vec![("LNA".to_string(), 30.0), ("PGA".to_string(), 8.0)]);
-        assert_eq!(settings.tx_gain, vec![("DAC".to_string(), 6.0), ("MIXER".to_string(), 30.0)]);
+        assert_eq!(settings.rx_gain, vec![("LNA".to_string(), 42.0), ("PGA".to_string(), 16.0)]);
+        assert_eq!(settings.tx_gain, vec![("DAC".to_string(), 9.0), ("MIXER".to_string(), 30.0)]);
     }
 }
