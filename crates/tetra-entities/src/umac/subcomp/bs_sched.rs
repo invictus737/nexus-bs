@@ -1339,7 +1339,7 @@ impl BsChannelScheduler {
         num_slots: usize,
         is_halfslot: bool,
     ) -> Option<(usize, Vec<TdmaTime>)> {
-        self.ul_find_grant_opportunity_on_channel_from(base_dltime, t, &[t], num_slots, is_halfslot)
+        self.ul_find_grant_opportunity_on_channel_from(base_dltime, t, &[t], num_slots, is_halfslot, None)
     }
 
     fn ul_find_grant_opportunity_for_addr_from(
@@ -1363,6 +1363,7 @@ impl BsChannelScheduler {
                 &packet_data_uplink_slots,
                 num_slots,
                 is_halfslot,
+                Some(addr.ssi),
             );
         }
         if !packet_data_uplink_slots.is_empty() {
@@ -1385,6 +1386,7 @@ impl BsChannelScheduler {
         channel_timeslots: &[u8],
         num_slots: usize,
         is_halfslot: bool,
+        reusable_owner: Option<u32>,
     ) -> Option<(usize, Vec<TdmaTime>)> {
         if channel_timeslots.is_empty() || !channel_timeslots.contains(&grant_timeslot) {
             return None;
@@ -1425,7 +1427,17 @@ impl BsChannelScheduler {
             let index = self.ul_ts_to_sched_index(&candidate_t);
             let elem = &self.ulsched[candidate_t.t as usize - 1][index];
             // tracing::debug!("ul_find_grant_opportunity: sched[{}] ts {}: {:?}", index, candidate_t, elem);
-            if (elem.ul1.is_none() && elem.ul2.is_none()) || (is_halfslot && (elem.ul1.is_none() || elem.ul2.is_none())) {
+            // Packet-data terminals can ask for more reserved access while
+            // earlier grants for the same assigned PDCH are still pending.
+            // Re-granting capacity that is already reserved for the same ISSI
+            // is conflict-free and follows EN 300 392-2 clause 23.5.2.2.7's
+            // recommendation to re-grant remaining capacity when needed.
+            let same_owner_full_slot =
+                reusable_owner.is_some_and(|owner| !is_halfslot && elem.ul1 == Some(owner) && elem.ul2 == Some(owner));
+            if (elem.ul1.is_none() && elem.ul2.is_none())
+                || same_owner_full_slot
+                || (is_halfslot && (elem.ul1.is_none() || elem.ul2.is_none()))
+            {
                 // Free UL slot, add this timeslot to result vec
                 grant_timeslots.push(candidate_t);
                 // continue;
@@ -1471,6 +1483,11 @@ impl BsChannelScheduler {
                     return 2;
                 }
             } else {
+                // Same-ISSI full-slot PDCH re-grants are already present in
+                // the UL schedule; keep the owner and refresh only the marker.
+                if elem.ul1 == Some(ssi) && elem.ul2 == Some(ssi) {
+                    continue;
+                }
                 assert!(elem.ul1.is_none(), "ul_reserve_grant: ul1 already set for ts {:?}, ssi {}", ts, ssi);
                 assert!(elem.ul2.is_none(), "ul_reserve_grant: ul2 already set for ts {:?}, ssi {}", ts, ssi);
                 elem.ul1 = Some(ssi);
@@ -8785,6 +8802,44 @@ mod tests {
                 .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
                     if *pending_addr == addr && debt.remaining_slots == 8)),
             "smaller grant must preserve remaining WAP/AL reservation debt"
+        );
+    }
+
+    #[test]
+    fn test_packet_data_multislot_grant_reuses_same_issi_reserved_capacity() {
+        let mut sched = get_testing_slotter();
+        let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(grant_base);
+        let addr = TetraAddress::issi(0x2260618);
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2, 3, 4]);
+
+        for dist in 0..14 {
+            let ts = grant_base.add_timeslots(dist);
+            if [2, 3, 4].contains(&ts.t) && !ts.is_mandatory_clch() {
+                block_test_uplink_slot(&mut sched, ts, addr.ssi);
+            }
+        }
+
+        sched.dl_enqueue_reservation_grant(2, addr, ReservationRequirement::Req10Slots);
+        sched.dl_integrate_sched_elems_for_timeslot(grant_base, &SubscriberRegistry::new(), &HashMap::new());
+
+        let slot_grant = sched.dltx_queues[1]
+            .iter()
+            .find_map(|elem| match elem {
+                DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr) => pdu.slot_granting_element.as_ref(),
+                _ => None,
+            })
+            .expect("same-ISSI reserved PDCH capacity should be re-grantable");
+
+        assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant4Slots);
+        assert_eq!(slot_grant.granting_delay, BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity);
+        assert!(
+            sched
+                .dltx_next_slot_queue
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                    if *pending_addr == addr && debt.remaining_slots == 6)),
+            "re-granting same-ISSI PDCH capacity must still preserve remaining WAP/AL reservation debt"
         );
     }
 
