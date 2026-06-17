@@ -52,7 +52,7 @@ const COMMON_CONTROL_TIMESLOT: u8 = 1;
 const FIRST_PACKET_DATA_TIMESLOT: u8 = 2;
 const AL_SETUP_PHASE_MOD_PDCH_MAX_TIMESLOTS: u8 = 1;
 const AL_ORIGINAL_DATA_HEADER_BITS: usize = 17;
-const AL_ORIGINAL_SEGMENTS_PER_ACK_REQUEST: usize = 16;
+const AL_ORIGINAL_SEGMENTS_PER_ACK_REQUEST: usize = 4;
 pub const LLC_MAX_OUTBOUND_ACKED_MESSAGES: usize = 8192;
 pub const LLC_MAX_OUTBOUND_UDATA_MESSAGES: usize = 8192;
 
@@ -118,6 +118,8 @@ struct ExpectedAlSegment {
     current_mac_reporter: Option<TxReporter>,
     acknowledged: bool,
     retransmission_requested: bool,
+    ack_request_probe_pending: bool,
+    ack_request_probe_count: u8,
     retransmit_count: u8,
     retransmission_buf: SapMsg,
 }
@@ -517,8 +519,37 @@ impl Llc {
         });
     }
 
-    fn establish_advanced_link(&mut self, key: AdvancedLinkKey, setup: AlSetup) {
+    fn clear_advanced_link_transfer_state(&mut self, queue: &mut MessageQueue, key: AdvancedLinkKey) {
+        self.advanced_link_rx.remove(&key);
+
+        let mut retained = VecDeque::with_capacity(self.outbound_al_messages.len());
+        while let Some(mut outbound) = self.outbound_al_messages.pop_front() {
+            if outbound.key == key {
+                tracing::warn!(
+                    "LLC: clearing pending AL TL-SDU SSI {} endpoint {} link {} N(S) {} due to AL setup/reset",
+                    key.addr.ssi,
+                    key.endpoint_id,
+                    key.link_id,
+                    outbound.ns
+                );
+                Self::mark_al_current_mac_discarded(&mut outbound);
+                Self::mark_al_service_failed(&outbound);
+                Self::push_tla_report(
+                    queue,
+                    outbound.req_handle,
+                    TLA_REPORT_FAILED_TRANSFER,
+                    Some(outbound.key.endpoint_id),
+                );
+            } else {
+                retained.push_back(outbound);
+            }
+        }
+        self.outbound_al_messages = retained;
+    }
+
+    fn establish_advanced_link(&mut self, queue: &mut MessageQueue, key: AdvancedLinkKey, setup: AlSetup) {
         self.clear_other_original_advanced_links(key);
+        self.clear_advanced_link_transfer_state(queue, key);
         self.pending_advanced_link_setups.remove(&key);
         self.advanced_links.insert(
             key,
@@ -531,7 +562,6 @@ impl Llc {
                 last_delivered_ns: None,
             },
         );
-        self.advanced_link_rx.remove(&key);
     }
 
     fn resolve_original_advanced_link_key(&self, addr: TetraAddress, endpoint_id: EndpointId) -> Option<AdvancedLinkKey> {
@@ -937,6 +967,8 @@ impl Llc {
             segment.current_mac_reporter = None;
             segment.acknowledged = false;
             segment.retransmission_requested = false;
+            segment.ack_request_probe_pending = false;
+            segment.ack_request_probe_count = 0;
             segment.retransmit_count = 0;
         }
     }
@@ -983,6 +1015,25 @@ impl Llc {
             al.t_retransmissions_exhausted = None;
         }
         Ok(retry_segments)
+    }
+
+    fn schedule_al_ack_request_probe(al: &mut ExpectedAlAck, max_ack_request_probes: u8) -> Result<usize, u8> {
+        let Some(segment) = al.segments.iter_mut().rev().find(|segment| segment.t_submitted_to_umac.is_some()) else {
+            return Ok(0);
+        };
+        if segment.ack_request_probe_count >= max_ack_request_probes {
+            return Err(segment.ss);
+        }
+
+        segment.t_submitted_to_umac = None;
+        segment.t_umac_done = None;
+        segment.current_mac_reporter = None;
+        segment.ack_request_probe_pending = true;
+        al.t_submitted_to_umac = None;
+        al.t_umac_done = None;
+        al.current_mac_reporter = None;
+        al.t_retransmissions_exhausted = None;
+        Ok(1)
     }
 
     fn find_outbound_al_ack_match(&self, prim: &TmaUnitdataInd, ack: &AlAck) -> (Option<usize>, usize) {
@@ -1535,10 +1586,13 @@ impl Llc {
                 }
                 segment.retransmit_count += 1;
             }
+            if segment.ack_request_probe_pending {
+                segment.ack_request_probe_count = segment.ack_request_probe_count.saturating_add(1);
+            }
             let mut sapmsg = segment.retransmission_buf.clone();
             let mac_reporter = TxReporter::new_unacked();
             if let SapMsgInner::TmaUnitdataReq(prim) = &mut sapmsg.msg {
-                if segment.retransmission_requested {
+                if segment.retransmission_requested || segment.ack_request_probe_pending {
                     if let Some(updated_pdu) = Self::al_segment_pdu_with_ack_request(&prim.pdu) {
                         prim.pdu = updated_pdu;
                     } else {
@@ -1564,6 +1618,7 @@ impl Llc {
             segment.t_submitted_to_umac = Some(dltime);
             segment.t_umac_done = None;
             segment.current_mac_reporter = Some(mac_reporter);
+            segment.ack_request_probe_pending = false;
             queue.push_back(sapmsg);
             submitted_any = true;
         }
@@ -1666,6 +1721,8 @@ impl Llc {
                 current_mac_reporter: None,
                 acknowledged: false,
                 retransmission_requested: false,
+                ack_request_probe_pending: false,
+                ack_request_probe_count: 0,
                 retransmit_count: 0,
                 retransmission_buf: SapMsg {
                     sap: Sap::TmaSap,
@@ -2392,7 +2449,7 @@ impl Llc {
 
         let key = Self::advanced_link_key_from_setup(prim.main_address, prim.endpoint_id, &setup);
         if setup.setup_report == AlSetup::SETUP_REPORT_SUCCESS {
-            self.establish_advanced_link(key, setup);
+            self.establish_advanced_link(queue, key, setup);
             tracing::info!(
                 "LLC: AL-SETUP success accepted for SSI {} endpoint {} link {}",
                 key.addr.ssi,
@@ -2405,6 +2462,7 @@ impl Llc {
         let response = Self::negotiate_inbound_al_setup_response(&setup);
         if response.setup_report == AlSetup::SETUP_REPORT_SERVICE_CHANGE {
             self.clear_other_original_advanced_links(key);
+            self.clear_advanced_link_transfer_state(queue, key);
             self.pending_advanced_link_setups.insert(key, response);
             self.advanced_links.remove(&key);
             self.advanced_link_rx.remove(&key);
@@ -2417,7 +2475,7 @@ impl Llc {
                 response
             );
         } else {
-            self.establish_advanced_link(key, setup);
+            self.establish_advanced_link(queue, key, setup);
         }
 
         let req_handle = self.next_tl_data_ind_req_handle();
@@ -3166,12 +3224,12 @@ impl Llc {
                 continue;
             }
 
+            let max_segment_retransmissions = self
+                .advanced_links
+                .get(&al.key)
+                .map(|session| session.max_segment_retransmissions)
+                .unwrap_or(0);
             let segment_retry_exhausted = if al.selective_segment_retry_pending {
-                let max_segment_retransmissions = self
-                    .advanced_links
-                    .get(&al.key)
-                    .map(|session| session.max_segment_retransmissions)
-                    .unwrap_or(0);
                 match Self::schedule_requested_al_segment_retries(al, max_segment_retransmissions) {
                     Ok(retry_segments) if retry_segments > 0 => {
                         tracing::info!(
@@ -3188,8 +3246,24 @@ impl Llc {
                     Ok(_) => None,
                     Err(ss) => Some(ss),
                 }
-            } else {
+            } else if !al.first_complete_report_sent {
                 None
+            } else {
+                match Self::schedule_al_ack_request_probe(al, max_segment_retransmissions) {
+                    Ok(probe_segments) if probe_segments > 0 => {
+                        tracing::info!(
+                            "LLC: AL TL-SDU SSI {} endpoint {} link {} N(S) {} repeating ACK request after T.252",
+                            al.key.addr.ssi,
+                            al.key.endpoint_id,
+                            al.key.link_id,
+                            al.ns
+                        );
+                        had_activity = true;
+                        continue;
+                    }
+                    Ok(_) => None,
+                    Err(ss) => Some(ss),
+                }
             };
 
             let max_retransmissions = self
