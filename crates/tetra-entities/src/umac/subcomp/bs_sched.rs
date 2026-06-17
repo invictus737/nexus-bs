@@ -239,7 +239,7 @@ pub struct BsChannelScheduler {
     /// channels.
     packet_data_assignments: [Option<PacketDataAssignment>; 4],
 
-    /// Round-robin cursor for downlink SNDCP data over active PDCH slots.
+    /// Round-robin cursor for downlink SNDCP/AL data over active PDCH slots.
     packet_data_downlink_cursor: usize,
 }
 
@@ -539,7 +539,7 @@ impl BsChannelScheduler {
             // Start each timeslot's marker cursor at 4 (first valid value).
             next_usage_marker: [4, 4, 4, 4],
             packet_data_assignments: [None, None, None, None],
-            packet_data_downlink_cursor: 1,
+            packet_data_downlink_cursor: 0,
         }
     }
 
@@ -1167,7 +1167,14 @@ impl BsChannelScheduler {
         }
 
         let selected = slots[self.packet_data_downlink_cursor % slots.len()];
-        self.packet_data_downlink_cursor = (self.packet_data_downlink_cursor + 1) % NUM_TIMESLOTS;
+        self.packet_data_downlink_cursor = self.packet_data_downlink_cursor.wrapping_add(1);
+        tracing::info!(
+            "packet-data PDCH downlink for {} selected TS{} from active {:?} sdu_kind={}",
+            addr,
+            selected,
+            slots,
+            if Self::sdu_is_sndcp_packet_data(sdu) { "sndcp" } else { "al" }
+        );
         let mut timeslots = [0; NUM_TIMESLOTS];
         timeslots[0] = selected;
         Some(timeslots)
@@ -1307,7 +1314,7 @@ impl BsChannelScheduler {
         self.dltx_queues = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
         self.ulsched = EMPTY_SCHED;
         self.packet_data_assignments = [None, None, None, None];
-        self.packet_data_downlink_cursor = 1;
+        self.packet_data_downlink_cursor = 0;
     }
 
     /// Sets the current downlink time to the given TdmaTime
@@ -5733,6 +5740,39 @@ mod tests {
             "voice-owned TS3 must be withheld from packet data"
         );
         assert!(sched.packet_data_assignments[3].is_some());
+    }
+
+    #[test]
+    fn test_packet_data_downlink_round_robin_starts_at_ts2_and_rotates_fairly() {
+        let mut sched = get_testing_slotter();
+        let now = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(now);
+        let addr = TetraAddress::issi(0x5119);
+        sched.apply_packet_data_assignment_update(
+            PacketDataAssignmentUpdate::Replace {
+                addr,
+                ts_assigned: [false, true, true, true],
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier_num: 1001,
+            },
+            now,
+        );
+
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let sdu = test_sndcp_llc_sdu();
+        let selected: Vec<u8> = (0..4)
+            .map(|_| {
+                sched
+                    .packet_data_downlink_timeslots_for_resource(&pdu, &sdu)
+                    .expect("active TS2-TS4 PDCH should route packet data")[0]
+            })
+            .collect();
+
+        assert_eq!(
+            selected,
+            vec![2, 3, 4, 2],
+            "packet-data downlink must start on first assigned traffic slot and then use TS2-TS4 fairly"
+        );
     }
 
     #[test]
