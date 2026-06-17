@@ -146,6 +146,12 @@ impl StackConfig {
         if self.cell.ms_txpwr_max_cell > 7 {
             return Err("ms_txpwr_max_cell must be 0-7 (3 bits)");
         }
+        if self.cell.rxlev_access_min > 15 {
+            return Err("rxlev_access_min must be 0-15 (4 bits)");
+        }
+        if self.cell.access_parameter > 15 {
+            return Err("access_parameter must be 0-15 (4 bits)");
+        }
 
         // Validate timezone if configured
         if let Some(ref tz) = self.cell.timezone {

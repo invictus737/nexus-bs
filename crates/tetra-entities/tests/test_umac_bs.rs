@@ -188,6 +188,26 @@ fn test_mac_sync_defaults_to_etsi_v3_system_code() {
     assert_eq!(precomps.mac_sync.system_code, 3);
 }
 
+#[test]
+fn test_mac_sysinfo_uses_configured_access_power_parameters() {
+    debug::setup_logging_verbose();
+
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    config.cell.ms_txpwr_max_cell = 4;
+    config.cell.rxlev_access_min = 3;
+    config.cell.access_parameter = 15;
+    let shared_config = SharedConfig::from_parts(config, None);
+    let precomps = UmacBs::generate_precomps(&shared_config);
+
+    // EN 300 392-2 clauses 23.4.4.2 and 23.6.3: CA MSs use
+    // MS_TXPWR_MAX_CELL, RXLEV_ACCESS_MIN and ACCESS_PARAMETER from
+    // MAC-SYSINFO for open-loop power control and access decisions.
+    assert_eq!(precomps.mac_sysinfo1.ms_txpwr_max_cell, 4);
+    assert_eq!(precomps.mac_sysinfo1.rxlev_access_min, 3);
+    assert_eq!(precomps.mac_sysinfo1.access_parameter, 15);
+    assert_eq!(precomps.mac_sysinfo2.access_parameter, precomps.mac_sysinfo1.access_parameter);
+}
+
 fn enable_wap_ip_status_mvp_for_sysinfo(config: &mut tetra_config::bluestation::StackConfig) {
     config.cell.sndcp_service = true;
     config.cell.wap_ip = Some(CfgWapIp {
@@ -299,6 +319,8 @@ fn test_wap_ip_bnch_advertises_packet_data_even_before_brew_connects() {
     // the serving cell advertises SNDCP service availability. Nexus-BS now
     // advertises original acknowledged LLC advanced link only under the local
     // WAP/IP SNDCP profile whose AL-SETUP/AL-FINAL/AL-ACK path is wired.
+    // MAC data-priority advertisement is optional and remains off until the
+    // full L2 data-priority procedure is implemented end-to-end.
     assert!(decoded_mle.bs_service_details.system_wide_services);
     assert!(decoded_mle.bs_service_details.sndcp_service);
     assert!(decoded_mle.bs_service_details.advanced_link);
@@ -306,14 +328,8 @@ fn test_wap_ip_bnch_advertises_packet_data_even_before_brew_connects() {
     assert!(!decoded_mle.bs_service_details.aie_service);
     assert_eq!(ext_services.section, 0);
     assert_eq!(
-        ext_services.section_data & 0b100_0000,
-        0b100_0000,
-        "WAP/IP SNDCP profile should advertise data priority support in extended services section 1"
-    );
-    assert_eq!(
-        ext_services.section_data & 0b011_1111,
-        0,
-        "WAP/IP SNDCP profile must not advertise extended AL, QoS negotiation, D8PSK, or extra sections yet"
+        ext_services.section_data, 0,
+        "WAP/IP SNDCP profile must not advertise optional data priority, extended AL, QoS negotiation, D8PSK, or extra sections yet"
     );
 }
 

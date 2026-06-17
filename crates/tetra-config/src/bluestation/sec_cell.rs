@@ -254,6 +254,8 @@ pub struct CfgCellInfo {
     pub frame_18_ext: bool,
 
     pub ms_txpwr_max_cell: u8,
+    pub rxlev_access_min: u8,
+    pub access_parameter: u8,
 
     pub local_ssi_ranges: SortedDisjointSsiRanges,
     /// Explicit local ISSIs to probe after a Nexus-BS process restart.
@@ -382,6 +384,8 @@ pub struct CellInfoDto {
     pub frame_18_ext: Option<bool>,
 
     pub ms_txpwr_max_cell: Option<u8>,
+    pub rxlev_access_min: Option<u8>,
+    pub access_parameter: Option<u8>,
 
     pub local_ssi_ranges: Option<Vec<(u32, u32)>>,
     pub restart_recovery_issis: Option<Vec<u32>>,
@@ -507,7 +511,9 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         ts_reserved_frames: ci.ts_reserved_frames.unwrap_or(0),
         u_plane_dtx: ci.u_plane_dtx.unwrap_or(false),
         frame_18_ext: ci.frame_18_ext.unwrap_or(false),
-        ms_txpwr_max_cell: ci.ms_txpwr_max_cell.unwrap_or(4), // 30 dBm (1W), Table 18.57
+        ms_txpwr_max_cell: ci.ms_txpwr_max_cell.unwrap_or(4), // 30 dBm nominal MS cap
+        rxlev_access_min: ci.rxlev_access_min.unwrap_or(3),   // -110 dBm
+        access_parameter: ci.access_parameter.unwrap_or(15),  // -23 dBm
         local_ssi_ranges,
         restart_recovery_issis,
         allowed_gssi_ranges: parse_allowed_gssi_ranges(ci.allowed_gssi_ranges)?,

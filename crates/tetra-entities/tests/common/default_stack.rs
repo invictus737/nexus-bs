@@ -79,6 +79,8 @@ pub fn default_cell_info(freq_info: FreqInfo) -> CfgCellInfo {
         u_plane_dtx: false,
         frame_18_ext: false,
         ms_txpwr_max_cell: 4,
+        rxlev_access_min: 3,
+        access_parameter: 15,
         local_ssi_ranges: SortedDisjointSsiRanges::from_vec_ssirange(vec![]),
         restart_recovery_issis: Vec::new(),
         allowed_gssi_ranges: None,

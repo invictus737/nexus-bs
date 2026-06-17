@@ -245,42 +245,48 @@ impl CircuitMgr {
         owner: TimeslotOwner,
         occupied_call_ids: &HashSet<u16>,
     ) -> Result<&CmceCircuit, CircuitErr> {
-        // Voice/circuit service is SwMI-critical. Keep packet data alive when
-        // any real free traffic slot exists; reclaim PDCH capacity only on
-        // demand and only for this bearer.
-        let ts = timeslot_alloc
-            .allocate_any_preempting(owner, TimeslotOwner::PacketData)
-            .ok_or(CircuitErr::NoCircuitFree)?;
-
         let call_id = match self.get_next_call_id_avoiding(occupied_call_ids) {
             Ok(call_id) => call_id,
-            Err(err) => {
-                let _ = timeslot_alloc.release(owner, ts);
-                return Err(err);
-            }
+            Err(err) => return Err(err),
         };
         let usage = self.get_next_usage_number();
 
-        // Create circuit
-        let circuit = CmceCircuit {
-            ts_created: self.dltime,
-            direction: dir,
-            ts,
-            call_id,
-            usage,
-            circuit_mode: CircuitModeType::TchS,
-            comm_type,
-            simplex_duplex,
-            speech_service: Some(0),
-            etee_encrypted: false,
-        };
+        let mut excluded_timeslots = Vec::new();
+        loop {
+            // Voice/circuit service is SwMI-critical. Keep packet data alive
+            // when any real free traffic slot exists; reclaim PDCH capacity
+            // only on demand and only for this bearer.
+            let ts = timeslot_alloc
+                .allocate_any_preempting_excluding(owner, TimeslotOwner::PacketData, &excluded_timeslots)
+                .ok_or(CircuitErr::NoCircuitFree)?;
 
-        // Register circuit and return
-        match self.open_circuit(dir, circuit) {
-            Ok(circuit) => Ok(circuit),
-            Err(err) => {
-                let _ = timeslot_alloc.release(owner, ts);
-                Err(err)
+            let circuit = CmceCircuit {
+                ts_created: self.dltime,
+                direction: dir,
+                ts,
+                call_id,
+                usage,
+                circuit_mode: CircuitModeType::TchS,
+                comm_type,
+                simplex_duplex,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            };
+
+            match self.insert_circuit(dir, circuit) {
+                Ok(()) => return self.circuit_ref(dir, ts),
+                Err(CircuitErr::CircuitAlreadyInUse) => {
+                    let _ = timeslot_alloc.release(owner, ts);
+                    excluded_timeslots.push(ts);
+                    tracing::warn!(
+                        "CMCE: allocator selected TS{} but CircuitMgr already has an active circuit; retrying next usable voice slot",
+                        ts
+                    );
+                }
+                Err(err) => {
+                    let _ = timeslot_alloc.release(owner, ts);
+                    return Err(err);
+                }
             }
         }
     }
@@ -296,29 +302,41 @@ impl CircuitMgr {
         timeslot_alloc: &mut TimeslotAllocator,
         owner: TimeslotOwner,
     ) -> Result<&CmceCircuit, CircuitErr> {
-        let ts = timeslot_alloc
-            .allocate_any_preempting(owner, TimeslotOwner::PacketData)
-            .ok_or(CircuitErr::NoCircuitFree)?;
         let usage = self.get_next_usage_number();
 
-        let circuit = CmceCircuit {
-            ts_created: self.dltime,
-            direction: dir,
-            ts,
-            call_id,
-            usage,
-            circuit_mode: CircuitModeType::TchS,
-            comm_type,
-            simplex_duplex,
-            speech_service: Some(0),
-            etee_encrypted: false,
-        };
+        let mut excluded_timeslots = Vec::new();
+        loop {
+            let ts = timeslot_alloc
+                .allocate_any_preempting_excluding(owner, TimeslotOwner::PacketData, &excluded_timeslots)
+                .ok_or(CircuitErr::NoCircuitFree)?;
+            let circuit = CmceCircuit {
+                ts_created: self.dltime,
+                direction: dir,
+                ts,
+                call_id,
+                usage,
+                circuit_mode: CircuitModeType::TchS,
+                comm_type,
+                simplex_duplex,
+                speech_service: Some(0),
+                etee_encrypted: false,
+            };
 
-        match self.open_circuit(dir, circuit) {
-            Ok(circuit) => Ok(circuit),
-            Err(err) => {
-                let _ = timeslot_alloc.release(owner, ts);
-                Err(err)
+            match self.insert_circuit(dir, circuit) {
+                Ok(()) => return self.circuit_ref(dir, ts),
+                Err(CircuitErr::CircuitAlreadyInUse) => {
+                    let _ = timeslot_alloc.release(owner, ts);
+                    excluded_timeslots.push(ts);
+                    tracing::warn!(
+                        "CMCE: allocator selected TS{} for call_id={} but CircuitMgr already has an active circuit; retrying next usable voice slot",
+                        ts,
+                        call_id
+                    );
+                }
+                Err(err) => {
+                    let _ = timeslot_alloc.release(owner, ts);
+                    return Err(err);
+                }
             }
         }
     }
@@ -348,6 +366,20 @@ impl CircuitMgr {
     /// This channel should be free, if not, warnings will be issued and existing circuit will be closed first
     /// Consumes the circuit but returns a reference
     fn open_circuit(&mut self, dir: Direction, circuit: CmceCircuit) -> Result<&CmceCircuit, CircuitErr> {
+        let ts = circuit.ts;
+        self.insert_circuit(dir, circuit)?;
+        self.circuit_ref(dir, ts)
+    }
+
+    fn circuit_ref(&self, dir: Direction, ts: u8) -> Result<&CmceCircuit, CircuitErr> {
+        match dir {
+            Direction::Dl | Direction::Both => self.dl[ts as usize - 1].as_ref().ok_or(CircuitErr::CircuitNotActive),
+            Direction::Ul => self.ul_only[ts as usize - 1].as_ref().ok_or(CircuitErr::CircuitNotActive),
+            _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
+        }
+    }
+
+    fn insert_circuit(&mut self, dir: Direction, circuit: CmceCircuit) -> Result<(), CircuitErr> {
         // Sanity check, close circuit and issue warning if exists
         let ts = circuit.ts;
         let (dl_active, ul_active) = self.is_active(ts);
@@ -365,11 +397,11 @@ impl CircuitMgr {
                     self.tx_data[ts as usize - 1].clear();
                 }
                 self.dl[ts as usize - 1] = Some(circuit);
-                Ok(self.dl[ts as usize - 1].as_ref().unwrap())
+                Ok(())
             }
             Direction::Ul => {
                 self.ul_only[ts as usize - 1] = Some(circuit);
-                Ok(self.ul_only[ts as usize - 1].as_ref().unwrap())
+                Ok(())
             }
             _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
         }
@@ -556,7 +588,7 @@ mod tests {
     }
 
     #[test]
-    fn second_leg_allocator_rolls_back_when_circuit_open_fails() {
+    fn allocator_retries_next_usable_slot_when_circuit_state_drifted() {
         let mut mgr = CircuitMgr::new();
         let existing = mgr
             .allocate_circuit(Direction::Dl, CommunicationType::P2Mp)
@@ -565,7 +597,7 @@ mod tests {
         assert_eq!(existing.ts, 2);
 
         let mut timeslot_alloc = TimeslotAllocator::default();
-        let err = mgr
+        let circuit_ts = mgr
             .allocate_circuit_for_call_with_allocator(
                 existing.call_id,
                 Direction::Dl,
@@ -574,18 +606,25 @@ mod tests {
                 &mut timeslot_alloc,
                 TimeslotOwner::Cmce,
             )
-            .expect_err("opening a second DL circuit on the already-active TS2 should fail");
+            .expect("allocator/CircuitMgr drift on TS2 must retry the next usable traffic slot")
+            .ts;
 
-        assert_eq!(err, CircuitErr::CircuitAlreadyInUse);
+        assert_eq!(circuit_ts, 3);
         assert_eq!(
             timeslot_alloc.owner(2),
             None,
-            "failed second-leg open must not leave a stale CMCE reservation in the central allocator"
+            "stale TS2 retry must not leave a CMCE reservation in the central allocator"
+        );
+        assert_eq!(
+            timeslot_alloc.owner(3),
+            Some(TimeslotOwner::Cmce),
+            "voice must reserve the usable retry slot"
         );
         assert_eq!(
             mgr.dl[1].as_ref().map(|circuit| circuit.call_id),
             Some(existing.call_id),
-            "rollback must preserve the original live circuit"
+            "retry must preserve the original live circuit"
         );
+        assert_eq!(mgr.dl[2].as_ref().map(|circuit| circuit.call_id), Some(existing.call_id));
     }
 }

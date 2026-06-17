@@ -1079,13 +1079,12 @@ impl UmacBs {
         // implement air-interface encryption yet, so keep the broadcast
         // fail-closed even if a direct StackConfig requests AIE.
         let wap_ip_sndcp_profile_enabled = Self::local_wap_ip_sndcp_profile_enabled(config);
-        let mut section1_services = 0;
-        if wap_ip_sndcp_profile_enabled {
-            // EN 300 392-2 clause 21.4.4.1 table 21.68: this stack resolves
-            // SNDCP data priority through LTPD/MLE, but does not yet advertise
-            // extended AL, QoS scheduled access, D8PSK, or extra sections.
-            section1_services |= 0b100_0000;
-        }
+        // EN 300 392-2 clause 21.4.4.1 table 21.68: SNDCP/WAP does not
+        // require advertising optional MAC data-priority support. Voice/data
+        // priority is enforced locally by the scheduler, while the on-air
+        // optional data-priority bit stays fail-closed until the full L2 data
+        // priority procedure is implemented end-to-end.
+        let section1_services = 0;
 
         let ext_services = SysinfoExtendedServices {
             auth_required: false,
@@ -1124,8 +1123,8 @@ impl UmacBs {
             reverse_operation: c.cell.reverse_operation,
             num_of_csch: 0, // Common secondary control channels
             ms_txpwr_max_cell: c.cell.ms_txpwr_max_cell,
-            rxlev_access_min: 3, // -110 dBm (permissive, suitable for single-cell)
-            access_parameter: 7, // -39 dBm (MS open-loop power control setpoint)
+            rxlev_access_min: c.cell.rxlev_access_min,
+            access_parameter: c.cell.access_parameter,
             radio_dl_timeout: 3, // 432 timeslots (~6s radio link timeout)
             cck_id: None,
             hyperframe_number: Some(0), // Updated dynamically in scheduler
@@ -1171,14 +1170,14 @@ impl UmacBs {
                 // packet-data/SNDCP availability through local BS service
                 // details. The parser only permits this bit for the explicit
                 // local WAP/IP SNDCP MVP profile.
-                sndcp_service: c.cell.sndcp_service && c.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled),
+                sndcp_service: wap_ip_sndcp_profile_enabled,
                 // Same fail-closed rule for air-interface encryption: do not
                 // advertise AIE until EN 300 392-7 security procedures are
                 // implemented and tested. Advanced link is advertised only for
                 // the local SNDCP/WAP profile whose LLC AL-SETUP/AL-FINAL path
                 // is implemented and test-backed.
                 aie_service: false,
-                advanced_link: c.cell.advanced_link && c.cell.sndcp_service && c.cell.wap_ip.as_ref().is_some_and(|wap| wap.enabled),
+                advanced_link: c.cell.advanced_link && wap_ip_sndcp_profile_enabled,
             },
         };
 

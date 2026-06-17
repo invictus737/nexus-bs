@@ -109,6 +109,35 @@ impl TimeslotAllocator {
             .and_then(|mut slots| slots.pop())
     }
 
+    pub fn allocate_any_preempting_excluding(
+        &mut self,
+        owner: TimeslotOwner,
+        preemptible_owner: TimeslotOwner,
+        excluded_timeslots: &[u8],
+    ) -> Option<u8> {
+        for (idx, slot_owner) in self.owners.iter_mut().enumerate() {
+            let ts = idx as u8 + 2;
+            if excluded_timeslots.contains(&ts) {
+                continue;
+            }
+            if slot_owner.is_none() {
+                *slot_owner = Some(owner);
+                return Some(ts);
+            }
+        }
+        for (idx, slot_owner) in self.owners.iter_mut().enumerate() {
+            let ts = idx as u8 + 2;
+            if excluded_timeslots.contains(&ts) {
+                continue;
+            }
+            if *slot_owner == Some(preemptible_owner) {
+                *slot_owner = Some(owner);
+                return Some(ts);
+            }
+        }
+        None
+    }
+
     pub fn reserve(&mut self, owner: TimeslotOwner, ts: u8) -> Result<(), TimeslotAllocErr> {
         let idx = Self::idx(ts)?;
         match self.owners[idx] {
@@ -168,6 +197,20 @@ mod tests {
 
         assert_eq!(ts, 3);
         assert_eq!(alloc.owner(2), Some(TimeslotOwner::PacketData));
+        assert_eq!(alloc.owner(3), Some(TimeslotOwner::Cmce));
+        assert_eq!(alloc.owner(4), None);
+    }
+
+    #[test]
+    fn preempting_allocation_can_skip_stale_unusable_slot() {
+        let mut alloc = TimeslotAllocator::default();
+
+        let ts = alloc
+            .allocate_any_preempting_excluding(TimeslotOwner::Cmce, TimeslotOwner::PacketData, &[2])
+            .expect("voice should allocate a usable non-excluded slot");
+
+        assert_eq!(ts, 3);
+        assert_eq!(alloc.owner(2), None);
         assert_eq!(alloc.owner(3), Some(TimeslotOwner::Cmce));
         assert_eq!(alloc.owner(4), None);
     }
