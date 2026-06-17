@@ -817,9 +817,8 @@ impl BsChannelScheduler {
         }
     }
 
-    fn packet_data_allocator_blocks_assignment(timeslot_alloc: &Option<&mut TimeslotAllocator>, ts: u8) -> bool {
+    fn packet_data_allocator_blocks_assignment(timeslot_alloc: Option<&TimeslotAllocator>, ts: u8) -> bool {
         timeslot_alloc
-            .as_ref()
             .and_then(|allocator| allocator.owner(ts))
             .is_some_and(|owner| owner != TimeslotOwner::PacketData)
     }
@@ -851,8 +850,27 @@ impl BsChannelScheduler {
         }
     }
 
-    fn packet_data_slot_available_for_assignment(&self, ts: u8, timeslot_alloc: &Option<&mut TimeslotAllocator>) -> bool {
-        !self.packet_data_slot_has_voice_circuit(ts) && !Self::packet_data_allocator_blocks_assignment(timeslot_alloc, ts)
+    fn packet_data_slot_has_other_assignment(&self, ts: u8, addr: TetraAddress) -> bool {
+        if !(2..=NUM_TIMESLOTS as u8).contains(&ts) {
+            return false;
+        }
+        self.packet_data_assignments[ts as usize - 1].is_some_and(|assignment| assignment.addr != addr)
+    }
+
+    fn packet_data_has_active_assignment_for_other_addr(&self, addr: TetraAddress, timeslot_alloc: Option<&TimeslotAllocator>) -> bool {
+        (2..=NUM_TIMESLOTS as u8).any(|ts| {
+            self.packet_data_assignments[ts as usize - 1].is_some_and(|assignment| {
+                assignment.addr != addr
+                    && !self.packet_data_slot_has_voice_circuit(ts)
+                    && !Self::packet_data_allocator_blocks_assignment(timeslot_alloc, ts)
+            })
+        })
+    }
+
+    fn packet_data_slot_available_for_assignment(&self, ts: u8, addr: TetraAddress, timeslot_alloc: Option<&TimeslotAllocator>) -> bool {
+        !self.packet_data_slot_has_voice_circuit(ts)
+            && !Self::packet_data_allocator_blocks_assignment(timeslot_alloc, ts)
+            && !self.packet_data_slot_has_other_assignment(ts, addr)
     }
 
     fn apply_packet_data_assignment_update(&mut self, update: PacketDataAssignmentUpdate, now: TdmaTime) {
@@ -875,10 +893,20 @@ impl BsChannelScheduler {
                 ul_dl_assigned,
                 carrier_num,
             } => {
+                let requested_count = Self::packet_data_requested_traffic_slot_count(ts_assigned);
+                let planned = self.plan_packet_data_traffic_slots_with_allocator(requested_count, addr, timeslot_alloc.as_deref());
+                if planned != ts_assigned {
+                    tracing::info!(
+                        "packet-data PDCH Replace for {} normalized {:?} -> {:?} (single first-free traffic slot)",
+                        addr,
+                        ts_assigned,
+                        planned
+                    );
+                }
                 for ts in 2..=NUM_TIMESLOTS {
                     let slot = ts - 1;
-                    if ts_assigned[slot]
-                        && self.packet_data_slot_available_for_assignment(ts as u8, timeslot_alloc)
+                    if planned[slot]
+                        && self.packet_data_slot_available_for_assignment(ts as u8, addr, timeslot_alloc.as_deref())
                         && Self::reserve_packet_data_allocator_slot(timeslot_alloc, ts as u8)
                     {
                         self.packet_data_assignments[slot] = Some(PacketDataAssignment {
@@ -887,7 +915,7 @@ impl BsChannelScheduler {
                             carrier_num,
                             expires_at,
                         });
-                    } else if ts_assigned[slot] {
+                    } else if planned[slot] {
                         tracing::debug!(
                             "packet-data assignment for {} skipped TS{} because a voice/circuit bearer owns it",
                             addr,
@@ -913,10 +941,20 @@ impl BsChannelScheduler {
                 ul_dl_assigned,
                 carrier_num,
             } => {
+                let requested_count = Self::packet_data_requested_traffic_slot_count(ts_assigned);
+                let planned = self.plan_packet_data_traffic_slots_with_allocator(requested_count, addr, timeslot_alloc.as_deref());
+                if planned != ts_assigned {
+                    tracing::info!(
+                        "packet-data PDCH Additional for {} normalized {:?} -> {:?} (single first-free traffic slot)",
+                        addr,
+                        ts_assigned,
+                        planned
+                    );
+                }
                 for ts in 2..=NUM_TIMESLOTS {
                     let slot = ts - 1;
-                    if ts_assigned[slot]
-                        && self.packet_data_slot_available_for_assignment(ts as u8, timeslot_alloc)
+                    if planned[slot]
+                        && self.packet_data_slot_available_for_assignment(ts as u8, addr, timeslot_alloc.as_deref())
                         && Self::reserve_packet_data_allocator_slot(timeslot_alloc, ts as u8)
                     {
                         self.packet_data_assignments[slot] = Some(PacketDataAssignment {
@@ -925,12 +963,15 @@ impl BsChannelScheduler {
                             carrier_num,
                             expires_at,
                         });
-                    } else if ts_assigned[slot] {
+                    } else if planned[slot] {
                         tracing::debug!(
                             "packet-data additional assignment for {} skipped TS{} because a voice/circuit bearer owns it",
                             addr,
                             ts
                         );
+                        self.packet_data_assignments[slot] = None;
+                        Self::release_packet_data_allocator_slot(timeslot_alloc, ts as u8);
+                    } else if self.packet_data_assignments[slot].is_some_and(|assignment| assignment.addr == addr) {
                         self.packet_data_assignments[slot] = None;
                         Self::release_packet_data_allocator_slot(timeslot_alloc, ts as u8);
                     }
@@ -1040,16 +1081,10 @@ impl BsChannelScheduler {
         }
     }
 
-    fn packet_data_slot_has_voice_or_reserved_circuit(&self, ts: u8, timeslot_alloc: Option<&TimeslotAllocator>) -> bool {
-        self.packet_data_slot_has_voice_circuit(ts)
-            || timeslot_alloc
-                .and_then(|allocator| allocator.owner(ts))
-                .is_some_and(|owner| owner != TimeslotOwner::PacketData)
-    }
-
     fn plan_packet_data_traffic_slots_with_allocator(
         &self,
         requested_count: usize,
+        addr: TetraAddress,
         timeslot_alloc: Option<&TimeslotAllocator>,
     ) -> [bool; NUM_TIMESLOTS] {
         let mut planned = [false; NUM_TIMESLOTS];
@@ -1057,16 +1092,16 @@ impl BsChannelScheduler {
             return planned;
         }
 
-        let mut remaining = requested_count.min(NUM_TIMESLOTS - 1);
+        if self.packet_data_has_active_assignment_for_other_addr(addr, timeslot_alloc) {
+            return planned;
+        }
+
         for ts in 2..=NUM_TIMESLOTS as u8 {
-            if remaining == 0 {
-                break;
-            }
-            if self.packet_data_slot_has_voice_or_reserved_circuit(ts, timeslot_alloc) {
+            if !self.packet_data_slot_available_for_assignment(ts, addr, timeslot_alloc) {
                 continue;
             }
             planned[ts as usize - 1] = true;
-            remaining -= 1;
+            break;
         }
         planned
     }
@@ -1095,20 +1130,20 @@ impl BsChannelScheduler {
             return true;
         }
 
+        let addr = pdu.addr.expect("checked above");
         let requested_count = Self::packet_data_requested_traffic_slot_count(chan_alloc.ts_assigned);
         if requested_count == 0 {
             return true;
         }
 
-        let planned = self.plan_packet_data_traffic_slots_with_allocator(requested_count, timeslot_alloc);
+        let planned = self.plan_packet_data_traffic_slots_with_allocator(requested_count, addr, timeslot_alloc);
         if planned == chan_alloc.ts_assigned {
             return true;
         }
 
-        let addr = pdu.addr.expect("checked above");
         if planned.iter().any(|assigned| *assigned) {
             tracing::info!(
-                "packet-data PDCH allocation for {} dynamically mapped {:?} -> {:?} around active voice/circuit bearers",
+                "packet-data PDCH allocation for {} dynamically mapped {:?} -> {:?} as single first-free traffic slot around active voice/circuit bearers",
                 addr,
                 chan_alloc.ts_assigned,
                 planned
@@ -1117,7 +1152,7 @@ impl BsChannelScheduler {
             chan_alloc.clch_permission = matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both);
         } else {
             tracing::info!(
-                "packet-data PDCH allocation for {} deferred because all traffic slots are voice/circuit-owned",
+                "packet-data PDCH allocation for {} deferred because no single traffic slot is available without parallel packet-data or voice/circuit conflict",
                 addr
             );
             return false;
@@ -1128,13 +1163,14 @@ impl BsChannelScheduler {
 
     fn packet_data_active_downlink_slots_for_addr(&self, addr: TetraAddress) -> Vec<u8> {
         (2..=NUM_TIMESLOTS as u8)
-            .filter(|ts| {
+            .find(|ts| {
                 self.packet_data_assignments[*ts as usize - 1].is_some_and(|assignment| {
                     assignment.addr == addr
                         && Self::packet_data_assignment_supports_downlink(assignment)
                         && !self.packet_data_slot_has_voice_circuit(*ts)
                 })
             })
+            .into_iter()
             .collect()
     }
 
@@ -1144,7 +1180,7 @@ impl BsChannelScheduler {
         timeslot_alloc: Option<&TimeslotAllocator>,
     ) -> Vec<u8> {
         (2..=NUM_TIMESLOTS as u8)
-            .filter(|ts| {
+            .find(|ts| {
                 self.packet_data_assignments[*ts as usize - 1].is_some_and(|assignment| {
                     assignment.addr == addr
                         && Self::packet_data_assignment_supports_uplink(assignment)
@@ -1154,6 +1190,7 @@ impl BsChannelScheduler {
                             .is_some_and(|owner| owner != TimeslotOwner::PacketData)
                 })
             })
+            .into_iter()
             .collect()
     }
 
@@ -1287,8 +1324,22 @@ impl BsChannelScheduler {
             return;
         };
 
+        for next_slot in 1..NUM_TIMESLOTS {
+            if next_slot != target_slot
+                && self.packet_data_assignments[next_slot].is_some_and(|candidate| candidate.addr == assignment.addr)
+            {
+                self.packet_data_assignments[next_slot] = None;
+            }
+        }
+        let mut single_remaining = [false; NUM_TIMESLOTS];
+        single_remaining[target_slot] = true;
+
         let mut pdu = Self::dl_make_minimal_resource(&assignment.addr, None, false);
-        pdu.chan_alloc_element = Some(Self::packet_data_channel_allocation(assignment, remaining, ChanAllocType::Replace));
+        pdu.chan_alloc_element = Some(Self::packet_data_channel_allocation(
+            assignment,
+            single_remaining,
+            ChanAllocType::Replace,
+        ));
         pdu.update_len_and_fill_ind(0);
         self.push_sched_queue_bounded(
             target_slot,
@@ -1296,10 +1347,10 @@ impl BsChannelScheduler {
             "dltx_queues:pdch_voice_preempt_resize",
         );
         tracing::info!(
-            "packet-data PDCH assignment for {} shrinks away from voice TS{} to bitmap {:?}",
+            "packet-data PDCH assignment for {} shrinks away from voice TS{} to single-slot bitmap {:?}",
             assignment.addr,
             ts,
-            remaining
+            single_remaining
         );
     }
 
@@ -5535,6 +5586,67 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_data_single_slot_policy_defers_second_parallel_pdch() {
+        let mut sched = get_testing_slotter();
+        let now = TdmaTime { t: 4, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(now);
+
+        let first_addr = TetraAddress::issi(0x511c);
+        let second_issi = 0x511d;
+        sched.apply_packet_data_assignment_update(
+            PacketDataAssignmentUpdate::Replace {
+                addr: first_addr,
+                ts_assigned: [false, true, false, false],
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier_num: 1001,
+            },
+            now,
+        );
+        assert!(sched.packet_data_assignments[1].is_some());
+
+        let (pdu, sdu) = test_packet_data_channel_allocation_resource(
+            second_issi,
+            [false, true, false, false],
+            None,
+            ChanAllocType::Replace,
+            UlDlAssignment::Both,
+        );
+        sched.dl_enqueue_tma(pdu, sdu, None);
+
+        assert!(
+            sched.dltx_queues.iter().all(Vec::is_empty),
+            "a second packet-data ISSI must not receive a parallel PDCH on TS3/TS4 while one data slot is active"
+        );
+        assert!(
+            sched.packet_data_assignments[1].is_some_and(|assignment| assignment.addr == first_addr)
+                && sched.packet_data_assignments[2].is_none()
+                && sched.packet_data_assignments[3].is_none(),
+            "single-slot packet-data state must remain globally capped to one traffic TS"
+        );
+
+        sched.apply_packet_data_assignment_update(PacketDataAssignmentUpdate::QuitAndGo { addr: first_addr }, now.add_timeslots(4));
+        let (pdu, sdu) = test_packet_data_channel_allocation_resource(
+            second_issi,
+            [false, true, false, false],
+            None,
+            ChanAllocType::Replace,
+            UlDlAssignment::Both,
+        );
+        sched.dl_enqueue_tma(pdu, sdu, None);
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let allocated_on_mcch = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        let chan_alloc = first_schf_channel_allocation(&allocated_on_mcch);
+        assert_eq!(chan_alloc.ts_assigned, [false, true, false, false]);
+        assert_eq!(
+            chan_alloc.ts_assigned.iter().filter(|assigned| **assigned).count(),
+            1,
+            "after the first PDCH is released, the next data session must still advertise exactly one slot"
+        );
+    }
+
+    #[test]
     fn test_packet_data_dynamic_single_slot_allocation_defers_when_all_traffic_slots_are_voice() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
@@ -5616,31 +5728,31 @@ mod tests {
         let mut timeslot_alloc = TimeslotAllocator::default();
         let allocated_on_mcch = sched.finalize_ts_for_tick_with_timeslot_allocator(&subscribers, &mut energy_saving, &mut timeslot_alloc);
         let chan_alloc = first_schf_channel_allocation(&allocated_on_mcch);
-        assert_eq!(chan_alloc.ts_assigned, [false, true, true, true]);
-        for ts in 2..=4 {
-            assert_eq!(timeslot_alloc.owner(ts), Some(TimeslotOwner::PacketData));
-            assert!(
-                sched
-                    .packet_data_assignment_for_timeslot(TdmaTime { t: ts, f: 2, m: 1, h: 0 })
-                    .is_some(),
-                "SNDCP MAC-RESOURCE should create a real PDCH assignment on TS{ts}"
-            );
-            assert_eq!(
-                sched.packet_data_uplink_owner(TdmaTime { t: ts, f: 2, m: 1, h: 0 }, PhyBlockNum::Both),
-                Some(addr),
-                "bidirectional PDCH assignment should own uplink packet data on TS{ts}"
-            );
-        }
+        assert_eq!(chan_alloc.ts_assigned, [false, true, false, false]);
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(3), None);
+        assert_eq!(timeslot_alloc.owner(4), None);
+        assert!(
+            sched
+                .packet_data_assignment_for_timeslot(TdmaTime { t: 2, f: 2, m: 1, h: 0 })
+                .is_some(),
+            "SNDCP MAC-RESOURCE should create exactly one PDCH assignment on TS2"
+        );
+        assert_eq!(
+            sched.packet_data_uplink_owner(TdmaTime { t: 2, f: 2, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr),
+            "bidirectional PDCH assignment should own uplink packet data on TS2"
+        );
 
         let voice_slots = timeslot_alloc
             .allocate_many_preempting(TimeslotOwner::Cmce, 2, TimeslotOwner::PacketData)
-            .expect("local duplex voice must reclaim only the slots it needs from stalled PDCH");
-        assert_eq!(voice_slots, vec![2, 3]);
+            .expect("local duplex voice must use free slots before reclaiming stalled PDCH");
+        assert_eq!(voice_slots, vec![3, 4]);
         for ts in &voice_slots {
             open_test_dl_circuit(&mut sched, *ts);
         }
 
-        for ts in [2, 3] {
+        for ts in [3, 4] {
             assert_eq!(timeslot_alloc.owner(ts), Some(TimeslotOwner::Cmce));
             assert!(
                 sched
@@ -5654,26 +5766,19 @@ mod tests {
                 "voice open must clear stale uplink packet-data ownership on reclaimed TS{ts}"
             );
         }
-        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
         assert_eq!(
-            sched.packet_data_uplink_owner(TdmaTime { t: 4, f: 2, m: 1, h: 0 }, PhyBlockNum::Both),
+            sched.packet_data_uplink_owner(TdmaTime { t: 2, f: 2, m: 1, h: 0 }, PhyBlockNum::Both),
             Some(addr),
-            "voice must preserve remaining PDCH capacity while it exists"
+            "voice must preserve the existing single-slot PDCH while free voice slots exist"
         );
 
-        let resize = sched.dltx_queues[3]
-            .iter()
-            .find_map(|elem| match elem {
-                DlSchedElem::Resource(pdu, sdu, _, _) if pdu.addr == Some(addr) && sdu.get_len() == 0 => pdu.chan_alloc_element.as_ref(),
-                _ => None,
-            })
-            .expect("voice preemption should queue a PDCH resize on the remaining data slot");
-        assert_eq!(resize.alloc_type, ChanAllocType::Replace);
-        assert_eq!(resize.ts_assigned, [false, false, false, true]);
-
         sched.tick_start(TdmaTime { t: 1, f: 2, m: 1, h: 0 });
+        let _pdch_slot = sched.finalize_ts_for_tick_with_timeslot_allocator(&subscribers, &mut energy_saving, &mut timeslot_alloc);
+
+        sched.tick_start(TdmaTime { t: 2, f: 2, m: 1, h: 0 });
         let voice_slot = sched.finalize_ts_for_tick_with_timeslot_allocator(&subscribers, &mut energy_saving, &mut timeslot_alloc);
-        assert_eq!(voice_slot.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+        assert_eq!(voice_slot.ts, TdmaTime { t: 3, f: 2, m: 1, h: 0 });
         let mut voice_aach = voice_slot.bbk.expect("voice slot should carry AACH").mac_block;
         voice_aach.seek(0);
         let voice_aach = AccessAssign::from_bitbuf(&mut voice_aach).expect("voice AACH should parse");
@@ -5682,7 +5787,7 @@ mod tests {
         assert_eq!(
             voice_slot.blk1.as_ref().map(|block| block.logical_channel),
             Some(LogicalChannel::Stch),
-            "reclaimed voice slot must schedule traffic/STCH instead of assigned PDCH maintenance"
+            "free voice slot must schedule traffic/STCH instead of assigned PDCH maintenance"
         );
 
         for ts in &voice_slots {
@@ -5691,17 +5796,20 @@ mod tests {
                 .release(TimeslotOwner::Cmce, *ts)
                 .expect("voice release should free only CMCE-owned scheduler slots");
         }
-        assert_eq!(timeslot_alloc.owner(2), None);
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
         assert_eq!(timeslot_alloc.owner(3), None);
-        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(4), None);
         assert!(
             sched
                 .packet_data_assignment_for_timeslot(TdmaTime { t: 2, f: 2, m: 1, h: 0 })
-                .is_none()
+                .is_some()
                 && sched
                     .packet_data_assignment_for_timeslot(TdmaTime { t: 3, f: 2, m: 1, h: 0 })
+                    .is_none()
+                && sched
+                    .packet_data_assignment_for_timeslot(TdmaTime { t: 4, f: 2, m: 1, h: 0 })
                     .is_none(),
-            "voice release must not resurrect stale PDCH on reclaimed slots"
+            "voice release must preserve only the single original PDCH slot"
         );
     }
 
@@ -5764,14 +5872,20 @@ mod tests {
             );
         }
         assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
-        assert_eq!(timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
-        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(3), None);
+        assert_eq!(timeslot_alloc.owner(4), None);
         assert!(
             sched
                 .packet_data_assignment_for_timeslot(TdmaTime { t: 2, f: 2, m: 1, h: 0 })
                 .is_some(),
             "test setup should have an idle PDCH assignment on TS2"
         );
+        timeslot_alloc
+            .reserve(TimeslotOwner::Brew, 3)
+            .expect("test setup occupies TS3 so voice must reclaim data");
+        timeslot_alloc
+            .reserve(TimeslotOwner::Brew, 4)
+            .expect("test setup occupies TS4 so voice must reclaim data");
 
         let voice_ts = timeslot_alloc
             .allocate_any_preempting(TimeslotOwner::Cmce, TimeslotOwner::PacketData)
@@ -5810,7 +5924,7 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_data_dynamic_multi_slot_allocation_shrinks_around_voice() {
+    fn test_packet_data_multi_slot_request_normalizes_to_single_slot_around_voice() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
         open_test_dl_circuit(&mut sched, 3);
@@ -5830,17 +5944,25 @@ mod tests {
         let allocated_on_mcch = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
 
         let chan_alloc = first_schf_channel_allocation(&allocated_on_mcch);
-        assert_eq!(chan_alloc.ts_assigned, [false, true, false, true]);
+        assert_eq!(chan_alloc.ts_assigned, [false, true, false, false]);
+        assert_eq!(
+            chan_alloc.ts_assigned.iter().filter(|assigned| **assigned).count(),
+            1,
+            "packet-data RF allocation must never advertise parallel PDCH slots"
+        );
         assert!(sched.packet_data_assignments[1].is_some());
         assert!(
             sched.packet_data_assignments[2].is_none(),
             "voice-owned TS3 must be withheld from packet data"
         );
-        assert!(sched.packet_data_assignments[3].is_some());
+        assert!(
+            sched.packet_data_assignments[3].is_none(),
+            "multi-slot packet-data request must be capped to one first-free traffic slot"
+        );
     }
 
     #[test]
-    fn test_packet_data_downlink_round_robin_starts_at_ts2_and_rotates_fairly() {
+    fn test_packet_data_downlink_uses_single_assigned_pdch_slot() {
         let mut sched = get_testing_slotter();
         let now = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
         sched.set_dl_time(now);
@@ -5861,14 +5983,14 @@ mod tests {
             .map(|_| {
                 sched
                     .packet_data_downlink_timeslots_for_resource(&pdu, &sdu)
-                    .expect("active TS2-TS4 PDCH should route packet data")[0]
+                    .expect("active single-slot PDCH should route packet data")[0]
             })
             .collect();
 
         assert_eq!(
             selected,
-            vec![2, 3, 4, 2],
-            "packet-data downlink must start on first assigned traffic slot and then use TS2-TS4 fairly"
+            vec![2, 2, 2, 2],
+            "packet-data downlink must stay on the single assigned PDCH slot"
         );
     }
 
@@ -5902,9 +6024,9 @@ mod tests {
         assert_eq!(
             sched
                 .packet_data_downlink_timeslots_for_resource(&pdu, &ss1)
-                .expect("following AL segment should still use multislot PDCH")[0],
-            3,
-            "after S(S)=0, subsequent AL data should continue rotating across TS2-TS4"
+                .expect("following AL segment should still use assigned PDCH")[0],
+            2,
+            "after S(S)=0, subsequent AL data must stay on the single assigned PDCH slot"
         );
     }
 
@@ -5945,7 +6067,8 @@ mod tests {
     #[test]
     fn test_packet_data_assignment_dl_only_uses_common_and_assigned_uplink() {
         let mut sched = get_testing_slotter();
-        sched.set_dl_time(TdmaTime { t: 2, f: 1, m: 1, h: 0 });
+        let now = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(now);
         sched.apply_packet_data_assignment_update(
             PacketDataAssignmentUpdate::Replace {
                 addr: TetraAddress::issi(0x5102),
@@ -5953,13 +6076,13 @@ mod tests {
                 ul_dl_assigned: UlDlAssignment::Dl,
                 carrier_num: 1001,
             },
-            TdmaTime { t: 2, f: 1, m: 1, h: 0 },
+            now,
         );
 
         let subscribers = SubscriberRegistry::new();
         let mut energy_saving = HashMap::new();
         let maintained = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
-        assert_eq!(maintained.ts, TdmaTime { t: 3, f: 1, m: 1, h: 0 });
+        assert_eq!(maintained.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
 
         let mut aach = maintained.bbk.expect("assigned PDCH should carry AACH").mac_block;
         aach.seek(0);
@@ -5990,7 +6113,10 @@ mod tests {
             now,
         );
         assert!(sched.packet_data_assignments[1].is_some());
-        assert!(sched.packet_data_assignments[2].is_some());
+        assert!(
+            sched.packet_data_assignments[2].is_none(),
+            "multi-slot request must be normalized to one packet-data assignment"
+        );
 
         sched.apply_packet_data_assignment_update(
             PacketDataAssignmentUpdate::Replace {
@@ -6002,12 +6128,12 @@ mod tests {
             now.add_timeslots(4),
         );
         assert!(
-            sched.packet_data_assignments[1].is_none(),
-            "Replace should shrink stale packet-data timeslots for the same ISSI"
+            sched.packet_data_assignments[1].is_some(),
+            "Replace should refresh the single first-free packet-data timeslot for the same ISSI"
         );
         assert!(
-            sched.packet_data_assignments[2].is_some(),
-            "remaining packet-data timeslot should be refreshed"
+            sched.packet_data_assignments[2].is_none(),
+            "Replace must not move or expand packet data while TS2 remains the first free traffic slot"
         );
 
         sched.apply_packet_data_assignment_update(PacketDataAssignmentUpdate::QuitAndGo { addr }, now.add_timeslots(8));
@@ -6022,10 +6148,15 @@ mod tests {
             },
             now,
         );
-        assert!(sched.packet_data_assignments[3].is_some());
+        assert!(
+            sched.packet_data_assignments[1].is_some(),
+            "fresh packet-data assignment should use TS2 as the first free traffic slot even if the request bitmap names TS4"
+        );
+        assert!(sched.packet_data_assignments[2].is_none());
+        assert!(sched.packet_data_assignments[3].is_none());
         sched.expire_packet_data_assignments(now.add_timeslots(PACKET_DATA_ASSIGNMENT_TTL_TIMESLOTS));
         assert!(
-            sched.packet_data_assignments[3].is_none(),
+            sched.packet_data_assignments[1].is_none(),
             "stale packet-data assignment should expire locally"
         );
     }
@@ -6048,8 +6179,10 @@ mod tests {
         sched.expire_packet_data_assignments(now.add_timeslots(4 * 18 * 4));
 
         assert!(
-            sched.packet_data_assignments[1..].iter().all(Option::is_some),
-            "PDCH TS2-TS4 must not disappear during a normal READY/STANDBY gap without voice pre-emption or QuitAndGo"
+            sched.packet_data_assignments[1].is_some()
+                && sched.packet_data_assignments[2].is_none()
+                && sched.packet_data_assignments[3].is_none(),
+            "single-slot PDCH must survive a normal READY/STANDBY gap without expanding to TS3/TS4"
         );
     }
 
@@ -6057,7 +6190,7 @@ mod tests {
     fn test_stuck_sndcp_packet_data_cannot_block_voice_allocation_and_release() {
         let mut sched = get_testing_slotter();
         let addr = TetraAddress::issi(0x5109);
-        let now = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        let now = TdmaTime { t: 2, f: 2, m: 1, h: 0 };
         let mut timeslot_alloc = TimeslotAllocator::default();
         sched.set_dl_time(now);
 
@@ -6075,59 +6208,44 @@ mod tests {
             );
         }
         assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
-        assert_eq!(timeslot_alloc.owner(3), Some(TimeslotOwner::PacketData));
-        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(3), None);
+        assert_eq!(timeslot_alloc.owner(4), None);
         assert!(
-            sched.packet_data_assignments[1..].iter().all(Option::is_some),
-            "stuck SNDCP leaves PDCH assigned until voice pressure, QuitAndGo, or expiry"
+            sched.packet_data_assignments[1].is_some()
+                && sched.packet_data_assignments[2].is_none()
+                && sched.packet_data_assignments[3].is_none(),
+            "stuck SNDCP must hold exactly one PDCH slot until voice pressure, QuitAndGo, or expiry"
         );
 
         let duplex_voice_slots = timeslot_alloc
             .allocate_many_preempting(TimeslotOwner::Cmce, 2, TimeslotOwner::PacketData)
-            .expect("local duplex voice must reclaim the required two slots from stale PDCH");
-        assert_eq!(duplex_voice_slots, vec![2, 3]);
-        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+            .expect("local duplex voice must use free slots before touching stale PDCH");
+        assert_eq!(duplex_voice_slots, vec![3, 4]);
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
         assert_eq!(timeslot_alloc.owner(3), Some(TimeslotOwner::Cmce));
-        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::Cmce));
 
         for ts in &duplex_voice_slots {
             open_test_dl_circuit(&mut sched, *ts);
         }
 
-        assert!(sched.circuit_is_active(Direction::Dl, 2));
         assert!(sched.circuit_is_active(Direction::Dl, 3));
+        assert!(sched.circuit_is_active(Direction::Dl, 4));
         assert!(
-            sched.packet_data_assignments[1].is_none() && sched.packet_data_assignments[2].is_none(),
-            "voice-open must clear stale PDCH state on the reclaimed voice slots"
-        );
-        assert!(
-            sched.packet_data_assignments[3].is_some(),
-            "voice should keep any remaining PDCH slot alive for data coexistence"
-        );
-
-        let final_resize = sched.dltx_queues[3]
-            .iter()
-            .find_map(|elem| match elem {
-                DlSchedElem::Resource(pdu, sdu, _, _) if pdu.addr == Some(addr) && sdu.get_len() == 0 => pdu.chan_alloc_element.as_ref(),
-                _ => None,
-            })
-            .expect("second voice preemption should queue a PDCH resize to the remaining data slot");
-        assert_eq!(final_resize.alloc_type, ChanAllocType::Replace);
-        assert_eq!(final_resize.ts_assigned, [false, false, false, true]);
-        assert_eq!(final_resize.ul_dl_assigned, UlDlAssignment::Both);
-        assert!(
-            !queue_has_resource_for_addr_on_ts(&sched, 2, addr) && !queue_has_resource_for_addr_on_ts(&sched, 3, addr),
-            "voice-owned TS2/TS3 must not retain stale queued PDCH resources after duplex pre-emption"
+            sched.packet_data_assignments[1].is_some()
+                && sched.packet_data_assignments[2].is_none()
+                && sched.packet_data_assignments[3].is_none(),
+            "voice on free TS3/TS4 must not kill the unrelated single-slot PDCH on TS2"
         );
 
         let subscribers = SubscriberRegistry::new();
         let mut energy_saving = HashMap::new();
         let voice_slot = sched.finalize_ts_for_tick_with_timeslot_allocator(&subscribers, &mut energy_saving, &mut timeslot_alloc);
-        assert_eq!(voice_slot.ts, TdmaTime { t: 2, f: 2, m: 1, h: 0 });
+        assert_eq!(voice_slot.ts, TdmaTime { t: 3, f: 2, m: 1, h: 0 });
         assert_eq!(
             voice_slot.blk1.as_ref().map(|block| block.logical_channel),
             Some(LogicalChannel::Stch),
-            "reclaimed voice slot must schedule traffic/STCH instead of assigned PDCH maintenance"
+            "free voice slot must schedule traffic/STCH instead of assigned PDCH maintenance"
         );
         let mut voice_aach = voice_slot.bbk.expect("voice slot should carry AACH").mac_block;
         voice_aach.seek(0);
@@ -6141,33 +6259,36 @@ mod tests {
                 .release(TimeslotOwner::Cmce, *ts)
                 .expect("voice release should free the central allocator slot");
         }
-        assert_eq!(timeslot_alloc.owner(2), None);
+        assert_eq!(timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
         assert_eq!(timeslot_alloc.owner(3), None);
-        assert_eq!(timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(timeslot_alloc.owner(4), None);
         assert!(
             sched
                 .packet_data_assignment_for_timeslot(TdmaTime { t: 2, f: 2, m: 1, h: 0 })
-                .is_none()
+                .is_some()
                 && sched
                     .packet_data_assignment_for_timeslot(TdmaTime { t: 3, f: 2, m: 1, h: 0 })
+                    .is_none()
+                && sched
+                    .packet_data_assignment_for_timeslot(TdmaTime { t: 4, f: 2, m: 1, h: 0 })
                     .is_none(),
-            "voice release must not resurrect PDCH on slots reclaimed while SNDCP was stuck"
+            "voice release must preserve only the original single-slot PDCH"
         );
 
         let simplex_voice_ts = timeslot_alloc
             .allocate_any_preempting(TimeslotOwner::Cmce, TimeslotOwner::PacketData)
             .expect("next voice call should use a free slot before touching remaining PDCH");
-        assert_eq!(simplex_voice_ts, 2);
+        assert_eq!(simplex_voice_ts, 3);
         assert_eq!(
-            timeslot_alloc.owner(4),
+            timeslot_alloc.owner(2),
             Some(TimeslotOwner::PacketData),
-            "remaining data slot must survive while free TS2/TS3 can carry voice"
+            "remaining data slot must survive while free TS3/TS4 can carry voice"
         );
         open_test_dl_circuit(&mut sched, simplex_voice_ts);
         assert!(sched.circuit_is_active(Direction::Dl, simplex_voice_ts));
         assert!(
-            sched.packet_data_assignments[3].is_some(),
-            "opening voice on a free slot must not kill unrelated stale PDCH"
+            sched.packet_data_assignments[1].is_some(),
+            "opening voice on a free slot must not kill unrelated single-slot PDCH"
         );
     }
 
@@ -6259,7 +6380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_data_partial_voice_preemption_queues_replace_without_voice_slot() {
+    fn test_packet_data_multi_slot_request_preempted_as_single_final_slot() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 1, f: 1, m: 1, h: 0 });
         let addr = TetraAddress::issi(0x5113);
@@ -6276,20 +6397,21 @@ mod tests {
 
         open_test_dl_circuit(&mut sched, 2);
 
-        assert!(sched.packet_data_assignments[1].is_none());
-        assert!(sched.packet_data_assignments[2].is_some());
-        assert!(sched.packet_data_assignments[3].is_some());
+        assert!(
+            sched.packet_data_assignments[1..].iter().all(Option::is_none),
+            "multi-slot request is normalized to one PDCH slot, so voice on TS2 is final packet-data preemption"
+        );
 
-        let resize = sched.dltx_queues[2]
+        let release = sched.dltx_queues[0]
             .iter()
             .find_map(|elem| match elem {
                 DlSchedElem::Resource(pdu, sdu, _, _) if pdu.addr == Some(addr) && sdu.get_len() == 0 => pdu.chan_alloc_element.as_ref(),
                 _ => None,
             })
-            .expect("partial voice preemption should queue a PDCH resize on a remaining assigned slot");
-        assert_eq!(resize.alloc_type, ChanAllocType::Replace);
-        assert_eq!(resize.ts_assigned, [false, false, true, true]);
-        assert_eq!(resize.ul_dl_assigned, UlDlAssignment::Both);
+            .expect("final voice preemption should queue a common-control PDCH release");
+        assert_eq!(release.alloc_type, ChanAllocType::QuitAndGo);
+        assert_eq!(release.ts_assigned, [false, false, false, false]);
+        assert_eq!(release.ul_dl_assigned, UlDlAssignment::Both);
 
         let subscribers = SubscriberRegistry::new();
         let mut energy_saving = HashMap::new();
@@ -8866,7 +8988,7 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_data_multislot_grant_counts_assigned_uplink_channel_opportunities() {
+    fn test_packet_data_single_slot_grant_does_not_count_adjacent_uplink_opportunities() {
         let mut sched = get_testing_slotter();
         let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
         sched.set_dl_time(grant_base);
@@ -8878,30 +9000,31 @@ mod tests {
             block_test_uplink_slot(&mut sched, grant_base.add_timeslots(dist * 4), blocker);
         }
 
-        let (grant, marker) = sched
-            .ul_process_cap_req_from(grant_base, 2, addr, &ReservationRequirement::Req1Slot)
-            .expect("multi-slot PDCH should use a nearer assigned uplink opportunity");
+        let grant = sched.ul_process_cap_req_from(grant_base, 2, addr, &ReservationRequirement::Req1Slot);
 
-        // EN 300 392-2 clause 23.5.2.2.2 says multi-slot assigned-channel
-        // delays count successive slots on the assigned uplink channel. TS3 in
-        // the same TDMA frame is therefore one opportunity after blocked TS2,
-        // avoiding an unencodable same-TS delay > 13.
-        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
-        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
-        assert_eq!(marker, None);
+        assert!(
+            grant.is_none(),
+            "single-slot PDCH must not count adjacent TS3/TS4 as assigned-channel opportunities"
+        );
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 3, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
-            Some(addr.ssi)
+            None,
+            "single-slot PDCH must not reserve TS3 when TS2 delay is unencodable"
         );
-        assert_ne!(
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 4, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
+            None,
+            "single-slot PDCH must not reserve TS4 when TS2 delay is unencodable"
+        );
+        assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 2, f: 15, m: 1, h: 0 }, PhyBlockNum::Both),
-            Some(addr.ssi),
-            "same-TS search must not reserve the first free TS2 frame after an unencodable delay"
+            None,
+            "same-TS search must not reserve an unencodable later TS2 frame"
         );
     }
 
     #[test]
-    fn test_packet_data_multislot_grant_excludes_voice_owned_timeslot() {
+    fn test_packet_data_single_slot_grant_stays_on_assigned_slot_when_adjacent_voice_exists() {
         let mut sched = get_testing_slotter();
         let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
         sched.set_dl_time(grant_base);
@@ -8913,11 +9036,11 @@ mod tests {
 
         let (grant, _) = sched
             .ul_process_cap_req_from(grant_base, 2, addr, &ReservationRequirement::Req1Slot)
-            .expect("PDCH grant should use remaining non-voice assigned slot");
+            .expect("single-slot PDCH grant should use the next opportunity on its assigned slot");
 
-        // Voice/circuit ownership removes TS3 from the data channel. With TS2
-        // busy, the next legal reserved-access opportunity for this PDCH is
-        // TS4, still a representable one-opportunity delay.
+        // Opening voice on TS3 collapses a legacy/stale multislot PDCH state
+        // back to one slot. With TS2 busy, reserved access waits for the next
+        // TS2 opportunity instead of jumping to an unassigned adjacent slot.
         assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 3, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
@@ -8926,12 +9049,18 @@ mod tests {
         );
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 4, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
-            Some(addr.ssi)
+            None,
+            "single-slot packet data must not reserve adjacent TS4 uplink capacity"
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 2, f: 2, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr.ssi),
+            "single-slot packet data should reserve the next opportunity on TS2"
         );
     }
 
     #[test]
-    fn test_packet_data_multislot_grant_reduces_chunk_to_keep_delay_representable() {
+    fn test_packet_data_single_slot_pending_grant_waits_when_delay_unrepresentable() {
         let mut sched = get_testing_slotter();
         let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
         sched.set_dl_time(grant_base);
@@ -8952,34 +9081,27 @@ mod tests {
                 DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr) => pdu.slot_granting_element.as_ref(),
                 _ => None,
             })
-            .expect("scheduler should emit a representable smaller grant");
+            .expect("scheduler should emit a wait grant when the single PDCH slot has no representable capacity");
 
-        // A four-slot chunk cannot start on TS3 because the following TS2
-        // opportunities are occupied for more than thirteen channel
-        // opportunities. Granting TS3+TS4 now and preserving the remaining
-        // debt is still clause-valid and avoids an AL/WAP wait-grant loop.
-        assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
-        assert_eq!(slot_grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+        assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant10Slots);
+        assert_eq!(
+            slot_grant.granting_delay,
+            BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage
+        );
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 3, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
-            Some(addr.ssi)
+            None,
+            "single-slot PDCH pending grant must not reserve TS3"
         );
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 4, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
-            Some(addr.ssi)
-        );
-        assert!(
-            sched
-                .dltx_next_slot_queue
-                .iter()
-                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
-                    if *pending_addr == addr && debt.remaining_slots == 8)),
-            "smaller grant must preserve remaining WAP/AL reservation debt"
+            None,
+            "single-slot PDCH pending grant must not reserve TS4"
         );
     }
 
     #[test]
-    fn test_packet_data_multislot_grant_reuses_same_issi_reserved_capacity() {
+    fn test_packet_data_single_slot_grant_reuses_same_issi_reserved_capacity() {
         let mut sched = get_testing_slotter();
         let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
         sched.set_dl_time(grant_base);

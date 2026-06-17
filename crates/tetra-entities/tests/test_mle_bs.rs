@@ -446,7 +446,12 @@ fn test_sndcp_unacknowledged_request_preserves_pdch_channel_allocation() {
     let chan_alloc = prim.chan_alloc.as_ref().expect("SNDCP PDCH allocation should reach LLC");
     assert_eq!(chan_alloc.usage, None);
     assert_eq!(chan_alloc.carrier, None);
-    assert_eq!(chan_alloc.timeslots, [false, true, true, true]);
+    assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+    assert_eq!(
+        chan_alloc.timeslots.iter().filter(|assigned| **assigned).count(),
+        1,
+        "packet-data lower allocation must be normalized to one assigned PDCH slot"
+    );
     assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
     assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     assert_mle_prefixed_sdu(&prim.tl_sdu, MleProtocolDiscriminator::Sndcp);

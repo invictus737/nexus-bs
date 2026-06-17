@@ -6,10 +6,12 @@
 use std::collections::HashMap;
 
 use crate::mle::components::broadcast::MleBroadcast;
+use crate::sndcp::pdch::normalize_pdch_timeslots_to_single;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::SharedConfig;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{BitBuffer, Layer2Service, MleHandle, Sap, TdmaTime, TetraAddress, Todo, unimplemented_log};
+use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
 use tetra_saps::lcmc::{LcmcMleReportInd, LcmcMleUnitdataInd};
 use tetra_saps::lmm::{LmmMleReportInd, LmmMleUnitdataInd};
 use tetra_saps::ltpd::{LtpdMleReportInd, LtpdMleUnitdataInd};
@@ -543,6 +545,13 @@ impl MleBs {
         (value >= 0).then_some(value)
     }
 
+    fn normalize_sndcp_pdch_chan_alloc_to_single_slot(chan_alloc: Option<CmceChanAllocReq>) -> Option<CmceChanAllocReq> {
+        chan_alloc.map(|mut chan_alloc| {
+            chan_alloc.timeslots = normalize_pdch_timeslots_to_single(chan_alloc.timeslots);
+            chan_alloc
+        })
+    }
+
     fn rx_ltpd_mle_unitdata_req(&mut self, queue: &mut MessageQueue, mut message: SapMsg) {
         tracing::trace!("rx_ltpd_mle_unitdata_req");
         let SapMsgInner::LtpdMleUnitdataReq(prim) = &mut message.msg else {
@@ -573,7 +582,7 @@ impl MleBs {
         pdu.seek(0);
 
         let subscriber_class = self.subscriber_class();
-        let chan_alloc = prim.chan_alloc.take();
+        let chan_alloc = Self::normalize_sndcp_pdch_chan_alloc_to_single_slot(prim.chan_alloc.take());
         let msg = match prim.layer2service {
             Layer2Service::Unacknowledged => {
                 let tla_handle = self.track_tla_data_request(MleSapUser::Sndcp, Self::todo_to_mle_handle(prim.handle));

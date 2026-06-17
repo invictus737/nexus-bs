@@ -33,6 +33,20 @@ pub const SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT: [bool; 4] = [false, true, fa
 pub const SNDCP_TRAFFIC_USAGE_MARKER_MIN: u8 = 4;
 pub const SNDCP_TRAFFIC_USAGE_MARKER_MAX: u8 = 62;
 
+pub fn normalize_pdch_timeslots_to_single(timeslots: [bool; 4]) -> [bool; 4] {
+    let selected_idx = timeslots
+        .iter()
+        .enumerate()
+        .find_map(|(idx, assigned)| (*assigned && idx > 0).then_some(idx))
+        .or_else(|| timeslots.iter().enumerate().find_map(|(idx, assigned)| (*assigned).then_some(idx)));
+
+    let mut normalized = [false; 4];
+    if let Some(selected_idx) = selected_idx {
+        normalized[selected_idx] = true;
+    }
+    normalized
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SndcpPdchState {
     CommonControl,
@@ -611,6 +625,7 @@ pub fn packet_data_plan_to_lower_channel_allocation(
         SndcpPacketDataAllocationDecision::NewPdchAllocation => {
             validate_pdch_allocation_policy(policy)?;
             let placement = validate_new_allocation_placement(plan.mac_channel_allocation_placement)?;
+            let policy = single_slot_pdch_allocation_policy(policy);
 
             Ok(Some(SndcpLowerChannelAllocation {
                 issi: plan.issi,
@@ -724,6 +739,11 @@ pub fn build_ltpd_configure_req(
         schedule_repetition_info: SNDCP_LTPD_NOT_APPLICABLE,
         sndcp_status: status.to_todo(),
     })
+}
+
+fn single_slot_pdch_allocation_policy(mut policy: SndcpPdchAllocationPolicy) -> SndcpPdchAllocationPolicy {
+    policy.timeslots = normalize_pdch_timeslots_to_single(policy.timeslots);
+    policy
 }
 
 fn validate_pdch_allocation_policy(policy: SndcpPdchAllocationPolicy) -> Result<(), SndcpPdchError> {
@@ -1454,7 +1474,12 @@ mod tests {
         assert_eq!(lower.placement, SndcpMacChannelAllocationPlacement::MacResource);
         assert_eq!(lower.chan_alloc.usage, None);
         assert_eq!(lower.chan_alloc.carrier, None);
-        assert_eq!(lower.chan_alloc.timeslots, [false, true, true, true]);
+        assert_eq!(lower.chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(
+            lower.chan_alloc.timeslots.iter().filter(|assigned| **assigned).count(),
+            1,
+            "packet-data lower allocation must advertise exactly one PDCH timeslot"
+        );
         assert_eq!(lower.chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(lower.chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     }

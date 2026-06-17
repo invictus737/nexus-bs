@@ -2735,7 +2735,7 @@ fn test_mac_u_blck_reservation_requirement_enqueues_grant_for_known_slot_owner()
 }
 
 #[test]
-fn test_mac_u_blck_reservation_on_multislot_pdch_uses_near_assigned_channel_slot() {
+fn test_mac_u_blck_reservation_on_single_slot_pdch_waits_instead_of_using_adjacent_slot() {
     debug::setup_logging_verbose();
 
     let start = TdmaTime::default().add_timeslots(2);
@@ -2778,10 +2778,9 @@ fn test_mac_u_blck_reservation_on_multislot_pdch_uses_near_assigned_channel_slot
     let grant_tx_base = inbound_dltime.add_timeslots(2);
     assert_eq!(grant_tx_base.t, 2, "next TS2 downlink should carry the pending slot grant");
 
-    // Occupy the next fourteen same-numbered TS2 uplink opportunities. A
-    // same-TS-only scheduler would have to encode delay 14 and would fall back
-    // to WaitForAnotherSlotgrantMessage; a multi-slot PDCH scheduler should
-    // count TS3/TS4 in the assigned channel and use TS3 immediately.
+    // Occupy the next fourteen same-numbered TS2 uplink opportunities. The
+    // WAP/IP MVP deliberately uses exactly one PDCH slot, so the scheduler
+    // must not jump to adjacent TS3/TS4 when TS2 delay is unencodable.
     reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 2, 14, 0x703000);
 
     submit_mac_u_blck(&mut test, 1);
@@ -2798,20 +2797,27 @@ fn test_mac_u_blck_reservation_on_multislot_pdch_uses_near_assigned_channel_slot
     assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
     assert_eq!(
         slot_grant.granting_delay,
-        BasicSlotgrantGrantingDelay::DelayNOpportunities(1),
-        "PDCH grant delay should count TS3 as the next assigned-channel opportunity"
+        BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage,
+        "single-slot PDCH must wait instead of treating TS3 as an assigned-channel opportunity"
     );
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
             .ul_get_slot_owner(grant_tx_base.add_timeslots(1), PhyBlockNum::Both),
-        Some(target_issi),
-        "serialized grant should reserve TS3 rather than waiting for a later TS2 frame"
+        None,
+        "single-slot PDCH must not reserve TS3"
+    );
+    assert_eq!(
+        umac_bs_mut(&mut test)
+            .channel_scheduler
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
+        None,
+        "single-slot PDCH must not reserve TS4"
     );
 }
 
 #[test]
-fn test_mac_u_blck_large_reservation_on_multislot_pdch_reduces_to_encodable_chunk() {
+fn test_mac_u_blck_large_reservation_on_single_slot_pdch_waits_when_delay_unencodable() {
     debug::setup_logging_verbose();
 
     let start = TdmaTime::default().add_timeslots(2);
@@ -2856,11 +2862,9 @@ fn test_mac_u_blck_large_reservation_on_multislot_pdch_reduces_to_encodable_chun
 
     reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 2, 14, 0x703100);
 
-    // MAC-U-BLCK reservation raw value 8 maps to Req10Slots. On the active
-    // TS2+TS3+TS4 PDCH, a four-slot chunk is not representable here because
-    // the TS2 opportunities are blocked for more than thirteen channel
-    // opportunities. The BS should grant the nearer legal TS3+TS4 chunk and
-    // preserve the rest as pending grant debt.
+    // MAC-U-BLCK reservation raw value 8 maps to Req10Slots. With the WAP/IP
+    // MVP restricted to a single PDCH slot, blocked TS2 opportunities must
+    // result in wait/retry instead of a reduced chunk on adjacent TS3+TS4.
     submit_mac_u_blck(&mut test, 8);
     test.deliver_all_messages();
     test.run_stack(Some(4));
@@ -2869,24 +2873,26 @@ fn test_mac_u_blck_large_reservation_on_multislot_pdch_reduces_to_encodable_chun
     let slot_grant = mac_resources_for_addr(&sink_msgs, target_addr)
         .into_iter()
         .filter_map(|(_, resource)| resource.slot_granting_element)
-        .find(|grant| grant.capacity_allocation == BasicSlotgrantCapAlloc::Grant2Slots)
-        .expect("large MAC-U-BLCK reservation on active PDCH should serialize a reduced real slot grant");
+        .find(|grant| grant.granting_delay == BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage)
+        .expect("large MAC-U-BLCK reservation on single-slot PDCH should serialize a wait grant when delay is unencodable");
 
-    assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
-    assert_eq!(slot_grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+    assert_eq!(
+        slot_grant.granting_delay,
+        BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage
+    );
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
             .ul_get_slot_owner(grant_tx_base.add_timeslots(1), PhyBlockNum::Both),
-        Some(target_issi),
-        "reduced grant should reserve TS3"
+        None,
+        "single-slot PDCH must not reserve TS3 for a large grant"
     );
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
             .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
-        Some(target_issi),
-        "reduced grant should reserve TS4"
+        None,
+        "single-slot PDCH must not reserve TS4 for a large grant"
     );
 }
 

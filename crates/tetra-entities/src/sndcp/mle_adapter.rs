@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use super::pdch::{SndcpLowerChannelAllocation, SndcpPdchError, validate_lower_channel_allocation};
+use super::pdch::{SndcpLowerChannelAllocation, SndcpPdchError, normalize_pdch_timeslots_to_single, validate_lower_channel_allocation};
 use super::priority::{SndcpDataScheduling, SndcpPriorityError, SndcpPriorityPolicy};
 use super::unitdata::{SndcpEncodeError, sn_data_req_to_pdu, sn_unitdata_req_to_pdu};
 use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, MleHandle, SsiType, TetraAddress, Todo};
@@ -18,6 +18,17 @@ use tetra_saps::tla::{
 };
 
 pub const SNDCP_CONTROL_PDU_PRIORITY: u8 = 4;
+
+fn single_slot_lower_allocation(allocation: &SndcpLowerChannelAllocation) -> SndcpLowerChannelAllocation {
+    let mut allocation = allocation.clone();
+    if matches!(
+        allocation.allocation,
+        super::pdch::SndcpPacketDataAllocationDecision::NewPdchAllocation
+    ) {
+        allocation.chan_alloc.timeslots = normalize_pdch_timeslots_to_single(allocation.chan_alloc.timeslots);
+    }
+    allocation
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SndcpLtpdUnitdataOptions {
@@ -304,7 +315,7 @@ pub fn ltpd_unitdata_req_to_tla_unitdata_req_with_allocation(
         n_tlsdu_repeats: todo_to_optional_u8(req.unacked_bl_repetitions),
         data_class_info: todo_to_optional_todo(req.data_class_info),
         req_handle: handle_to_todo(tla_handle)?,
-        chan_alloc: allocation.map(|allocation| allocation.chan_alloc.clone()),
+        chan_alloc: allocation.map(|allocation| single_slot_lower_allocation(allocation).chan_alloc),
         tx_reporter: None,
     })
 }
@@ -741,7 +752,12 @@ mod tests {
         let chan_alloc = tla.chan_alloc.expect("PDCH allocation should be passed to lower layers");
         assert_eq!(chan_alloc.usage, None);
         assert_eq!(chan_alloc.carrier, None);
-        assert_eq!(chan_alloc.timeslots, [false, true, true, true]);
+        assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(
+            chan_alloc.timeslots.iter().filter(|assigned| **assigned).count(),
+            1,
+            "SNDCP-to-MLE adapter must not pass parallel PDCH slots to TLA"
+        );
         assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
 
@@ -780,7 +796,7 @@ mod tests {
         let chan_alloc = tla.chan_alloc.expect("planned PDCH allocation should reach the pure TLA primitive");
         assert_eq!(chan_alloc.usage, None);
         assert_eq!(chan_alloc.carrier, None);
-        assert_eq!(chan_alloc.timeslots, [false, true, true, true]);
+        assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
         assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     }
