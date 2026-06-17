@@ -991,7 +991,7 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("Nexus-BS: Health OK"), "page={page:?}");
+    assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
     assert!(page.contains("Version:"));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
@@ -1124,7 +1124,7 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("Nexus-BS: Health OK"), "page={page:?}");
+    assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
     assert!(page.contains("Version:"));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
@@ -1372,7 +1372,7 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("Nexus-BS: Health OK"), "page={page:?}");
+    assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
     assert!(page.contains("Version:"));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));

@@ -117,9 +117,9 @@ fn render_tiny_wml2_status_page(snapshot: &WapStatusSnapshot, max_bytes: usize) 
     let queued_sds = compact_count(snapshot.queued_sds);
     let uptime = compact_tiny_uptime(snapshot.uptime_secs);
     let body_with_counts = format!(
-        "{title}: Health {state}{TINY_XHTML_BR}Version: {version}{TINY_XHTML_BR}MS {registered_ms} Calls {active_calls} SDS {queued_sds}{TINY_XHTML_BR}Uptime {uptime}"
+        "{title}: {state}{TINY_XHTML_BR}Version: {version}{TINY_XHTML_BR}MS {registered_ms} Calls {active_calls} SDS {queued_sds}{TINY_XHTML_BR}Uptime {uptime}"
     );
-    let body_without_counts = format!("{title}: Health {state}{TINY_XHTML_BR}Version: {version}{TINY_XHTML_BR}Uptime {uptime}");
+    let body_without_counts = format!("{title}: {state}{TINY_XHTML_BR}Version: {version}{TINY_XHTML_BR}Uptime {uptime}");
     let mut body = if TINY_XHTML_PREFIX
         .len()
         .saturating_add(body_with_counts.len())
@@ -289,9 +289,9 @@ fn compact_count(value: usize) -> String {
 fn compact_tiny_state(snapshot: &WapStatusSnapshot) -> &'static str {
     let health = snapshot.health_summary.as_deref().unwrap_or_default();
     if snapshot.service_state.contains("CRITICAL") || health.contains("CRITICAL") {
-        "BAD"
+        "Err"
     } else if snapshot.service_state.contains("DEGRADED") || health.contains("DEGRADED") {
-        "WARN"
+        "Warn"
     } else {
         "OK"
     }
@@ -459,7 +459,7 @@ mod tests {
 
         assert!(page.len() <= 128);
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("Nexus-BS: Health OK"));
+        assert!(page.contains("Nexus-BS: OK"));
         assert!(page.contains("Version: 0.1.69"));
         assert!(page.contains("Uptime 1d2h3m4s"));
         assert!(!page.contains("MS 3 Calls 1 SDS 2"));
@@ -482,6 +482,18 @@ mod tests {
         assert_eq!(compact_tiny_uptime(0), "0d0h0m0s");
         assert_eq!(compact_tiny_uptime(93_784), "1d2h3m4s");
         assert_eq!(compact_tiny_uptime(u64::MAX), "99d23h59m59s");
+    }
+
+    #[test]
+    fn compact_tiny_state_uses_short_status_labels() {
+        let mut snapshot = sample_snapshot();
+        assert_eq!(compact_tiny_state(&snapshot), "OK");
+
+        snapshot.service_state = "DEGRADED".to_string();
+        assert_eq!(compact_tiny_state(&snapshot), "Warn");
+
+        snapshot.service_state = "CRITICAL".to_string();
+        assert_eq!(compact_tiny_state(&snapshot), "Err");
     }
 
     #[test]
