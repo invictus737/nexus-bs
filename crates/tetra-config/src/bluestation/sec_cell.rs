@@ -513,7 +513,7 @@ pub fn cell_dto_to_cfg(ci: CellInfoDto) -> Result<CfgCellInfo, String> {
         frame_18_ext: ci.frame_18_ext.unwrap_or(false),
         ms_txpwr_max_cell: ci.ms_txpwr_max_cell.unwrap_or(4), // 30 dBm nominal MS cap
         rxlev_access_min: ci.rxlev_access_min.unwrap_or(3),   // -110 dBm
-        access_parameter: ci.access_parameter.unwrap_or(15),  // -23 dBm
+        access_parameter: ci.access_parameter.unwrap_or(7),   // -39 dBm RF-good default
         local_ssi_ranges,
         restart_recovery_issis,
         allowed_gssi_ranges: parse_allowed_gssi_ranges(ci.allowed_gssi_ranges)?,

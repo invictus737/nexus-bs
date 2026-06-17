@@ -1079,12 +1079,14 @@ impl UmacBs {
         // implement air-interface encryption yet, so keep the broadcast
         // fail-closed even if a direct StackConfig requests AIE.
         let wap_ip_sndcp_profile_enabled = Self::local_wap_ip_sndcp_profile_enabled(config);
-        // EN 300 392-2 clause 21.4.4.1 table 21.68: SNDCP/WAP does not
-        // require advertising optional MAC data-priority support. Voice/data
-        // priority is enforced locally by the scheduler, while the on-air
-        // optional data-priority bit stays fail-closed until the full L2 data
-        // priority procedure is implemented end-to-end.
-        let section1_services = 0;
+        let mut section1_services = 0;
+        if wap_ip_sndcp_profile_enabled {
+            // Keep the historical RF-good WAP/IP profile advertisement. EN
+            // 300 392-2 clause 21.4.4.1 table 21.68 carries this in the MAC
+            // extended-services section; Nexus-BS still enforces voice/data
+            // priority locally in the scheduler.
+            section1_services |= 0b100_0000;
+        }
 
         let ext_services = SysinfoExtendedServices {
             auth_required: false,

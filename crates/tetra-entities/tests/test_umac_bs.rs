@@ -319,8 +319,9 @@ fn test_wap_ip_bnch_advertises_packet_data_even_before_brew_connects() {
     // the serving cell advertises SNDCP service availability. Nexus-BS now
     // advertises original acknowledged LLC advanced link only under the local
     // WAP/IP SNDCP profile whose AL-SETUP/AL-FINAL/AL-ACK path is wired.
-    // MAC data-priority advertisement is optional and remains off until the
-    // full L2 data-priority procedure is implemented end-to-end.
+    // Keep the historical Nexus-BS WAP/IP profile marker in MAC extended
+    // services so terminals see the same pre-attach service shape that is used
+    // by the field-tested AL/SNDCP path.
     assert!(decoded_mle.bs_service_details.system_wide_services);
     assert!(decoded_mle.bs_service_details.sndcp_service);
     assert!(decoded_mle.bs_service_details.advanced_link);
@@ -328,8 +329,8 @@ fn test_wap_ip_bnch_advertises_packet_data_even_before_brew_connects() {
     assert!(!decoded_mle.bs_service_details.aie_service);
     assert_eq!(ext_services.section, 0);
     assert_eq!(
-        ext_services.section_data, 0,
-        "WAP/IP SNDCP profile must not advertise optional data priority, extended AL, QoS negotiation, D8PSK, or extra sections yet"
+        ext_services.section_data, 0b100_0000,
+        "WAP/IP SNDCP profile must preserve the historical MAC extended-services marker"
     );
 }
 
