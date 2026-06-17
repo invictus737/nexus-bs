@@ -22,6 +22,7 @@ pub struct BsFragger {
     sdu: BitBuffer,
     fragmented_chan_alloc: Option<ChanAllocElement>,
     tx_reporter: Option<TxReporter>,
+    requires_packet_data_owner: bool,
 }
 
 /// We won't start fragmentation if less than MIN_SLOT_CAP_FOR_FRAG_START bits are free in the slot
@@ -42,11 +43,21 @@ impl BsFragger {
             sdu,
             fragmented_chan_alloc: None,
             tx_reporter,
+            requires_packet_data_owner: false,
         }
     }
 
     pub fn addr(&self) -> Option<TetraAddress> {
         self.resource.addr
+    }
+
+    pub fn with_requires_packet_data_owner(mut self, requires_packet_data_owner: bool) -> Self {
+        self.requires_packet_data_owner = requires_packet_data_owner;
+        self
+    }
+
+    pub fn requires_packet_data_owner(&self) -> bool {
+        self.requires_packet_data_owner
     }
 
     pub fn carries_channel_allocation(&self) -> bool {

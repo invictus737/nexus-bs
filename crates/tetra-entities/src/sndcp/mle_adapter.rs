@@ -558,7 +558,7 @@ mod tests {
             chan_alloc: CmceChanAllocReq {
                 usage: None,
                 carrier: None,
-                timeslots: [false, true, false, false],
+                timeslots: [false, false, false, true],
                 alloc_type: ChanAllocType::Replace,
                 ul_dl_assigned: UlDlAssignment::Both,
             },
@@ -752,7 +752,7 @@ mod tests {
         let chan_alloc = tla.chan_alloc.expect("PDCH allocation should be passed to lower layers");
         assert_eq!(chan_alloc.usage, None);
         assert_eq!(chan_alloc.carrier, None);
-        assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(chan_alloc.timeslots, [false, false, false, true]);
         assert_eq!(
             chan_alloc.timeslots.iter().filter(|assigned| **assigned).count(),
             1,
@@ -796,7 +796,7 @@ mod tests {
         let chan_alloc = tla.chan_alloc.expect("planned PDCH allocation should reach the pure TLA primitive");
         assert_eq!(chan_alloc.usage, None);
         assert_eq!(chan_alloc.carrier, None);
-        assert_eq!(chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(chan_alloc.timeslots, [false, false, false, true]);
         assert_eq!(chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     }
