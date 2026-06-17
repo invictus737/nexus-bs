@@ -3946,8 +3946,10 @@ impl BsChannelScheduler {
 
             let mut buf = BitBuffer::new(124);
 
-            // Write MAC-SYSINFO (alternating sysinfo1/sysinfo2 over time), followed by MLE-SYSINFO.
-            if ts.f % 2 == 1 {
+            // Keep the primary MCCH BNCH (TS1) on SYSINFO1 so cold MSs always
+            // see the default definition for access code A. Auxiliary BNCH
+            // opportunities on even timeslots carry SYSINFO2/extended services.
+            if ts.t % 2 == 1 {
                 self.precomps.mac_sysinfo1.to_bitbuf(&mut buf);
             } else {
                 self.precomps.mac_sysinfo2.to_bitbuf(&mut buf);
@@ -8733,28 +8735,45 @@ mod tests {
     }
 
     #[test]
-    fn test_ts1_bnch_alternates_sysinfo1_and_sysinfo2_over_frames() {
+    fn test_primary_mcch_bnch_keeps_default_access_sysinfo() {
         let mut sched = get_testing_slotter();
         let subscribers = SubscriberRegistry::new();
         let mut energy_saving = HashMap::new();
 
-        for (ts, expect_extended_services) in [
-            (TdmaTime { t: 1, f: 1, m: 1, h: 0 }, false),
-            (TdmaTime { t: 1, f: 2, m: 1, h: 0 }, true),
-        ] {
-            sched.set_dl_time(ts);
-            let slot = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
-            let mut bnch = slot.blk2.expect("TS1 SCH/HD half-slot should carry BNCH in second half-slot");
-            assert_eq!(bnch.logical_channel, LogicalChannel::Bnch);
+        let ts1_bnch = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        sched.set_dl_time(ts1_bnch.add_timeslots(-1));
+        let slot = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(slot.ts, ts1_bnch);
+        let mut bnch = slot.blk2.expect("TS1 SCH/HD half-slot should carry BNCH in second half-slot");
+        assert_eq!(bnch.logical_channel, LogicalChannel::Bnch);
 
-            let decoded_sysinfo = MacSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should start with MAC-SYSINFO");
-            let _decoded_mle = DMleSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should carry D-MLE-SYSINFO after MAC-SYSINFO");
-            assert_eq!(
-                decoded_sysinfo.ext_services.is_some(),
-                expect_extended_services,
-                "TS1 BNCH at {ts} should alternate SYSINFO1/SYSINFO2 over frames"
-            );
-        }
+        let decoded_sysinfo = MacSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should start with MAC-SYSINFO");
+        let _decoded_mle = DMleSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should carry D-MLE-SYSINFO after MAC-SYSINFO");
+        assert_eq!(decoded_sysinfo.option_field, SysinfoOptFieldFlag::DefaultDefForAccCodeA);
+        assert!(
+            decoded_sysinfo.default_access_code.is_some(),
+            "primary MCCH SYSINFO must carry access code A for cold random access"
+        );
+        assert!(
+            decoded_sysinfo.ext_services.is_none(),
+            "primary MCCH SYSINFO must not replace access parameters with extended services"
+        );
+
+        let ts2_bnch = TdmaTime { t: 2, f: 2, m: 1, h: 0 };
+        sched.set_dl_time(ts2_bnch.add_timeslots(-1));
+        let slot = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+        assert_eq!(slot.ts, ts2_bnch);
+        let mut bnch = slot.blk2.expect("TS2 BSCH half-slot should carry BNCH in second half-slot");
+        assert_eq!(bnch.logical_channel, LogicalChannel::Bnch);
+
+        let decoded_sysinfo = MacSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should start with MAC-SYSINFO");
+        let _decoded_mle = DMleSysinfo::from_bitbuf(&mut bnch.mac_block).expect("BNCH should carry D-MLE-SYSINFO after MAC-SYSINFO");
+        assert_eq!(decoded_sysinfo.option_field, SysinfoOptFieldFlag::ExtServicesBroadcast);
+        assert!(decoded_sysinfo.default_access_code.is_none());
+        assert!(
+            decoded_sysinfo.ext_services.is_some(),
+            "auxiliary BNCH should still carry SYSINFO2/extended services for WAP/IP profile advertisement"
+        );
     }
 
     #[test]
