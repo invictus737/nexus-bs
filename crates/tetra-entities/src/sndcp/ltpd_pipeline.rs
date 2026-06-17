@@ -362,7 +362,9 @@ mod tests {
     use crate::sndcp::bearer_policy::SndcpPacketDataBearerProfile;
     use crate::sndcp::ip::{bitbuffer_npdu_octets, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
     use crate::sndcp::mle_adapter::SNDCP_CONTROL_PDU_PRIORITY;
-    use crate::sndcp::pdch::{SndcpPacketDataResourceRequest, SndcpPdchError, SndcpPdchState, SndcpPhaseModulationResourceRequest};
+    use crate::sndcp::pdch::{
+        SNDCP_BASIC_LINK_ID, SndcpPacketDataResourceRequest, SndcpPdchError, SndcpPdchState, SndcpPhaseModulationResourceRequest,
+    };
     use crate::sndcp::pdp::{
         SndcpActivateAddressDemand, SndcpActivatePdpContextDemand, SndcpActivationRejectCause, SndcpDeactivation,
         decode_activate_pdp_context_accept, decode_activate_pdp_context_reject, decode_deactivate_pdp_context_accept,
@@ -1043,7 +1045,9 @@ mod tests {
         assert_eq!(allocation.timeslots, [false, false, false, false]);
         assert_eq!(allocation.alloc_type, ChanAllocType::QuitAndGo);
         assert_eq!(
-            pipeline.pdch().ensure_packet_data_ready(ISSI, end_ind.endpoint_id, end_ind.link_id),
+            pipeline
+                .pdch()
+                .ensure_packet_data_ready(ISSI, end_ind.endpoint_id, SNDCP_BASIC_LINK_ID),
             Err(SndcpPdchError::PacketDataBearerNotReady {
                 issi: ISSI,
                 state: SndcpPdchState::CommonControl

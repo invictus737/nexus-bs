@@ -1474,7 +1474,7 @@ mod tests {
         assert_eq!(lower.placement, SndcpMacChannelAllocationPlacement::MacResource);
         assert_eq!(lower.chan_alloc.usage, None);
         assert_eq!(lower.chan_alloc.carrier, None);
-        assert_eq!(lower.chan_alloc.timeslots, [false, true, false, false]);
+        assert_eq!(lower.chan_alloc.timeslots, [false, true, true, true]);
         assert_eq!(lower.chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(lower.chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
     }
@@ -1721,7 +1721,7 @@ mod tests {
             .mark_return_to_common_control_transmitted(ISSI)
             .expect("completed SN-END OF DATA should clear PDCH readiness");
         assert_eq!(
-            manager.ensure_packet_data_ready(ISSI, 3, 7),
+            manager.ensure_packet_data_ready(ISSI, 3, SNDCP_BASIC_LINK_ID),
             Err(SndcpPdchError::PacketDataBearerNotReady {
                 issi: ISSI,
                 state: SndcpPdchState::CommonControl

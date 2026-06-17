@@ -1019,6 +1019,10 @@ impl BsChannelScheduler {
         matches!(assignment.ul_dl_assigned, UlDlAssignment::Dl | UlDlAssignment::Both)
     }
 
+    fn packet_data_assignment_supports_uplink(assignment: PacketDataAssignment) -> bool {
+        matches!(assignment.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both)
+    }
+
     fn packet_data_requested_traffic_slot_count(ts_assigned: [bool; NUM_TIMESLOTS]) -> usize {
         let requested_non_mcch = ts_assigned[1..].iter().filter(|assigned| **assigned).count();
         if requested_non_mcch > 0 {
@@ -1123,6 +1127,25 @@ impl BsChannelScheduler {
                     assignment.addr == addr
                         && Self::packet_data_assignment_supports_downlink(assignment)
                         && !self.packet_data_slot_has_voice_circuit(*ts)
+                })
+            })
+            .collect()
+    }
+
+    fn packet_data_active_uplink_slots_for_addr_with_allocator(
+        &self,
+        addr: TetraAddress,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> Vec<u8> {
+        (2..=NUM_TIMESLOTS as u8)
+            .filter(|ts| {
+                self.packet_data_assignments[*ts as usize - 1].is_some_and(|assignment| {
+                    assignment.addr == addr
+                        && Self::packet_data_assignment_supports_uplink(assignment)
+                        && !self.packet_data_slot_has_voice_circuit(*ts)
+                        && !timeslot_alloc
+                            .and_then(|allocator| allocator.owner(*ts))
+                            .is_some_and(|owner| owner != TimeslotOwner::PacketData)
                 })
             })
             .collect()
@@ -1315,27 +1338,75 @@ impl BsChannelScheduler {
         num_slots: usize,
         is_halfslot: bool,
     ) -> Option<(usize, Vec<TdmaTime>)> {
-        let first_opportunity = base_dltime.forward_to_timeslot(t);
+        self.ul_find_grant_opportunity_on_channel_from(base_dltime, t, &[t], num_slots, is_halfslot)
+    }
+
+    fn ul_find_grant_opportunity_for_addr_from(
+        &self,
+        base_dltime: TdmaTime,
+        timeslot: u8,
+        addr: TetraAddress,
+        num_slots: usize,
+        is_halfslot: bool,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> Option<(usize, Vec<TdmaTime>)> {
+        let packet_data_uplink_slots = self.packet_data_active_uplink_slots_for_addr_with_allocator(addr, timeslot_alloc);
+        if packet_data_uplink_slots.contains(&timeslot) {
+            // EN 300 392-2 clause 23.5.2.2.2: on a multi-slot assigned
+            // channel, slot-grant delay opportunities are counted across all
+            // uplink timeslots assigned to that channel, not just the
+            // same-numbered timeslot carrying the grant.
+            return self.ul_find_grant_opportunity_on_channel_from(
+                base_dltime,
+                timeslot,
+                &packet_data_uplink_slots,
+                num_slots,
+                is_halfslot,
+            );
+        }
+        if !packet_data_uplink_slots.is_empty() {
+            tracing::debug!(
+                "ul_find_grant_opportunity: addr {} pending grant on TS{} but active PDCH uplink channel is {:?}",
+                addr,
+                timeslot,
+                packet_data_uplink_slots
+            );
+            return None;
+        }
+
+        self.ul_find_grant_opportunity_from(base_dltime, timeslot, num_slots, is_halfslot)
+    }
+
+    fn ul_find_grant_opportunity_on_channel_from(
+        &self,
+        base_dltime: TdmaTime,
+        grant_timeslot: u8,
+        channel_timeslots: &[u8],
+        num_slots: usize,
+        is_halfslot: bool,
+    ) -> Option<(usize, Vec<TdmaTime>)> {
+        if channel_timeslots.is_empty() || !channel_timeslots.contains(&grant_timeslot) {
+            return None;
+        }
+        let first_opportunity = base_dltime.forward_to_timeslot(grant_timeslot);
         let mut grant_timeslots = Vec::with_capacity(num_slots);
         let mut opportunities_skipped = 0;
 
         assert!(!is_halfslot || num_slots == 1, "is_halfslot set for num_slots > 1");
 
-        for dist in 0..MACSCHED_NUM_FRAMES - 1 {
+        for dist in 0..(MACSCHED_NUM_FRAMES - 1) * NUM_TIMESLOTS {
             // let candidate_t = self.cur_ts.add_timeslots(dist as i32 * 4);
             // Base off of internal perception of time, convert to UL time
             // Below may crash someday, but I'd want to investigate that situation
-            let candidate_t = first_opportunity.add_timeslots(dist as i32 * 4);
-            assert!(
-                candidate_t.t == first_opportunity.t,
-                "ul_find_grant_opportunity: candidate_t.ts {} does not match requested ts {}. Please report this to developer. ",
-                candidate_t.t,
-                first_opportunity.t
-            );
+            let candidate_t = first_opportunity.add_timeslots(dist as i32);
+            if !channel_timeslots.contains(&candidate_t.t) {
+                continue;
+            }
 
             tracing::debug!(
-                "ul_find_grant_opportunity: considering candidate ul_ts {}, have {:?}",
+                "ul_find_grant_opportunity: considering candidate ul_ts {} on channel {:?}, have {:?}",
                 candidate_t,
+                channel_timeslots,
                 grant_timeslots
             );
 
@@ -1351,7 +1422,7 @@ impl BsChannelScheduler {
             }
 
             let index = self.ul_ts_to_sched_index(&candidate_t);
-            let elem = &self.ulsched[t as usize - 1][index];
+            let elem = &self.ulsched[candidate_t.t as usize - 1][index];
             // tracing::debug!("ul_find_grant_opportunity: sched[{}] ts {}: {:?}", index, candidate_t, elem);
             if (elem.ul1.is_none() && elem.ul2.is_none()) || (is_halfslot && (elem.ul1.is_none() || elem.ul2.is_none())) {
                 // Free UL slot, add this timeslot to result vec
@@ -1442,11 +1513,23 @@ impl BsChannelScheduler {
         addr: TetraAddress,
         debt: PendingGrantDebt,
     ) -> Option<(BasicSlotgrant, Option<u8>, usize)> {
+        self.ul_process_pending_grant_from_with_allocator(base_dltime, timeslot, addr, debt, None)
+    }
+
+    fn ul_process_pending_grant_from_with_allocator(
+        &mut self,
+        base_dltime: TdmaTime,
+        timeslot: u8,
+        addr: TetraAddress,
+        debt: PendingGrantDebt,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> Option<(BasicSlotgrant, Option<u8>, usize)> {
         let is_halfslot = debt.is_halfslot();
         let requested_cap = debt.next_chunk_slots();
 
         // Find a suitable grant opportunity
-        let grant_op = self.ul_find_grant_opportunity_from(base_dltime, timeslot, requested_cap, is_halfslot);
+        let grant_op =
+            self.ul_find_grant_opportunity_for_addr_from(base_dltime, timeslot, addr, requested_cap, is_halfslot, timeslot_alloc);
 
         tracing::debug!(
             "ul_process_cap_req: addr {}, debt {:?}, chunk_cap {}, is_halfslot {}, grant_op: {:?}",
@@ -3119,6 +3202,16 @@ impl BsChannelScheduler {
         subscribers: &SubscriberRegistry,
         energy_saving: &HashMap<u32, EnergySavingAssignment>,
     ) {
+        self.dl_integrate_sched_elems_for_timeslot_with_allocator(ts, subscribers, energy_saving, None);
+    }
+
+    fn dl_integrate_sched_elems_for_timeslot_with_allocator(
+        &mut self,
+        ts: TdmaTime,
+        subscribers: &SubscriberRegistry,
+        energy_saving: &HashMap<u32, EnergySavingAssignment>,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) {
         let Some(slot) = Self::dl_slot_index(ts.t, "dl_integrate_sched_elems_for_timeslot") else {
             return;
         };
@@ -3143,32 +3236,34 @@ impl BsChannelScheduler {
         // Process grants and acks
         for elem in grants_and_acks {
             let elem = match elem {
-                DlSchedElem::PendingGrant(addr, debt) => match self.ul_process_pending_grant_from(ts, ts.t, addr, debt) {
-                    Some((grant, usage_marker, granted_slots)) => {
-                        if let Some(remaining_debt) = debt.remaining_after_grant(granted_slots) {
-                            self.dl_defer_pending_grant_next_frame(addr, remaining_debt);
+                DlSchedElem::PendingGrant(addr, debt) => {
+                    match self.ul_process_pending_grant_from_with_allocator(ts, ts.t, addr, debt, timeslot_alloc) {
+                        Some((grant, usage_marker, granted_slots)) => {
+                            if let Some(remaining_debt) = debt.remaining_after_grant(granted_slots) {
+                                self.dl_defer_pending_grant_next_frame(addr, remaining_debt);
+                            }
+                            DlSchedElem::Grant(addr, grant, usage_marker)
                         }
-                        DlSchedElem::Grant(addr, grant, usage_marker)
+                        None => {
+                            tracing::warn!(
+                                "dl_integrate_sched_elems_for_timeslot: no grant opportunity for addr {} debt {:?} at tx {}",
+                                addr,
+                                debt,
+                                ts
+                            );
+                            // EN 300 392-2 23.5.2.2.2 defines granting delay 1111 as
+                            // "Wait for another slot grant", which restarts T.206
+                            // without granting slots. Keep the EG-gated grant pending
+                            // until a transmit window also has usable uplink capacity.
+                            self.dl_defer_pending_grant_next_frame(addr, debt);
+                            let wait_grant = BasicSlotgrant {
+                                capacity_allocation: debt.wait_capacity_allocation(),
+                                granting_delay: BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage,
+                            };
+                            DlSchedElem::Grant(addr, wait_grant, None)
+                        }
                     }
-                    None => {
-                        tracing::warn!(
-                            "dl_integrate_sched_elems_for_timeslot: no grant opportunity for addr {} debt {:?} at tx {}",
-                            addr,
-                            debt,
-                            ts
-                        );
-                        // EN 300 392-2 23.5.2.2.2 defines granting delay 1111 as
-                        // "Wait for another slot grant", which restarts T.206
-                        // without granting slots. Keep the EG-gated grant pending
-                        // until a transmit window also has usable uplink capacity.
-                        self.dl_defer_pending_grant_next_frame(addr, debt);
-                        let wait_grant = BasicSlotgrant {
-                            capacity_allocation: debt.wait_capacity_allocation(),
-                            granting_delay: BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage,
-                        };
-                        DlSchedElem::Grant(addr, wait_grant, None)
-                    }
-                },
+                }
                 elem => elem,
             };
 
@@ -3853,7 +3948,7 @@ impl BsChannelScheduler {
         } else {
             // Signalling mode (either no circuit, or hangtime on an allocated timeslot)
             // Integrate all grants and random access acks into resources (either existing or new)
-            self.dl_integrate_sched_elems_for_timeslot(ts, subscribers, energy_saving);
+            self.dl_integrate_sched_elems_for_timeslot_with_allocator(ts, subscribers, energy_saving, timeslot_alloc.as_deref());
 
             // Fill our signalling block with scheduled items (if any)
             let buf = self.dl_build_block_from_signalling_schedule(ts, subscribers, energy_saving, timeslot_alloc);
@@ -5126,6 +5221,24 @@ mod tests {
                 active_secondary_addrs: Vec::new(),
             },
         );
+    }
+
+    fn assign_test_packet_data_uplink_slots(sched: &mut BsChannelScheduler, addr: TetraAddress, slots: &[u8]) {
+        for ts in slots {
+            sched.packet_data_assignments[*ts as usize - 1] = Some(PacketDataAssignment {
+                addr,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier_num: 1001,
+                expires_at: TdmaTime { t: *ts, f: 1, m: 2, h: 0 }.add_timeslots(PACKET_DATA_ASSIGNMENT_TTL_TIMESLOTS),
+            });
+        }
+    }
+
+    fn block_test_uplink_slot(sched: &mut BsChannelScheduler, ts: TdmaTime, owner: u32) {
+        let index = sched.ul_ts_to_sched_index(&ts);
+        let elem = &mut sched.ulsched[ts.t as usize - 1][index];
+        elem.ul1 = Some(owner);
+        elem.ul2 = Some(owner);
     }
 
     fn open_test_group_circuit(sched: &mut BsChannelScheduler, ts: u8, gssi: u32, speaker_issi: u32, usage: u8) {
@@ -8537,6 +8650,71 @@ mod tests {
 
         let free_ts = TdmaTime { t: 1, f: 15, m: 1, h: 0 };
         assert_eq!(sched.ul_get_slot_owner(free_ts, PhyBlockNum::Both), None);
+    }
+
+    #[test]
+    fn test_packet_data_multislot_grant_counts_assigned_uplink_channel_opportunities() {
+        let mut sched = get_testing_slotter();
+        let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(grant_base);
+        let addr = TetraAddress::issi(0x2260618);
+        let blocker = 0x2260001;
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2, 3, 4]);
+
+        for dist in 0..14 {
+            block_test_uplink_slot(&mut sched, grant_base.add_timeslots(dist * 4), blocker);
+        }
+
+        let (grant, marker) = sched
+            .ul_process_cap_req_from(grant_base, 2, addr, &ReservationRequirement::Req1Slot)
+            .expect("multi-slot PDCH should use a nearer assigned uplink opportunity");
+
+        // EN 300 392-2 clause 23.5.2.2.2 says multi-slot assigned-channel
+        // delays count successive slots on the assigned uplink channel. TS3 in
+        // the same TDMA frame is therefore one opportunity after blocked TS2,
+        // avoiding an unencodable same-TS delay > 13.
+        assert_eq!(grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+        assert_eq!(marker, None);
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 3, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr.ssi)
+        );
+        assert_ne!(
+            sched.ul_get_slot_owner(TdmaTime { t: 2, f: 15, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr.ssi),
+            "same-TS search must not reserve the first free TS2 frame after an unencodable delay"
+        );
+    }
+
+    #[test]
+    fn test_packet_data_multislot_grant_excludes_voice_owned_timeslot() {
+        let mut sched = get_testing_slotter();
+        let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(grant_base);
+        let addr = TetraAddress::issi(0x2260618);
+        let blocker = 0x2260001;
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2, 3, 4]);
+        open_test_dl_circuit(&mut sched, 3);
+        block_test_uplink_slot(&mut sched, grant_base, blocker);
+
+        let (grant, _) = sched
+            .ul_process_cap_req_from(grant_base, 2, addr, &ReservationRequirement::Req1Slot)
+            .expect("PDCH grant should use remaining non-voice assigned slot");
+
+        // Voice/circuit ownership removes TS3 from the data channel. With TS2
+        // busy, the next legal reserved-access opportunity for this PDCH is
+        // TS4, still a representable one-opportunity delay.
+        assert_eq!(grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 3, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
+            None,
+            "packet data must not reserve uplink capacity on the voice-owned slot"
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 4, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr.ssi)
+        );
     }
 
     #[test]

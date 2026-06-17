@@ -1174,13 +1174,7 @@ fn count_ul_inactivity_timeouts(msgs: &[SapMsg], ts: u8) -> usize {
 
 fn reserve_current_uplink_for_mac_u_blck(test: &mut ComponentTest, start: TdmaTime, issi: u32) {
     let msg_dltime = start.add_timeslots(-2);
-    let umac = test
-        .router
-        .get_entity(TetraEntity::Umac)
-        .expect("UMAC entity should be registered")
-        .as_any_mut()
-        .downcast_mut::<UmacBs>()
-        .expect("registered UMAC should be UmacBs");
+    let umac = umac_bs_mut(test);
     umac.channel_scheduler
         .ul_process_cap_req_from(
             msg_dltime,
@@ -1189,6 +1183,47 @@ fn reserve_current_uplink_for_mac_u_blck(test: &mut ComponentTest, start: TdmaTi
             &ReservationRequirement::Req1Slot,
         )
         .expect("test setup should reserve the uplink slot that carries MAC-U-BLCK");
+}
+
+fn umac_bs_mut(test: &mut ComponentTest) -> &mut UmacBs {
+    test.router
+        .get_entity(TetraEntity::Umac)
+        .expect("UMAC entity should be registered")
+        .as_any_mut()
+        .downcast_mut::<UmacBs>()
+        .expect("registered UMAC should be UmacBs")
+}
+
+fn current_umac_dl_time(test: &mut ComponentTest) -> TdmaTime {
+    umac_bs_mut(test).channel_scheduler.cur_dltime
+}
+
+fn run_until_mac_u_blck_would_be_received_on_uplink_ts(test: &mut ComponentTest, target_ts: u8) -> TdmaTime {
+    for _ in 0..8 {
+        let dltime = current_umac_dl_time(test);
+        if dltime.add_timeslots(-2).t == target_ts {
+            return dltime;
+        }
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+    }
+    panic!("test setup could not align UMAC dltime so MAC-U-BLCK is received on uplink TS{target_ts}");
+}
+
+fn reserve_same_timeslot_grant_opportunities(test: &mut ComponentTest, base: TdmaTime, timeslot: u8, count: usize, owner_base: u32) {
+    let umac = umac_bs_mut(test);
+    let mut blocked = 0usize;
+    let mut dist = 0i32;
+    while blocked < count {
+        let candidate = base.forward_to_timeslot(timeslot).add_timeslots(dist * 4);
+        dist += 1;
+        if candidate.is_mandatory_clch() {
+            continue;
+        }
+        umac.channel_scheduler
+            .ul_reserve_grant(owner_base + blocked as u32, vec![candidate], false, None);
+        blocked += 1;
+    }
 }
 
 #[test]
@@ -2696,6 +2731,82 @@ fn test_mac_u_blck_reservation_requirement_enqueues_grant_for_known_slot_owner()
     assert!(
         !sink_msgs.iter().any(|msg| matches!(msg.msg, SapMsgInner::TmaUnitdataInd(_))),
         "header-only MAC-U-BLCK must not emit an empty TM-SDU"
+    );
+}
+
+#[test]
+fn test_mac_u_blck_reservation_on_multislot_pdch_uses_near_assigned_channel_slot() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime::default().add_timeslots(2);
+    let target_issi = 0x3022;
+    let target_addr = TetraAddress::issi(target_issi);
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 72,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: target_addr,
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    let inbound_dltime = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 2);
+    assert_eq!(inbound_dltime.add_timeslots(-2).t, 2);
+    let grant_tx_base = inbound_dltime.add_timeslots(2);
+    assert_eq!(grant_tx_base.t, 2, "next TS2 downlink should carry the pending slot grant");
+
+    // Occupy the next fourteen same-numbered TS2 uplink opportunities. A
+    // same-TS-only scheduler would have to encode delay 14 and would fall back
+    // to WaitForAnotherSlotgrantMessage; a multi-slot PDCH scheduler should
+    // count TS3/TS4 in the assigned channel and use TS3 immediately.
+    reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 2, 14, 0x703000);
+
+    submit_mac_u_blck(&mut test, 1);
+    test.deliver_all_messages();
+    test.run_stack(Some(4));
+
+    let sink_msgs = test.dump_sinks();
+    let slot_grant = mac_resources_for_addr(&sink_msgs, target_addr)
+        .into_iter()
+        .filter_map(|(_, resource)| resource.slot_granting_element)
+        .find(|grant| grant.capacity_allocation == BasicSlotgrantCapAlloc::Grant1Slot)
+        .expect("MAC-U-BLCK reservation on active PDCH should serialize a real slot grant");
+
+    assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant1Slot);
+    assert_eq!(
+        slot_grant.granting_delay,
+        BasicSlotgrantGrantingDelay::DelayNOpportunities(1),
+        "PDCH grant delay should count TS3 as the next assigned-channel opportunity"
+    );
+    assert_eq!(
+        umac_bs_mut(&mut test)
+            .channel_scheduler
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(1), PhyBlockNum::Both),
+        Some(target_issi),
+        "serialized grant should reserve TS3 rather than waiting for a later TS2 frame"
     );
 }
 
