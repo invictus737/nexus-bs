@@ -776,6 +776,11 @@ impl BsChannelScheduler {
             .is_some_and(|pdu_type| matches!(pdu_type, LlcPduType::AlSetup | LlcPduType::AlDataAlFinal | LlcPduType::AlAckAlRnr))
     }
 
+    fn sdu_is_first_original_al_data_segment(sdu: &BitBuffer) -> bool {
+        let mut wrapped = BitBuffer::from_bitbuffer(sdu);
+        AlData::from_bitbuf(&mut wrapped).is_ok_and(|al| al.ss == 0)
+    }
+
     fn packet_data_assignment_update_from_resource(pdu: &MacResource, sdu: &BitBuffer) -> Option<PacketDataAssignmentUpdate> {
         let addr = pdu.addr?;
         if addr.ssi_type != SsiType::Issi || !Self::sdu_is_sndcp_packet_data(sdu) {
@@ -1166,14 +1171,25 @@ impl BsChannelScheduler {
             return None;
         }
 
-        let selected = slots[self.packet_data_downlink_cursor % slots.len()];
-        self.packet_data_downlink_cursor = self.packet_data_downlink_cursor.wrapping_add(1);
+        let (selected, affinity) = if Self::sdu_is_first_original_al_data_segment(sdu) {
+            // Segment 0 is the reassembly anchor for original AL TL-SDUs.
+            // Keep multislot use for the rest of the transfer, but put this
+            // anchor on the first active PDCH slot so half-duplex, non-fast
+            // switching MSs do not repeatedly miss only S(S)=0.
+            self.packet_data_downlink_cursor = 1;
+            (slots[0], "first_al_segment")
+        } else {
+            let selected = slots[self.packet_data_downlink_cursor % slots.len()];
+            self.packet_data_downlink_cursor = self.packet_data_downlink_cursor.wrapping_add(1);
+            (selected, "round_robin")
+        };
         tracing::info!(
-            "packet-data PDCH downlink for {} selected TS{} from active {:?} sdu_kind={}",
+            "packet-data PDCH downlink for {} selected TS{} from active {:?} sdu_kind={} affinity={}",
             addr,
             selected,
             slots,
-            if Self::sdu_is_sndcp_packet_data(sdu) { "sndcp" } else { "al" }
+            if Self::sdu_is_sndcp_packet_data(sdu) { "sndcp" } else { "al" },
+            affinity
         );
         let mut timeslots = [0; NUM_TIMESLOTS];
         timeslots[0] = selected;
@@ -4661,6 +4677,21 @@ mod tests {
         sdu
     }
 
+    fn test_sndcp_al_data_sdu(ss: u8) -> BitBuffer {
+        let mut sdu = BitBuffer::new_autoexpand(32);
+        AlData {
+            final_segment: false,
+            acknowledgement_requested: true,
+            ns: 0,
+            ss,
+        }
+        .to_bitbuf(&mut sdu);
+        sdu.write_bits(MleProtocolDiscriminator::Sndcp.into_raw(), 3);
+        sdu.write_bits(0b0100, 4);
+        sdu.seek(0);
+        sdu
+    }
+
     fn test_cmce_llc_sdu() -> BitBuffer {
         let mut sdu = BitBuffer::new_autoexpand(16);
         BlUdata { has_fcs: false }.to_bitbuf(&mut sdu);
@@ -5772,6 +5803,42 @@ mod tests {
             selected,
             vec![2, 3, 4, 2],
             "packet-data downlink must start on first assigned traffic slot and then use TS2-TS4 fairly"
+        );
+    }
+
+    #[test]
+    fn test_packet_data_downlink_keeps_first_al_segment_on_first_active_pdch_slot() {
+        let mut sched = get_testing_slotter();
+        let now = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(now);
+        let addr = TetraAddress::issi(0x511a);
+        sched.apply_packet_data_assignment_update(
+            PacketDataAssignmentUpdate::Replace {
+                addr,
+                ts_assigned: [false, true, true, true],
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier_num: 1001,
+            },
+            now,
+        );
+
+        let pdu = BsChannelScheduler::dl_make_minimal_resource(&addr, None, false);
+        let ss0 = test_sndcp_al_data_sdu(0);
+        let ss1 = test_sndcp_al_data_sdu(1);
+
+        assert_eq!(
+            sched
+                .packet_data_downlink_timeslots_for_resource(&pdu, &ss0)
+                .expect("first AL segment should route on active PDCH")[0],
+            2,
+            "AL S(S)=0 is the reassembly anchor and should use the first active PDCH slot"
+        );
+        assert_eq!(
+            sched
+                .packet_data_downlink_timeslots_for_resource(&pdu, &ss1)
+                .expect("following AL segment should still use multislot PDCH")[0],
+            3,
+            "after S(S)=0, subsequent AL data should continue rotating across TS2-TS4"
         );
     }
 
