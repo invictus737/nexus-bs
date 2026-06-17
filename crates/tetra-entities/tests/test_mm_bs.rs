@@ -2684,6 +2684,7 @@ fn test_restart_recovery_keeps_group_report_pending_until_attach_detach_complete
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -5077,7 +5078,7 @@ fn test_known_migrating_location_update_deaffiliates_and_deregisters_without_acc
 }
 
 #[test]
-fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
+fn test_restart_recovery_explicit_seed_sends_location_update_command_on_startup() {
     debug::setup_logging_verbose();
     let cached_issi = 2260082;
     let seeded_issi = 2260616;
@@ -5109,30 +5110,22 @@ fn test_restart_recovery_cache_sends_location_update_command_on_startup() {
     let sink_msgs = test.dump_sinks();
     let commands = location_update_commands(&sink_msgs);
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0, cached_issi);
-    assert_eq!(commands[0].1, 0);
-    assert!(commands[0].2.group_identity_report);
-
-    test.run_stack(Some(71));
-    assert!(
-        location_update_commands(&test.dump_sinks()).is_empty(),
-        "restart recovery must pace configured/cached ISSIs instead of sending a burst"
-    );
-
-    test.run_stack(Some(1));
-    let sink_msgs = test.dump_sinks();
-    let commands = location_update_commands(&sink_msgs);
-    assert_eq!(commands.len(), 1);
     assert_eq!(commands[0].0, seeded_issi);
     assert_eq!(commands[0].1, 0);
     assert!(commands[0].2.group_identity_report);
+
+    test.run_stack(Some(72));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "auto-managed restart recovery cache must not act as an implicit startup probe list"
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
 }
 
 #[test]
-fn test_restart_recovery_cache_is_not_limited_by_local_ssi_routing_exceptions() {
+fn test_restart_recovery_cache_does_not_probe_without_explicit_seed() {
     debug::setup_logging_verbose();
     let cached_issi = 2260618;
     let path = unique_restart_recovery_path("startup-cache-with-brew-exceptions");
@@ -5147,15 +5140,16 @@ fn test_restart_recovery_cache_is_not_limited_by_local_ssi_routing_exceptions() 
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
 
     // EN 300 392-2 clause 16.4.4 permits SwMI-initiated registration with
-    // D-LOCATION UPDATE COMMAND. The volatile restart cache records terminals
-    // that were actually attached at runtime, so it must not be filtered by the
-    // operator's Brew/local routing exceptions in cell.local_ssi_ranges.
+    // D-LOCATION UPDATE COMMAND, but Nexus-BS must not turn an auto-managed
+    // stale cache into a startup probe list. Only operator-configured
+    // restart_recovery_issis may initiate commands after restart.
     test.run_stack(Some(73));
     let sink_msgs = test.dump_sinks();
     let commands = location_update_commands(&sink_msgs);
-    assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0, cached_issi);
-    assert!(commands[0].2.group_identity_report);
+    assert!(
+        commands.is_empty(),
+        "stale auto-managed cache entry must not trigger D-LOCATION-UPDATE-COMMAND at startup"
+    );
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
@@ -5175,6 +5169,7 @@ fn test_restart_recovery_large_cache_paces_one_command_per_interval_and_restores
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.cell.restart_recovery_issis = (0..member_count).map(|offset| first_issi + offset).collect();
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -5261,6 +5256,7 @@ fn test_restart_recovery_large_cache_first_sweep_reaches_every_issi_before_retry
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.cell.restart_recovery_issis = (0..member_count).map(|offset| first_issi + offset).collect();
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -5329,6 +5325,7 @@ fn test_restart_recovery_large_cache_overdue_sweep_remains_ordered_and_paced() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2_260_000, 2_269_999)]);
+    config.cell.restart_recovery_issis = (0..member_count).map(|offset| first_issi + offset).collect();
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6087,6 +6084,7 @@ fn test_restart_recovery_group_less_demand_restores_cached_affiliation() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6176,6 +6174,7 @@ fn test_restart_recovery_group_less_update_preserves_pending_swmi_refresh_until_
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
     config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6260,6 +6259,7 @@ fn test_restart_recovery_group_less_update_preserves_pending_swmi_refresh_until_
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
     config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6310,6 +6310,7 @@ fn test_restart_recovery_complete_group_report_abandons_pending_swmi_refresh() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
     config.cell.energy_saving_mode = EnergySavingMode::Eg7 as u8;
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6371,6 +6372,7 @@ fn test_group_less_roaming_location_update_preserves_restart_group_affiliation()
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6463,6 +6465,7 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6550,6 +6553,7 @@ fn test_restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_gr
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6616,6 +6620,7 @@ fn test_restart_recovery_group_refresh_reject_rolls_back_cached_affiliation_and_
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6675,6 +6680,7 @@ fn test_restart_recovery_group_refresh_accepts_unrouted_nonzero_ack_without_t353
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6745,6 +6751,7 @@ fn test_restart_recovery_group_refresh_t353_expiry_rolls_back_cached_affiliation
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6801,6 +6808,7 @@ fn test_restart_recovery_empty_complete_report_clears_cached_affiliation() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6844,6 +6852,7 @@ fn test_restart_recovery_explicit_group_report_replaces_cached_affiliation() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -6899,6 +6908,7 @@ fn test_restart_recovery_demand_location_update_restores_affiliation_and_eg3() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
     config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7025,6 +7035,7 @@ fn test_restart_recovery_failed_location_update_accept_reprobes_registration() {
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
     config.cell.energy_saving_mode = EnergySavingMode::Eg3 as u8;
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7107,6 +7118,7 @@ fn test_restart_recovery_demand_location_update_accepts_complete_group_report_wi
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7181,6 +7193,7 @@ fn test_restart_recovery_accepts_solicited_attach_detach_group_report_completion
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7284,6 +7297,7 @@ fn test_restart_recovery_group_report_complete_keeps_groups_empty() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7350,6 +7364,7 @@ fn test_restart_recovery_re_requests_group_report_when_recovered_without_groups(
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7407,6 +7422,7 @@ fn test_restart_recovery_retries_are_long_lived_and_paced() {
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
@@ -7449,6 +7465,7 @@ fn test_restart_recovery_absent_issi_expires_and_clears_cache_after_max_attempts
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
+    config.cell.restart_recovery_issis = vec![issi];
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));

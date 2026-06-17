@@ -198,7 +198,7 @@ impl MmBs {
             .as_deref()
             .map(Self::read_restart_recovery_cache)
             .unwrap_or_default();
-        let restart_recovery_entries: Vec<_> = Self::load_restart_recovery_candidates(&config, &restart_recovery_cache)
+        let restart_recovery_entries: Vec<_> = Self::load_restart_recovery_candidates(&config)
             .into_iter()
             .enumerate()
             .map(|(index, issi)| {
@@ -396,7 +396,7 @@ impl MmBs {
         std::fs::rename(&tmp, path)
     }
 
-    fn load_restart_recovery_candidates(config: &SharedConfig, cache: &RestartRecoveryCache) -> BTreeSet<u32> {
+    fn load_restart_recovery_candidates(config: &SharedConfig) -> BTreeSet<u32> {
         if !config.config().cell.registration {
             return BTreeSet::new();
         }
@@ -408,19 +408,8 @@ impl MmBs {
             }
         }
 
-        for issi in cache.keys().copied() {
-            if Self::restart_recovery_eligible(config, issi) {
-                issis.insert(issi);
-            } else {
-                tracing::warn!(
-                    "MM: restart recovery cache ISSI {} ignored because it is outside air-interface/security policy",
-                    issi
-                );
-            }
-        }
-
         if !issis.is_empty() {
-            tracing::info!("MM: restart recovery armed for {} local ISSI(s): {:?}", issis.len(), issis);
+            tracing::info!("MM: explicit restart recovery armed for {} local ISSI(s): {:?}", issis.len(), issis);
         }
 
         issis
@@ -493,6 +482,13 @@ impl MmBs {
                 }
             })
             .collect()
+    }
+
+    fn restart_recovery_cache_contains_issi(&mut self, issi: u32) -> bool {
+        if self.sync_restart_recovery_cache_path().is_none() {
+            return false;
+        }
+        self.restart_recovery_cache.contains_key(&issi)
     }
 
     fn restart_recovery_group_allowed(&self, gssi: u32) -> bool {
@@ -2088,11 +2084,12 @@ impl MmBs {
         let location_update_carries_group_state = location_update_has_group_identity_location_demand || group_report_complete;
         let was_solicited_group_report_pending = self.solicited_group_report_pending(issi);
         let was_restart_recovery_candidate = self.restart_recovery.contains_key(&issi);
+        let had_restart_recovery_cache_entry = self.restart_recovery_cache_contains_issi(issi);
         let defer_shared_registration_for_incomplete_solicited_report = pdu.location_update_type
             == LocationUpdateType::DemandLocationUpdating
             && !location_update_has_group_identity_location_demand
             && !group_report_complete
-            && (was_solicited_group_report_pending || was_restart_recovery_candidate);
+            && (was_solicited_group_report_pending || was_restart_recovery_candidate || had_restart_recovery_cache_entry);
 
         // ISSI whitelist check — reject if whitelist is non-empty and ISSI not in it.
         // The dashboard can override the config whitelist at runtime (state override takes
@@ -2467,7 +2464,11 @@ impl MmBs {
             }
         }
 
-        if is_new && !_has_groups && !group_report_complete && (was_solicited_group_report_pending || was_restart_recovery_candidate) {
+        if is_new
+            && !_has_groups
+            && !group_report_complete
+            && (was_solicited_group_report_pending || was_restart_recovery_candidate || had_restart_recovery_cache_entry)
+        {
             // EN 300 392-2 clause 16.8.0 keeps previously accepted group
             // identities valid while their lifetime remains valid. When a
             // restarted BS has just recovered the registration but the MS did
@@ -2624,7 +2625,9 @@ impl MmBs {
             && !has_groups
             && cached_restart_group_refresh.groups.is_empty()
             && !was_solicited_group_report_pending
-            && (pdu.location_update_type != LocationUpdateType::ItsiAttach || was_restart_recovery_candidate);
+            && (pdu.location_update_type != LocationUpdateType::ItsiAttach
+                || was_restart_recovery_candidate
+                || had_restart_recovery_cache_entry);
 
         self.remember_restart_recovery_issi(issi);
 
