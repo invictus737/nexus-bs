@@ -18,7 +18,8 @@ const WTP_PDU_INVOKE: u8 = 1;
 const WTP_PDU_RESULT: u8 = 2;
 const WTP_PDU_ACK: u8 = 3;
 const WTP_PDU_ABORT: u8 = 4;
-const WTP_RESULT_GTR_TTR: u8 = (WTP_PDU_RESULT << 3) | 0x06;
+const WTP_TRAILER_LAST_PACKET_OF_MESSAGE: u8 = 0x02;
+const WTP_RESULT_LAST_PACKET_OF_MESSAGE: u8 = (WTP_PDU_RESULT << 3) | WTP_TRAILER_LAST_PACKET_OF_MESSAGE;
 const WTP_TID_RESPONSE_FLAG: u16 = 0x8000;
 const WTP_TID_VALUE_MASK: u16 = 0x7fff;
 const WSP_PDU_CONNECT: u8 = 0x01;
@@ -515,7 +516,7 @@ fn parse_wsp_capabilities(mut buf: &[u8]) -> Result<Vec<WspCapability>, WapIpErr
 fn build_wtp_wsp_result(transaction_id: u16, wsp_payload: &[u8]) -> Vec<u8> {
     let response_tid = (transaction_id & WTP_TID_VALUE_MASK) | WTP_TID_RESPONSE_FLAG;
     let mut payload = Vec::with_capacity(3 + wsp_payload.len());
-    payload.push(WTP_RESULT_GTR_TTR);
+    payload.push(WTP_RESULT_LAST_PACKET_OF_MESSAGE);
     payload.extend_from_slice(&response_tid.to_be_bytes());
     payload.extend_from_slice(wsp_payload);
     payload
@@ -1092,7 +1093,7 @@ mod tests {
         assert_eq!(response_ip.destination, [10, 0, 0, 2]);
         assert_eq!(response_udp.source_port, endpoint.port);
         assert_eq!(response_udp.destination_port, 49152);
-        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR, 0x93, 0xcc]);
+        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_LAST_PACKET_OF_MESSAGE, 0x93, 0xcc]);
         assert_eq!(response_udp.payload[3], WSP_PDU_CONNECT_REPLY);
         assert_eq!(response_udp.payload[4], 0x01);
         assert_eq!(
@@ -1135,7 +1136,7 @@ mod tests {
         let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
         let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
 
-        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_GTR_TTR, 0x92, 0x34]);
+        assert_eq!(&response_udp.payload[..3], &[WTP_RESULT_LAST_PACKET_OF_MESSAGE, 0x92, 0x34]);
         assert_eq!(response_udp.payload[3], WSP_PDU_CONNECT_REPLY);
         assert_eq!(response_udp.payload[4], 0x01);
         let (capabilities_len, cap_len_octets) =
@@ -1227,6 +1228,65 @@ mod tests {
     }
 
     #[test]
+    fn wap_status_response_handles_connect_ack_then_get_sequence() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+
+        let connect_payload = build_wtp_wsp_connect_payload(0x1234, &[0x03, WSP_CAP_CLIENT_SDU_SIZE, 0x8a, 0x78]);
+        let connect_request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &connect_payload, 0x2222, 64)
+            .expect("WSP Connect request N-PDU should build");
+        let connect_response =
+            build_wap_status_response_npdu(&connect_request, endpoint, &policy(), &snapshot()).expect("WSP Connect response should build");
+        let connect_response_ip = parse_ipv4_packet(&connect_response).expect("ConnectReply IPv4 should parse");
+        let connect_response_udp = parse_udp_datagram(connect_response_ip.payload).expect("ConnectReply UDP should parse");
+        assert_eq!(
+            &connect_response_udp.payload[..4],
+            [WTP_RESULT_LAST_PACKET_OF_MESSAGE, 0x92, 0x34, WSP_PDU_CONNECT_REPLY],
+            "non-fragmented WSP ConnectReply must be a WTP Result last packet"
+        );
+
+        let ack_request = build_ipv4_udp_npdu(
+            [10, 0, 0, 2],
+            endpoint.address,
+            49152,
+            endpoint.port,
+            &[WTP_PDU_ACK << 3, 0x12, 0x34],
+            0x2223,
+            64,
+        )
+        .expect("WTP ACK request N-PDU should build");
+        assert_eq!(
+            build_wap_status_response_npdu_optional_with_npdu_budget(&ack_request, endpoint, &policy(), &snapshot(), Some(576)),
+            Ok(None),
+            "WTP ACK after ConnectReply is terminal control traffic and must not consume the page response"
+        );
+
+        let get_payload = build_wtp_wsp_get_payload(0x1235, "/status.xhtml");
+        let get_request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &get_payload, 0x2224, 64)
+            .expect("WSP GET request N-PDU should build");
+        let get_response =
+            build_wap_status_response_npdu(&get_request, endpoint, &policy(), &snapshot()).expect("WSP GET response should build");
+        let get_response_ip = parse_ipv4_packet(&get_response).expect("GET response IPv4 should parse");
+        let get_response_udp = parse_udp_datagram(get_response_ip.payload).expect("GET response UDP should parse");
+        assert_eq!(
+            &get_response_udp.payload[..7],
+            [
+                WTP_RESULT_LAST_PACKET_OF_MESSAGE,
+                0x92,
+                0x35,
+                WSP_PDU_REPLY,
+                WSP_STATUS_OK,
+                0x01,
+                WSP_CT_APP_VND_WAP_XHTML_XML,
+            ],
+            "GET /status.xhtml after WSP Connect should receive an XHTML WSP Reply"
+        );
+    }
+
+    #[test]
     fn wap_status_response_suppresses_wtp_abort_control_pdu() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
@@ -1266,7 +1326,7 @@ mod tests {
         assert_eq!(
             &response_udp.payload[..7],
             [
-                WTP_RESULT_GTR_TTR,
+                WTP_RESULT_LAST_PACKET_OF_MESSAGE,
                 0x92,
                 0x34,
                 WSP_PDU_REPLY,
@@ -1320,7 +1380,7 @@ mod tests {
         assert_eq!(
             &response_udp.payload[..7],
             [
-                WTP_RESULT_GTR_TTR,
+                WTP_RESULT_LAST_PACKET_OF_MESSAGE,
                 0x92,
                 0x34,
                 WSP_PDU_REPLY,

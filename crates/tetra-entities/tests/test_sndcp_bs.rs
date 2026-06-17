@@ -1078,7 +1078,7 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
     assert_eq!(
         &response_udp.payload[..7],
-        &[0x16, 0x92, 0x34, 0x04, 0x20, 0x01, 0xc5],
+        &[0x12, 0x92, 0x34, 0x04, 0x20, 0x01, 0xc5],
         "WSP GET should receive WTP Result + WSP Reply 200 application/vnd.wap.xhtml+xml"
     );
     let page = std::str::from_utf8(&response_udp.payload[7..]).expect("XHTML response should be UTF-8");
@@ -1207,7 +1207,7 @@ fn sndcp_wap_al_connect_reply_e2e_acknowledges_segmented_response() {
     assert_eq!(response_udp.destination_port, 49_152);
     assert_eq!(
         &response_udp.payload[..4],
-        &[0x16, 0x92, 0x34, 0x02],
+        &[0x12, 0x92, 0x34, 0x02],
         "WSP Connect should receive WTP Result + WSP ConnectReply"
     );
     assert_eq!(
@@ -1334,7 +1334,7 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert_eq!(response_udp.destination_port, 49_152);
     assert_eq!(
         &response_payload[..7],
-        &[0x16, 0x92, 0x35, 0x04, 0x20, 0x01, 0xc5],
+        &[0x12, 0x92, 0x35, 0x04, 0x20, 0x01, 0xc5],
         "WSP GET should receive WTP Result + WSP Reply(application/vnd.wap.xhtml+xml)"
     );
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
