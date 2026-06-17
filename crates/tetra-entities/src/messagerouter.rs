@@ -50,6 +50,13 @@ impl MessageQueue {
     pub fn pop_front(&mut self) -> Option<SapMsg> {
         self.messages.pop_front()
     }
+
+    pub fn retain<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&SapMsg) -> bool,
+    {
+        self.messages.retain(|message| f(message));
+    }
 }
 
 pub struct MessageRouter {

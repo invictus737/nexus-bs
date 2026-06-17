@@ -782,11 +782,31 @@ impl CcBsSubentity {
             );
         }
 
+        self.refresh_group_cached_d_setup_speaker(call_id, source_issi);
+        self.discard_queued_group_d_setups_for_call(
+            queue,
+            call_id,
+            TetraAddress::new(dest_gssi, SsiType::Gssi),
+            "network group speaker change",
+        );
+        let Some(setup_refresh_reporter) =
+            self.send_group_d_setup_refresh_reported(queue, call_id, ts, usage, "network group speaker change")
+        else {
+            return Err(GroupTransitionError::MissingCachedSetup(call_id));
+        };
         let ready_reporter = self.send_network_d_tx_granted_facch_reported(queue, call_id, source_issi, dest_gssi, ts, usage);
         self.reset_group_t310_after_floor_grant(call_id);
-        self.refresh_group_cached_d_setup_speaker(call_id, source_issi);
 
-        self.queue_network_group_ready(call_id, brew_uuid, source_issi, dest_gssi, ts, usage, vec![ready_reporter], true);
+        self.queue_network_group_ready(
+            call_id,
+            brew_uuid,
+            source_issi,
+            dest_gssi,
+            ts,
+            usage,
+            vec![setup_refresh_reporter, ready_reporter],
+            true,
+        );
 
         Ok(())
     }

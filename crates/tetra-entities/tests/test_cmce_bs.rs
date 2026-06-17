@@ -3032,6 +3032,7 @@ fn test_network_group_speaker_change_updates_dashboard_after_rf_grant() {
 
     let first_uuid = uuid::Uuid::new_v4();
     let (call_id, active_ts, _start_msgs) = start_network_group_call(&mut test, first_uuid, TEST_CALLED_ISSI, TEST_GSSI, 7);
+    let active_usage = call_id as u8;
 
     let dashboard = DashboardServer::new("test.toml".to_string());
     for event in drain_telemetry(&telemetry_source) {
@@ -3054,8 +3055,44 @@ fn test_network_group_speaker_change_updates_dashboard_after_rf_grant() {
     let grant_msgs = test.dump_sinks();
     assert!(
         network_group_ready_tuple(&grant_msgs, second_uuid).is_none(),
-        "network speaker change must wait until RF D-TX GRANTED is transmitted before Brew ready/dashboard update"
+        "network speaker change must wait until RF D-SETUP refresh and D-TX GRANTED are transmitted before Brew ready/dashboard update"
     );
+
+    let matching_setups: Vec<_> = grant_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .filter(|(prim, setup)| prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi) && setup.call_identifier == call_id)
+        .collect();
+    let setup_speakers: Vec<_> = matching_setups.iter().map(|(_, setup)| setup.calling_party_address_ssi).collect();
+    assert_eq!(
+        setup_speakers,
+        vec![Some(TEST_OTHER_ISSI)],
+        "network speaker change should suppress stale GSSI D-SETUPs and advertise only the new speaker ISSI"
+    );
+    let setup_refresh = matching_setups
+        .first()
+        .expect("network speaker change should send immediate GSSI D-SETUP refresh");
+    assert_eq!(setup_refresh.1.transmission_grant, TransmissionGrant::GrantedToOtherUser);
+    let setup_refresh_alloc = setup_refresh
+        .0
+        .chan_alloc
+        .as_ref()
+        .expect("network speaker change D-SETUP refresh should carry channel allocation");
+    assert_chan_alloc_matches_circuit(
+        setup_refresh_alloc,
+        active_ts,
+        active_usage,
+        "network-origin speaker-change D-SETUP refresh",
+    );
+    assert_eq!(setup_refresh_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    let setup_refresh_reporter = setup_refresh
+        .0
+        .tx_reporter
+        .clone()
+        .expect("network speaker change D-SETUP refresh should carry TxReporter");
 
     let grant_reporter = d_tx_granted_reporter(
         &grant_msgs,
@@ -3077,16 +3114,24 @@ fn test_network_group_speaker_change_updates_dashboard_after_rf_grant() {
         network_listener_grant.0,
         &network_listener_grant.1,
         active_ts,
-        call_id as u8,
+        active_usage,
         UlDlAssignment::Both,
         "network-origin listener floor notification must preserve UL request signalling",
     );
     grant_reporter.mark_transmitted();
     test.run_stack(Some(1));
+    let not_ready_msgs = test.dump_sinks();
+    assert!(
+        network_group_ready_tuple(&not_ready_msgs, second_uuid).is_none(),
+        "network speaker change must not notify Brew ready until the D-SETUP refresh is also transmitted"
+    );
+
+    setup_refresh_reporter.mark_transmitted();
+    test.run_stack(Some(1));
     let ready_msgs = test.dump_sinks();
     assert!(
         network_group_ready_tuple(&ready_msgs, second_uuid).is_some(),
-        "network speaker change should notify Brew ready after RF D-TX GRANTED transmission"
+        "network speaker change should notify Brew ready after RF D-SETUP refresh and D-TX GRANTED transmission"
     );
 
     let events = drain_telemetry(&telemetry_source);
@@ -4060,14 +4105,33 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
         UlDlAssignment::Both
     );
 
+    let matching_setups: Vec<_> = msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::LcmcMleUnitdataReq(prim) => parse_d_setup(prim).map(|pdu| (prim, pdu)),
+            _ => None,
+        })
+        .filter(|(prim, setup)| prim.main_address == TetraAddress::new(TEST_GSSI, SsiType::Gssi) && setup.call_identifier == call_id)
+        .collect();
+    let setup_speakers: Vec<_> = matching_setups.iter().map(|(_, setup)| setup.calling_party_address_ssi).collect();
+    assert_eq!(
+        setup_speakers,
+        vec![Some(TEST_CALLED_ISSI)],
+        "network preemption should suppress stale GSSI D-SETUPs and advertise only the preempting speaker ISSI"
+    );
+    let setup_refresh_reporter = matching_setups
+        .first()
+        .and_then(|(prim, _)| prim.tx_reporter.clone())
+        .expect("network preemption D-SETUP refresh should carry TxReporter");
+
     assert_eq!(
         count_umac_floor_granted(&msgs),
         0,
-        "network preemption must wait for RF D-TX-GRANTED transmission before U-plane activation"
+        "network preemption must wait for RF D-SETUP refresh and D-TX-GRANTED transmission before U-plane activation"
     );
     assert!(
         network_group_ready_tuple(&msgs, brew_uuid).is_none(),
-        "network preemption must not report ready before RF D-TX-GRANTED transmission"
+        "network preemption must not report ready before RF D-SETUP refresh and D-TX-GRANTED transmission"
     );
     let grant_reporter = d_tx_granted_reporter(
         &msgs,
@@ -4075,6 +4139,15 @@ fn test_network_group_preemption_emits_d_tx_interrupt_before_d_tx_granted() {
         TransmissionGrant::GrantedToOtherUser,
     );
     grant_reporter.mark_transmitted();
+    test.run_stack(Some(1));
+    let grant_only_msgs = test.dump_sinks();
+    assert_eq!(count_umac_floor_granted(&grant_only_msgs), 0);
+    assert!(
+        network_group_ready_tuple(&grant_only_msgs, brew_uuid).is_none(),
+        "network preemption must not report ready until the D-SETUP refresh is also transmitted"
+    );
+
+    setup_refresh_reporter.mark_transmitted();
     test.run_stack(Some(1));
     let activation_msgs = test.dump_sinks();
     assert_eq!(count_umac_floor_granted(&activation_msgs), 1);

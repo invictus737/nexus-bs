@@ -314,14 +314,101 @@ impl CcBsSubentity {
         }
 
         // EN 300 392-2 clauses 14.5.2.1.1/14.5.2.1.2 make D-SETUP carry
-        // the call's current calling/transmitting party for group-call setup
-        // and late entry. Clause 14.5.2.2.1 then moves the active floor with
-        // D-TX GRANTED; keep the cached back-up D-SETUP coherent with that
-        // floor so late-entry resends do not advertise a stale speaker.
+        // the group call's calling party for setup and late entry. Clause
+        // 14.5.2.2.1 then moves the active floor with D-TX GRANTED; keep the
+        // cached back-up D-SETUP coherent with that floor so late-entry
+        // resends do not advertise a stale speaker.
         cached.pdu.calling_party_address_ssi = Some(speaker_issi);
         cached.pdu.transmission_grant = TransmissionGrant::GrantedToOtherUser;
         cached.pdu.transmission_request_permission = false;
         cached.last_resend_reporter = None;
+    }
+
+    pub(super) fn discard_queued_group_d_setups_for_call(
+        &self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        dest_addr: TetraAddress,
+        reason: &str,
+    ) -> usize {
+        let mut discarded = 0;
+        queue.retain(|msg| {
+            let should_discard = match &msg.msg {
+                SapMsgInner::LcmcMleUnitdataReq(prim) if prim.main_address == dest_addr => {
+                    Self::parse_d_setup_call_id(prim).is_some_and(|queued_call_id| queued_call_id == call_id)
+                }
+                _ => false,
+            };
+
+            if should_discard {
+                if let SapMsgInner::LcmcMleUnitdataReq(prim) = &msg.msg
+                    && let Some(reporter) = &prim.tx_reporter
+                {
+                    reporter.try_mark_discarded();
+                }
+                discarded += 1;
+            }
+
+            !should_discard
+        });
+
+        if discarded > 0 {
+            tracing::debug!(
+                "CMCE: discarded {} queued stale group D-SETUP(s) for call_id={} addr={} because {}",
+                discarded,
+                call_id,
+                dest_addr,
+                reason
+            );
+        }
+
+        discarded
+    }
+
+    fn parse_d_setup_call_id(prim: &LcmcMleUnitdataReq) -> Option<u16> {
+        let pdu_type = prim.sdu.peek_bits(5).and_then(|bits| CmcePduTypeDl::try_from(bits).ok());
+        if pdu_type != Some(CmcePduTypeDl::DSetup) {
+            return None;
+        }
+
+        let mut sdu = BitBuffer::from_bitbuffer(&prim.sdu);
+        DSetup::from_bitbuf(&mut sdu).ok().map(|pdu| pdu.call_identifier)
+    }
+
+    pub(super) fn send_group_d_setup_refresh_reported(
+        &mut self,
+        queue: &mut MessageQueue,
+        call_id: u16,
+        ts: u8,
+        usage: u8,
+        reason: &str,
+    ) -> Option<TxReporter> {
+        let Some(cached) = self.cached_setups.get_mut(&call_id) else {
+            tracing::warn!("CMCE: cannot send group D-SETUP refresh for call_id={} ({})", call_id, reason);
+            return None;
+        };
+        if cached.is_individual {
+            tracing::warn!(
+                "CMCE: refusing to send group D-SETUP refresh for individual call_id={} ({})",
+                call_id,
+                reason
+            );
+            return None;
+        }
+
+        let dest_addr = cached.dest_addr;
+        let reporter = TxReporter::new_unacked();
+        cached.last_resend_reporter = Some(reporter.clone());
+        let (sdu, chan_alloc) = Self::build_d_setup_prim(&cached.pdu, usage, ts, UlDlAssignment::Both);
+        let msg = Self::build_sapmsg(
+            sdu,
+            Some(chan_alloc),
+            dest_addr,
+            Layer2Service::Unacknowledged,
+            Some(reporter.clone()),
+        );
+        queue.push_back(msg);
+        Some(reporter)
     }
 
     /// Build a generic SAP message addressed to MLE via LCMC.
@@ -1647,9 +1734,9 @@ impl CcBsSubentity {
             .pending_network_group_readies
             .iter()
             .filter_map(|(&call_id, pending)| {
-                if pending.reporters.is_empty() || pending.reporters.iter().any(TxReporter::is_transmitted) {
+                if pending.reporters.is_empty() || pending.reporters.iter().all(TxReporter::is_transmitted) {
                     Some((call_id, true))
-                } else if pending.reporters.iter().all(TxReporter::is_discarded)
+                } else if pending.reporters.iter().all(TxReporter::is_in_final_state)
                     || pending.started_at.age(self.dltime) >= NETWORK_GROUP_READY_PENDING_TIMEOUT_TIMESLOTS
                 {
                     Some((call_id, false))
