@@ -37,8 +37,10 @@ const WSP_CAP_PROTOCOL_OPTIONS: u8 = 0x82;
 const WSP_CAP_METHOD_MOR: u8 = 0x83;
 const WSP_CAP_EXTENDED_METHODS: u8 = 0x85;
 const WSP_CAP_HEADER_CODE_PAGES: u8 = 0x86;
-const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 1400;
-const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 1400;
+// Keep default WSP SDUs inside a 576-octet SNDCP N-PDU on a one-slot PDCH.
+// IPv4+UDP consumes 28 octets and WTP Result consumes 3 octets.
+const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 545;
+const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 545;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1092,13 +1094,17 @@ mod tests {
         assert_eq!(response_ip.destination, [10, 0, 0, 226]);
         assert_eq!(response_ip.identification, 0x2223);
         assert_eq!(response_ip.ttl, 32);
+        assert!(
+            response.len() <= IPV4_UDP_HEADER_BYTES + DEFAULT_WAP_STATUS_MAX_BYTES,
+            "fallback WAP status response N-PDU should remain one-slot safe: {} bytes",
+            response.len()
+        );
         assert_eq!(response_udp.source_port, endpoint.port);
         assert_eq!(response_udp.destination_port, 49152);
         let page = std::str::from_utf8(response_udp.payload).expect("WAP status page should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("-//WAPFORUM//DTD XHTML Mobile 1.0//EN"));
         assert!(page.contains("Welcome to Nexus-BS"));
-        assert!(page.contains("WAP 2.0 / WML2"));
         assert!(!page.contains("<wml"));
         assert!(!page.contains("<card"));
         assert!(page.contains("Nexus-BS"));
@@ -1172,12 +1178,12 @@ mod tests {
                 0x00,
                 0x03,
                 WSP_CAP_CLIENT_SDU_SIZE,
-                0x8a,
-                0x78,
+                0x84,
+                0x21,
                 0x03,
                 WSP_CAP_SERVER_SDU_SIZE,
-                0x8a,
-                0x78
+                0x84,
+                0x21
             ]
         );
     }

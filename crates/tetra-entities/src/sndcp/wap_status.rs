@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 // SPDX-FileComment: Nexus-BS original WAP 2.0/WML2 status renderer for TETRA packet-data experiments.
 
-pub const DEFAULT_WAP_STATUS_MAX_BYTES: usize = 1400;
+pub const DEFAULT_WAP_STATUS_MAX_BYTES: usize = 548;
 pub const WAP_STATUS_REFRESH_PATH: &str = "/status.xhtml";
 pub const WAP_STATUS_LEGACY_WML_PATH: &str = "/status.wml";
 pub const WAP_STATUS_HTML_PATH: &str = "/status.html";

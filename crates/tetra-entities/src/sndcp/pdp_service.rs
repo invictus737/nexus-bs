@@ -102,7 +102,7 @@ impl SndcpPdpPolicy {
             accept_type_b_alternating: true,
             accept_type_c_ip_single_mode: true,
             accept_type_d_restricted_ip_single_mode: false,
-            maximum_transmission_unit: SndcpMaximumTransmissionUnit::Octets1500,
+            maximum_transmission_unit: SndcpMaximumTransmissionUnit::Octets576,
             ..Self::default()
         }
     }
@@ -447,10 +447,10 @@ mod tests {
         assert_eq!(accept.nsapi, 2);
         assert_eq!(accept.type_identifier, SndcpTypeIdentifierInAccept::Ipv4DynamicAddress);
         assert_eq!(accept.assigned_address, Some(SnAddress::Ipv4([10, 0, 0, 2])));
-        assert_eq!(accept.maximum_transmission_unit, SndcpMaximumTransmissionUnit::Octets1500);
+        assert_eq!(accept.maximum_transmission_unit, SndcpMaximumTransmissionUnit::Octets576);
         assert_eq!(context.key.issi, 2260618);
         assert_eq!(context.address, SnAddress::Ipv4([10, 0, 0, 2]));
-        assert_eq!(context.max_npdu_len, Some(1500));
+        assert_eq!(context.max_npdu_len, Some(576));
         assert!(service.contexts().get_issi_nsapi(2260618, 2).unwrap().is_some());
     }
 

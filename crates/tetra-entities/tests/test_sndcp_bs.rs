@@ -969,10 +969,14 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     assert_eq!(response_ip.destination, [10, 0, 0, 2]);
     assert_eq!(response_udp.source_port, 9200);
     assert_eq!(response_udp.destination_port, 49_152);
+    assert!(
+        response_octets.len() <= 576,
+        "WAP status SN-UNITDATA response should fit the single-slot-safe SNDCP MTU: {} bytes",
+        response_octets.len()
+    );
     let page = std::str::from_utf8(response_udp.payload).unwrap();
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("Welcome to Nexus-BS"));
-    assert!(page.contains("WAP 2.0 / WML2"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 }
@@ -1093,8 +1097,9 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         response_udp.payload.len()
     );
     assert!(
-        response_udp.payload.len() > 448 + 7,
-        "segmented AL path should carry the normal XHTML page rather than the old tiny workaround"
+        response_octets.len() <= 576,
+        "single-slot WAP/IP response N-PDU should fit the negotiated 576-octet SNDCP MTU: {} bytes",
+        response_octets.len()
     );
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("Welcome to Nexus-BS"));
@@ -1212,7 +1217,7 @@ fn sndcp_wap_al_connect_reply_e2e_acknowledges_segmented_response() {
     );
     assert_eq!(
         &response_udp.payload[5..],
-        &[0x08, 0x00, 0x03, 0x80, 0x8a, 0x78, 0x03, 0x81, 0x8a, 0x78],
+        &[0x08, 0x00, 0x03, 0x80, 0x84, 0x21, 0x03, 0x81, 0x84, 0x21],
         "ConnectReply should keep WSP negotiation to bounded SDU sizes"
     );
 

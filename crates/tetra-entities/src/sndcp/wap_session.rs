@@ -491,7 +491,7 @@ mod tests {
             .expect("activation should produce accept PDU");
         let accept = decode_activate_pdp_context_accept(&accept_pdu).expect("activation accept should decode");
         assert_eq!(accept.assigned_address, Some(SnAddress::Ipv4([10, 0, 0, 2])));
-        assert_eq!(accept.maximum_transmission_unit, SndcpMaximumTransmissionUnit::Octets1500);
+        assert_eq!(accept.maximum_transmission_unit, SndcpMaximumTransmissionUnit::Octets576);
         assert_eq!(session.state_for_issi(ISSI), SwmiSndcpState::Standby);
         enter_ready(&mut session, 2);
 
