@@ -788,7 +788,7 @@ mod tests {
         let allocation = req.chan_alloc.expect("PDCH allocation should be present");
         assert_eq!(allocation.usage, None);
         assert_eq!(allocation.carrier, None);
-        assert_eq!(allocation.timeslots, [false, false, false, true]);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
         assert_eq!(allocation.alloc_type, tetra_saps::lcmc::enums::alloc_type::ChanAllocType::Replace);
         assert_eq!(
             allocation.ul_dl_assigned,
@@ -832,11 +832,11 @@ mod tests {
 
         let allocation = req.chan_alloc.expect("PDCH allocation should be present");
         assert_eq!(allocation.usage, None);
-        assert_eq!(allocation.timeslots, [false, false, false, true]);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
         assert!(!allocation.timeslots[0], "single-slot PDCH must preserve MCCH TS1");
         assert!(
-            !allocation.timeslots[1] && !allocation.timeslots[2],
-            "single-slot resource/capability must not advertise TS2/TS3"
+            !allocation.timeslots[2] && !allocation.timeslots[3],
+            "single-slot resource/capability must not advertise TS3/TS4"
         );
         assert_eq!(allocation.alloc_type, tetra_saps::lcmc::enums::alloc_type::ChanAllocType::Replace);
         assert_eq!(
@@ -885,7 +885,7 @@ mod tests {
 
         let allocation = req.chan_alloc.expect("PDCH allocation should be present");
         assert_eq!(allocation.usage, None);
-        assert_eq!(allocation.timeslots, [false, false, false, true]);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
         assert_eq!(allocation.alloc_type, tetra_saps::lcmc::enums::alloc_type::ChanAllocType::Replace);
         assert_eq!(
             allocation.ul_dl_assigned,
@@ -933,7 +933,7 @@ mod tests {
 
         let allocation = req.chan_alloc.expect("PDCH allocation should be present");
         assert_eq!(allocation.usage, None);
-        assert_eq!(allocation.timeslots, [false, false, false, true]);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
         assert_eq!(allocation.alloc_type, tetra_saps::lcmc::enums::alloc_type::ChanAllocType::Replace);
         assert_eq!(
             allocation.ul_dl_assigned,
@@ -1045,7 +1045,7 @@ mod tests {
             .chan_alloc
             .expect("existing PDCH refresh must carry a replacement channel allocation");
         assert_eq!(allocation.usage, None);
-        assert_eq!(allocation.timeslots, [false, false, false, true]);
+        assert_eq!(allocation.timeslots, [false, true, false, false]);
         assert_eq!(allocation.alloc_type, ChanAllocType::Replace);
         assert_eq!(allocation.ul_dl_assigned, UlDlAssignment::Both);
     }

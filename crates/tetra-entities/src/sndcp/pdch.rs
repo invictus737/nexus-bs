@@ -29,7 +29,7 @@ pub const LTPD_CONFIG_REASON_RECOVERY_OF_RADIO_RESOURCES: Todo = 4;
 pub const SNDCP_PDCH_TIMESLOT_MIN: u8 = 1;
 pub const SNDCP_PDCH_TIMESLOT_MAX: u8 = 4;
 pub const SNDCP_PDCH_ASSIGNED_SCCH_TIMESLOTS: [bool; 4] = [false, true, true, true];
-pub const SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT: [bool; 4] = [false, false, false, true];
+pub const SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT: [bool; 4] = [false, true, false, false];
 pub const SNDCP_TRAFFIC_USAGE_MARKER_MIN: u8 = 4;
 pub const SNDCP_TRAFFIC_USAGE_MARKER_MAX: u8 = 62;
 
@@ -37,7 +37,6 @@ pub fn normalize_pdch_timeslots_to_single(timeslots: [bool; 4]) -> [bool; 4] {
     let selected_idx = timeslots
         .iter()
         .enumerate()
-        .rev()
         .find_map(|(idx, assigned)| (*assigned && idx > 0).then_some(idx))
         .or_else(|| timeslots.iter().enumerate().find_map(|(idx, assigned)| (*assigned).then_some(idx)));
 
@@ -312,6 +311,13 @@ impl SndcpPdchManager {
         self.sessions.get(&issi).copied()
     }
 
+    pub fn session_issis_for_endpoint(&self, endpoint_id: EndpointId) -> Vec<u32> {
+        self.sessions
+            .iter()
+            .filter_map(|(issi, session)| (session.endpoint_id == endpoint_id).then_some(*issi))
+            .collect()
+    }
+
     pub fn observe_ltpd_unitdata_ind(&mut self, issi: u32, ind: &LtpdMleUnitdataInd) -> Result<(), SndcpPdchError> {
         let session = self.ensure_session(issi, ind.endpoint_id, ind.link_id);
         validate_endpoint_link(issi, session, ind.endpoint_id, ind.link_id)?;
@@ -343,6 +349,7 @@ impl SndcpPdchManager {
             }
             SndcpLtpdConfigureReason::RecoveryOfRadioResources => {
                 session.state = SndcpPdchState::CommonControl;
+                session.link_id = SNDCP_BASIC_LINK_ID;
             }
             _ => {}
         }
@@ -1475,7 +1482,7 @@ mod tests {
         assert_eq!(lower.placement, SndcpMacChannelAllocationPlacement::MacResource);
         assert_eq!(lower.chan_alloc.usage, None);
         assert_eq!(lower.chan_alloc.carrier, None);
-        assert_eq!(lower.chan_alloc.timeslots, [false, false, false, true]);
+        assert_eq!(lower.chan_alloc.timeslots, [false, true, false, false]);
         assert_eq!(
             lower.chan_alloc.timeslots.iter().filter(|assigned| **assigned).count(),
             1,
@@ -1531,8 +1538,8 @@ mod tests {
         assert_eq!(single_policy.timeslots, SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT);
         assert!(!single_policy.timeslots[0], "single-slot PDCH must not allocate MCCH TS1");
         assert!(
-            !single_policy.timeslots[1] && !single_policy.timeslots[2],
-            "single-slot phase-modulation capability must not expand to TS2/TS3"
+            !single_policy.timeslots[2] && !single_policy.timeslots[3],
+            "single-slot phase-modulation capability must not expand to TS3/TS4"
         );
 
         let unspecified_four_slot = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
@@ -1710,6 +1717,7 @@ mod tests {
             .handle_ltpd_configure_ind_fail_closed(
                 ISSI,
                 &LtpdMleConfigureInd {
+                    received_tetra_address: Some(TetraAddress::issi(ISSI)),
                     endpoint_id: 3,
                     chan_change_responce_required: false,
                     chan_change_handle: -1,
@@ -1730,6 +1738,41 @@ mod tests {
                 state: SndcpPdchState::RadioResourceLost
             })
         );
+    }
+
+    #[test]
+    fn recovery_of_radio_resources_resets_session_to_basic_common_control_link() {
+        let mut manager = SndcpPdchManager::new();
+        manager.mark_pdch_ready(ISSI, 3, 7);
+        let loss = LtpdMleConfigureInd {
+            received_tetra_address: Some(TetraAddress::issi(ISSI)),
+            endpoint_id: 3,
+            chan_change_responce_required: false,
+            chan_change_handle: -1,
+            reason_for_config_indication: LTPD_CONFIG_REASON_LOSS_OF_RADIO_RESOURCES,
+            conflicting_endpoint_id: 0,
+        };
+        manager
+            .handle_ltpd_configure_ind_fail_closed(ISSI, &loss, SndcpStatusForMle::Idle)
+            .expect("loss indication should be handled");
+
+        let recovery = LtpdMleConfigureInd {
+            reason_for_config_indication: LTPD_CONFIG_REASON_RECOVERY_OF_RADIO_RESOURCES,
+            ..loss
+        };
+        manager
+            .handle_ltpd_configure_ind_fail_closed(ISSI, &recovery, SndcpStatusForMle::Ready)
+            .expect("recovery indication should be handled");
+
+        let plan = manager
+            .plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+                link_id: SNDCP_BASIC_LINK_ID,
+                pdch_available: true,
+                ..packet_plan_input()
+            })
+            .expect("post-recovery retry on common control should plan a fresh PDCH");
+
+        assert_eq!(plan.allocation, SndcpPacketDataAllocationDecision::NewPdchAllocation);
     }
 
     #[test]

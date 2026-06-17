@@ -2485,7 +2485,7 @@ fn test_assigned_pdch_mac_u_blck_payload_reaches_llc_with_packet_data_owner() {
     debug::setup_logging_verbose();
 
     let target_issi = 2_260_618;
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(3)));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
     test.submit_message(SapMsg {
@@ -2515,7 +2515,7 @@ fn test_assigned_pdch_mac_u_blck_payload_reaches_llc_with_packet_data_owner() {
     });
     test.run_stack(Some(32));
     let _ = test.dump_sinks();
-    let _ = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 4);
+    let _ = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 2);
 
     let mut payload = BitBuffer::new_autoexpand(24);
     BlUdata { has_fcs: false }.to_bitbuf(&mut payload);
@@ -2743,7 +2743,7 @@ fn test_mac_u_blck_reservation_on_single_slot_pdch_waits_instead_of_using_adjace
     let start = TdmaTime::default().add_timeslots(2);
     let target_issi = 0x3022;
     let target_addr = TetraAddress::issi(target_issi);
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(start));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
 
@@ -2775,15 +2775,15 @@ fn test_mac_u_blck_reservation_on_single_slot_pdch_waits_instead_of_using_adjace
     test.run_stack(Some(32));
     let _ = test.dump_sinks();
 
-    let inbound_dltime = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 4);
-    assert_eq!(inbound_dltime.add_timeslots(-2).t, 4);
+    let inbound_dltime = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 2);
+    assert_eq!(inbound_dltime.add_timeslots(-2).t, 2);
     let grant_tx_base = inbound_dltime.add_timeslots(2);
-    assert_eq!(grant_tx_base.t, 4, "next TS4 downlink should carry the pending slot grant");
+    assert_eq!(grant_tx_base.t, 2, "next TS2 downlink should carry the pending slot grant");
 
-    // Occupy the next fourteen same-numbered TS4 uplink opportunities. The
+    // Occupy the next fourteen same-numbered TS2 uplink opportunities. The
     // WAP/IP MVP deliberately uses exactly one PDCH slot, so the scheduler
-    // must not jump to alternate TS2/TS3 when TS4 delay is unencodable.
-    reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 4, 14, 0x703000);
+    // must not jump to alternate TS3/TS4 when TS2 delay is unencodable.
+    reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 2, 14, 0x703000);
 
     submit_mac_u_blck(&mut test, 1);
     test.deliver_all_messages();
@@ -2805,16 +2805,16 @@ fn test_mac_u_blck_reservation_on_single_slot_pdch_waits_instead_of_using_adjace
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
-            .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(1), PhyBlockNum::Both),
         None,
-        "single-slot PDCH must not reserve TS2"
+        "single-slot PDCH must not reserve TS3"
     );
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
-            .ul_get_slot_owner(grant_tx_base.add_timeslots(3), PhyBlockNum::Both),
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
         None,
-        "single-slot PDCH must not reserve TS3"
+        "single-slot PDCH must not reserve TS4"
     );
 }
 
@@ -2825,7 +2825,7 @@ fn test_mac_u_blck_large_reservation_on_single_slot_pdch_waits_when_delay_unenco
     let start = TdmaTime::default().add_timeslots(2);
     let target_issi = 0x3023;
     let target_addr = TetraAddress::issi(target_issi);
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(start));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
 
@@ -2857,16 +2857,16 @@ fn test_mac_u_blck_large_reservation_on_single_slot_pdch_waits_when_delay_unenco
     test.run_stack(Some(32));
     let _ = test.dump_sinks();
 
-    let inbound_dltime = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 4);
-    assert_eq!(inbound_dltime.add_timeslots(-2).t, 4);
+    let inbound_dltime = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 2);
+    assert_eq!(inbound_dltime.add_timeslots(-2).t, 2);
     let grant_tx_base = inbound_dltime.add_timeslots(2);
-    assert_eq!(grant_tx_base.t, 4, "next TS4 downlink should carry the pending slot grant");
+    assert_eq!(grant_tx_base.t, 2, "next TS2 downlink should carry the pending slot grant");
 
-    reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 4, 14, 0x703100);
+    reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 2, 14, 0x703100);
 
     // MAC-U-BLCK reservation raw value 8 maps to Req10Slots. With the WAP/IP
-    // MVP restricted to a single PDCH slot, blocked TS4 opportunities must
-    // result in wait/retry instead of a reduced chunk on alternate TS2+TS3.
+    // MVP restricted to a single PDCH slot, blocked TS2 opportunities must
+    // result in wait/retry instead of a reduced chunk on alternate TS3+TS4.
     submit_mac_u_blck(&mut test, 8);
     test.deliver_all_messages();
     test.run_stack(Some(4));
@@ -2885,16 +2885,16 @@ fn test_mac_u_blck_large_reservation_on_single_slot_pdch_waits_when_delay_unenco
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
-            .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(1), PhyBlockNum::Both),
         None,
-        "single-slot PDCH must not reserve TS2 for a large grant"
+        "single-slot PDCH must not reserve TS3 for a large grant"
     );
     assert_eq!(
         umac_bs_mut(&mut test)
             .channel_scheduler
-            .ul_get_slot_owner(grant_tx_base.add_timeslots(3), PhyBlockNum::Both),
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
         None,
-        "single-slot PDCH must not reserve TS3 for a large grant"
+        "single-slot PDCH must not reserve TS4 for a large grant"
     );
 }
 
@@ -3774,7 +3774,7 @@ fn test_sndcp_pdch_channel_allocation_maintains_single_assigned_scch_without_tra
     debug::setup_logging_verbose();
 
     let target_issi = 0x5106;
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let test_prim = TmaUnitdataReq {
         req_handle: 51,
         pdu: build_sndcp_bl_udata_sdu(),
@@ -3820,12 +3820,12 @@ fn test_sndcp_pdch_channel_allocation_maintains_single_assigned_scch_without_tra
         sink_msgs.iter().any(|msg| {
             matches!(
                 &msg.msg,
-                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 4 && has_assigned_schf_slot(slot)
+                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 2 && has_assigned_schf_slot(slot)
             )
         }),
-        "single assigned packet-data TS4 should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+        "single assigned packet-data TS2 should be maintained as assigned SCCH/SCH/F without a traffic circuit"
     );
-    for ts in [2, 3] {
+    for ts in [3, 4] {
         assert!(
             sink_msgs.iter().all(|msg| {
                 !matches!(
@@ -3856,7 +3856,7 @@ fn test_sndcp_al_final_pdch_channel_allocation_maintains_single_assigned_scch() 
     debug::setup_logging_verbose();
 
     let target_issi = 0x5107;
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let test_prim = TmaUnitdataReq {
         req_handle: 52,
         pdu: build_sndcp_al_final_ar_sdu(),
@@ -3902,12 +3902,12 @@ fn test_sndcp_al_final_pdch_channel_allocation_maintains_single_assigned_scch() 
         sink_msgs.iter().any(|msg| {
             matches!(
                 &msg.msg,
-                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 4 && has_assigned_schf_slot(slot)
+                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 2 && has_assigned_schf_slot(slot)
             )
         }),
-        "single assigned packet-data AL TS4 should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+        "single assigned packet-data AL TS2 should be maintained as assigned SCCH/SCH/F without a traffic circuit"
     );
-    for ts in [2, 3] {
+    for ts in [3, 4] {
         assert!(
             sink_msgs.iter().all(|msg| {
                 !matches!(
@@ -3925,7 +3925,7 @@ fn test_advanced_link_control_after_pdch_allocation_uses_assigned_packet_data_sl
     debug::setup_logging_verbose();
 
     let target_issi = 0x5108;
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
 
@@ -4013,7 +4013,7 @@ fn test_wap_al_final_endpoint_zero_after_pdch_allocation_uses_assigned_pdch_even
 
     let target_issi = 0x5109;
     let target_addr = TetraAddress::issi(target_issi);
-    let assigned = [false, false, false, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
     test.populate_entities(vec![TetraEntity::Umac, TetraEntity::Llc], vec![TetraEntity::Lmac, TetraEntity::Mle]);
 
@@ -4070,7 +4070,7 @@ fn test_wap_al_final_endpoint_zero_after_pdch_allocation_uses_assigned_pdch_even
         "endpoint=0/link=1 WAP AL-FINAL-AR after active PDCH assignment must be routed on the assigned packet-data slot"
     );
     assert!(
-        routed_pdch_slots.iter().all(|ts| *ts == 4),
+        routed_pdch_slots.iter().all(|ts| *ts == 2),
         "single-slot WAP AL-FINAL-AR routed outside the assigned packet-data slot: {routed_pdch_slots:?}"
     );
     assert!(

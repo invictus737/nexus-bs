@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use super::ltpd_pipeline::{SndcpWapLtpdPipeline, SndcpWapLtpdPipelineError, issi_from_ltpd_ind};
-use super::pdch::SndcpPdchState;
+use super::pdch::{SndcpLtpdConfigureReason, SndcpPdchState, SndcpStatusForMle};
 use super::pdp::{
     SndcpActivatePdpContextDemand, SndcpDeactivation, SndcpPdpError, decode_activate_pdp_context_demand,
     decode_deactivate_pdp_context_accept, decode_deactivate_pdp_context_demand,
@@ -27,9 +27,9 @@ use super::wap_status::WapStatusSnapshot;
 use crate::{MessageQueue, TetraEntityTrait};
 use tetra_config::bluestation::{CfgWapIp, SharedConfig};
 use tetra_core::tetra_entities::TetraEntity;
-use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, Sap, TimeslotOwner, Todo};
+use tetra_core::{BitBuffer, EndpointId, Layer2Service, LinkId, Sap, SsiType, TimeslotOwner, Todo};
 use tetra_saps::control::brew::BrewSubscriberAction;
-use tetra_saps::ltpd::LtpdMleReportInd;
+use tetra_saps::ltpd::{LtpdMleConfigureInd, LtpdMleReportInd};
 use tetra_saps::tla::{
     TLA_REPORT_FAILED_TRANSFER, TLA_REPORT_FIRST_COMPLETE_TRANSMISSION, TLA_REPORT_NO_SPECIFIC_REPORT, TLA_REPORT_SUCCESSFUL_TRANSFER,
 };
@@ -294,6 +294,11 @@ impl Sndcp {
         decode: &SndcpDecode,
     ) {
         let snapshot = self.wap_status_snapshot();
+        if matches!(decode, SndcpDecode::TransferControl(SndcpTransferControl::DataTransmitRequest(_)))
+            && let Ok(issi) = issi_from_ltpd_ind(&prim)
+        {
+            self.prepare_packet_data_retry_after_bearer_break(issi, prim.endpoint_id, prim.link_id);
+        }
         let response = match self.wap_pipeline.as_mut() {
             Some(pipeline) => pipeline.handle_ltpd_mle_unitdata_ind_allocating_optional(&prim, &snapshot),
             None => {
@@ -347,7 +352,12 @@ impl Sndcp {
                         tracing::warn!("SNDCP/WAP-IP runtime is enabled but no WAP/IP pipeline is configured; dropping PDCH handoff");
                         return;
                     };
-                    if matches!(decode, SndcpDecode::TransferControl(SndcpTransferControl::Reconnect(_))) {
+                    let retry_after_radio_resource_loss = pipeline
+                        .pdch()
+                        .session(issi)
+                        .is_some_and(|session| session.state == SndcpPdchState::RadioResourceLost);
+                    if matches!(decode, SndcpDecode::TransferControl(SndcpTransferControl::Reconnect(_))) || retry_after_radio_resource_loss
+                    {
                         pipeline
                             .pdch_mut()
                             .mark_common_control_on_link(issi, prim.endpoint_id, prim.link_id);
@@ -520,8 +530,136 @@ impl Sndcp {
         }
     }
 
+    fn rx_ltpd_mle_configure_ind(&mut self, queue: &mut MessageQueue, prim: LtpdMleConfigureInd) {
+        let Some(pipeline) = self.wap_pipeline.as_ref() else {
+            tracing::debug!(
+                "SNDCP/WAP-IP: dropping MLE-CONFIGURE.ind endpoint={} reason={} with WAP/IP pipeline disabled",
+                prim.endpoint_id,
+                prim.reason_for_config_indication
+            );
+            return;
+        };
+        let affected_issis = match prim.received_tetra_address {
+            Some(addr) if addr.ssi_type == SsiType::Issi => {
+                if pipeline.pdch().session(addr.ssi).is_some() {
+                    vec![addr.ssi]
+                } else {
+                    Vec::new()
+                }
+            }
+            Some(addr) => {
+                tracing::debug!(
+                    "SNDCP/WAP-IP: dropping MLE-CONFIGURE.ind endpoint={} reason={} for non-ISSI address {}",
+                    prim.endpoint_id,
+                    prim.reason_for_config_indication,
+                    addr
+                );
+                return;
+            }
+            None => pipeline.pdch().session_issis_for_endpoint(prim.endpoint_id),
+        };
+        if affected_issis.is_empty() {
+            tracing::debug!(
+                "SNDCP/WAP-IP: MLE-CONFIGURE.ind endpoint={} reason={} had no matching PDCH session",
+                prim.endpoint_id,
+                prim.reason_for_config_indication
+            );
+            return;
+        }
+
+        if matches!(
+            SndcpLtpdConfigureReason::from_todo(prim.reason_for_config_indication),
+            SndcpLtpdConfigureReason::LossOfRadioResources
+        ) {
+            if let Some(addr) = prim.received_tetra_address.filter(|addr| addr.ssi_type == SsiType::Issi) {
+                self.pending_pdch_handoffs.retain(|_, pending| pending.issi != addr.ssi);
+            } else {
+                self.pending_pdch_handoffs
+                    .retain(|_, pending| pending.endpoint_id != prim.endpoint_id);
+            }
+        }
+
+        for issi in affected_issis {
+            let status = self
+                .wap_pipeline
+                .as_ref()
+                .map(|pipeline| SndcpStatusForMle::from(pipeline.session().state_for_issi(issi)))
+                .unwrap_or(SndcpStatusForMle::Idle);
+            let response = {
+                let Some(pipeline) = self.wap_pipeline.as_mut() else {
+                    return;
+                };
+                pipeline.pdch_mut().handle_ltpd_configure_ind_fail_closed(issi, &prim, status)
+            };
+
+            match response {
+                Ok(Some(response)) => {
+                    tracing::info!(
+                        "SNDCP/WAP-IP: MLE-CONFIGURE.ind endpoint={} reason={} applied to issi={}; sending fail-closed MLE-CONFIGURE.req",
+                        prim.endpoint_id,
+                        prim.reason_for_config_indication,
+                        issi
+                    );
+                    queue.push_back(SapMsg {
+                        sap: Sap::TlpdSap,
+                        src: TetraEntity::Sndcp,
+                        dest: TetraEntity::Mle,
+                        msg: SapMsgInner::LtpdMleConfigureReq(response),
+                    });
+                }
+                Ok(None) => {
+                    tracing::info!(
+                        "SNDCP/WAP-IP: MLE-CONFIGURE.ind endpoint={} reason={} applied to issi={}",
+                        prim.endpoint_id,
+                        prim.reason_for_config_indication,
+                        issi
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "SNDCP/WAP-IP: failed to apply MLE-CONFIGURE.ind endpoint={} reason={} to issi={}: {:?}",
+                        prim.endpoint_id,
+                        prim.reason_for_config_indication,
+                        issi,
+                        err
+                    );
+                }
+            }
+        }
+    }
+
     fn log_wap_pipeline_drop(&self, err: &SndcpWapLtpdPipelineError) {
         tracing::warn!("SNDCP/WAP-IP: dropping inbound SNDCP PDU: {:?}", err);
+    }
+
+    fn prepare_packet_data_retry_after_bearer_break(&mut self, issi: u32, endpoint_id: EndpointId, link_id: LinkId) {
+        let ts2_owner = {
+            let state = self.config.state_read();
+            state.timeslot_alloc.owner(2)
+        };
+        let Some(pipeline) = self.wap_pipeline.as_mut() else {
+            return;
+        };
+        let pdch_state = pipeline.pdch().session(issi).map(|session| session.state);
+        let local_pdch_active = ts2_owner == Some(TimeslotOwner::PacketData) && pdch_state == Some(SndcpPdchState::PdchReady);
+        if local_pdch_active {
+            return;
+        }
+
+        if let Err(err) = pipeline.session_mut().mark_ready_bearer_temporarily_broken(issi) {
+            tracing::warn!(
+                "SNDCP/WAP-IP: failed to prepare packet-data retry after bearer break issi={} endpoint={} link={}: {:?}",
+                issi,
+                endpoint_id,
+                link_id,
+                err
+            );
+            return;
+        }
+
+        if ts2_owner != Some(TimeslotOwner::PacketData) || pdch_state == Some(SndcpPdchState::RadioResourceLost) {
+            pipeline.pdch_mut().mark_common_control_on_link(issi, endpoint_id, link_id);
+        }
     }
 
     fn rx_control(&mut self, message: SapMsg) {
@@ -556,10 +694,11 @@ impl Sndcp {
 
     fn packet_data_handoff_capacity_available_for(&self, issi: u32) -> bool {
         let state = self.config.state_read();
-        if (2..=4).any(|ts| state.timeslot_alloc.owner(ts).is_none()) {
+        let ts2_owner = state.timeslot_alloc.owner(2);
+        if ts2_owner.is_none() {
             return true;
         }
-        let packet_data_slot_exists = (2..=4).any(|ts| state.timeslot_alloc.owner(ts) == Some(TimeslotOwner::PacketData));
+        let packet_data_slot_exists = ts2_owner == Some(TimeslotOwner::PacketData);
         drop(state);
 
         packet_data_slot_exists
@@ -804,6 +943,7 @@ impl TetraEntityTrait for Sndcp {
             Sap::TlpdSap => match message.msg {
                 SapMsgInner::LtpdMleUnitdataInd(prim) => self.rx_ltpd_mle_unitdata_ind(_queue, prim),
                 SapMsgInner::LtpdMleReportInd(prim) => self.rx_ltpd_mle_report_ind(prim),
+                SapMsgInner::LtpdMleConfigureInd(prim) => self.rx_ltpd_mle_configure_ind(_queue, prim),
                 other => {
                     tracing::warn!("SNDCP: dropping unexpected LTPD primitive {:?}", other);
                 }

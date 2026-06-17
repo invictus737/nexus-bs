@@ -119,6 +119,7 @@ fn build_ltpd_configure_ind() -> SapMsg {
         src: TetraEntity::Mle,
         dest: TetraEntity::Sndcp,
         msg: SapMsgInner::LtpdMleConfigureInd(LtpdMleConfigureInd {
+            received_tetra_address: Some(TetraAddress::issi(1000001)),
             endpoint_id: 1,
             chan_change_responce_required: true,
             chan_change_handle: 10,
@@ -659,14 +660,14 @@ fn assert_default_dynamic_pdch_channel_allocation(allocation: &CmceChanAllocReq)
 fn assert_single_slot_fallback_pdch_channel_allocation(allocation: &CmceChanAllocReq) {
     assert_eq!(allocation.usage, None);
     assert_eq!(allocation.carrier, None);
-    assert_eq!(allocation.timeslots, [false, false, false, true]);
+    assert_eq!(allocation.timeslots, [false, true, false, false]);
     assert!(
         !allocation.timeslots[0],
         "single-slot SNDCP PDCH fallback allocation must not include MCCH TS1"
     );
     assert!(
-        !allocation.timeslots[1] && !allocation.timeslots[2],
-        "single-slot SNDCP PDCH fallback must not allocate parallel TS2/TS3"
+        !allocation.timeslots[2] && !allocation.timeslots[3],
+        "single-slot SNDCP PDCH fallback must not allocate parallel TS3/TS4"
     );
     assert_eq!(allocation.alloc_type, ChanAllocType::Replace);
     assert_eq!(allocation.ul_dl_assigned, UlDlAssignment::Both);
@@ -675,14 +676,14 @@ fn assert_single_slot_fallback_pdch_channel_allocation(allocation: &CmceChanAllo
 fn assert_single_slot_pdch_channel_allocation(allocation: &CmceChanAllocReq) {
     assert_eq!(allocation.usage, None);
     assert_eq!(allocation.carrier, None);
-    assert_eq!(allocation.timeslots, [false, false, false, true]);
+    assert_eq!(allocation.timeslots, [false, true, false, false]);
     assert!(
         !allocation.timeslots[0],
         "single-slot SNDCP PDCH allocation must not include MCCH TS1"
     );
     assert!(
-        !allocation.timeslots[1] && !allocation.timeslots[2],
-        "single-slot phase-modulation request must not receive TS2/TS3"
+        !allocation.timeslots[2] && !allocation.timeslots[3],
+        "single-slot phase-modulation request must not receive TS3/TS4"
     );
     assert_eq!(allocation.alloc_type, ChanAllocType::Replace);
     assert_eq!(allocation.ul_dl_assigned, UlDlAssignment::Both);
@@ -707,6 +708,17 @@ fn take_ltpd_unitdata_reqs(test: &mut ComponentTest) -> Vec<LtpdMleUnitdataReq> 
         .filter(|msg| msg.sap == Sap::TlpdSap && msg.src == TetraEntity::Sndcp && msg.dest == TetraEntity::Mle)
         .filter_map(|msg| match msg.msg {
             SapMsgInner::LtpdMleUnitdataReq(req) => Some(req),
+            _ => None,
+        })
+        .collect()
+}
+
+fn take_ltpd_configure_reqs(test: &mut ComponentTest) -> Vec<LtpdMleConfigureReq> {
+    test.dump_sinks()
+        .into_iter()
+        .filter(|msg| msg.sap == Sap::TlpdSap && msg.src == TetraEntity::Sndcp && msg.dest == TetraEntity::Mle)
+        .filter_map(|msg| match msg.msg {
+            SapMsgInner::LtpdMleConfigureReq(req) => Some(req),
             _ => None,
         })
         .collect()
@@ -1394,7 +1406,7 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
 }
 
 #[test]
-fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse() {
+fn sndcp_created_pdch_on_ts2_does_not_block_group_voice_on_free_slot_or_reuse() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     enable_wap_ip_status_mvp(&mut config);
@@ -1444,16 +1456,16 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         test.run_stack(Some(1));
         let _ = test.dump_sinks();
         let state = test.config.state_read();
-        if state.timeslot_alloc.owner(4) == Some(TimeslotOwner::PacketData) {
+        if state.timeslot_alloc.owner(2) == Some(TimeslotOwner::PacketData) {
             break;
         }
     }
 
     {
         let state = test.config.state_read();
-        assert_eq!(state.timeslot_alloc.owner(2), None);
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
         assert_eq!(state.timeslot_alloc.owner(3), None);
-        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 
     // Do not deliver a TMA report/end-of-data back to SNDCP. This models a
@@ -1471,28 +1483,28 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
-            Some(TimeslotOwner::Cmce),
-            "one-slot group voice must use TS2 while default WAP PDCH stays on TS4"
+            Some(TimeslotOwner::PacketData),
+            "one-slot group voice should not preempt TS2 packet data while another traffic slot is free"
         );
         assert_eq!(
             state.timeslot_alloc.owner(3),
-            None,
-            "TS3 should remain free after default TS4 WAP PDCH plus one-slot voice"
+            Some(TimeslotOwner::Cmce),
+            "one-slot group voice should use the next free traffic slot while TS2 carries packet data"
         );
         assert_eq!(
             state.timeslot_alloc.owner(4),
-            Some(TimeslotOwner::PacketData),
-            "one-slot default WAP PDCH must stay on TS4 while TS2/TS3 are free for voice"
+            None,
+            "TS4 should remain free after TS2 WAP PDCH plus one-slot voice"
         );
     }
     {
         let umac = umac_bs_mut(&mut test);
         assert!(
-            umac.channel_scheduler.circuit_is_active(Direction::Dl, 2),
+            umac.channel_scheduler.circuit_is_active(Direction::Dl, 3),
             "UMAC must open downlink voice on the free slot"
         );
         assert!(
-            umac.channel_scheduler.circuit_is_active(Direction::Ul, 2),
+            umac.channel_scheduler.circuit_is_active(Direction::Ul, 3),
             "UMAC must open uplink voice on the free slot"
         );
     }
@@ -1502,15 +1514,15 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
-            Some(TimeslotOwner::Cmce),
-            "stuck SNDCP must not expand into an active voice slot"
+            Some(TimeslotOwner::PacketData),
+            "stuck SNDCP must remain confined to TS2"
         );
         assert_eq!(
             state.timeslot_alloc.owner(3),
-            None,
+            Some(TimeslotOwner::Cmce),
             "stuck SNDCP must not steal back an active voice slot"
         );
-        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 
     test.submit_message(build_group_u_disconnect_msg(data_issi, call_id));
@@ -1518,19 +1530,19 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         test.run_stack(Some(1));
         let _ = test.dump_sinks();
         let state = test.config.state_read();
-        if state.timeslot_alloc.owner(2).is_none() {
+        if state.timeslot_alloc.owner(3).is_none() {
             break;
         }
     }
     {
         let state = test.config.state_read();
-        assert_eq!(state.timeslot_alloc.owner(2), None, "voice release must free TS2");
-        assert_eq!(state.timeslot_alloc.owner(3), None);
         assert_eq!(
-            state.timeslot_alloc.owner(4),
+            state.timeslot_alloc.owner(2),
             Some(TimeslotOwner::PacketData),
-            "voice release must preserve default single-slot WAP PDCH on TS4"
+            "voice release must preserve TS2 packet data"
         );
+        assert_eq!(state.timeslot_alloc.owner(3), None, "voice release must free TS3");
+        assert_eq!(state.timeslot_alloc.owner(4), None, "voice release must not create TS4 packet data");
     }
 
     test.submit_message(build_group_u_setup_msg(data_issi, voice_gssi));
@@ -1540,20 +1552,137 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         let state = test.config.state_read();
         assert_eq!(
             state.timeslot_alloc.owner(2),
-            Some(TimeslotOwner::Cmce),
-            "next one-slot group voice must preserve default WAP PDCH on TS4 while TS2 is free"
+            Some(TimeslotOwner::PacketData),
+            "next one-slot group voice must preserve TS2 packet data while another traffic slot is free"
         );
         assert_eq!(
             state.timeslot_alloc.owner(3),
-            None,
-            "next one-slot group voice should not consume TS3 while TS2 is free"
+            Some(TimeslotOwner::Cmce),
+            "next one-slot group voice should reuse TS3 while TS2 is packet data"
         );
-        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::PacketData));
+        assert_eq!(state.timeslot_alloc.owner(4), None);
     }
 }
 
 #[test]
-fn sndcp_wap_reload_with_ts2_voice_busy_allocates_ts4_packet_data() {
+fn sndcp_wap_ts2_pdch_is_preempted_for_voice_and_resumes_on_ts2_after_release() {
+    debug::setup_logging_verbose();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp(&mut config);
+    config.cell.advanced_link = true;
+    config
+        .cell
+        .wap_ip
+        .as_mut()
+        .expect("WAP/IP profile should be enabled")
+        .assume_pdch_ready_after_data_transmit = false;
+
+    let data_issi = 1000001;
+    let voice_gssi = 91;
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(
+        vec![
+            TetraEntity::Sndcp,
+            TetraEntity::Mle,
+            TetraEntity::Llc,
+            TetraEntity::Umac,
+            TetraEntity::Cmce,
+        ],
+        vec![TetraEntity::Lmac],
+    );
+    register_voice_subscriber(&mut test, data_issi, voice_gssi);
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_ltpd_ind_on_link(Sap::TlpdSap, build_dynamic_ipv4_activation_demand(2), 1, 0));
+    test.run_stack(Some(6));
+    let _ = test.dump_sinks();
+    test.submit_message(build_bl_ack_ind(TetraAddress::issi(data_issi), 1, 0));
+    test.run_stack(Some(2));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_mxp600_single_slot_data_transmit_request(2),
+        1,
+        0,
+    ));
+    for _ in 0..96 {
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        if test.config.state_read().timeslot_alloc.owner(2) == Some(TimeslotOwner::PacketData) {
+            break;
+        }
+    }
+    {
+        let mut state = test.config.state_write();
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::PacketData));
+        state
+            .timeslot_alloc
+            .reserve(TimeslotOwner::Brew, 3)
+            .expect("test setup occupies TS3 so voice must reclaim TS2 packet data");
+        state
+            .timeslot_alloc
+            .reserve(TimeslotOwner::Brew, 4)
+            .expect("test setup occupies TS4 so voice must reclaim TS2 packet data");
+    }
+
+    test.submit_message(build_group_u_setup_msg(data_issi, voice_gssi));
+    for _ in 0..96 {
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        if test.config.state_read().timeslot_alloc.owner(2) == Some(TimeslotOwner::Cmce) {
+            break;
+        }
+    }
+    let call_id = *cmce_debug_active_call_ids(&mut test)
+        .first()
+        .expect("group voice call should be active after TS2 preemption");
+    {
+        let state = test.config.state_read();
+        assert_eq!(state.timeslot_alloc.owner(2), Some(TimeslotOwner::Cmce));
+        assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::Brew));
+        assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::Brew));
+    }
+
+    test.submit_message(build_group_u_disconnect_msg(data_issi, call_id));
+    for _ in 0..128 {
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        if test.config.state_read().timeslot_alloc.owner(2).is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        test.config.state_read().timeslot_alloc.owner(2),
+        None,
+        "voice release must free TS2 for packet-data resume"
+    );
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_mxp600_single_slot_data_transmit_request(2),
+        1,
+        0,
+    ));
+    for _ in 0..128 {
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        if test.config.state_read().timeslot_alloc.owner(2) == Some(TimeslotOwner::PacketData) {
+            break;
+        }
+    }
+    let state = test.config.state_read();
+    assert_eq!(
+        state.timeslot_alloc.owner(2),
+        Some(TimeslotOwner::PacketData),
+        "SNDCP/WAP reload must resume on TS2 after voice releases it"
+    );
+    assert_eq!(state.timeslot_alloc.owner(3), Some(TimeslotOwner::Brew));
+    assert_eq!(state.timeslot_alloc.owner(4), Some(TimeslotOwner::Brew));
+}
+
+#[test]
+fn sndcp_wap_reload_with_ts2_voice_busy_rejects_without_fallback_packet_data() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     enable_wap_ip_status_mvp(&mut config);
@@ -1599,7 +1728,7 @@ fn sndcp_wap_reload_with_ts2_voice_busy_allocates_ts4_packet_data() {
     for _ in 0..96 {
         test.run_stack(Some(1));
         let _ = test.dump_sinks();
-        if test.config.state_read().timeslot_alloc.owner(4) == Some(TimeslotOwner::PacketData) {
+        if test.config.state_read().timeslot_alloc.owner(2) == Some(TimeslotOwner::PacketData) {
             break;
         }
     }
@@ -1613,17 +1742,17 @@ fn sndcp_wap_reload_with_ts2_voice_busy_allocates_ts4_packet_data() {
     assert_eq!(
         state.timeslot_alloc.owner(3),
         None,
-        "SNDCP/WAP reload should leave TS3 free when preferred TS4 is available"
+        "SNDCP/WAP reload must not fall back to TS3 when TS2 is voice-owned"
     );
     assert_eq!(
         state.timeslot_alloc.owner(4),
-        Some(TimeslotOwner::PacketData),
-        "SNDCP/WAP reload should allocate preferred TS4 even when TS2 is voice-owned"
+        None,
+        "SNDCP/WAP reload must not fall back to TS4 when TS2 is voice-owned"
     );
 }
 
 #[test]
-fn sndcp_wap_reload_with_ts4_voice_busy_allocates_ts3_packet_data() {
+fn sndcp_wap_reload_with_ts4_voice_busy_still_allocates_ts2_packet_data() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     enable_wap_ip_status_mvp(&mut config);
@@ -1669,7 +1798,7 @@ fn sndcp_wap_reload_with_ts4_voice_busy_allocates_ts3_packet_data() {
     for _ in 0..96 {
         test.run_stack(Some(1));
         let _ = test.dump_sinks();
-        if test.config.state_read().timeslot_alloc.owner(3) == Some(TimeslotOwner::PacketData) {
+        if test.config.state_read().timeslot_alloc.owner(2) == Some(TimeslotOwner::PacketData) {
             break;
         }
     }
@@ -1678,14 +1807,14 @@ fn sndcp_wap_reload_with_ts4_voice_busy_allocates_ts3_packet_data() {
     assert_eq!(
         state.timeslot_alloc.owner(4),
         Some(TimeslotOwner::Cmce),
-        "SNDCP/WAP reload must not take the voice-owned preferred TS4"
+        "SNDCP/WAP reload must not take voice-owned TS4"
     );
     assert_eq!(
-        state.timeslot_alloc.owner(3),
+        state.timeslot_alloc.owner(2),
         Some(TimeslotOwner::PacketData),
-        "SNDCP/WAP reload should fall back to TS3 when preferred TS4 is voice-owned"
+        "SNDCP/WAP reload should use TS2 when TS2 is free, even if TS4 is voice-owned"
     );
-    assert_eq!(state.timeslot_alloc.owner(2), None);
+    assert_eq!(state.timeslot_alloc.owner(3), None);
 }
 
 #[test]
@@ -2025,7 +2154,7 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_specific_four_slot_reconnect() {
 }
 
 #[test]
-fn sndcp_pdch_default_dynamic_policy_uses_ts4_only_and_keeps_ts1_common_control() {
+fn sndcp_pdch_default_dynamic_policy_uses_ts2_only_and_keeps_ts1_common_control() {
     let manager = SndcpPdchManager::new();
     let plan = manager
         .plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
@@ -2140,21 +2269,40 @@ fn sndcp_wap_ip_mvp_routes_through_live_mle_to_llc_when_enabled() {
 }
 
 #[test]
-fn sndcp_ltpd_configure_primitives_drop_without_output() {
+fn sndcp_ltpd_configure_ind_clears_live_pdch_session_fail_closed() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
-    config.cell.sndcp_service = true;
+    enable_wap_ip_status_mvp(&mut config);
+    config
+        .cell
+        .wap_ip
+        .as_mut()
+        .expect("WAP/IP profile should be enabled")
+        .assume_pdch_ready_after_data_transmit = true;
     let mut test = ComponentTest::from_config(config, None);
     test.populate_entities(vec![TetraEntity::Sndcp], vec![TetraEntity::Mle, TetraEntity::Cmce]);
 
-    // The pure PDCH planner models LTPD-MLE-CONFIGURE, but the runtime SNDCP
-    // entity has no live PDCH/session owner yet. Until that boundary exists,
-    // configure primitives must be logged/dropped without side effects.
+    test.submit_message(build_ltpd_configure_ind());
+    test.deliver_all_messages();
+    assert_no_runtime_side_effects(&mut test);
+
+    test.submit_message(build_ltpd_ind(Sap::TlpdSap, build_dynamic_ipv4_activation_demand(2)));
+    test.submit_message(build_ltpd_ind(Sap::TlpdSap, build_mxp600_single_slot_data_transmit_request(2)));
+    test.deliver_all_messages();
+    let _ = test.dump_sinks();
+
+    // Opposite-direction Configure.req is still unexpected at SNDCP, but a
+    // live lower Configure.ind for the endpoint must clear stale PDCH readiness.
     test.submit_message(build_ltpd_configure_req());
     test.submit_message(build_ltpd_configure_ind());
     test.deliver_all_messages();
 
-    assert_no_runtime_side_effects(&mut test);
+    let configure_reqs = take_ltpd_configure_reqs(&mut test);
+    assert_eq!(configure_reqs.len(), 1);
+    let req = &configure_reqs[0];
+    assert_eq!(req.endpoint_id, 1);
+    assert_eq!(req.sndcp_status, 2);
+    assert_eq!(req.ms_default_data_prio, -1);
 }
 
 #[test]

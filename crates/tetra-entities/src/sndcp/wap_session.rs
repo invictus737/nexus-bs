@@ -118,6 +118,18 @@ impl SndcpWapSession {
         self.bearer.state_for_issi(issi)
     }
 
+    pub fn mark_ready_bearer_temporarily_broken(&mut self, issi: u32) -> Result<(), SndcpWapSessionError> {
+        if let Some(transition) = self.bearer.mark_ready_bearer_temporarily_broken(issi)? {
+            tracing::info!(
+                "SNDCP/WAP-IP: packet-data bearer temporarily broken issi={} {:?}->{:?}",
+                issi,
+                transition.previous_state,
+                transition.new_state
+            );
+        }
+        Ok(())
+    }
+
     pub fn deregister_issi(&mut self, issi: u32) -> Result<(), SndcpWapSessionError> {
         let transition = self.bearer.deregister_issi(issi)?;
         tracing::info!(

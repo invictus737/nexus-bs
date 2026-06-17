@@ -49,6 +49,7 @@ pub struct LtpdMleConfigureReq {
 
 #[derive(Debug, Clone)]
 pub struct LtpdMleConfigureInd {
+    pub received_tetra_address: Option<TetraAddress>,
     pub endpoint_id: EndpointId,
     pub chan_change_responce_required: bool,
     pub chan_change_handle: Todo,

@@ -69,6 +69,16 @@ impl SndcpBearerManager {
             .unwrap_or(SwmiSndcpState::Idle)
     }
 
+    pub fn mark_ready_bearer_temporarily_broken(&mut self, issi: u32) -> Result<Option<SwmiSndcpTransition>, SndcpBearerError> {
+        if self.state_for_issi(issi) != SwmiSndcpState::Ready {
+            return Ok(None);
+        }
+        self.state_for_issi_mut(issi)
+            .reconnect_without_data_received()
+            .map(Some)
+            .map_err(SndcpBearerError::State)
+    }
+
     pub fn handle_activate_demand(
         &mut self,
         issi: u32,

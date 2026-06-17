@@ -44,6 +44,7 @@ use tetra_saps::control::call_control::{CallControl, Circuit, CircuitDlMediaSour
 use tetra_saps::lcmc::enums::alloc_type::ChanAllocType;
 use tetra_saps::lcmc::enums::ul_dl_assignment::UlDlAssignment;
 use tetra_saps::lcmc::fields::chan_alloc_req::CmceChanAllocReq;
+use tetra_saps::ltpd::LtpdMleConfigureInd;
 use tetra_saps::tlmc::{TlmcConfigureReq, TlmcEnergyEconomyStartpoint};
 use tetra_saps::tma::{TmaReport, TmaReportInd, TmaUnitdataInd, TmaUnitdataReq};
 use tetra_saps::tmv::TmvConfigureReq;
@@ -51,6 +52,7 @@ use tetra_saps::tmv::enums::logical_chans::LogicalChannel;
 use tetra_saps::{SapMsg, SapMsgInner};
 
 use crate::lmac::components::scrambler;
+use crate::sndcp::pdch::{LTPD_CONFIG_REASON_LOSS_OF_RADIO_RESOURCES, LTPD_CONFIG_REASON_RECOVERY_OF_RADIO_RESOURCES};
 use crate::umac::subcomp::bs_sched::{BsChannelScheduler, PrecomputedUmacPdus, TCH_S_CAP};
 use crate::umac::subcomp::fillbits;
 use crate::{MessagePrio, MessageQueue, TetraEntityTrait};
@@ -97,6 +99,9 @@ pub struct UmacBs {
     /// not encoded in MAC-U-BLCK/MAC-END, so UMAC must carry the endpoint from
     /// the downlink channel allocation that created the PDCH.
     packet_data_link_contexts: HashMap<TetraAddress, PacketDataLinkContext>,
+    /// Packet-data endpoints that lost their assigned SCCH to voice/circuit
+    /// service and need a recovery indication once TS2 is free again.
+    lost_packet_data_link_contexts: HashMap<TetraAddress, PacketDataLinkContext>,
     active_energy_saving_suspensions: HashMap<EnergySavingSuspensionKey, Vec<u32>>,
 }
 
@@ -268,6 +273,7 @@ impl UmacBs {
             current_ul_speaker: [None; 4],
             ul_media_events_since_floor: [0; 4],
             packet_data_link_contexts: HashMap::new(),
+            lost_packet_data_link_contexts: HashMap::new(),
             active_energy_saving_suspensions: HashMap::new(),
         }
     }
@@ -577,6 +583,75 @@ impl UmacBs {
                     endpoint_id: prim.endpoint_id,
                 },
             );
+            self.lost_packet_data_link_contexts.remove(&prim.main_address);
+        }
+    }
+
+    fn enqueue_packet_data_configure_ind(
+        queue: &mut MessageQueue,
+        addr: TetraAddress,
+        context: PacketDataLinkContext,
+        reason_for_config_indication: Todo,
+    ) {
+        if addr.ssi_type != SsiType::Issi {
+            return;
+        }
+        queue.push_back(SapMsg {
+            sap: Sap::TlpdSap,
+            src: TetraEntity::Umac,
+            dest: TetraEntity::Sndcp,
+            msg: SapMsgInner::LtpdMleConfigureInd(LtpdMleConfigureInd {
+                received_tetra_address: Some(addr),
+                endpoint_id: context.endpoint_id,
+                chan_change_responce_required: false,
+                chan_change_handle: -1,
+                reason_for_config_indication,
+                conflicting_endpoint_id: 0,
+            }),
+        });
+    }
+
+    fn notify_packet_data_radio_resource_loss(&mut self, queue: &mut MessageQueue, addr: TetraAddress) {
+        let Some(context) = self.packet_data_link_contexts.get(&addr).copied() else {
+            tracing::debug!(
+                "UMAC: packet-data TS2 preempted for {}, but no SNDCP endpoint context is known",
+                addr
+            );
+            return;
+        };
+        if self.lost_packet_data_link_contexts.insert(addr, context).is_some() {
+            return;
+        }
+        tracing::info!(
+            "UMAC: notifying SNDCP packet-data radio-resource loss for {} endpoint={} on TS2",
+            addr,
+            context.endpoint_id
+        );
+        Self::enqueue_packet_data_configure_ind(queue, addr, context, LTPD_CONFIG_REASON_LOSS_OF_RADIO_RESOURCES);
+    }
+
+    fn recover_packet_data_radio_resources_if_ts2_free(&mut self, queue: &mut MessageQueue) {
+        if self.lost_packet_data_link_contexts.is_empty() {
+            return;
+        }
+        let ts2_available = {
+            let state = self.config.state_read();
+            state.timeslot_alloc.owner(2).is_none()
+                && !self.channel_scheduler.circuit_is_active(Direction::Dl, 2)
+                && !self.channel_scheduler.circuit_is_active(Direction::Ul, 2)
+        };
+        if !ts2_available {
+            return;
+        }
+
+        let recovered: Vec<_> = self.lost_packet_data_link_contexts.drain().collect();
+        for (addr, context) in recovered {
+            tracing::info!(
+                "UMAC: notifying SNDCP packet-data radio-resource recovery for {} endpoint={} on TS2",
+                addr,
+                context.endpoint_id
+            );
+            Self::enqueue_packet_data_configure_ind(queue, addr, context, LTPD_CONFIG_REASON_RECOVERY_OF_RADIO_RESOURCES);
         }
     }
 
@@ -3515,7 +3590,7 @@ impl UmacBs {
     //     queue.push_back(m);
     // }
 
-    fn rx_control_circuit_open(&mut self, _queue: &mut MessageQueue, prim: CallControl) {
+    fn rx_control_circuit_open(&mut self, queue: &mut MessageQueue, prim: CallControl) {
         let CallControl::Open(circuit) = prim else {
             tracing::error!("BUG: unexpected message or state -- routing error");
             return;
@@ -3560,7 +3635,9 @@ impl UmacBs {
                 active_addr: circuit.active_addr,
                 active_secondary_addrs: circuit.active_secondary_addrs.clone(),
             };
-            self.channel_scheduler.create_circuit(d, c);
+            if let Some(preempted_packet_data_addr) = self.channel_scheduler.create_circuit(d, c) {
+                self.notify_packet_data_radio_resource_loss(queue, preempted_packet_data_addr);
+            }
 
             // Start UL inactivity timer when opening a UL circuit
             if d == Direction::Ul && (1..=4).contains(&ts) {
@@ -3927,6 +4004,10 @@ impl TetraEntityTrait for UmacBs {
         tracing::trace!("UmacBs tick: Pushing finalized timeslot to LMAC: {:?}", s);
         queue.push_back(s);
         self.emit_completed_tma_reports(queue);
+        for addr in self.channel_scheduler.drain_packet_data_allocator_loss_events() {
+            self.notify_packet_data_radio_resource_loss(queue, addr);
+        }
+        self.recover_packet_data_radio_resources_if_ts2_free(queue);
         let mut stats = self.channel_scheduler.health_stats();
         stats.pending_tma_reports = self.pending_tma_reports.len();
         stats.pending_private_ul_media_total = self.pending_private_ul_media.iter().map(VecDeque::len).sum();
