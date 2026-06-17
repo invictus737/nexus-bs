@@ -10,7 +10,7 @@ use super::wap_status::{
 };
 
 pub const DEFAULT_WAP_UDP_REQUEST_MAX_BYTES: usize = 1024;
-pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES - WSP_REPLY_FIXED_HEADER_BYTES;
+pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = 128;
 pub const IPV4_UDP_HEADER_BYTES: usize = 28;
 const WTP_CON_FLAG: u8 = 0x80;
 const WTP_RID_FLAG: u8 = 0x01;
@@ -1103,12 +1103,12 @@ mod tests {
         assert_eq!(response_udp.destination_port, 49152);
         let page = std::str::from_utf8(response_udp.payload).expect("WAP status page should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("-//WAPFORUM//DTD XHTML Mobile 1.0//EN"));
         assert!(page.contains("Welcome to Nexus-BS"));
         assert!(!page.contains("<wml"));
         assert!(!page.contains("<card"));
         assert!(page.contains("Nexus-BS"));
         assert!(page.contains("MS</span> 4") || page.contains("MS:4"));
+        assert!(page.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
     }
 
     #[test]

@@ -101,7 +101,7 @@ fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusR
             snapshot.registered_ms, snapshot.active_calls, snapshot.queued_sds
         ),
         WapStatusRenderMode::Tiny => format!(
-            "<?xml version=\"1.0\"?>\n{XHTML_MP_DOCTYPE}\n<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>{title}</title><meta http-equiv=\"refresh\" content=\"15;url={refresh_path}\" /></head><body><p>Welcome to {title}<br />{service_state}<br />MS:{} C:{} SDS:{}<br />Up:{uptime}{health_summary}</p></body></html>",
+            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>Welcome to {title}<br />{service_state}<br />MS:{} C:{} S:{}</body></html>",
             snapshot.registered_ms, snapshot.active_calls, snapshot.queued_sds
         ),
     }
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn render_wml2_status_produces_small_terminal_page() {
-        let page = render_wml2_status(&sample_snapshot(), DEFAULT_WAP_STATUS_MAX_BYTES).expect("WAP 2.0 status should render");
+        let page = render_wml2_status(&sample_snapshot(), 2048).expect("WAP 2.0 status should render");
 
         assert!(page.starts_with("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"));
         assert!(page.contains("-//WAPFORUM//DTD XHTML Mobile 1.0//EN"));
@@ -280,7 +280,7 @@ mod tests {
         assert!(page.contains("<b>Calls</b><br />"));
         assert!(page.contains("MS 2260082 -52dB G1 SA"));
         assert!(page.contains("P2P-S 2260082&gt;2260618 TS2"));
-        assert!(page.len() <= DEFAULT_WAP_STATUS_MAX_BYTES);
+        assert!(page.len() <= 2048);
     }
 
     #[test]
@@ -290,7 +290,7 @@ mod tests {
         snapshot.service_state = "RX < TX & ok".to_string();
         snapshot.last_activity = Some("P2P 1<2 & ok".to_string());
 
-        let page = render_wml2_status(&snapshot, DEFAULT_WAP_STATUS_MAX_BYTES).expect("escaped WML2 should render");
+        let page = render_wml2_status(&snapshot, 2048).expect("escaped WML2 should render");
 
         assert!(page.contains("Nexus &lt;BS&gt; &amp;"));
         assert!(page.contains("RX &lt; TX &amp; ok"));
@@ -310,7 +310,7 @@ mod tests {
         ];
         snapshot.call_lines = Vec::new();
 
-        let page = render_wml2_status(&snapshot, DEFAULT_WAP_STATUS_MAX_BYTES).expect("bounded details should render");
+        let page = render_wml2_status(&snapshot, 2048).expect("bounded details should render");
 
         assert!(page.contains("MS 3 "));
         assert!(page.contains("MS 2"));
@@ -325,7 +325,7 @@ mod tests {
         snapshot.service_state = "ON\nAIR\tOK".to_string();
         snapshot.last_activity = Some("SDS\u{0001}2260082".to_string());
 
-        let page = render_wml2_status(&snapshot, DEFAULT_WAP_STATUS_MAX_BYTES).expect("sanitized WML2 should render");
+        let page = render_wml2_status(&snapshot, 2048).expect("sanitized WML2 should render");
 
         assert!(page.contains("ON AIR OK"));
         assert!(page.contains("SDS?2260082"));
