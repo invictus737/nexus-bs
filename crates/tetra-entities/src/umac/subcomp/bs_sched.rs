@@ -5497,6 +5497,72 @@ mod tests {
     }
 
     #[test]
+    fn test_packet_data_dynamic_single_slot_allocation_uses_ts4_when_ts2_ts3_are_voice() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+        open_test_dl_circuit(&mut sched, 3);
+
+        let issi = 0x511a;
+        let (pdu, sdu) = test_packet_data_channel_allocation_resource(
+            issi,
+            [false, true, false, false],
+            None,
+            ChanAllocType::Replace,
+            UlDlAssignment::Both,
+        );
+        sched.dl_enqueue_tma(pdu, sdu, None);
+
+        let subscribers = SubscriberRegistry::new();
+        let mut energy_saving = HashMap::new();
+        let allocated_on_mcch = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
+
+        let chan_alloc = first_schf_channel_allocation(&allocated_on_mcch);
+        assert_eq!(chan_alloc.ts_assigned, [false, false, false, true]);
+        assert_eq!(
+            chan_alloc.ts_assigned.iter().filter(|assigned| **assigned).count(),
+            1,
+            "single-slot packet-data fallback must not expand to parallel TS"
+        );
+        assert!(
+            sched.packet_data_assignments[1].is_none() && sched.packet_data_assignments[2].is_none(),
+            "voice-owned TS2/TS3 must not become packet-data assigned channels"
+        );
+        assert!(
+            sched.packet_data_assignments[3].is_some(),
+            "single-slot packet data should use TS4 when it is the first free traffic slot"
+        );
+    }
+
+    #[test]
+    fn test_packet_data_dynamic_single_slot_allocation_defers_when_all_traffic_slots_are_voice() {
+        let mut sched = get_testing_slotter();
+        sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+        open_test_dl_circuit(&mut sched, 2);
+        open_test_dl_circuit(&mut sched, 3);
+        open_test_dl_circuit(&mut sched, 4);
+
+        let issi = 0x511b;
+        let (pdu, sdu) = test_packet_data_channel_allocation_resource(
+            issi,
+            [false, true, false, false],
+            None,
+            ChanAllocType::Replace,
+            UlDlAssignment::Both,
+        );
+        sched.dl_enqueue_tma(pdu, sdu, None);
+
+        assert!(
+            sched.dltx_queues.iter().all(|queue| queue.is_empty()),
+            "when voice owns TS2/TS3/TS4, packet data must not queue a channel allocation on any slot"
+        );
+        assert!(
+            sched.packet_data_assignments[1..].iter().all(Option::is_none),
+            "when no traffic slot is free, packet data must not create a stale assigned-PDCH owner"
+        );
+    }
+
+    #[test]
     fn test_packet_data_assignment_marks_central_allocator_and_voice_avoids_it() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });

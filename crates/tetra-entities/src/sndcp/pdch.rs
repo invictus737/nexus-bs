@@ -852,28 +852,8 @@ fn validate_channel_advice_and_resource_request(
     Ok(())
 }
 
-fn assigned_scch_pdch_timeslots_for_resource_request(resource_request: SndcpPacketDataResourceRequest) -> [bool; 4] {
-    let requested_slots = match resource_request {
-        SndcpPacketDataResourceRequest::None => 1,
-        SndcpPacketDataResourceRequest::PhaseModulation(request) => {
-            if request.uplink_timeslots == 1 && request.downlink_timeslots == 1 {
-                1
-            } else if request.unspecified_phase_modulation_resource {
-                request.full_phase_modulation_capability_timeslots
-            } else {
-                request
-                    .uplink_timeslots
-                    .max(request.downlink_timeslots)
-                    .min(request.full_phase_modulation_capability_timeslots)
-            }
-        }
-    };
-    let assigned_slots = usize::from(requested_slots.clamp(1, SNDCP_PDCH_TIMESLOT_MAX - 1));
-    let mut timeslots = [false; 4];
-    for idx in 1..=assigned_slots {
-        timeslots[idx] = true;
-    }
-    timeslots
+fn assigned_scch_pdch_timeslots_for_resource_request(_resource_request: SndcpPacketDataResourceRequest) -> [bool; 4] {
+    SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT
 }
 
 fn packet_data_channel_plan(
@@ -1510,7 +1490,7 @@ mod tests {
         let unspecified_policy = SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(unspecified_four_slot);
 
         assert_eq!(unspecified_policy.usage_marker, None);
-        assert_eq!(unspecified_policy.timeslots, SNDCP_PDCH_ASSIGNED_SCCH_TIMESLOTS);
+        assert_eq!(unspecified_policy.timeslots, SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT);
 
         let specific_four_slot = SndcpPacketDataResourceRequest::PhaseModulation(SndcpPhaseModulationResourceRequest {
             uplink_timeslots: 4,
@@ -1521,7 +1501,7 @@ mod tests {
         let specific_policy = SndcpPdchAllocationPolicy::assigned_scch_for_resource_request(specific_four_slot);
 
         assert_eq!(specific_policy.usage_marker, None);
-        assert_eq!(specific_policy.timeslots, SNDCP_PDCH_ASSIGNED_SCCH_TIMESLOTS);
+        assert_eq!(specific_policy.timeslots, SNDCP_PDCH_SINGLE_ASSIGNED_SCCH_TIMESLOT);
     }
 
     #[test]

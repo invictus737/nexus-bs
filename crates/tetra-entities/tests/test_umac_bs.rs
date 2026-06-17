@@ -3762,11 +3762,11 @@ fn slot_carries_al_setup_for_addr_with_report(slot: &TmvUnitdataReqSlot, target_
 }
 
 #[test]
-fn test_sndcp_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to_ts4_without_traffic_circuit() {
+fn test_sndcp_pdch_channel_allocation_maintains_single_assigned_scch_without_traffic_circuit() {
     debug::setup_logging_verbose();
 
     let target_issi = 0x5106;
-    let assigned = [false, true, true, true];
+    let assigned = [false, true, false, false];
     let test_prim = TmaUnitdataReq {
         req_handle: 51,
         pdu: build_sndcp_bl_udata_sdu(),
@@ -3808,15 +3808,24 @@ fn test_sndcp_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to_ts4_with
     assert_eq!(chan_alloc.ts_assigned, assigned);
     assert!(!chan_alloc.ts_assigned[0], "default packet-data allocation must not assign TS1");
 
-    for ts in [2, 3, 4] {
+    assert!(
+        sink_msgs.iter().any(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 2 && has_assigned_schf_slot(slot)
+            )
+        }),
+        "single assigned packet-data TS2 should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+    );
+    for ts in [3, 4] {
         assert!(
-            sink_msgs.iter().any(|msg| {
-                matches!(
+            sink_msgs.iter().all(|msg| {
+                !matches!(
                     &msg.msg,
                     SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == ts && has_assigned_schf_slot(slot)
                 )
             }),
-            "assigned packet-data TS{ts} should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+            "single-slot packet-data fallback must not maintain parallel TS{ts}"
         );
     }
 
@@ -3835,11 +3844,11 @@ fn test_sndcp_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to_ts4_with
 }
 
 #[test]
-fn test_sndcp_al_final_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to_ts4() {
+fn test_sndcp_al_final_pdch_channel_allocation_maintains_single_assigned_scch() {
     debug::setup_logging_verbose();
 
     let target_issi = 0x5107;
-    let assigned = [false, true, true, true];
+    let assigned = [false, true, false, false];
     let test_prim = TmaUnitdataReq {
         req_handle: 52,
         pdu: build_sndcp_al_final_ar_sdu(),
@@ -3881,15 +3890,24 @@ fn test_sndcp_al_final_pdch_channel_allocation_maintains_assigned_scch_on_ts2_to
     assert_eq!(chan_alloc.ts_assigned, assigned);
     assert!(!chan_alloc.ts_assigned[0], "packet-data AL allocation must not assign TS1");
 
-    for ts in [2, 3, 4] {
+    assert!(
+        sink_msgs.iter().any(|msg| {
+            matches!(
+                &msg.msg,
+                SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == 2 && has_assigned_schf_slot(slot)
+            )
+        }),
+        "single assigned packet-data AL TS2 should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+    );
+    for ts in [3, 4] {
         assert!(
-            sink_msgs.iter().any(|msg| {
-                matches!(
+            sink_msgs.iter().all(|msg| {
+                !matches!(
                     &msg.msg,
                     SapMsgInner::TmvUnitdataReq(slot) if slot.ts.t == ts && has_assigned_schf_slot(slot)
                 )
             }),
-            "assigned packet-data AL TS{ts} should be maintained as assigned SCCH/SCH/F without a traffic circuit"
+            "single-slot packet-data AL fallback must not maintain parallel TS{ts}"
         );
     }
 }
@@ -3899,7 +3917,7 @@ fn test_advanced_link_control_after_pdch_allocation_uses_assigned_packet_data_sl
     debug::setup_logging_verbose();
 
     let target_issi = 0x5108;
-    let assigned = [false, true, true, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
     test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
 
@@ -3987,7 +4005,7 @@ fn test_wap_al_final_endpoint_zero_after_pdch_allocation_uses_assigned_pdch_even
 
     let target_issi = 0x5109;
     let target_addr = TetraAddress::issi(target_issi);
-    let assigned = [false, true, true, true];
+    let assigned = [false, true, false, false];
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
     test.populate_entities(vec![TetraEntity::Umac, TetraEntity::Llc], vec![TetraEntity::Lmac, TetraEntity::Mle]);
 
@@ -4041,11 +4059,11 @@ fn test_wap_al_final_endpoint_zero_after_pdch_allocation_uses_assigned_pdch_even
 
     assert!(
         !routed_pdch_slots.is_empty(),
-        "endpoint=0/link=1 WAP AL-FINAL-AR after active PDCH assignment must be routed on assigned TS2-TS4"
+        "endpoint=0/link=1 WAP AL-FINAL-AR after active PDCH assignment must be routed on the assigned packet-data slot"
     );
     assert!(
-        routed_pdch_slots.iter().all(|ts| (2..=4).contains(ts)),
-        "AL-FINAL-AR routed outside assigned packet-data slots: {routed_pdch_slots:?}"
+        routed_pdch_slots.iter().all(|ts| *ts == 2),
+        "single-slot WAP AL-FINAL-AR routed outside the assigned packet-data slot: {routed_pdch_slots:?}"
     );
     assert!(
         sink_msgs.iter().all(|msg| {

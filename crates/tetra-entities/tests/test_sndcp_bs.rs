@@ -648,13 +648,17 @@ fn assert_default_dynamic_pdch_channel_allocation(allocation: &CmceChanAllocReq)
     assert_single_slot_pdch_channel_allocation(allocation);
 }
 
-fn assert_multi_slot_pdch_channel_allocation(allocation: &CmceChanAllocReq) {
+fn assert_single_slot_fallback_pdch_channel_allocation(allocation: &CmceChanAllocReq) {
     assert_eq!(allocation.usage, None);
     assert_eq!(allocation.carrier, None);
-    assert_eq!(allocation.timeslots, [false, true, true, true]);
+    assert_eq!(allocation.timeslots, [false, true, false, false]);
     assert!(
         !allocation.timeslots[0],
-        "multi-slot SNDCP PDCH allocation must not include MCCH TS1"
+        "single-slot SNDCP PDCH fallback allocation must not include MCCH TS1"
+    );
+    assert!(
+        !allocation.timeslots[2] && !allocation.timeslots[3],
+        "single-slot SNDCP PDCH fallback must not allocate parallel TS3/TS4"
     );
     assert_eq!(allocation.alloc_type, ChanAllocType::Replace);
     assert_eq!(allocation.ul_dl_assigned, UlDlAssignment::Both);
@@ -1649,7 +1653,7 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_unspecified_four_slot_resource_request
         .chan_alloc
         .as_ref()
         .expect("accepted four-slot capability SN-DATA TRANSMIT RESPONSE should carry PDCH allocation");
-    assert_multi_slot_pdch_channel_allocation(allocation);
+    assert_single_slot_fallback_pdch_channel_allocation(allocation);
 }
 
 #[test]
@@ -1689,7 +1693,7 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_specific_four_slot_resource_request() 
         .chan_alloc
         .as_ref()
         .expect("accepted specific four-slot SN-DATA TRANSMIT RESPONSE should carry PDCH allocation");
-    assert_multi_slot_pdch_channel_allocation(allocation);
+    assert_single_slot_fallback_pdch_channel_allocation(allocation);
 }
 
 #[test]
@@ -1729,7 +1733,7 @@ fn sndcp_wap_ip_end_of_data_returns_common_control_after_pdch_assignment() {
 
     assert_eq!(ltpd_reqs.len(), 3);
     let ready_response = ltpd_reqs.remove(1);
-    assert_multi_slot_pdch_channel_allocation(
+    assert_single_slot_fallback_pdch_channel_allocation(
         ready_response
             .chan_alloc
             .as_ref()
@@ -1787,7 +1791,7 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_specific_four_slot_reconnect() {
         .chan_alloc
         .as_ref()
         .expect("accepted SN-RECONNECT response should carry the MVP PDCH allocation");
-    assert_multi_slot_pdch_channel_allocation(allocation);
+    assert_single_slot_fallback_pdch_channel_allocation(allocation);
 }
 
 #[test]

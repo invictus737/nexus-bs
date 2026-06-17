@@ -1020,8 +1020,8 @@ fn test_al_setup_four_slot_phase_mod_request_is_negotiated_down_before_data_tran
     assert_eq!(setup_response.setup_report, AlSetup::SETUP_REPORT_SERVICE_CHANGE);
     assert_eq!(
         setup_response.uplink_timeslots,
-        Some(2),
-        "N.264 response must match the TS2-TS4 PDCH capacity, not echo a 4-slot request"
+        Some(0),
+        "N.264 response must advertise the single-slot PDCH fallback, not echo a 4-slot request"
     );
     assert_eq!(setup_response.throughput_code, 6);
 
