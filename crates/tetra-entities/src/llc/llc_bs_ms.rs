@@ -929,6 +929,7 @@ impl Llc {
         al.t_submitted_to_umac = None;
         al.t_umac_done = None;
         al.current_mac_reporter = None;
+        al.t_retransmissions_exhausted = None;
         al.selective_segment_retry_pending = false;
         for segment in &mut al.segments {
             segment.t_submitted_to_umac = None;
@@ -938,6 +939,25 @@ impl Llc {
             segment.retransmission_requested = false;
             segment.retransmit_count = 0;
         }
+    }
+
+    fn al_segment_pdu_with_ack_request(pdu: &BitBuffer) -> Option<BitBuffer> {
+        let mut reader = BitBuffer::from_bitbuffer(pdu);
+        let header = AlData::from_bitbuf(&mut reader).ok()?;
+        if header.acknowledgement_requested {
+            return Some(BitBuffer::from_bitbuffer(pdu));
+        }
+
+        let payload_bits = reader.get_len_remaining();
+        let mut updated = BitBuffer::new_autoexpand(17 + payload_bits);
+        AlData {
+            acknowledgement_requested: true,
+            ..header
+        }
+        .to_bitbuf(&mut updated);
+        updated.copy_bits(&mut reader, payload_bits);
+        updated.seek(0);
+        Some(updated)
     }
 
     fn schedule_requested_al_segment_retries(al: &mut ExpectedAlAck, max_segment_retransmissions: u8) -> Result<usize, u8> {
@@ -1518,6 +1538,19 @@ impl Llc {
             let mut sapmsg = segment.retransmission_buf.clone();
             let mac_reporter = TxReporter::new_unacked();
             if let SapMsgInner::TmaUnitdataReq(prim) = &mut sapmsg.msg {
+                if segment.retransmission_requested {
+                    if let Some(updated_pdu) = Self::al_segment_pdu_with_ack_request(&prim.pdu) {
+                        prim.pdu = updated_pdu;
+                    } else {
+                        tracing::warn!(
+                            "LLC: cannot set AL retransmission ACK request for SSI {} endpoint {} link {} segment {}; preserving original PDU",
+                            al.key.addr.ssi,
+                            al.key.endpoint_id,
+                            al.key.link_id,
+                            segment.ss
+                        );
+                    }
+                }
                 prim.tx_reporter = Some(mac_reporter.clone());
             } else {
                 tracing::warn!(
@@ -2662,6 +2695,7 @@ impl Llc {
                     outbound.t_submitted_to_umac = None;
                     outbound.t_umac_done = None;
                     outbound.current_mac_reporter = None;
+                    outbound.t_retransmissions_exhausted = None;
                     outbound.selective_segment_retry_pending = true;
                 } else {
                     outbound.selective_segment_retry_pending = false;

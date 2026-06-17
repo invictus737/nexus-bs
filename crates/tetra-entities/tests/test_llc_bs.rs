@@ -1618,6 +1618,65 @@ fn test_outbound_segmented_al_requests_periodic_ack_and_retries_selective_missin
 }
 
 #[test]
+fn test_outbound_segmented_al_selective_retry_requests_ack_for_nonfinal_segment() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 7114;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    setup.max_segment_retransmissions = 3;
+    test.submit_message(build_al_setup_ind_with_setup(addr, 0, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let payload = [0x5a; 25];
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.link_id = 1;
+    prim.pdu_prio = 4;
+    prim.fcs_flag = false;
+    prim.tl_sdu = BitBuffer::from_bytes(&payload);
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    let first_segments = al_segment_headers(&first_msgs);
+    assert_eq!(
+        first_segments
+            .iter()
+            .map(|(_, acknowledgement_requested, _, ss, _)| (*acknowledgement_requested, *ss))
+            .collect::<Vec<_>>(),
+        vec![(false, 0), (true, 1)],
+        "test vector should model a two-segment WAP ConnectReply where only the final segment asks for AL-ACK"
+    );
+
+    for handle in first_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 0, 1, 2));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    let retry_segments = al_segment_headers(&retry_msgs);
+    assert_eq!(
+        retry_segments
+            .iter()
+            .map(|(final_segment, acknowledgement_requested, _, ss, _)| (*final_segment, *acknowledgement_requested, *ss))
+            .collect::<Vec<_>>(),
+        vec![(false, true, 0)],
+        "selective retransmission of a non-final missing segment must request AL-ACK so the peer can complete the TL-SDU"
+    );
+}
+
+#[test]
 fn test_outbound_segmented_al_t252_retries_selectively_requested_segments_before_n273_failure() {
     debug::setup_logging_verbose();
 
