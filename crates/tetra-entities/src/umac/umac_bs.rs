@@ -1525,6 +1525,30 @@ impl UmacBs {
                 .circuit_is_active_for_addr(Direction::Ul, ts, prim.main_address)
     }
 
+    fn can_omit_group_listener_floor_grant_chan_alloc(&self, prim: &TmaUnitdataReq, ts: u8, grant: &DTxGranted) -> bool {
+        if prim.main_address.ssi_type != SsiType::Gssi {
+            return false;
+        }
+        if grant.transmission_grant != TransmissionGrant::GrantedToOtherUser.into_raw() as u8 {
+            return false;
+        }
+        if grant.transmitting_party_type_identifier != Some(1) || grant.transmitting_party_address_ssi.is_none() {
+            return false;
+        }
+        let Some(chan_alloc) = prim.chan_alloc.as_ref() else {
+            return false;
+        };
+        if !matches!(chan_alloc.ul_dl_assigned, UlDlAssignment::Dl | UlDlAssignment::Both) {
+            return false;
+        }
+        if !chan_alloc.timeslots.get(ts as usize - 1).copied().unwrap_or(false) {
+            return false;
+        }
+
+        self.channel_scheduler
+            .circuit_is_active_for_addr(Direction::Dl, ts, prim.main_address)
+    }
+
     fn evict_lower_priority_tma_report(&mut self, queue: &mut MessageQueue, incoming_priority: TmaAdmissionPriority) -> bool {
         let Some((pos, _)) = self
             .pending_tma_reports
@@ -2864,10 +2888,9 @@ impl UmacBs {
 
                     if total_len > STCH_CAP
                         && prim.main_address.ssi_type == SsiType::Gssi
-                        && prim
-                            .chan_alloc
+                        && d_tx_granted
                             .as_ref()
-                            .is_some_and(|chan_alloc| chan_alloc.ul_dl_assigned == UlDlAssignment::Dl)
+                            .is_some_and(|grant| self.can_omit_group_listener_floor_grant_chan_alloc(&prim, ts, grant))
                     {
                         // EN 300 392-2 clause 14.5.2.2.1 b) recommends that
                         // group-addressed "granted to another user" signalling

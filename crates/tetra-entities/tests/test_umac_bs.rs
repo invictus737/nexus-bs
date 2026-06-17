@@ -5633,7 +5633,7 @@ fn test_group_listener_floor_grant_with_speaker_id_stays_on_stch() {
                 usage: Some(6),
                 timeslots,
                 alloc_type: ChanAllocType::Replace,
-                ul_dl_assigned: UlDlAssignment::Dl,
+                ul_dl_assigned: UlDlAssignment::Both,
                 carrier: None,
             }),
             tx_reporter: Some(reporter.clone()),
