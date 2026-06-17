@@ -976,9 +976,12 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     );
     let page = std::str::from_utf8(response_udp.payload).unwrap();
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
-    assert!(page.contains("style=\"color:#0f0\""));
+    assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+    assert!(page.contains("<font color=\"#00ff00\">"));
     assert!(page.contains("Nexus "));
-    assert!(page.contains(" M"));
+    assert!(page.contains("<br />M"));
+    assert_eq!(page.matches("<br />").count(), 3);
+    assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 }
@@ -1104,9 +1107,12 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         response_octets.len()
     );
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
-    assert!(page.contains("style=\"color:#0f0\""));
+    assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+    assert!(page.contains("<font color=\"#00ff00\">"));
     assert!(page.contains("Nexus "));
-    assert!(page.contains(" M"));
+    assert!(page.contains("<br />M"));
+    assert_eq!(page.matches("<br />").count(), 3);
+    assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 }
@@ -1347,9 +1353,12 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         "WSP GET should receive WTP Result + WSP Reply(application/vnd.wap.xhtml+xml)"
     );
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
-    assert!(page.contains("style=\"color:#0f0\""));
+    assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+    assert!(page.contains("<font color=\"#00ff00\">"));
     assert!(page.contains("Nexus "));
-    assert!(page.contains(" M"));
+    assert!(page.contains("<br />M"));
+    assert_eq!(page.matches("<br />").count(), 3);
+    assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 }

@@ -10,7 +10,7 @@ use super::wap_status::{
 };
 
 pub const DEFAULT_WAP_UDP_REQUEST_MAX_BYTES: usize = 1024;
-pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = 128;
+pub const DEFAULT_WAP_WSP_STATUS_MAX_BYTES: usize = 192;
 pub const IPV4_UDP_HEADER_BYTES: usize = 28;
 const WTP_CON_FLAG: u8 = 0x80;
 const WTP_RID_FLAG: u8 = 0x01;
@@ -1103,11 +1103,14 @@ mod tests {
         assert_eq!(response_udp.destination_port, 49152);
         let page = std::str::from_utf8(response_udp.payload).expect("WAP status page should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+        assert!(page.contains("<font color=\"#00ff00\">"));
         assert!(!page.contains("<wml"));
         assert!(!page.contains("<card"));
         assert!(page.contains("Nexus OK"));
         assert!(page.contains("M4 C0 S1"));
+        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(!page.contains("<br/>"));
         assert!(page.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
     }
 
@@ -1445,8 +1448,11 @@ mod tests {
         );
         let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+        assert!(page.contains("<font color=\"#00ff00\">"));
         assert!(page.contains("Nexus OK"));
+        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(!page.contains("<br/>"));
         assert!(!page.contains("<wml"));
     }
 
@@ -1496,8 +1502,11 @@ mod tests {
         let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
         let page = std::str::from_utf8(response_udp.payload).unwrap();
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+        assert!(page.contains("<font color=\"#00ff00\">"));
         assert!(page.contains("Nexus OK"));
+        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(!page.contains("<br/>"));
     }
 
     #[test]

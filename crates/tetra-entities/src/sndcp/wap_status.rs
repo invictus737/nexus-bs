@@ -17,8 +17,10 @@ pub const WAP_STATUS_HEALTH_LINE_MAX_ESCAPED_BYTES: usize = 28;
 pub const WAP_STATUS_DETAIL_MAX_LINES: usize = 3;
 const XHTML_MP_DOCTYPE: &str =
     "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"http://www.wapforum.org/DTD/xhtml-mobile10.dtd\">";
-const TINY_XHTML_PREFIX: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body style=\"color:#0f0\">";
-const TINY_XHTML_SUFFIX: &str = "</body></html>";
+const TINY_XHTML_PREFIX: &str =
+    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body bgcolor=\"#000000\" text=\"#00ff00\"><p><font color=\"#00ff00\">";
+const TINY_XHTML_SUFFIX: &str = "</font></p></body></html>";
+const TINY_XHTML_BR: &str = "<br />";
 const TINY_LAST_PREFIX: &str = " L:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,7 +84,7 @@ fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusR
         .filter(|activity| !activity.is_empty())
         .map(|activity| {
             format!(
-                "<br/>Last: {}",
+                "<br />Last: {}",
                 escape_xhtml_text_limited(activity, WAP_STATUS_LAST_ACTIVITY_MAX_ESCAPED_BYTES)
             )
         })
@@ -114,7 +116,7 @@ fn render_tiny_wml2_status_page(snapshot: &WapStatusSnapshot, max_bytes: usize) 
     let active_calls = compact_count(snapshot.active_calls);
     let queued_sds = compact_count(snapshot.queued_sds);
     let uptime = compact_tiny_uptime(snapshot.uptime_secs);
-    let mut body = format!("{title} {state} M{registered_ms} C{active_calls} S{queued_sds} U{uptime}");
+    let mut third_line = format!("U{uptime}");
 
     if let Some(activity) = snapshot
         .last_activity
@@ -123,21 +125,27 @@ fn render_tiny_wml2_status_page(snapshot: &WapStatusSnapshot, max_bytes: usize) 
         .filter(|activity| !activity.is_empty())
         .map(compact_tiny_last_activity)
     {
+        let base_body = format!(
+            "{title} {state}{TINY_XHTML_BR}M{registered_ms} C{active_calls} S{queued_sds}{TINY_XHTML_BR}{third_line}{TINY_XHTML_BR}Voice"
+        );
         let used = TINY_XHTML_PREFIX
             .len()
-            .saturating_add(body.len())
+            .saturating_add(base_body.len())
             .saturating_add(TINY_LAST_PREFIX.len())
             .saturating_add(TINY_XHTML_SUFFIX.len());
         if used < max_bytes {
             let remaining = max_bytes - used;
             let activity = escape_xhtml_text_limited(&activity, remaining);
             if !activity.is_empty() {
-                body.push_str(TINY_LAST_PREFIX);
-                body.push_str(&activity);
+                third_line.push_str(TINY_LAST_PREFIX);
+                third_line.push_str(&activity);
             }
         }
     }
 
+    let body = format!(
+        "{title} {state}{TINY_XHTML_BR}M{registered_ms} C{active_calls} S{queued_sds}{TINY_XHTML_BR}{third_line}{TINY_XHTML_BR}Voice"
+    );
     format!("{TINY_XHTML_PREFIX}{body}{TINY_XHTML_SUFFIX}")
 }
 
@@ -432,13 +440,17 @@ mod tests {
 
     #[test]
     fn render_wml2_status_tiny_page_keeps_dynamic_demo_fields() {
-        let page = render_wml2_status(&sample_snapshot(), 128).expect("tiny WML2 status should render");
+        let page = render_wml2_status(&sample_snapshot(), 192).expect("tiny WML2 status should render");
 
-        assert!(page.len() <= 128);
-        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.len() <= 192);
+        assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
+        assert!(page.contains("<font color=\"#00ff00\">"));
         assert!(page.contains("Nexus OK"));
-        assert!(page.contains("M3 C1 S2 U1d"));
+        assert!(page.contains("M3 C1 S2<br />U1d"));
         assert!(page.contains("L:S2260082"));
+        assert!(page.contains("<br />Voice"));
+        assert_eq!(page.matches("<br />").count(), 3);
+        assert!(!page.contains("<br/>"));
     }
 
     #[test]
