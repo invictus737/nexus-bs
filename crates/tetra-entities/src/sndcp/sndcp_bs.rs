@@ -552,7 +552,8 @@ impl Sndcp {
             active_calls,
             queued_sds,
             uptime_secs: self.started_at.elapsed().as_secs(),
-            last_activity: None,
+            last_activity: crate::net_dashboard::state::latest_last_heard_entry()
+                .map(|entry| super::wap_dashboard::last_activity_text(&entry)),
             health_summary: Some(health_summary(&health)),
             health_lines: health_lines_from_health(&health),
             radio_lines: registered_issis.into_iter().take(3).map(|issi| format!("MS {issi}")).collect(),

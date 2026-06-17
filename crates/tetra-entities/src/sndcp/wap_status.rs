@@ -17,6 +17,9 @@ pub const WAP_STATUS_HEALTH_LINE_MAX_ESCAPED_BYTES: usize = 28;
 pub const WAP_STATUS_DETAIL_MAX_LINES: usize = 3;
 const XHTML_MP_DOCTYPE: &str =
     "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"http://www.wapforum.org/DTD/xhtml-mobile10.dtd\">";
+const TINY_XHTML_PREFIX: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body style=\"color:#0f0\">";
+const TINY_XHTML_SUFFIX: &str = "</body></html>";
+const TINY_LAST_PREFIX: &str = " L:";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WapStatusSnapshot {
@@ -46,13 +49,13 @@ pub fn render_wml2_status(snapshot: &WapStatusSnapshot, max_bytes: usize) -> Res
     }
 
     for detail_mode in [WapStatusRenderMode::Full, WapStatusRenderMode::Compact, WapStatusRenderMode::Tiny] {
-        let page = render_wml2_status_page(snapshot, detail_mode);
+        let page = render_wml2_status_page(snapshot, detail_mode, max_bytes);
         if page.len() <= max_bytes {
             return Ok(page);
         }
     }
 
-    let page = render_wml2_status_page(snapshot, WapStatusRenderMode::Tiny);
+    let page = render_wml2_status_page(snapshot, WapStatusRenderMode::Tiny, max_bytes);
     Err(WapStatusError::RenderedTooLarge {
         len: page.len(),
         max: max_bytes,
@@ -66,7 +69,7 @@ enum WapStatusRenderMode {
     Tiny,
 }
 
-fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusRenderMode) -> String {
+fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusRenderMode, max_bytes: usize) -> String {
     let title = escape_xhtml_text_limited(snapshot.title.trim(), WAP_STATUS_TITLE_MAX_ESCAPED_BYTES);
     let stack_version = escape_xhtml_text_limited(snapshot.stack_version.trim(), WAP_STATUS_VERSION_MAX_ESCAPED_BYTES);
     let service_state = escape_xhtml_text_limited(snapshot.service_state.trim(), WAP_STATUS_STATE_MAX_ESCAPED_BYTES);
@@ -100,11 +103,42 @@ fn render_wml2_status_page(snapshot: &WapStatusSnapshot, detail_mode: WapStatusR
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{XHTML_MP_DOCTYPE}\n<html xmlns=\"http://www.w3.org/1999/xhtml\"><head><title>{title}</title><meta http-equiv=\"refresh\" content=\"10;url={refresh_path}\" /><style type=\"text/css\">body{{background:#00140a;color:#eaffea;font-family:sans-serif}}.box{{border:1px solid #33aa66;margin:2px;padding:2px}}.ok{{color:#69ff69}}.warn{{color:#ffd84d}}.bad{{color:#ff5a5a}}</style></head><body><p><b>Welcome to {title}</b><br />{subtitle}<br />{service_state} MS:{} C:{} SDS:{}<br />Up {uptime}</p><div class=\"box\"><b>Health</b>{health_summary}{health_lines}</div><div class=\"box\">{detail_lines}</div><p><a href=\"{refresh_path}\">Refresh</a></p></body></html>",
             snapshot.registered_ms, snapshot.active_calls, snapshot.queued_sds
         ),
-        WapStatusRenderMode::Tiny => format!(
-            "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body>Welcome to {title}<br />{service_state}<br />MS:{} C:{} S:{}</body></html>",
-            snapshot.registered_ms, snapshot.active_calls, snapshot.queued_sds
-        ),
+        WapStatusRenderMode::Tiny => render_tiny_wml2_status_page(snapshot, max_bytes),
     }
+}
+
+fn render_tiny_wml2_status_page(snapshot: &WapStatusSnapshot, max_bytes: usize) -> String {
+    let title = escape_xhtml_text_limited(snapshot.title.trim(), 5);
+    let state = compact_tiny_state(snapshot);
+    let registered_ms = compact_count(snapshot.registered_ms);
+    let active_calls = compact_count(snapshot.active_calls);
+    let queued_sds = compact_count(snapshot.queued_sds);
+    let uptime = compact_tiny_uptime(snapshot.uptime_secs);
+    let mut body = format!("{title} {state} M{registered_ms} C{active_calls} S{queued_sds} U{uptime}");
+
+    if let Some(activity) = snapshot
+        .last_activity
+        .as_deref()
+        .map(str::trim)
+        .filter(|activity| !activity.is_empty())
+        .map(compact_tiny_last_activity)
+    {
+        let used = TINY_XHTML_PREFIX
+            .len()
+            .saturating_add(body.len())
+            .saturating_add(TINY_LAST_PREFIX.len())
+            .saturating_add(TINY_XHTML_SUFFIX.len());
+        if used < max_bytes {
+            let remaining = max_bytes - used;
+            let activity = escape_xhtml_text_limited(&activity, remaining);
+            if !activity.is_empty() {
+                body.push_str(TINY_LAST_PREFIX);
+                body.push_str(&activity);
+            }
+        }
+    }
+
+    format!("{TINY_XHTML_PREFIX}{body}{TINY_XHTML_SUFFIX}")
 }
 
 pub fn render_wml2_detail_lines(lines: &[String]) -> String {
@@ -225,6 +259,55 @@ pub fn compact_uptime(uptime_secs: u64) -> String {
     }
 }
 
+fn compact_count(value: usize) -> String {
+    if value < 1_000 {
+        value.to_string()
+    } else if value < 1_000_000 {
+        format!("{}k", value / 1_000)
+    } else {
+        "999k".to_string()
+    }
+}
+
+fn compact_tiny_state(snapshot: &WapStatusSnapshot) -> &'static str {
+    let health = snapshot.health_summary.as_deref().unwrap_or_default();
+    if snapshot.service_state.contains("CRITICAL") || health.contains("CRITICAL") {
+        "BAD"
+    } else if snapshot.service_state.contains("DEGRADED") || health.contains("DEGRADED") {
+        "WARN"
+    } else {
+        "OK"
+    }
+}
+
+fn compact_tiny_uptime(uptime_secs: u64) -> String {
+    let days = uptime_secs / 86_400;
+    let hours = (uptime_secs % 86_400) / 3_600;
+    let minutes = (uptime_secs % 3_600) / 60;
+
+    if days > 0 {
+        format!("{}d", days.min(999))
+    } else if hours > 0 {
+        format!("{hours}h")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{}s", uptime_secs.min(59))
+    }
+}
+
+fn compact_tiny_last_activity(activity: &str) -> String {
+    let activity = activity.trim();
+    let compact = activity
+        .strip_prefix("SDS ")
+        .map(|rest| format!("S{rest}"))
+        .or_else(|| activity.strip_prefix("GRP ").map(|rest| format!("G{rest}")))
+        .or_else(|| activity.strip_prefix("P2P-S ").map(|rest| format!("P{rest}")))
+        .or_else(|| activity.strip_prefix("P2P-D ").map(|rest| format!("P{rest}")))
+        .unwrap_or_else(|| activity.to_string());
+    compact.replace(' ', "")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,9 +426,19 @@ mod tests {
         let page = render_wml2_status(&snapshot, 548).expect("bounded WML2 status should fit IPv4/UDP payload budget");
 
         assert!(page.len() <= 548);
-        assert!(page.contains("~"));
         assert!(page.contains("Nexus "));
         assert!(page.contains("Last: SDS 2260082&gt;2260618") || !page.contains("Last:"));
+    }
+
+    #[test]
+    fn render_wml2_status_tiny_page_keeps_dynamic_demo_fields() {
+        let page = render_wml2_status(&sample_snapshot(), 128).expect("tiny WML2 status should render");
+
+        assert!(page.len() <= 128);
+        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.contains("Nexus OK"));
+        assert!(page.contains("M3 C1 S2 U1d"));
+        assert!(page.contains("L:S2260082"));
     }
 
     #[test]

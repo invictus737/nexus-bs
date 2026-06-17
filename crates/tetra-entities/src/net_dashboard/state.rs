@@ -4,7 +4,7 @@
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 /// Per-MS state tracked by the dashboard
@@ -122,6 +122,7 @@ pub struct SdrHealthSnapshot {
 }
 
 pub const LAST_HEARD_MAX: usize = 50;
+static LATEST_LAST_HEARD: Mutex<Option<LastHeardEntry>> = Mutex::new(None);
 
 #[derive(Debug)]
 pub struct MsEntry {
@@ -178,6 +179,9 @@ impl DashboardStateInner {
             activity: activity.to_string(),
             dest,
         };
+        if let Ok(mut latest) = LATEST_LAST_HEARD.lock() {
+            *latest = Some(entry.clone());
+        }
         if self.last_heard.len() >= LAST_HEARD_MAX {
             self.last_heard.pop_back();
         }
@@ -237,4 +241,8 @@ impl DashboardStateInner {
             })
             .collect()
     }
+}
+
+pub fn latest_last_heard_entry() -> Option<LastHeardEntry> {
+    LATEST_LAST_HEARD.lock().ok().and_then(|latest| latest.clone())
 }

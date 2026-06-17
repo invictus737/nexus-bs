@@ -1103,11 +1103,11 @@ mod tests {
         assert_eq!(response_udp.destination_port, 49152);
         let page = std::str::from_utf8(response_udp.payload).expect("WAP status page should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("Welcome to Nexus-BS"));
+        assert!(page.contains("style=\"color:#0f0\""));
         assert!(!page.contains("<wml"));
         assert!(!page.contains("<card"));
-        assert!(page.contains("Nexus-BS"));
-        assert!(page.contains("MS</span> 4") || page.contains("MS:4"));
+        assert!(page.contains("Nexus OK"));
+        assert!(page.contains("M4 C0 S1"));
         assert!(page.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
     }
 
@@ -1445,7 +1445,8 @@ mod tests {
         );
         let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("Welcome to Nexus-BS"));
+        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.contains("Nexus OK"));
         assert!(!page.contains("<wml"));
     }
 
@@ -1495,7 +1496,8 @@ mod tests {
         let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
         let page = std::str::from_utf8(response_udp.payload).unwrap();
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
-        assert!(page.contains("Welcome"));
+        assert!(page.contains("style=\"color:#0f0\""));
+        assert!(page.contains("Nexus OK"));
     }
 
     #[test]
