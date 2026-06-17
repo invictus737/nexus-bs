@@ -126,6 +126,24 @@ impl SndcpContextTable {
         Ok(())
     }
 
+    pub fn replace_existing(&mut self, context: SndcpPdpContext) -> Result<SndcpPdpContext, SndcpContextError> {
+        if !self.contexts.contains_key(&context.key) {
+            return Err(SndcpContextError::MissingContext(context.key));
+        }
+
+        if let Some(primary_nsapi) = context.primary_nsapi {
+            let primary_key = SndcpContextKey::new(context.key.issi, primary_nsapi)?;
+            if !self.contexts.contains_key(&primary_key) {
+                return Err(SndcpContextError::PrimaryContextMissing(primary_key));
+            }
+        }
+
+        Ok(self
+            .contexts
+            .insert(context.key, context)
+            .expect("context existence checked before replace"))
+    }
+
     pub fn get(&self, key: SndcpContextKey) -> Option<&SndcpPdpContext> {
         self.contexts.get(&key)
     }
@@ -226,6 +244,23 @@ mod tests {
         );
 
         assert_eq!(table.get(key).map(|context| context.address), Some(SnAddress::Ipv4([10, 0, 0, 18])));
+    }
+
+    #[test]
+    fn replace_existing_updates_context_without_creating_a_duplicate() {
+        let mut table = SndcpContextTable::default();
+        let key = SndcpContextKey::new(2260618, 2).unwrap();
+
+        table
+            .activate(primary(2260618, 2, [10, 0, 0, 18]))
+            .expect("first context should activate");
+        let previous = table
+            .replace_existing(primary(2260618, 2, [10, 0, 0, 19]))
+            .expect("existing context should be replaceable");
+
+        assert_eq!(previous.address, SnAddress::Ipv4([10, 0, 0, 18]));
+        assert_eq!(table.len(), 1);
+        assert_eq!(table.get(key).map(|context| context.address), Some(SnAddress::Ipv4([10, 0, 0, 19])));
     }
 
     #[test]

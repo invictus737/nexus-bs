@@ -651,6 +651,63 @@ mod tests {
     }
 
     #[test]
+    fn dynamic_activation_after_recovered_context_refreshes_mxp600_ms_type() {
+        let mut pipeline = pipeline();
+        let address = TetraAddress::issi(ISSI);
+        let recovered_ready = pipeline
+            .handle_ltpd_mle_unitdata_ind(&ltpd_ind(address, data_transmit_request(1)), HANDLE, &snapshot())
+            .expect("missing WAP/IP context should be recovered from MS data-transfer request");
+        let recovered_response = decode_data_transmit_response(&recovered_ready.sdu).expect("SN-DATA TRANSMIT RESPONSE should decode");
+        assert_eq!(recovered_response.nsapi, 1);
+        assert_eq!(recovered_response.result, SndcpDataTransmitResponseResult::Accepted);
+        assert_eq!(
+            pipeline
+                .session()
+                .pdp()
+                .contexts()
+                .get_issi_nsapi(ISSI, 1)
+                .unwrap()
+                .map(|context| context.packet_data_ms_type),
+            Some(SnPacketDataMsType::TypeAParallel)
+        );
+
+        pipeline
+            .handle_ltpd_mle_unitdata_ind(
+                &ltpd_ind(
+                    address,
+                    encode_end_of_data(&SndcpEndOfData {
+                        immediate_service_change: false,
+                    })
+                    .expect("SN-END OF DATA should encode"),
+                ),
+                HANDLE,
+                &snapshot(),
+            )
+            .expect("SN-END OF DATA should return recovered context to STANDBY");
+
+        let reactivation = pipeline
+            .handle_ltpd_mle_unitdata_ind(
+                &ltpd_ind(address, dynamic_ipv4_demand_with_ms_type(1, SnPacketDataMsType::TypeBAlternating)),
+                HANDLE,
+                &snapshot(),
+            )
+            .expect("MXP600 Type B reactivation should refresh the recovered context");
+        let accept = decode_activate_pdp_context_accept(&reactivation.sdu).expect("reactivation should decode as accept, not reject");
+        assert_eq!(accept.nsapi, 1);
+        assert_eq!(accept.assigned_address, Some(SnAddress::Ipv4([10, 0, 0, 2])));
+        assert_eq!(
+            pipeline
+                .session()
+                .pdp()
+                .contexts()
+                .get_issi_nsapi(ISSI, 1)
+                .unwrap()
+                .map(|context| context.packet_data_ms_type),
+            Some(SnPacketDataMsType::TypeBAlternating)
+        );
+    }
+
+    #[test]
     fn activation_reject_uses_acknowledged_control_link() {
         let mut pipeline = pipeline();
         let demand = encode_activate_pdp_context_demand(&SndcpActivatePdpContextDemand {
