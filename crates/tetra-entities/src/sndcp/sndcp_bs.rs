@@ -108,7 +108,6 @@ struct PendingPacketDataHandoff {
 struct PendingWapTransactionKey {
     issi: u32,
     endpoint_id: EndpointId,
-    link_id: LinkId,
     nsapi: u8,
     client_addr: [u8; 4],
     server_addr: [u8; 4],
@@ -455,7 +454,7 @@ impl Sndcp {
             response.endpoint_id,
             response.link_id
         );
-        if response.packet_data_flag
+        if response.layer2service == Layer2Service::Acknowledged
             && let Some(key) = pending_wap_key
         {
             self.track_pending_wap_response(response.handle, key);
@@ -548,7 +547,6 @@ impl Sndcp {
         Some(PendingWapTransactionKey {
             issi: prim.received_tetra_address.ssi,
             endpoint_id: prim.endpoint_id,
-            link_id: prim.link_id,
             nsapi: unitdata.nsapi,
             client_addr: request_ip.source,
             server_addr: request_ip.destination,

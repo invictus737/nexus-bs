@@ -1258,7 +1258,7 @@ fn sndcp_wap_al_xhtml_suppresses_duplicate_wtp_get_while_response_pending() {
     let mut duplicate_payload = request_payload.clone();
     duplicate_payload[0] |= 0x01;
     let duplicate_sndcp = build_wap_status_sn_data_from(2, [10, 0, 0, 2], &duplicate_payload);
-    let duplicate_tl_sdu = build_mle_prefixed_sndcp_sdu(duplicate_sndcp);
+    let duplicate_tl_sdu = build_mle_prefixed_sndcp_sdu(duplicate_sndcp.clone());
     test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 1, &duplicate_tl_sdu));
     test.run_stack(Some(1));
     let duplicate_pending_msgs = test.dump_sinks();
@@ -1267,6 +1267,14 @@ fn sndcp_wap_al_xhtml_suppresses_duplicate_wtp_get_while_response_pending() {
             .iter()
             .all(|msg| llc_pdu_type_from_tma_req(msg) != Some(LlcPduType::AlDataAlFinal)),
         "duplicate WTP GET must not spawn a second AL response while the first response is pending"
+    );
+
+    test.submit_message(build_ltpd_ind_on_link(Sap::TlpdSap, duplicate_sndcp, endpoint_id, 0));
+    test.run_stack(Some(1));
+    let duplicate_common_control_msgs = test.dump_sinks();
+    assert!(
+        duplicate_common_control_msgs.is_empty(),
+        "duplicate WTP GET on a different bearer link must still be suppressed while the first response is pending"
     );
 
     for handle in first_response_msgs.iter().filter_map(tma_req_handle) {
