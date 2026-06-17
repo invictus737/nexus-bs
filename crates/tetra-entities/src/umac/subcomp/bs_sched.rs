@@ -69,6 +69,7 @@ pub const TCH_S_CAP: usize = 274;
 pub const NUM_TIMESLOTS: usize = 4;
 
 const MAX_RESERVED_ACCESS_GRANT_CHUNK_SLOTS: usize = 4;
+const BASIC_GRANT_FULL_SLOT_COUNTS_DESC: &[usize] = &[68, 51, 34, 24, 17, 13, 10, 8, 6, 5, 4, 3, 2, 1];
 const PREDEFINED_BROADCAST_GSSI: u32 = 0xFF_FFFF;
 const MAX_PENDING_RA_ACKS_PER_TIMESLOT: usize = 8192;
 const MAX_DLSCHED_ELEMS_PER_TIMESLOT: usize = 4096;
@@ -1527,9 +1528,20 @@ impl BsChannelScheduler {
         let is_halfslot = debt.is_halfslot();
         let requested_cap = debt.next_chunk_slots();
 
-        // Find a suitable grant opportunity
-        let grant_op =
-            self.ul_find_grant_opportunity_for_addr_from(base_dltime, timeslot, addr, requested_cap, is_halfslot, timeslot_alloc);
+        let mut too_late_op = None;
+        let mut grant_op = None;
+        let candidate_caps: &[usize] = if is_halfslot { &[1] } else { BASIC_GRANT_FULL_SLOT_COUNTS_DESC };
+        for candidate_cap in candidate_caps.iter().copied().filter(|cap| *cap <= requested_cap) {
+            let candidate_op =
+                self.ul_find_grant_opportunity_for_addr_from(base_dltime, timeslot, addr, candidate_cap, is_halfslot, timeslot_alloc);
+            if let Some((skips, grant_timestamps)) = candidate_op {
+                if skips <= 13 {
+                    grant_op = Some((candidate_cap, skips, grant_timestamps));
+                    break;
+                }
+                too_late_op.get_or_insert((candidate_cap, skips));
+            }
+        }
 
         tracing::debug!(
             "ul_process_cap_req: addr {}, debt {:?}, chunk_cap {}, is_halfslot {}, grant_op: {:?}",
@@ -1541,31 +1553,28 @@ impl BsChannelScheduler {
         );
 
         // If found, reserve the slots and return a BasicSlotgrant + optional usage_marker.
-        if let Some((skips, grant_timestamps)) = grant_op {
-            if skips > 13 {
-                // EN 300 392-2 clause 21.5.6 defines delay opportunities only
-                // for raw values 1..=13. Raw 14/15 are special meanings, so do
-                // not reserve capacity that cannot be represented as a valid
-                // basic slot-grant delay.
-                tracing::warn!(
-                    "ul_process_cap_req: grant opportunity for addr {} debt {:?} needs {} delay opportunities",
-                    addr,
-                    debt,
-                    skips
-                );
-                return None;
-            }
-
+        if let Some((granted_cap, skips, grant_timestamps)) = grant_op {
             // For multi-slot full grants, allocate a usage marker. We do this
             // BEFORE reserving so the marker can be embedded in the schedule.
             // Single-slot or half-slot grants don't need a marker — the MS
             // either has nothing to fragment (subslot) or completes the burst
             // in the one slot (single full slot).
-            let usage_marker = if !is_halfslot && requested_cap >= 2 {
+            let usage_marker = if !is_halfslot && granted_cap >= 2 {
                 Some(self.alloc_usage_marker(timeslot))
             } else {
                 None
             };
+
+            if granted_cap < requested_cap {
+                tracing::debug!(
+                    "ul_process_cap_req: addr {} debt {:?} reduced grant chunk {} -> {} to keep delay {} representable",
+                    addr,
+                    debt,
+                    requested_cap,
+                    granted_cap,
+                    skips
+                );
+            }
 
             // Reserve the target granting opportunity. Get subslot (only relevant for halfslot reservation)
             let subslot = self.ul_reserve_grant(addr.ssi, grant_timestamps, is_halfslot, usage_marker);
@@ -1581,7 +1590,7 @@ impl BsChannelScheduler {
                     _ => unreachable!("ul_process_cap_req: subslot must be 1 or 2, got {}", subslot),
                 }
             } else {
-                BasicSlotgrantCapAlloc::from_req_slotcount(requested_cap)
+                BasicSlotgrantCapAlloc::from_req_slotcount(granted_cap)
             };
             let grant_delay = if skips == 0 {
                 BasicSlotgrantGrantingDelay::CapAllocAtNextOpportunity
@@ -1594,9 +1603,23 @@ impl BsChannelScheduler {
                     granting_delay: grant_delay,
                 },
                 usage_marker,
-                requested_cap,
+                granted_cap,
             ))
         } else {
+            if let Some((candidate_cap, skips)) = too_late_op {
+                // EN 300 392-2 clause 21.5.6 defines delay opportunities only
+                // for raw values 1..=13. Raw 14/15 are special meanings, so do
+                // not reserve capacity that cannot be represented as a valid
+                // basic slot-grant delay.
+                tracing::warn!(
+                    "ul_process_cap_req: grant opportunity for addr {} debt {:?} chunk {} needs {} delay opportunities",
+                    addr,
+                    debt,
+                    candidate_cap,
+                    skips
+                );
+                return None;
+            }
             tracing::warn!(
                 "ul_process_cap_req: no suitable grant opportunity found for addr {}, debt {:?}",
                 addr,
@@ -8714,6 +8737,54 @@ mod tests {
         assert_eq!(
             sched.ul_get_slot_owner(TdmaTime { t: 4, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
             Some(addr.ssi)
+        );
+    }
+
+    #[test]
+    fn test_packet_data_multislot_grant_reduces_chunk_to_keep_delay_representable() {
+        let mut sched = get_testing_slotter();
+        let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(grant_base);
+        let addr = TetraAddress::issi(0x2260618);
+        let blocker = 0x2260001;
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2, 3, 4]);
+
+        for dist in 0..14 {
+            block_test_uplink_slot(&mut sched, grant_base.add_timeslots(dist * 4), blocker);
+        }
+
+        sched.dl_enqueue_reservation_grant(2, addr, ReservationRequirement::Req10Slots);
+        sched.dl_integrate_sched_elems_for_timeslot(grant_base, &SubscriberRegistry::new(), &HashMap::new());
+
+        let slot_grant = sched.dltx_queues[1]
+            .iter()
+            .find_map(|elem| match elem {
+                DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr) => pdu.slot_granting_element.as_ref(),
+                _ => None,
+            })
+            .expect("scheduler should emit a representable smaller grant");
+
+        // A four-slot chunk cannot start on TS3 because the following TS2
+        // opportunities are occupied for more than thirteen channel
+        // opportunities. Granting TS3+TS4 now and preserving the remaining
+        // debt is still clause-valid and avoids an AL/WAP wait-grant loop.
+        assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
+        assert_eq!(slot_grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 3, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr.ssi)
+        );
+        assert_eq!(
+            sched.ul_get_slot_owner(TdmaTime { t: 4, f: 1, m: 1, h: 0 }, PhyBlockNum::Both),
+            Some(addr.ssi)
+        );
+        assert!(
+            sched
+                .dltx_next_slot_queue
+                .iter()
+                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                    if *pending_addr == addr && debt.remaining_slots == 8)),
+            "smaller grant must preserve remaining WAP/AL reservation debt"
         );
     }
 

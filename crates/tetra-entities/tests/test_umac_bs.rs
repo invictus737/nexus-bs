@@ -2811,6 +2811,86 @@ fn test_mac_u_blck_reservation_on_multislot_pdch_uses_near_assigned_channel_slot
 }
 
 #[test]
+fn test_mac_u_blck_large_reservation_on_multislot_pdch_reduces_to_encodable_chunk() {
+    debug::setup_logging_verbose();
+
+    let start = TdmaTime::default().add_timeslots(2);
+    let target_issi = 0x3023;
+    let target_addr = TetraAddress::issi(target_issi);
+    let assigned = [false, true, true, true];
+    let mut test = ComponentTest::new(StackMode::Bs, Some(start));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 73,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: target_addr,
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: assigned,
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    let inbound_dltime = run_until_mac_u_blck_would_be_received_on_uplink_ts(&mut test, 2);
+    assert_eq!(inbound_dltime.add_timeslots(-2).t, 2);
+    let grant_tx_base = inbound_dltime.add_timeslots(2);
+    assert_eq!(grant_tx_base.t, 2, "next TS2 downlink should carry the pending slot grant");
+
+    reserve_same_timeslot_grant_opportunities(&mut test, grant_tx_base, 2, 14, 0x703100);
+
+    // MAC-U-BLCK reservation raw value 8 maps to Req10Slots. On the active
+    // TS2+TS3+TS4 PDCH, a four-slot chunk is not representable here because
+    // the TS2 opportunities are blocked for more than thirteen channel
+    // opportunities. The BS should grant the nearer legal TS3+TS4 chunk and
+    // preserve the rest as pending grant debt.
+    submit_mac_u_blck(&mut test, 8);
+    test.deliver_all_messages();
+    test.run_stack(Some(4));
+
+    let sink_msgs = test.dump_sinks();
+    let slot_grant = mac_resources_for_addr(&sink_msgs, target_addr)
+        .into_iter()
+        .filter_map(|(_, resource)| resource.slot_granting_element)
+        .find(|grant| grant.capacity_allocation == BasicSlotgrantCapAlloc::Grant2Slots)
+        .expect("large MAC-U-BLCK reservation on active PDCH should serialize a reduced real slot grant");
+
+    assert_eq!(slot_grant.capacity_allocation, BasicSlotgrantCapAlloc::Grant2Slots);
+    assert_eq!(slot_grant.granting_delay, BasicSlotgrantGrantingDelay::DelayNOpportunities(1));
+    assert_eq!(
+        umac_bs_mut(&mut test)
+            .channel_scheduler
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(1), PhyBlockNum::Both),
+        Some(target_issi),
+        "reduced grant should reserve TS3"
+    );
+    assert_eq!(
+        umac_bs_mut(&mut test)
+            .channel_scheduler
+            .ul_get_slot_owner(grant_tx_base.add_timeslots(2), PhyBlockNum::Both),
+        Some(target_issi),
+        "reduced grant should reserve TS4"
+    );
+}
+
+#[test]
 fn test_stale_frame_18_energy_saving_assignment_does_not_starve_private_reservation_grant() {
     debug::setup_logging_verbose();
 
