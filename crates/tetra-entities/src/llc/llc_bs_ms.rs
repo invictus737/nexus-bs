@@ -25,7 +25,7 @@ use crate::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::{
     N251_BL_MAX_TLSDU_LEN_BITS, N252_BL_MAX_TLSDU_RETRANSMITS_ACKED, N253_BL_MAX_TLSDU_REPETITIONS_UNACKED,
 };
-use tetra_pdus::llc::consts::timers::{T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER};
+use tetra_pdus::llc::consts::timers::{T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
 use tetra_pdus::llc::pdus::al_ack::AlAck;
 use tetra_pdus::llc::pdus::al_data::AlData;
@@ -96,10 +96,12 @@ struct RebuildableAckTransfer {
 struct AdvancedLinkSession {
     key: AdvancedLinkKey,
     al_number: u8,
+    max_tl_sdu_len_bytes: usize,
     max_tl_sdu_retransmissions: u8,
     max_segment_retransmissions: u8,
     tx_next_ns: u8,
     last_delivered_ns: Option<u8>,
+    receiver_not_ready_since: Option<TdmaTime>,
 }
 
 #[derive(Debug, Clone)]
@@ -307,6 +309,20 @@ impl Llc {
 
     fn tl_sdu_exceeds_n251(tl_sdu: &BitBuffer, fcs_flag: bool) -> bool {
         tl_sdu.get_len_remaining() > Self::n251_max_tl_sdu_bits(fcs_flag)
+    }
+
+    fn n271_max_tl_sdu_bytes(max_tl_sdu_len_code: u8) -> usize {
+        // EN 300 392-2 table 21.23: N.271 code 0..7 maps to
+        // 32, 64, 128, 256, 512, 1024, 2048, 4096 octets, including AL FCS.
+        32usize << max_tl_sdu_len_code.min(7)
+    }
+
+    fn al_tl_sdu_with_fcs_octets(tl_sdu: &BitBuffer) -> usize {
+        (tl_sdu.get_len_remaining() + 32).div_ceil(8)
+    }
+
+    fn al_receiver_not_ready_expired(since: TdmaTime, now: TdmaTime) -> bool {
+        since.age(now) >= T271_RECEIVER_NOT_READY_FOR_TX_TIMER as i32
     }
 
     fn strip_validated_fcs(pdu: &mut BitBuffer) {
@@ -556,10 +572,12 @@ impl Llc {
             AdvancedLinkSession {
                 key,
                 al_number: setup.advanced_link_number,
+                max_tl_sdu_len_bytes: Self::n271_max_tl_sdu_bytes(setup.max_tl_sdu_len_code),
                 max_tl_sdu_retransmissions: setup.max_tl_sdu_retransmissions,
                 max_segment_retransmissions: setup.max_segment_retransmissions,
                 tx_next_ns: 0,
                 last_delivered_ns: None,
+                receiver_not_ready_since: None,
             },
         );
     }
@@ -580,6 +598,64 @@ impl Llc {
             return None;
         }
         Some(first)
+    }
+
+    fn clear_expired_al_receiver_not_ready(&mut self) {
+        let now = self.dltime;
+        for session in self.advanced_links.values_mut() {
+            let Some(since) = session.receiver_not_ready_since else {
+                continue;
+            };
+            if Self::al_receiver_not_ready_expired(since, now) {
+                tracing::info!(
+                    "LLC: AL-RNR T.271 expired for SSI {} endpoint {} link {}; allowing new TL-SDUs",
+                    session.key.addr.ssi,
+                    session.key.endpoint_id,
+                    session.key.link_id
+                );
+                session.receiver_not_ready_since = None;
+            }
+        }
+    }
+
+    fn apply_al_receiver_flow_control(&mut self, addr: TetraAddress, endpoint_id: EndpointId, receiver_ready: bool) {
+        let Some(key) = self.resolve_original_advanced_link_key(addr, endpoint_id) else {
+            return;
+        };
+        let Some(session) = self.advanced_links.get_mut(&key) else {
+            return;
+        };
+        if receiver_ready {
+            if session.receiver_not_ready_since.take().is_some() {
+                tracing::info!(
+                    "LLC: AL-ACK receiver-ready for SSI {} endpoint {} link {}; clearing AL-RNR flow control",
+                    key.addr.ssi,
+                    key.endpoint_id,
+                    key.link_id
+                );
+            }
+        } else {
+            session.receiver_not_ready_since = Some(self.dltime);
+            tracing::info!(
+                "LLC: AL-RNR receiver-not-ready for SSI {} endpoint {} link {}; blocking new TL-SDUs for T.271",
+                key.addr.ssi,
+                key.endpoint_id,
+                key.link_id
+            );
+        }
+    }
+
+    fn al_receiver_not_ready(&self, key: AdvancedLinkKey) -> bool {
+        self.advanced_links
+            .get(&key)
+            .and_then(|session| session.receiver_not_ready_since)
+            .is_some()
+    }
+
+    fn al_transfer_is_rnr_allowed(al: &ExpectedAlAck) -> bool {
+        al.first_complete_report_sent
+            || al.selective_segment_retry_pending
+            || al.segments.iter().any(|segment| segment.retransmission_requested)
     }
 
     fn al_tl_sdu_with_fcs(tl_sdu: &mut BitBuffer) -> BitBuffer {
@@ -1059,11 +1135,8 @@ impl Llc {
     }
 
     fn al_segment_retry_pending_or_inflight(segment: &ExpectedAlSegment) -> bool {
-        if !segment.retransmission_requested {
-            return false;
-        }
         if segment.t_submitted_to_umac.is_none() || segment.t_umac_done.is_none() {
-            return true;
+            return segment.retransmission_requested || segment.t_submitted_to_umac.is_some();
         }
         matches!(
             segment.current_mac_reporter.as_ref().map(TxReporter::get_state),
@@ -1695,6 +1768,20 @@ impl Llc {
             Self::reject_tldata_backlog_full(queue, &mut prim);
             return;
         };
+
+        let tl_sdu_with_fcs_octets = Self::al_tl_sdu_with_fcs_octets(&prim.tl_sdu);
+        if tl_sdu_with_fcs_octets > session.max_tl_sdu_len_bytes {
+            tracing::warn!(
+                "LLC: rejecting AL TL-DATA.req for SSI {} endpoint {} link {}; TL-SDU+FCS {} octets exceeds negotiated N.271 {} octets",
+                prim.main_address.ssi,
+                prim.endpoint_id,
+                prim.link_id,
+                tl_sdu_with_fcs_octets,
+                session.max_tl_sdu_len_bytes
+            );
+            Self::reject_tldata_backlog_full(queue, &mut prim);
+            return;
+        }
 
         let ns = session.tx_next_ns;
         session.tx_next_ns = (session.tx_next_ns + 1) & 0b111;
@@ -2665,6 +2752,8 @@ impl Llc {
         };
         tracing::debug!(ts=%self.dltime, "<- {}", ack);
 
+        self.apply_al_receiver_flow_control(prim.main_address, prim.endpoint_id, ack.receiver_ready);
+
         let (match_idx, exact_matches) = self.find_outbound_al_ack_match(prim, &ack);
         let Some(idx) = match_idx else {
             tracing::warn!(
@@ -2767,8 +2856,13 @@ impl Llc {
                             }
                         }
                         Some(false) => {
+                            if segment.acknowledged {
+                                continue;
+                            }
                             if Self::al_segment_retry_pending_or_inflight(segment) {
                                 segment.acknowledged = false;
+                                segment.retransmission_requested = true;
+                                segment.ack_request_probe_pending = false;
                                 retransmit_segments += 1;
                             } else if segment.retransmit_count < max_segment_retransmissions {
                                 segment.acknowledged = false;
@@ -3181,7 +3275,11 @@ impl Llc {
     fn highest_priority_unsubmitted_al_index(&self, link_blocked: &HashSet<AdvancedLinkKey>) -> Option<usize> {
         let mut selected: Option<(usize, Todo)> = None;
         for (idx, al) in self.outbound_al_messages.iter().enumerate() {
-            if al.t_submitted_to_umac.is_some() || link_blocked.contains(&Self::expected_al_key(al)) {
+            let key = Self::expected_al_key(al);
+            if al.t_submitted_to_umac.is_some() || link_blocked.contains(&key) {
+                continue;
+            }
+            if self.al_receiver_not_ready(key) && !Self::al_transfer_is_rnr_allowed(al) {
                 continue;
             }
             match selected {
@@ -3194,6 +3292,7 @@ impl Llc {
 
     fn submit_free_al_messages_to_umac(&mut self, queue: &mut MessageQueue) -> bool {
         let mut had_activity = false;
+        self.clear_expired_al_receiver_not_ready();
         let mut link_blocked: HashSet<AdvancedLinkKey> = self
             .outbound_al_messages
             .iter()
