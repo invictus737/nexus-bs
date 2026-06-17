@@ -31,7 +31,7 @@ use tetra_entities::sndcp::sndcp_bs::{
 };
 use tetra_entities::sndcp::transfer::{
     SN_PDU_TYPE_DATA, SN_PDU_TYPE_END_OF_DATA, SndcpDataTransmitRequest, SndcpDataTransmitResponseResult, SndcpEndOfData,
-    SndcpNotSupported, SndcpReconnect, SndcpTransferControl, decode_data_transmit_response, decode_end_of_data,
+    SndcpNotSupported, SndcpReconnect, SndcpTransferControl, SndcpTransferRejectCause, decode_data_transmit_response, decode_end_of_data,
     encode_data_transmit_request, encode_end_of_data, encode_not_supported, encode_reconnect,
 };
 use tetra_entities::sndcp::unitdata::decode_sn_user_data_pdu;
@@ -699,6 +699,17 @@ fn assert_quit_and_go_common_control_allocation(allocation: &CmceChanAllocReq) {
 fn assert_no_runtime_side_effects(test: &mut ComponentTest) {
     assert_eq!(test.router.get_msgqueue_len(), 0);
     assert!(test.dump_sinks().is_empty());
+}
+
+fn take_ltpd_unitdata_reqs(test: &mut ComponentTest) -> Vec<LtpdMleUnitdataReq> {
+    test.dump_sinks()
+        .into_iter()
+        .filter(|msg| msg.sap == Sap::TlpdSap && msg.src == TetraEntity::Sndcp && msg.dest == TetraEntity::Mle)
+        .filter_map(|msg| match msg.msg {
+            SapMsgInner::LtpdMleUnitdataReq(req) => Some(req),
+            _ => None,
+        })
+        .collect()
 }
 
 fn build_subscriber_deregister(issi: u32) -> SapMsg {
@@ -1539,6 +1550,116 @@ fn sndcp_created_pdch_stall_cannot_block_group_voice_allocation_release_or_reuse
         );
         assert_eq!(state.timeslot_alloc.owner(4), None);
     }
+}
+
+#[test]
+fn sndcp_wap_reload_with_ts2_voice_busy_allocates_ts3_packet_data() {
+    debug::setup_logging_verbose();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp(&mut config);
+    config.cell.advanced_link = true;
+    config
+        .cell
+        .wap_ip
+        .as_mut()
+        .expect("WAP/IP profile should be enabled")
+        .assume_pdch_ready_after_data_transmit = false;
+
+    let data_issi = 1000001;
+    let endpoint_id = 1;
+    let mut test = ComponentTest::from_config(config, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(
+        vec![TetraEntity::Sndcp, TetraEntity::Mle, TetraEntity::Llc, TetraEntity::Umac],
+        vec![TetraEntity::Lmac],
+    );
+    test.config
+        .state_write()
+        .timeslot_alloc
+        .reserve(TimeslotOwner::Cmce, 2)
+        .expect("test voice owner should reserve TS2 before SNDCP reload");
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_dynamic_ipv4_activation_demand(2),
+        endpoint_id,
+        0,
+    ));
+    test.run_stack(Some(6));
+    let _ = test.dump_sinks();
+    test.submit_message(build_bl_ack_ind(TetraAddress::issi(data_issi), endpoint_id, 0));
+    test.run_stack(Some(2));
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_mxp600_single_slot_data_transmit_request(2),
+        endpoint_id,
+        0,
+    ));
+    for _ in 0..96 {
+        test.run_stack(Some(1));
+        let _ = test.dump_sinks();
+        if test.config.state_read().timeslot_alloc.owner(3) == Some(TimeslotOwner::PacketData) {
+            break;
+        }
+    }
+
+    let state = test.config.state_read();
+    assert_eq!(
+        state.timeslot_alloc.owner(2),
+        Some(TimeslotOwner::Cmce),
+        "SNDCP/WAP reload must not take the voice-owned TS2"
+    );
+    assert_eq!(
+        state.timeslot_alloc.owner(3),
+        Some(TimeslotOwner::PacketData),
+        "SNDCP/WAP reload should allocate the next free traffic slot when TS2 is voice-owned"
+    );
+    assert_eq!(state.timeslot_alloc.owner(4), None);
+}
+
+#[test]
+fn sndcp_wap_data_handoff_rejects_when_all_traffic_timeslots_are_voice_busy() {
+    debug::setup_logging_verbose();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp(&mut config);
+    let mut test = ComponentTest::from_config(config, None);
+    test.populate_entities(vec![TetraEntity::Sndcp], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+    {
+        let mut state = test.config.state_write();
+        for ts in 2..=4 {
+            state
+                .timeslot_alloc
+                .reserve(TimeslotOwner::Cmce, ts)
+                .expect("test voice owner should reserve every traffic TS");
+        }
+    }
+
+    test.submit_message(build_ltpd_ind(
+        Sap::TlpdSap,
+        build_dynamic_ipv4_activation_demand_with_ms_type(2, SnPacketDataMsType::TypeBAlternating),
+    ));
+    test.submit_message(build_ltpd_ind(Sap::TlpdSap, build_mxp600_single_slot_data_transmit_request(2)));
+    test.deliver_all_messages();
+
+    let mut ltpd_reqs = take_ltpd_unitdata_reqs(&mut test);
+    assert_eq!(
+        ltpd_reqs.len(),
+        2,
+        "activation plus fast reject should emit exactly two SNDCP responses"
+    );
+    let ready_response = ltpd_reqs.remove(1);
+    let ready = decode_data_transmit_response(&ready_response.sdu).expect("SN-DATA TRANSMIT reject should decode");
+    assert_eq!(ready.nsapi, 2);
+    assert_eq!(
+        ready.result,
+        SndcpDataTransmitResponseResult::Rejected(SndcpTransferRejectCause::SndcpServiceTemporarilyNotAvailable)
+    );
+    assert!(!ready_response.packet_data_flag);
+    assert!(
+        ready_response.chan_alloc.is_none(),
+        "all traffic slots busy by voice must fail fast without advertising a stale PDCH allocation"
+    );
 }
 
 #[test]

@@ -143,6 +143,12 @@ pub struct PendingGrantDebt {
     pub remaining_slots: usize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingGrantOrigin {
+    CommonControl,
+    PacketData { assigned_ts: u8 },
+}
+
 impl PendingGrantDebt {
     fn new(res_req: ReservationRequirement) -> Self {
         let remaining_slots = match res_req {
@@ -261,7 +267,7 @@ pub enum DlSchedElem {
     /// reserved only when this element is integrated into the actual
     /// MAC-RESOURCE transmission, so EG-delayed downlink grants do not point at
     /// already-expired uplink opportunities.
-    PendingGrant(TetraAddress, PendingGrantDebt),
+    PendingGrant(TetraAddress, PendingGrantDebt, PendingGrantOrigin),
 
     /// A MAC-RESOURCE PDU. May be split into fragments upon processing, in which case a FragBuf will be inserted after processing the resource.
     Resource(MacResource, BitBuffer, Option<TxReporter>, Option<GroupDeliveryState>),
@@ -1070,6 +1076,31 @@ impl BsChannelScheduler {
         matches!(assignment.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both)
     }
 
+    fn packet_data_pending_grant_origin_is_valid(
+        &self,
+        addr: TetraAddress,
+        origin: PendingGrantOrigin,
+        timeslot_alloc: Option<&TimeslotAllocator>,
+    ) -> bool {
+        let PendingGrantOrigin::PacketData { assigned_ts } = origin else {
+            return true;
+        };
+        if !(2..=NUM_TIMESLOTS as u8).contains(&assigned_ts) {
+            return false;
+        }
+        if self.packet_data_slot_has_voice_circuit(assigned_ts) {
+            return false;
+        }
+        if timeslot_alloc
+            .and_then(|allocator| allocator.owner(assigned_ts))
+            .is_some_and(|owner| owner != TimeslotOwner::PacketData)
+        {
+            return false;
+        }
+        self.packet_data_assignments[assigned_ts as usize - 1]
+            .is_some_and(|assignment| assignment.addr == addr && Self::packet_data_assignment_supports_uplink(assignment))
+    }
+
     fn packet_data_requested_traffic_slot_count(ts_assigned: [bool; NUM_TIMESLOTS]) -> usize {
         let requested_non_mcch = ts_assigned[1..].iter().filter(|assigned| **assigned).count();
         if requested_non_mcch > 0 {
@@ -1285,6 +1316,39 @@ impl BsChannelScheduler {
         }
     }
 
+    fn purge_packet_data_pending_grants_for_slot(&mut self, addr: TetraAddress, assigned_ts: u8, reason: &str) {
+        fn retain_not_matching(queue: &mut Vec<DlSchedElem>, addr: TetraAddress, assigned_ts: u8) -> usize {
+            let before = queue.len();
+            queue.retain(|elem| {
+                !matches!(
+                    elem,
+                    DlSchedElem::PendingGrant(
+                        pending_addr,
+                        _,
+                        PendingGrantOrigin::PacketData {
+                            assigned_ts: pending_ts
+                        }
+                    ) if *pending_addr == addr && *pending_ts == assigned_ts
+                )
+            });
+            before - queue.len()
+        }
+
+        let mut purged = retain_not_matching(&mut self.dltx_next_slot_queue, addr, assigned_ts);
+        for queue in &mut self.dltx_queues {
+            purged += retain_not_matching(queue, addr, assigned_ts);
+        }
+        if purged > 0 {
+            tracing::info!(
+                "packet-data PDCH pending grants purged for {} TS{}: {} entries ({})",
+                addr,
+                assigned_ts,
+                purged,
+                reason
+            );
+        }
+    }
+
     fn preempt_packet_data_assignment_for_voice(&mut self, ts: u8) {
         let Some(slot) = Self::dl_slot_index(ts, "preempt_packet_data_assignment_for_voice") else {
             return;
@@ -1293,6 +1357,7 @@ impl BsChannelScheduler {
             return;
         };
 
+        self.purge_packet_data_pending_grants_for_slot(assignment.addr, ts, "voice/circuit preemption");
         self.packet_data_assignments[slot] = None;
         let mut remaining = [false; NUM_TIMESLOTS];
         for next_slot in 1..NUM_TIMESLOTS {
@@ -1814,16 +1879,31 @@ impl BsChannelScheduler {
     }
 
     pub fn dl_enqueue_reservation_grant(&mut self, ts: u8, addr: TetraAddress, res_req: ReservationRequirement) {
+        self.dl_enqueue_reservation_grant_with_origin(ts, addr, res_req, PendingGrantOrigin::CommonControl);
+    }
+
+    pub fn dl_enqueue_packet_data_reservation_grant(&mut self, ts: u8, addr: TetraAddress, res_req: ReservationRequirement) {
+        self.dl_enqueue_reservation_grant_with_origin(ts, addr, res_req, PendingGrantOrigin::PacketData { assigned_ts: ts });
+    }
+
+    fn dl_enqueue_reservation_grant_with_origin(
+        &mut self,
+        ts: u8,
+        addr: TetraAddress,
+        res_req: ReservationRequirement,
+        origin: PendingGrantOrigin,
+    ) {
         let Some(slot) = Self::dl_slot_index(ts, "dl_enqueue_reservation_grant") else {
             return;
         };
         tracing::debug!(
-            "dl_enqueue_reservation_grant: ts {} enqueueing reservation {:?} for addr {}",
+            "dl_enqueue_reservation_grant: ts {} enqueueing reservation {:?} for addr {} origin {:?}",
             ts,
             res_req,
-            addr
+            addr,
+            origin
         );
-        let elem = DlSchedElem::PendingGrant(addr, PendingGrantDebt::new(res_req));
+        let elem = DlSchedElem::PendingGrant(addr, PendingGrantDebt::new(res_req), origin);
         self.push_sched_queue_bounded(slot, elem, "dltx_queues:dl_enqueue_reservation_grant");
     }
 
@@ -2032,16 +2112,17 @@ impl BsChannelScheduler {
                 }
                 Some(DlSchedElem::RandomAccessAck(addr))
             }
-            DlSchedElem::PendingGrant(addr, debt) => {
+            DlSchedElem::PendingGrant(addr, debt, origin) => {
                 for queued in queue.iter_mut().rev() {
-                    if let DlSchedElem::PendingGrant(pending_addr, pending_debt) = queued
+                    if let DlSchedElem::PendingGrant(pending_addr, pending_debt, pending_origin) = queued
                         && *pending_addr == addr
+                        && *pending_origin == origin
                     {
                         *pending_debt = pending_debt.coalesce_max(debt);
                         return None;
                     }
                 }
-                Some(DlSchedElem::PendingGrant(addr, debt))
+                Some(DlSchedElem::PendingGrant(addr, debt, origin))
             }
             elem => Some(elem),
         }
@@ -2135,7 +2216,7 @@ impl BsChannelScheduler {
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
                 self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma");
                 if let Some((grant_addr, res_req)) = current_channel_ack_grant {
-                    let elem = DlSchedElem::PendingGrant(grant_addr, PendingGrantDebt::new(res_req));
+                    let elem = DlSchedElem::PendingGrant(grant_addr, PendingGrantDebt::new(res_req), PendingGrantOrigin::CommonControl);
                     self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_tma_ack_grant");
                 }
                 break;
@@ -2145,7 +2226,7 @@ impl BsChannelScheduler {
                 let elem = DlSchedElem::Resource(pdu.clone(), sdu.clone(), tx_reporter.clone(), None);
                 self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma");
                 if let Some((grant_addr, res_req)) = current_channel_ack_grant {
-                    let elem = DlSchedElem::PendingGrant(grant_addr, PendingGrantDebt::new(res_req));
+                    let elem = DlSchedElem::PendingGrant(grant_addr, PendingGrantDebt::new(res_req), PendingGrantOrigin::CommonControl);
                     self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma_ack_grant");
                 }
             } else {
@@ -2153,7 +2234,7 @@ impl BsChannelScheduler {
                 let elem = DlSchedElem::Resource(pdu, sdu, tx_reporter, None);
                 self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma");
                 if let Some((grant_addr, res_req)) = current_channel_ack_grant {
-                    let elem = DlSchedElem::PendingGrant(grant_addr, PendingGrantDebt::new(res_req));
+                    let elem = DlSchedElem::PendingGrant(grant_addr, PendingGrantDebt::new(res_req), PendingGrantOrigin::CommonControl);
                     self.push_sched_queue_bounded(ts as usize - 1, elem, "dltx_queues:dl_enqueue_tma_ack_grant");
                 }
                 break;
@@ -2329,21 +2410,22 @@ impl BsChannelScheduler {
         self.push_next_slot_queue_bounded(elem, "dltx_next_slot_queue:dl_enqueue_group_repeat_next_frame");
     }
 
-    fn dl_defer_pending_grant_next_frame(&mut self, addr: TetraAddress, debt: PendingGrantDebt) {
+    fn dl_defer_pending_grant_next_frame(&mut self, addr: TetraAddress, debt: PendingGrantDebt, origin: PendingGrantOrigin) {
         tracing::debug!(
-            "dl_defer_pending_grant_next_frame: requeueing reservation debt {:?} for addr {}",
+            "dl_defer_pending_grant_next_frame: requeueing reservation debt {:?} for addr {} origin {:?}",
             debt,
-            addr
+            addr,
+            origin
         );
         self.push_next_slot_queue_bounded(
-            DlSchedElem::PendingGrant(addr, debt),
+            DlSchedElem::PendingGrant(addr, debt, origin),
             "dltx_next_slot_queue:dl_defer_pending_grant_next_frame",
         );
     }
 
     fn elem_addr(elem: &DlSchedElem) -> Option<TetraAddress> {
         match elem {
-            DlSchedElem::RandomAccessAck(addr) | DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _) => Some(*addr),
+            DlSchedElem::RandomAccessAck(addr) | DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _, _) => Some(*addr),
             DlSchedElem::Resource(pdu, _, _, _) => pdu.addr,
             DlSchedElem::FragBuf(fragger, _) => fragger.addr(),
             DlSchedElem::Stealing(_, addr, _, _) => Some(*addr),
@@ -3245,7 +3327,7 @@ impl BsChannelScheduler {
         let dropped_grant_addrs: HashSet<TetraAddress> = self.dltx_queues[slot]
             .iter()
             .filter_map(|elem| match elem {
-                DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _) => Some(*addr),
+                DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _, _) => Some(*addr),
                 _ => None,
             })
             .collect();
@@ -3350,11 +3432,21 @@ impl BsChannelScheduler {
         // Process grants and acks
         for elem in grants_and_acks {
             let elem = match elem {
-                DlSchedElem::PendingGrant(addr, debt) => {
+                DlSchedElem::PendingGrant(addr, debt, origin) => {
+                    if !self.packet_data_pending_grant_origin_is_valid(addr, origin, timeslot_alloc) {
+                        tracing::warn!(
+                            "dl_integrate_sched_elems_for_timeslot: dropping stale packet-data pending grant for addr {} debt {:?} origin {:?} at tx {}",
+                            addr,
+                            debt,
+                            origin,
+                            ts
+                        );
+                        continue;
+                    }
                     match self.ul_process_pending_grant_from_with_allocator(ts, ts.t, addr, debt, timeslot_alloc) {
                         Some((grant, usage_marker, granted_slots)) => {
                             if let Some(remaining_debt) = debt.remaining_after_grant(granted_slots) {
-                                self.dl_defer_pending_grant_next_frame(addr, remaining_debt);
+                                self.dl_defer_pending_grant_next_frame(addr, remaining_debt, origin);
                             }
                             DlSchedElem::Grant(addr, grant, usage_marker)
                         }
@@ -3369,7 +3461,7 @@ impl BsChannelScheduler {
                             // "Wait for another slot grant", which restarts T.206
                             // without granting slots. Keep the EG-gated grant pending
                             // until a transmit window also has usable uplink capacity.
-                            self.dl_defer_pending_grant_next_frame(addr, debt);
+                            self.dl_defer_pending_grant_next_frame(addr, debt, origin);
                             let wait_grant = BasicSlotgrant {
                                 capacity_allocation: debt.wait_capacity_allocation(),
                                 granting_delay: BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage,
@@ -3383,7 +3475,7 @@ impl BsChannelScheduler {
 
             // Try to find existing resource for this address
             let addr = match &elem {
-                DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _) => *addr,
+                DlSchedElem::Grant(addr, _, _) | DlSchedElem::PendingGrant(addr, _, _) => *addr,
                 DlSchedElem::RandomAccessAck(addr) => *addr,
                 _ => unreachable!("BUG: unhandled match variant -- should never be reached"),
             };
@@ -6463,6 +6555,67 @@ mod tests {
     }
 
     #[test]
+    fn test_voice_preemption_purges_packet_data_pending_grants_for_that_slot() {
+        let mut sched = get_testing_slotter();
+        let addr = TetraAddress::issi(0x510a);
+        let now = TdmaTime { t: 1, f: 2, m: 1, h: 0 };
+        sched.apply_packet_data_assignment_update(
+            PacketDataAssignmentUpdate::Replace {
+                addr,
+                ts_assigned: [false, true, false, false],
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier_num: 1001,
+            },
+            now,
+        );
+
+        sched.dl_enqueue_packet_data_reservation_grant(2, addr, ReservationRequirement::Req10Slots);
+        sched.dltx_queues[0].push(DlSchedElem::PendingGrant(
+            addr,
+            PendingGrantDebt::new(ReservationRequirement::Req4Slots),
+            PendingGrantOrigin::PacketData { assigned_ts: 2 },
+        ));
+        sched.dltx_next_slot_queue.push(DlSchedElem::PendingGrant(
+            addr,
+            PendingGrantDebt::new(ReservationRequirement::Req1Slot),
+            PendingGrantOrigin::PacketData { assigned_ts: 2 },
+        ));
+        sched.dltx_next_slot_queue.push(DlSchedElem::PendingGrant(
+            addr,
+            PendingGrantDebt::new(ReservationRequirement::Req1Slot),
+            PendingGrantOrigin::CommonControl,
+        ));
+
+        open_test_dl_circuit(&mut sched, 2);
+
+        assert!(
+            sched
+                .dltx_queues
+                .iter()
+                .chain(std::iter::once(&sched.dltx_next_slot_queue))
+                .flat_map(|queue| queue.iter())
+                .all(|elem| !matches!(
+                    elem,
+                    DlSchedElem::PendingGrant(
+                        pending_addr,
+                        _,
+                        PendingGrantOrigin::PacketData {
+                            assigned_ts: 2
+                        }
+                    ) if *pending_addr == addr
+                )),
+            "voice preemption on TS2 must purge stale packet-data reservation debt for that assigned slot"
+        );
+        assert!(
+            sched.dltx_next_slot_queue.iter().any(
+                |elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, _, PendingGrantOrigin::CommonControl)
+                    if *pending_addr == addr)
+            ),
+            "common-control reservation grants are not tied to the preempted PDCH slot"
+        );
+    }
+
+    #[test]
     fn test_non_sndcp_channel_allocation_does_not_activate_packet_data_assignment() {
         let mut sched = get_testing_slotter();
         sched.set_dl_time(TdmaTime { t: 4, f: 1, m: 1, h: 0 });
@@ -6771,7 +6924,7 @@ mod tests {
         assert!(
             !sched.dltx_queues[0]
                 .iter()
-                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt, _)
                     if *pending_addr == addr
                         && debt.res_req == ReservationRequirement::Req1Slot
                         && debt.remaining_slots == 1)),
@@ -6821,12 +6974,12 @@ mod tests {
             );
             assert_eq!(sched.ul_get_slot_owner(fixed_ts, PhyBlockNum::Both), None);
             assert!(
-                sched.dltx_queues[fixed_ts.t as usize - 1]
-                    .iter()
-                    .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                sched.dltx_queues[fixed_ts.t as usize - 1].iter().any(
+                    |elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt, _)
                         if *pending_addr == addr
                             && debt.res_req == ReservationRequirement::Req1Slot
-                            && debt.remaining_slots == 1)),
+                            && debt.remaining_slots == 1)
+                ),
                 "fixed frame-18 finalization must leave the pending grant queued"
             );
         }
@@ -6895,7 +7048,7 @@ mod tests {
         assert!(
             sched.dltx_queues[0]
                 .iter()
-                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt, _)
                     if *pending_addr == addr
                         && debt.res_req == ReservationRequirement::Req1Slot
                         && debt.remaining_slots == 1)),
@@ -9132,7 +9285,7 @@ mod tests {
             sched
                 .dltx_next_slot_queue
                 .iter()
-                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt, _)
                     if *pending_addr == addr && debt.remaining_slots == 6)),
             "re-granting same-ISSI PDCH capacity must still preserve remaining WAP/AL reservation debt"
         );
@@ -9325,7 +9478,7 @@ mod tests {
         assert!(
             sched.dltx_queues[tx_ts.t as usize - 1]
                 .iter()
-                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt, _)
                     if *pending_addr == addr
                         && debt.remaining_slots == 51 - MAX_RESERVED_ACCESS_GRANT_CHUNK_SLOTS
                         && debt.res_req == ReservationRequirement::Req51Slots)),
@@ -9425,7 +9578,7 @@ mod tests {
                 sched
                     .dltx_next_slot_queue
                     .iter()
-                    .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt)
+                    .any(|elem| matches!(elem, DlSchedElem::PendingGrant(pending_addr, debt, _)
                         if *pending_addr == addr
                             && debt.res_req == res_req
                             && debt.remaining_slots == expected_slots)),

@@ -105,6 +105,13 @@ struct PacketDataLinkContext {
     endpoint_id: EndpointId,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct UplinkContext {
+    addr: TetraAddress,
+    endpoint_id: EndpointId,
+    packet_data_assigned_ts: Option<u8>,
+}
+
 struct PendingStch {
     addr: TetraAddress,
     scrambling_code: u32,
@@ -458,13 +465,17 @@ impl UmacBs {
         self.current_ul_speaker[ts as usize - 1]
     }
 
-    fn scheduled_or_packet_data_uplink_context(&self, msg_dltime: TdmaTime, block_num: PhyBlockNum) -> Option<(TetraAddress, EndpointId)> {
+    fn scheduled_or_packet_data_uplink_context(&self, msg_dltime: TdmaTime, block_num: PhyBlockNum) -> Option<UplinkContext> {
         if let Some(addr) = self
             .channel_scheduler
             .ul_get_slot_owner(msg_dltime, block_num)
             .map(TetraAddress::issi)
         {
-            return Some((addr, 0));
+            return Some(UplinkContext {
+                addr,
+                endpoint_id: 0,
+                packet_data_assigned_ts: None,
+            });
         }
 
         let addr = self.channel_scheduler.packet_data_uplink_owner(msg_dltime, block_num)?;
@@ -473,7 +484,43 @@ impl UmacBs {
             .get(&addr)
             .map(|context| context.endpoint_id)
             .unwrap_or(0);
-        Some((addr, endpoint_id))
+        Some(UplinkContext {
+            addr,
+            endpoint_id,
+            packet_data_assigned_ts: Some(msg_dltime.t),
+        })
+    }
+
+    fn packet_data_uplink_assigned_ts_for_addr(&self, addr: TetraAddress, msg_dltime: TdmaTime, block_num: PhyBlockNum) -> Option<u8> {
+        self.channel_scheduler
+            .packet_data_uplink_owner(msg_dltime, block_num)
+            .filter(|owner| *owner == addr)
+            .map(|_| msg_dltime.t)
+    }
+
+    fn enqueue_reservation_grant_for_uplink_context(&mut self, context: UplinkContext, fallback_ts: u8, res_req: ReservationRequirement) {
+        if let Some(assigned_ts) = context.packet_data_assigned_ts {
+            self.channel_scheduler
+                .dl_enqueue_packet_data_reservation_grant(assigned_ts, context.addr, res_req);
+        } else {
+            self.channel_scheduler
+                .dl_enqueue_reservation_grant(fallback_ts, context.addr, res_req);
+        }
+    }
+
+    fn enqueue_reservation_grant_for_addr(
+        &mut self,
+        addr: TetraAddress,
+        msg_dltime: TdmaTime,
+        block_num: PhyBlockNum,
+        res_req: ReservationRequirement,
+    ) {
+        if let Some(assigned_ts) = self.packet_data_uplink_assigned_ts_for_addr(addr, msg_dltime, block_num) {
+            self.channel_scheduler
+                .dl_enqueue_packet_data_reservation_grant(assigned_ts, addr, res_req);
+        } else {
+            self.channel_scheduler.dl_enqueue_reservation_grant(msg_dltime.t, addr, res_req);
+        }
     }
 
     fn llc_sdu_is_original_advanced_link(sdu: &BitBuffer) -> bool {
@@ -2011,7 +2058,7 @@ impl UmacBs {
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         self.mark_ms_signalling_activity(addr, msg_dltime);
         if let Some(res_req) = &pdu.reservation_req {
-            self.channel_scheduler.dl_enqueue_reservation_grant(msg_dltime.t, addr, *res_req);
+            self.enqueue_reservation_grant_for_addr(addr, msg_dltime, prim.block_num, *res_req);
         };
 
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
@@ -2202,7 +2249,7 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            self.channel_scheduler.dl_enqueue_reservation_grant(msg_dltime.t, addr, *res_req);
+            self.enqueue_reservation_grant_for_addr(addr, msg_dltime, prim.block_num, *res_req);
         };
 
         // tracing::debug!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));
@@ -2314,12 +2361,12 @@ impl UmacBs {
 
         // Get slot owner from schedule
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        let Some((slot_owner_addr, _slot_owner_endpoint_id)) = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num)
-        else {
+        let Some(slot_owner_context) = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num) else {
             tracing::warn!("rx_mac_frag_ul: Received MAC-FRAG-UL for unassigned block {:?}", prim.block_num);
             self.channel_scheduler.dump_ul_schedule_full(true);
             return;
         };
+        let slot_owner_addr = slot_owner_context.addr;
         self.mark_ms_signalling_activity(slot_owner_addr, msg_dltime);
 
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner_addr, msg_dltime) {
@@ -2384,12 +2431,12 @@ impl UmacBs {
 
         // Get slot owner from schedule, decrypt if needed
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
-        let Some((slot_owner_addr, slot_owner_endpoint_id)) = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num)
-        else {
+        let Some(slot_owner_context) = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num) else {
             // Common with scan-list terminals that transmit on UL without waiting for a grant
             tracing::debug!("rx_mac_end_ul: Received MAC-END-UL for unassigned block {:?}", prim.block_num);
             return;
         };
+        let slot_owner_addr = slot_owner_context.addr;
         self.mark_ms_signalling_activity(slot_owner_addr, msg_dltime);
         if let Some(_aie_info) = self.defrag.get_aie_info(slot_owner_addr, msg_dltime) {
             // EN 300 392-2 air-interface encryption is not implemented in
@@ -2409,8 +2456,14 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            self.channel_scheduler
-                .dl_enqueue_reservation_grant(msg_dltime.t, defragbuf.addr, *res_req);
+            let reservation_context = UplinkContext {
+                addr: defragbuf.addr,
+                endpoint_id: slot_owner_context.endpoint_id,
+                packet_data_assigned_ts: (defragbuf.addr == slot_owner_context.addr)
+                    .then_some(slot_owner_context.packet_data_assigned_ts)
+                    .flatten(),
+            };
+            self.enqueue_reservation_grant_for_uplink_context(reservation_context, msg_dltime.t, *res_req);
         };
 
         // Pass completed block to LLC
@@ -2424,7 +2477,7 @@ impl UmacBs {
                 pdu: Some(defragbuf.buffer),
                 main_address: defragbuf.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: slot_owner_endpoint_id,
+                endpoint_id: slot_owner_context.endpoint_id,
                 new_endpoint_id: None,       // TODO FIXME
                 css_endpoint_id: None,       // TODO FIXME
                 air_interface_encryption: 0, // TODO FIXME implement
@@ -2689,10 +2742,10 @@ impl UmacBs {
 
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         let slot_owner_context = self.scheduled_or_packet_data_uplink_context(msg_dltime, prim.block_num);
-        if let Some((slot_owner_addr, _slot_owner_endpoint_id)) = slot_owner_context {
+        if let Some(context) = slot_owner_context {
             self.defrag
-                .discard_incomplete_for_addr(msg_dltime, slot_owner_addr, "new MAC-U-BLCK before MAC-END");
-            self.mark_ms_signalling_activity(slot_owner_addr, msg_dltime);
+                .discard_incomplete_for_addr(msg_dltime, context.addr, "new MAC-U-BLCK before MAC-END");
+            self.mark_ms_signalling_activity(context.addr, msg_dltime);
         }
 
         if let Some(res_req) = pdu.reservation_requirement() {
@@ -2709,7 +2762,7 @@ impl UmacBs {
             return;
         }
 
-        let Some((slot_owner_addr, slot_owner_endpoint_id)) = slot_owner_context else {
+        let Some(slot_owner_context) = slot_owner_context else {
             tracing::warn!(
                 "MAC-U-BLCK event_label={} reservation_req={} has no scheduled or assigned-PDCH uplink owner; dropping TM-SDU",
                 pdu.event_label,
@@ -2741,7 +2794,7 @@ impl UmacBs {
         if self.wap_ip_diag_enabled() {
             tracing::info!(
                 "WAP/IP diag: UMAC MAC-U-BLCK delivering TM-SDU addr={:?} event_label={} reservation_req={} sdu_bits={} llc_prefix={:?} fill_bits={} stripped_fill_bits={}",
-                slot_owner_addr,
+                slot_owner_context.addr,
                 pdu.event_label,
                 pdu.reservation_req,
                 sdu.get_len(),
@@ -2756,9 +2809,9 @@ impl UmacBs {
             dest: TetraEntity::Llc,
             msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
                 pdu: Some(sdu),
-                main_address: slot_owner_addr,
+                main_address: slot_owner_context.addr,
                 scrambling_code: prim.scrambling_code,
-                endpoint_id: slot_owner_endpoint_id,
+                endpoint_id: slot_owner_context.endpoint_id,
                 new_endpoint_id: None,
                 css_endpoint_id: None,
                 air_interface_encryption: pdu.encrypted as Todo,
@@ -2777,7 +2830,7 @@ impl UmacBs {
         res_req: ReservationRequirement,
         event_label: u16,
     ) {
-        let Some((addr, _endpoint_id)) = self.scheduled_or_packet_data_uplink_context(msg_dltime, block_num) else {
+        let Some(context) = self.scheduled_or_packet_data_uplink_context(msg_dltime, block_num) else {
             tracing::warn!(
                 "MAC-U-BLCK event_label={} requested {:?}, but no reserved-access or assigned-PDCH uplink owner is known; dropping reservation",
                 event_label,
@@ -2786,8 +2839,8 @@ impl UmacBs {
             return;
         };
 
-        self.mark_ms_signalling_activity(addr, msg_dltime);
-        self.channel_scheduler.dl_enqueue_reservation_grant(msg_dltime.t, addr, res_req);
+        self.mark_ms_signalling_activity(context.addr, msg_dltime);
+        self.enqueue_reservation_grant_for_uplink_context(context, msg_dltime.t, res_req);
     }
 
     fn rx_ul_tma_unitdata_req(&mut self, queue: &mut MessageQueue, message: SapMsg) {
