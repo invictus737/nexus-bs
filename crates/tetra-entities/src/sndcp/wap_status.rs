@@ -298,19 +298,15 @@ fn compact_tiny_state(snapshot: &WapStatusSnapshot) -> &'static str {
 }
 
 fn compact_tiny_uptime(uptime_secs: u64) -> String {
+    const MAX_TINY_UPTIME_SECS: u64 = 99 * 86_400 + 23 * 3_600 + 59 * 60 + 59;
+
+    let uptime_secs = uptime_secs.min(MAX_TINY_UPTIME_SECS);
     let days = uptime_secs / 86_400;
     let hours = (uptime_secs % 86_400) / 3_600;
     let minutes = (uptime_secs % 3_600) / 60;
+    let seconds = uptime_secs % 60;
 
-    if days > 0 {
-        format!("{}d", days.min(999))
-    } else if hours > 0 {
-        format!("{hours}h")
-    } else if minutes > 0 {
-        format!("{minutes}m")
-    } else {
-        format!("{}s", uptime_secs.min(59))
-    }
+    format!("{days}d{hours}h{minutes}m{seconds}s")
 }
 
 fn compact_tiny_version(version: &str) -> String {
@@ -465,7 +461,7 @@ mod tests {
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("Nexus-BS: Health OK"));
         assert!(page.contains("Version: 0.1.69"));
-        assert!(page.contains("Uptime 1d"));
+        assert!(page.contains("Uptime 1d2h3m4s"));
         assert!(!page.contains("MS 3 Calls 1 SDS 2"));
         assert!(!page.contains("Last S2260082"));
         assert!(!page.contains("Voice"));
@@ -479,6 +475,23 @@ mod tests {
         assert_eq!(compact_tiny_version("v0.1.71_dev-4fc71583"), "0.1.71");
         assert_eq!(compact_tiny_version("0.1.62"), "0.1.62");
         assert_eq!(compact_tiny_version(""), "?");
+    }
+
+    #[test]
+    fn compact_tiny_uptime_includes_days_hours_minutes_and_seconds() {
+        assert_eq!(compact_tiny_uptime(0), "0d0h0m0s");
+        assert_eq!(compact_tiny_uptime(93_784), "1d2h3m4s");
+        assert_eq!(compact_tiny_uptime(u64::MAX), "99d23h59m59s");
+    }
+
+    #[test]
+    fn render_wml2_status_tiny_page_fits_maximum_compact_uptime() {
+        let mut snapshot = sample_snapshot();
+        snapshot.uptime_secs = u64::MAX;
+        let page = render_wml2_status(&snapshot, 128).expect("maximum compact uptime should still fit tiny WML2");
+
+        assert!(page.len() <= 128);
+        assert!(page.contains("Uptime 99d23h59m59s"));
     }
 
     #[test]

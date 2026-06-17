@@ -1110,7 +1110,7 @@ mod tests {
         assert!(!page.contains("<card"));
         assert!(page.contains("Nexus-BS: Health OK"));
         assert!(page.contains("Version: 0.1.69"));
-        assert!(page.contains("Uptime 2m"));
+        assert!(page.contains("Uptime 0d0h2m5s"));
         assert!(!page.contains("Voice"));
         assert!((2..=3).contains(&page.matches("<br />").count()));
         assert!(!page.contains("<br/>"));
@@ -1455,7 +1455,7 @@ mod tests {
         assert!(!page.contains("text=\"#0f0\""));
         assert!(page.contains("Nexus-BS: Health OK"));
         assert!(page.contains("Version: 0.1.69"));
-        assert!(page.contains("Uptime 2m"));
+        assert!(page.contains("Uptime 0d0h2m5s"));
         assert!(!page.contains("Voice"));
         assert!((2..=3).contains(&page.matches("<br />").count()));
         assert!(!page.contains("<br/>"));
@@ -1512,7 +1512,7 @@ mod tests {
         assert!(!page.contains("text=\"#0f0\""));
         assert!(page.contains("Nexus-BS: Health OK"));
         assert!(page.contains("Version: 0.1.69"));
-        assert!(page.contains("Uptime 2m"));
+        assert!(page.contains("Uptime 0d0h2m5s"));
         assert!(!page.contains("Voice"));
         assert!((2..=3).contains(&page.matches("<br />").count()));
         assert!(!page.contains("<br/>"));
