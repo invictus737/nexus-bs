@@ -25,6 +25,7 @@ const WTP_TID_VALUE_MASK: u16 = 0x7fff;
 const WSP_PDU_CONNECT: u8 = 0x01;
 const WSP_PDU_CONNECT_REPLY: u8 = 0x02;
 const WSP_PDU_REPLY: u8 = 0x04;
+const WSP_PDU_RESUME: u8 = 0x09;
 const WSP_PDU_GET: u8 = 0x40;
 const WSP_STATUS_OK: u8 = 0x20;
 const WSP_SHORT_INTEGER_FLAG: u8 = 0x80;
@@ -64,6 +65,11 @@ pub enum WapUdpRequestKind {
     Status,
     WtpWspConnect {
         transaction_id: u16,
+        retransmission: bool,
+    },
+    WtpWspResume {
+        transaction_id: u16,
+        session_id: usize,
         retransmission: bool,
     },
     WtpWspStatus {
@@ -112,6 +118,11 @@ struct WspCapability {
 struct WspConnectRequest {
     version: u8,
     capabilities: Vec<WspCapability>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WspResumeRequest {
+    session_id: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -273,6 +284,14 @@ fn build_udp_status_response(
             );
             build_wtp_wsp_result(transaction_id, &build_wsp_connect_reply(&connect))
         }
+        WapUdpRequestKind::WtpWspResume {
+            transaction_id,
+            session_id,
+            retransmission: _,
+        } => {
+            tracing::info!("WAP/IP diag: WSP Resume session_id={}", session_id);
+            build_wtp_wsp_result(transaction_id, &build_wsp_session_ok_reply())
+        }
         WapUdpRequestKind::WtpWspStatus {
             transaction_id,
             retransmission: _,
@@ -389,6 +408,14 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
             transaction_id: invoke.transaction_id,
             retransmission: invoke.retransmission,
         })),
+        Some(WSP_PDU_RESUME) => {
+            let resume = parse_wsp_resume_request(wsp).ok_or(WapIpError::UnsupportedWapUdpPayload { len: payload.len() })?;
+            Ok(Some(WapUdpRequestKind::WtpWspResume {
+                transaction_id: invoke.transaction_id,
+                session_id: resume.session_id,
+                retransmission: invoke.retransmission,
+            }))
+        }
         Some(pdu_type) if pdu_type == WSP_PDU_GET || (0x50..=0x5f).contains(&pdu_type) => {
             let (uri_len, len_octets) = read_uintvar(&wsp[1..]).ok_or(WapIpError::UnsupportedWapUdpPayload { len: payload.len() })?;
             let uri_start = 1 + len_octets;
@@ -496,6 +523,21 @@ fn parse_wsp_connect_request(wsp: &[u8]) -> Result<WspConnectRequest, WapIpError
     Ok(WspConnectRequest { version, capabilities })
 }
 
+fn parse_wsp_resume_request(wsp: &[u8]) -> Option<WspResumeRequest> {
+    if wsp.first().copied() != Some(WSP_PDU_RESUME) {
+        return None;
+    }
+    let (session_id, session_len_octets) = read_uintvar(&wsp[1..])?;
+    let capabilities_len_start = 1 + session_len_octets;
+    let (capabilities_len, cap_len_octets) = read_uintvar(&wsp[capabilities_len_start..])?;
+    let capabilities_start = capabilities_len_start + cap_len_octets;
+    let capabilities_end = capabilities_start + capabilities_len;
+    if capabilities_end > wsp.len() {
+        return None;
+    }
+    Some(WspResumeRequest { session_id })
+}
+
 fn parse_wsp_capabilities(mut buf: &[u8]) -> Result<Vec<WspCapability>, WapIpError> {
     let mut capabilities = Vec::new();
     while !buf.is_empty() {
@@ -531,6 +573,10 @@ fn build_wsp_connect_reply(connect: &WspConnectRequest) -> Vec<u8> {
     write_uintvar(0, &mut payload); // Headers length.
     payload.extend_from_slice(&capabilities);
     payload
+}
+
+fn build_wsp_session_ok_reply() -> Vec<u8> {
+    vec![WSP_PDU_REPLY, WSP_STATUS_OK, 0]
 }
 
 fn build_wsp_connect_reply_capabilities(connect: &WspConnectRequest) -> Vec<u8> {
@@ -756,6 +802,17 @@ mod tests {
         payload
     }
 
+    fn build_wtp_wsp_resume_payload(transaction_id: u16, session_id: usize) -> Vec<u8> {
+        let mut payload = Vec::new();
+        payload.push(0x0a);
+        payload.extend_from_slice(&(transaction_id & WTP_TID_VALUE_MASK).to_be_bytes());
+        payload.push(0x12);
+        payload.push(WSP_PDU_RESUME);
+        write_uintvar(session_id, &mut payload);
+        write_uintvar(0, &mut payload);
+        payload
+    }
+
     fn build_wtp_wsp_connect_payload(transaction_id: u16, capabilities: &[u8]) -> Vec<u8> {
         let mut wsp = Vec::new();
         wsp.push(WSP_PDU_CONNECT);
@@ -884,6 +941,18 @@ mod tests {
             parse_wap_udp_request(&build_wtp_wsp_get_payload(0x1234, "status.xhtml"), &policy()),
             Ok(WapUdpRequestKind::WtpWspStatus {
                 transaction_id: 0x1234,
+                retransmission: false
+            })
+        );
+    }
+
+    #[test]
+    fn wap_udp_request_classifier_accepts_wtp_wsp_resume() {
+        assert_eq!(
+            parse_wap_udp_request(&build_wtp_wsp_resume_payload(0x13f5, 1), &policy()),
+            Ok(WapUdpRequestKind::WtpWspResume {
+                transaction_id: 0x13f5,
+                session_id: 1,
                 retransmission: false
             })
         );
@@ -1228,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn wap_status_response_handles_connect_ack_then_get_sequence() {
+    fn wap_status_response_handles_connect_resume_then_get_sequence() {
         let endpoint = WapIpEndpoint {
             address: [10, 0, 0, 1],
             port: 9200,
@@ -1264,8 +1333,21 @@ mod tests {
             "WTP ACK after ConnectReply is terminal control traffic and must not consume the page response"
         );
 
+        let resume_payload = build_wtp_wsp_resume_payload(0x13f5, 1);
+        let resume_request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 8502, endpoint.port, &resume_payload, 0x2224, 64)
+            .expect("WSP Resume request N-PDU should build");
+        let resume_response =
+            build_wap_status_response_npdu(&resume_request, endpoint, &policy(), &snapshot()).expect("WSP Resume response should build");
+        let resume_response_ip = parse_ipv4_packet(&resume_response).expect("Resume response IPv4 should parse");
+        let resume_response_udp = parse_udp_datagram(resume_response_ip.payload).expect("Resume response UDP should parse");
+        assert_eq!(
+            resume_response_udp.payload,
+            [WTP_RESULT_LAST_PACKET_OF_MESSAGE, 0x93, 0xf5, WSP_PDU_REPLY, WSP_STATUS_OK, 0,],
+            "WSP Resume should receive a WTP Result + empty WSP Reply OK"
+        );
+
         let get_payload = build_wtp_wsp_get_payload(0x1235, "/status.xhtml");
-        let get_request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &get_payload, 0x2224, 64)
+        let get_request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &get_payload, 0x2225, 64)
             .expect("WSP GET request N-PDU should build");
         let get_response =
             build_wap_status_response_npdu(&get_request, endpoint, &policy(), &snapshot()).expect("WSP GET response should build");
