@@ -17,9 +17,8 @@ pub const WAP_STATUS_HEALTH_LINE_MAX_ESCAPED_BYTES: usize = 28;
 pub const WAP_STATUS_DETAIL_MAX_LINES: usize = 3;
 const XHTML_MP_DOCTYPE: &str =
     "<!DOCTYPE html PUBLIC \"-//WAPFORUM//DTD XHTML Mobile 1.0//EN\" \"http://www.wapforum.org/DTD/xhtml-mobile10.dtd\">";
-const TINY_XHTML_PREFIX: &str =
-    "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body bgcolor=\"#000000\" text=\"#00ff00\"><p><font color=\"#00ff00\">";
-const TINY_XHTML_SUFFIX: &str = "</font></p></body></html>";
+const TINY_XHTML_PREFIX: &str = "<html xmlns=\"http://www.w3.org/1999/xhtml\"><body text=\"#0f0\">";
+const TINY_XHTML_SUFFIX: &str = "</body></html>";
 const TINY_XHTML_BR: &str = "<br />";
 const TINY_LAST_PREFIX: &str = " L:";
 
@@ -440,11 +439,10 @@ mod tests {
 
     #[test]
     fn render_wml2_status_tiny_page_keeps_dynamic_demo_fields() {
-        let page = render_wml2_status(&sample_snapshot(), 192).expect("tiny WML2 status should render");
+        let page = render_wml2_status(&sample_snapshot(), 128).expect("tiny WML2 status should render");
 
-        assert!(page.len() <= 192);
-        assert!(page.contains("<body bgcolor=\"#000000\" text=\"#00ff00\"><p>"));
-        assert!(page.contains("<font color=\"#00ff00\">"));
+        assert!(page.len() <= 128);
+        assert!(page.contains("<body text=\"#0f0\">"));
         assert!(page.contains("Nexus OK"));
         assert!(page.contains("M3 C1 S2<br />U1d"));
         assert!(page.contains("L:S2260082"));
