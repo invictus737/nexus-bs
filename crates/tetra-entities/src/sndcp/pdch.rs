@@ -686,7 +686,7 @@ pub fn validate_lower_channel_allocation(allocation: &SndcpLowerChannelAllocatio
                 return Err(SndcpPdchError::InvalidPdchUsageMarker(usage_marker));
             }
             let timeslot_count = allocation.chan_alloc.timeslots.iter().filter(|assigned| **assigned).count();
-            if timeslot_count == 0 || timeslot_count > SNDCP_PDCH_TIMESLOT_MAX.saturating_sub(1) as usize {
+            if timeslot_count != 1 {
                 return Err(SndcpPdchError::InvalidPdchTimeslotSelection(timeslot_count));
             }
             if allocation.chan_alloc.timeslots[0] {
@@ -1482,6 +1482,34 @@ mod tests {
         );
         assert_eq!(lower.chan_alloc.alloc_type, ChanAllocType::Replace);
         assert_eq!(lower.chan_alloc.ul_dl_assigned, UlDlAssignment::Both);
+    }
+
+    #[test]
+    fn lower_pdch_allocation_validation_is_single_slot_only() {
+        let manager = SndcpPdchManager::new();
+        let plan = manager
+            .plan_swmi_unitdata_channel(SndcpPacketDataPlanInput {
+                pdch_available: true,
+                ..packet_plan_input()
+            })
+            .expect("new PDCH should produce a pure channel plan");
+        let mut lower = packet_data_plan_to_lower_channel_allocation(&plan, pdch_policy())
+            .expect("PDCH plan should map to lower allocation")
+            .expect("new PDCH plan should carry a lower allocation");
+
+        lower.chan_alloc.timeslots = [false, true, true, false];
+        assert_eq!(
+            validate_lower_channel_allocation(&lower),
+            Err(SndcpPdchError::InvalidPdchTimeslotSelection(2)),
+            "lower PDCH handoff must reject parallel packet-data timeslots"
+        );
+
+        lower.chan_alloc.timeslots = [false, false, false, false];
+        assert_eq!(
+            validate_lower_channel_allocation(&lower),
+            Err(SndcpPdchError::InvalidPdchTimeslotSelection(0)),
+            "lower PDCH handoff must reject an empty assigned-channel bitmap"
+        );
     }
 
     #[test]

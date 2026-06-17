@@ -558,7 +558,7 @@ mod tests {
             chan_alloc: CmceChanAllocReq {
                 usage: None,
                 carrier: None,
-                timeslots: [false, true, true, true],
+                timeslots: [false, true, false, false],
                 alloc_type: ChanAllocType::Replace,
                 ul_dl_assigned: UlDlAssignment::Both,
             },
@@ -849,6 +849,19 @@ mod tests {
                 address_issi: ISSI,
                 allocation_issi: ISSI + 1,
             }
+        );
+    }
+
+    #[test]
+    fn packet_data_ltpd_to_tla_rejects_parallel_lower_allocation() {
+        let req = packet_ltpd_req();
+        let mut allocation = lower_pdch_allocation(ISSI);
+        allocation.chan_alloc.timeslots = [false, true, true, false];
+
+        assert_eq!(
+            ltpd_unitdata_req_to_tla_unitdata_req_with_allocation(&req, 91, 6, Some(&allocation))
+                .expect_err("lower allocation must already be a single PDCH slot"),
+            SndcpMleAdapterError::LowerAllocation(SndcpPdchError::InvalidPdchTimeslotSelection(2))
         );
     }
 
