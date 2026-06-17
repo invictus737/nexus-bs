@@ -492,6 +492,37 @@ fn build_al_final_ar_ind(addr: TetraAddress, endpoint_id: u32, ns: u8, payload: 
     }
 }
 
+fn build_al_data_ar_ind(addr: TetraAddress, endpoint_id: u32, ns: u8, ss: u8, payload: &[u8]) -> SapMsg {
+    let data = AlData {
+        final_segment: false,
+        acknowledgement_requested: true,
+        ns,
+        ss,
+    };
+    let mut pdu = BitBuffer::new_autoexpand(64);
+    data.to_bitbuf(&mut pdu);
+    append_payload_and_optional_fcs_for_test(&mut pdu, payload, false);
+    pdu.seek(0);
+
+    SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+            pdu: Some(pdu),
+            main_address: addr,
+            scrambling_code: 0,
+            endpoint_id,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            air_interface_encryption: 0,
+            chan_change_response_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+        }),
+    }
+}
+
 fn build_al_ack_ind(addr: TetraAddress, endpoint_id: u32, nr: u8) -> SapMsg {
     let mut pdu = BitBuffer::new_autoexpand(16);
     AlAck::complete(nr).to_bitbuf(&mut pdu);
@@ -704,6 +735,14 @@ fn al_ack_nr(msg: &SapMsg) -> Option<u8> {
     };
     let mut pdu = prim.pdu.clone();
     AlAck::from_bitbuf(&mut pdu).ok().map(|ack| ack.nr)
+}
+
+fn al_ack_from_tma_req(msg: &SapMsg) -> Option<AlAck> {
+    let SapMsgInner::TmaUnitdataReq(prim) = &msg.msg else {
+        return None;
+    };
+    let mut pdu = prim.pdu.clone();
+    AlAck::from_bitbuf(&mut pdu).ok()
 }
 
 fn al_setup_report(msg: &SapMsg) -> Option<u8> {
@@ -1095,6 +1134,42 @@ fn test_inbound_al_final_ar_delivers_tldata_with_link_id_and_ack() {
     };
     assert_eq!(ack_prim.pdu_prio, 5);
     assert!(ack_prim.stealing_permission);
+}
+
+#[test]
+fn test_inbound_incomplete_al_data_ar_sends_selective_ack_not_whole_repeat() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    test.submit_message(build_al_setup_ind(addr, 0, 0));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_data_ar_ind(addr, 0, 0, 1, &[0xA5]));
+    test.deliver_all_messages();
+    let sink_msgs = test.dump_sinks();
+
+    assert!(
+        sink_msgs.iter().all(|msg| !matches!(&msg.msg, SapMsgInner::TlaTlDataIndBl(_))),
+        "incomplete AL TL-SDU must not be delivered to MLE before missing segment 0 arrives"
+    );
+
+    let ack = sink_msgs
+        .iter()
+        .find(|msg| llc_pdu_type(msg) == Some(LlcPduType::AlAckAlRnr))
+        .and_then(al_ack_from_tma_req)
+        .expect("AL-DATA-AR with a missing older segment should be selectively acknowledged");
+    assert_eq!(ack.nr, 0);
+    assert_eq!(ack.sr, Some(0));
+    assert_eq!(ack.acknowledgement_length, 2);
+    assert_eq!(ack.acknowledgement_bitmap, 1);
+    assert!(
+        !ack.requests_repeat_entire_tl_sdu(),
+        "EN 300 392-2 22.3.3.2.3 uses selective ACK for missing segments; whole repeat is for TL-SDU FCS failure"
+    );
 }
 
 #[test]

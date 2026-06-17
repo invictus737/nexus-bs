@@ -712,6 +712,28 @@ impl Llc {
         Some(out)
     }
 
+    fn selective_al_ack_for_incomplete_receive(assembly: &AdvancedLinkReceiveAssembly) -> AlAck {
+        let highest_received = assembly.segments.keys().next_back().copied().unwrap_or(0);
+        let highest_covered = assembly.final_ss.unwrap_or(highest_received);
+        let first_missing = (0..=highest_covered)
+            .find(|ss| !assembly.segments.contains_key(ss))
+            .unwrap_or_else(|| highest_covered.saturating_add(1));
+        let highest_covered = highest_covered.max(first_missing);
+        let ack_len = highest_covered
+            .saturating_sub(first_missing)
+            .saturating_add(1)
+            .min(AlAck::ACK_LENGTH_MAX_SELECTIVE_SEGMENTS);
+        let mut bitmap = 0u64;
+        for offset in 1..ack_len {
+            let ss = first_missing.saturating_add(offset);
+            if assembly.segments.contains_key(&ss) {
+                bitmap |= 1u64 << (offset - 1);
+            }
+        }
+
+        AlAck::selective(true, assembly.ns, first_missing, bitmap, ack_len)
+    }
+
     fn inbound_duplicate_state_expired(state: ReceiveSeqState, now: TdmaTime) -> bool {
         Self::downlink_signalling_frames_elapsed(state.received_at, now, state.ack_timeslot)
             > INBOUND_DUPLICATE_SUPPRESSION_SIGNALLING_FRAMES
@@ -2571,13 +2593,12 @@ impl Llc {
 
         let Some(mut complete) = self.advanced_link_rx.get(&key).and_then(Self::concatenate_al_segments) else {
             if header.acknowledgement_requested {
-                Self::push_al_ack_to_umac(
-                    queue,
-                    key,
-                    AlAck::repeat_entire(header.ns),
-                    self.next_tl_data_ind_req_handle(),
-                    prim.air_interface_encryption,
-                );
+                let ack = self
+                    .advanced_link_rx
+                    .get(&key)
+                    .map(Self::selective_al_ack_for_incomplete_receive)
+                    .unwrap_or_else(|| AlAck::selective(true, header.ns, 0, 0, 1));
+                Self::push_al_ack_to_umac(queue, key, ack, self.next_tl_data_ind_req_handle(), prim.air_interface_encryption);
             }
             return;
         };
