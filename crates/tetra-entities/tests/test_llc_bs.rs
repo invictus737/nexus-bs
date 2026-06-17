@@ -1947,6 +1947,83 @@ fn test_outbound_segmented_al_t252_retries_selectively_requested_segments_before
 }
 
 #[test]
+fn test_outbound_segmented_al_repeated_selective_ack_does_not_exhaust_n274_while_retry_inflight() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 7113;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    setup.max_segment_retransmissions = 1;
+    test.submit_message(build_al_setup_ind_with_setup(addr, 0, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let payload = [0x4d; 50];
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.link_id = 1;
+    prim.pdu_prio = 4;
+    prim.fcs_flag = false;
+    prim.tl_sdu = BitBuffer::from_bytes(&payload);
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&first_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2],
+        "test vector should create three original AL segments"
+    );
+
+    for handle in first_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 1, 0, 1));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&retry_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![1],
+        "first selective ACK should queue one S(S)=1 retransmission"
+    );
+
+    test.submit_message(build_al_selective_ack_ind_with_bitmap(addr, 0, 0, 1, 0, 1));
+    test.run_stack(Some(1));
+    let duplicate_ack_msgs = test.dump_sinks();
+    assert!(
+        al_segment_headers(&duplicate_ack_msgs).is_empty(),
+        "duplicate selective ACK must not resubmit a segment retry that is already in flight"
+    );
+    assert!(
+        !find_tla_report(&duplicate_ack_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
+        "duplicate selective ACK must not spend another N.274 retry before MAC progress"
+    );
+
+    test.submit_message(build_al_ack_ind(addr, 0, 0));
+    test.deliver_all_messages();
+    let complete_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
+        "complete AL-ACK after a duplicate selective ACK should still finish the transfer"
+    );
+}
+
+#[test]
 fn test_outbound_segmented_al_selective_n274_exhaustion_waits_for_late_ack_without_resubmitting() {
     debug::setup_logging_verbose();
 

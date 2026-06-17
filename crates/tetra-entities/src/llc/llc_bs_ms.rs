@@ -1036,6 +1036,19 @@ impl Llc {
         Ok(1)
     }
 
+    fn al_segment_retry_pending_or_inflight(segment: &ExpectedAlSegment) -> bool {
+        if !segment.retransmission_requested {
+            return false;
+        }
+        if segment.t_submitted_to_umac.is_none() || segment.t_umac_done.is_none() {
+            return true;
+        }
+        matches!(
+            segment.current_mac_reporter.as_ref().map(TxReporter::get_state),
+            Some(TxState::Pending)
+        )
+    }
+
     fn find_outbound_al_ack_match(&self, prim: &TmaUnitdataInd, ack: &AlAck) -> (Option<usize>, usize) {
         let mut exact_idx = None;
         let mut exact_matches = 0usize;
@@ -2715,6 +2728,7 @@ impl Llc {
                 .unwrap_or(0);
             let mut acknowledged_segments = 0usize;
             let mut retransmit_segments = 0usize;
+            let mut newly_requested_retransmit_segments = 0usize;
             let mut exhausted_segment = None;
             {
                 let outbound = &mut self.outbound_al_messages[idx];
@@ -2726,38 +2740,48 @@ impl Llc {
                             }
                             segment.acknowledged = true;
                             segment.retransmission_requested = false;
+                            segment.ack_request_probe_pending = false;
                             if let Some(reporter) = &segment.current_mac_reporter {
                                 reporter.try_mark_transmitted();
                             }
                         }
                         Some(false) => {
-                            if segment.retransmit_count < max_segment_retransmissions {
+                            if Self::al_segment_retry_pending_or_inflight(segment) {
+                                segment.acknowledged = false;
+                                retransmit_segments += 1;
+                            } else if segment.retransmit_count < max_segment_retransmissions {
                                 segment.acknowledged = false;
                                 segment.retransmission_requested = true;
+                                segment.ack_request_probe_pending = false;
                                 segment.t_submitted_to_umac = None;
                                 segment.t_umac_done = None;
                                 segment.current_mac_reporter = None;
                                 retransmit_segments += 1;
+                                newly_requested_retransmit_segments += 1;
                             } else {
                                 exhausted_segment = Some(segment.ss);
                                 break;
                             }
                         }
                         None => {
-                            segment.retransmission_requested = false;
+                            if !Self::al_segment_retry_pending_or_inflight(segment) {
+                                segment.retransmission_requested = false;
+                            }
                         }
                     }
                 }
 
-                if retransmit_segments > 0 {
+                let retry_pending = outbound
+                    .segments
+                    .iter()
+                    .any(|segment| !segment.acknowledged && segment.retransmission_requested);
+                if newly_requested_retransmit_segments > 0 {
                     outbound.t_submitted_to_umac = None;
                     outbound.t_umac_done = None;
                     outbound.current_mac_reporter = None;
                     outbound.t_retransmissions_exhausted = None;
-                    outbound.selective_segment_retry_pending = true;
-                } else {
-                    outbound.selective_segment_retry_pending = false;
                 }
+                outbound.selective_segment_retry_pending = retry_pending;
             }
 
             if let Some(ss) = exhausted_segment {
