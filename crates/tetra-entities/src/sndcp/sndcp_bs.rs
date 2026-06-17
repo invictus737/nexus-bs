@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use super::ip::{IPV4_PROTOCOL_UDP, bitbuffer_npdu_octets, parse_ipv4_packet, parse_udp_datagram};
 use super::ltpd_pipeline::{SndcpWapLtpdPipeline, SndcpWapLtpdPipelineError, issi_from_ltpd_ind};
 use super::pdch::{SndcpLtpdConfigureReason, SndcpPdchState, SndcpStatusForMle};
 use super::pdp::{
@@ -21,7 +22,7 @@ use super::transfer::{
     encode_data_transmit_response,
 };
 use super::unitdata::{SN_PDU_TYPE_UNITDATA, SndcpUnitdataError, decode_sn_unitdata_body};
-use super::wap_ip::{WapIpEndpoint, WapIpServicePolicy};
+use super::wap_ip::{WapIpEndpoint, WapIpServicePolicy, WapUdpRequestKind, parse_wap_udp_request};
 use super::wap_session::{SndcpWapSession, SndcpWapSessionError};
 use super::wap_status::WapStatusSnapshot;
 use crate::{MessageQueue, TetraEntityTrait};
@@ -91,6 +92,8 @@ pub struct Sndcp {
     runtime_handoff: SndcpRuntimeHandoffPolicy,
     wap_pipeline: Option<SndcpWapLtpdPipeline>,
     pending_pdch_handoffs: HashMap<Todo, PendingPacketDataHandoff>,
+    pending_wap_responses: HashMap<Todo, PendingWapTransactionKey>,
+    pending_wap_response_keys: HashMap<PendingWapTransactionKey, Todo>,
     started_at: Instant,
 }
 
@@ -99,6 +102,27 @@ struct PendingPacketDataHandoff {
     issi: u32,
     endpoint_id: EndpointId,
     link_id: LinkId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct PendingWapTransactionKey {
+    issi: u32,
+    endpoint_id: EndpointId,
+    link_id: LinkId,
+    nsapi: u8,
+    client_addr: [u8; 4],
+    server_addr: [u8; 4],
+    client_port: u16,
+    server_port: u16,
+    transaction_id: u16,
+    kind: PendingWapTransactionKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum PendingWapTransactionKind {
+    Connect,
+    Resume,
+    Status,
 }
 
 impl Default for SndcpRuntimeHandoffPolicy {
@@ -177,6 +201,8 @@ impl Sndcp {
             runtime_handoff,
             wap_pipeline,
             pending_pdch_handoffs: HashMap::new(),
+            pending_wap_responses: HashMap::new(),
+            pending_wap_response_keys: HashMap::new(),
             started_at: Instant::now(),
         }
     }
@@ -187,6 +213,8 @@ impl Sndcp {
             runtime_handoff,
             wap_pipeline: None,
             pending_pdch_handoffs: HashMap::new(),
+            pending_wap_responses: HashMap::new(),
+            pending_wap_response_keys: HashMap::new(),
             started_at: Instant::now(),
         }
     }
@@ -298,6 +326,17 @@ impl Sndcp {
             && let Ok(issi) = issi_from_ltpd_ind(&prim)
         {
             self.prepare_packet_data_retry_after_bearer_break(issi, prim.endpoint_id, prim.link_id);
+        }
+        let pending_wap_key = self.pending_wap_transaction_key_for_decode(&prim, decode);
+        if let Some(key) = pending_wap_key
+            && let Some(handle) = self.pending_wap_response_keys.get(&key)
+        {
+            tracing::warn!(
+                "SNDCP/WAP-IP: suppressing duplicate WTP request while response handle={} is still pending key={:?}",
+                handle,
+                key
+            );
+            return;
         }
         let response = match self.wap_pipeline.as_mut() {
             Some(pipeline) => pipeline.handle_ltpd_mle_unitdata_ind_allocating_optional(&prim, &snapshot),
@@ -416,6 +455,11 @@ impl Sndcp {
             response.endpoint_id,
             response.link_id
         );
+        if response.packet_data_flag
+            && let Some(key) = pending_wap_key
+        {
+            self.track_pending_wap_response(response.handle, key);
+        }
         queue.push_back(SapMsg {
             sap: Sap::TlpdSap,
             src: TetraEntity::Sndcp,
@@ -479,6 +523,80 @@ impl Sndcp {
         pipeline.mark_pdch_ready(pending.issi, pending.endpoint_id, pending.link_id);
     }
 
+    fn pending_wap_transaction_key_for_decode(
+        &self,
+        prim: &tetra_saps::ltpd::LtpdMleUnitdataInd,
+        decode: &SndcpDecode,
+    ) -> Option<PendingWapTransactionKey> {
+        let SndcpDecode::Unitdata(unitdata) = decode else {
+            return None;
+        };
+        let policy = self.wap_pipeline.as_ref()?.session().wap_policy();
+        let request_npdu = bitbuffer_npdu_octets(&unitdata.n_pdu).ok()?;
+        let request_ip = parse_ipv4_packet(&request_npdu).ok()?;
+        if request_ip.protocol != IPV4_PROTOCOL_UDP {
+            return None;
+        }
+        let request_udp = parse_udp_datagram(request_ip.payload).ok()?;
+        let request_kind = parse_wap_udp_request(request_udp.payload, policy).ok()?;
+        let (transaction_id, kind) = match request_kind {
+            WapUdpRequestKind::WtpWspConnect { transaction_id, .. } => (transaction_id, PendingWapTransactionKind::Connect),
+            WapUdpRequestKind::WtpWspResume { transaction_id, .. } => (transaction_id, PendingWapTransactionKind::Resume),
+            WapUdpRequestKind::WtpWspStatus { transaction_id, .. } => (transaction_id, PendingWapTransactionKind::Status),
+            WapUdpRequestKind::Empty | WapUdpRequestKind::Status | WapUdpRequestKind::WtpControlNoResponse { .. } => return None,
+        };
+        Some(PendingWapTransactionKey {
+            issi: prim.received_tetra_address.ssi,
+            endpoint_id: prim.endpoint_id,
+            link_id: prim.link_id,
+            nsapi: unitdata.nsapi,
+            client_addr: request_ip.source,
+            server_addr: request_ip.destination,
+            client_port: request_udp.source_port,
+            server_port: request_udp.destination_port,
+            transaction_id,
+            kind,
+        })
+    }
+
+    fn track_pending_wap_response(&mut self, handle: Todo, key: PendingWapTransactionKey) {
+        if handle <= 0 {
+            tracing::warn!(
+                "SNDCP/WAP-IP: cannot track pending WTP response with invalid handle={} key={:?}",
+                handle,
+                key
+            );
+            return;
+        }
+        self.pending_wap_responses.insert(handle, key);
+        self.pending_wap_response_keys.insert(key, handle);
+        tracing::debug!("SNDCP/WAP-IP: tracking pending WTP response handle={} key={:?}", handle, key);
+    }
+
+    fn finish_pending_wap_response(&mut self, handle: Todo, transfer_result: Todo) {
+        let Some(key) = self.pending_wap_responses.remove(&handle) else {
+            return;
+        };
+        self.pending_wap_response_keys.remove(&key);
+        tracing::debug!(
+            "SNDCP/WAP-IP: cleared pending WTP response handle={} transfer_result={} key={:?}",
+            handle,
+            transfer_result,
+            key
+        );
+    }
+
+    fn clear_pending_wap_responses_matching(&mut self, mut should_clear: impl FnMut(&PendingWapTransactionKey) -> bool) {
+        let handles: Vec<_> = self
+            .pending_wap_responses
+            .iter()
+            .filter_map(|(handle, key)| should_clear(key).then_some(*handle))
+            .collect();
+        for handle in handles {
+            self.finish_pending_wap_response(handle, TLA_REPORT_FAILED_TRANSFER);
+        }
+    }
+
     fn rx_ltpd_mle_report_ind(&mut self, prim: LtpdMleReportInd) {
         match prim.transfer_result {
             TLA_REPORT_NO_SPECIFIC_REPORT => {
@@ -499,6 +617,7 @@ impl Sndcp {
                 }
             }
             TLA_REPORT_SUCCESSFUL_TRANSFER => {
+                self.finish_pending_wap_response(prim.handle, prim.transfer_result);
                 if let Some(pending) = self.pending_pdch_handoffs.remove(&prim.handle) {
                     self.mark_pending_pdch_ready(prim.handle, pending, prim.transfer_result);
                 } else {
@@ -509,6 +628,7 @@ impl Sndcp {
                 }
             }
             TLA_REPORT_FAILED_TRANSFER => {
+                self.finish_pending_wap_response(prim.handle, prim.transfer_result);
                 if let Some(pending) = self.pending_pdch_handoffs.remove(&prim.handle) {
                     tracing::warn!(
                         "SNDCP/WAP-IP: PDCH handoff failed before lower completion handle={} issi={} endpoint={} link={}",
@@ -573,9 +693,11 @@ impl Sndcp {
         ) {
             if let Some(addr) = prim.received_tetra_address.filter(|addr| addr.ssi_type == SsiType::Issi) {
                 self.pending_pdch_handoffs.retain(|_, pending| pending.issi != addr.ssi);
+                self.clear_pending_wap_responses_matching(|key| key.issi == addr.ssi);
             } else {
                 self.pending_pdch_handoffs
                     .retain(|_, pending| pending.endpoint_id != prim.endpoint_id);
+                self.clear_pending_wap_responses_matching(|key| key.endpoint_id == prim.endpoint_id);
             }
         }
 
@@ -685,6 +807,8 @@ impl Sndcp {
                 if let Err(err) = pipeline.deregister_issi(update.issi) {
                     self.log_wap_pipeline_drop(&err);
                 }
+                self.pending_pdch_handoffs.retain(|_, pending| pending.issi != update.issi);
+                self.clear_pending_wap_responses_matching(|key| key.issi == update.issi);
             }
             other => {
                 tracing::warn!("SNDCP: dropping unexpected Control primitive {:?}", other);

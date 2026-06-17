@@ -27,7 +27,7 @@ use tetra_pdus::llc::consts::consts::{
 };
 use tetra_pdus::llc::consts::timers::{T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
-use tetra_pdus::llc::pdus::al_ack::AlAck;
+use tetra_pdus::llc::pdus::al_ack::{AlAck, AlAckBlock};
 use tetra_pdus::llc::pdus::al_data::AlData;
 use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
@@ -1144,7 +1144,7 @@ impl Llc {
         )
     }
 
-    fn find_outbound_al_ack_match(&self, prim: &TmaUnitdataInd, ack: &AlAck) -> (Option<usize>, usize) {
+    fn find_outbound_al_ack_block_match(&self, prim: &TmaUnitdataInd, block: &AlAckBlock) -> (Option<usize>, usize) {
         let mut exact_idx = None;
         let mut exact_matches = 0usize;
 
@@ -1152,7 +1152,7 @@ impl Llc {
             if outbound.key.addr != prim.main_address || outbound.key.endpoint_id != prim.endpoint_id {
                 continue;
             }
-            if outbound.ns == ack.nr {
+            if outbound.ns == block.nr {
                 exact_matches += 1;
                 exact_idx = Some(idx);
             }
@@ -1162,6 +1162,63 @@ impl Llc {
             return (exact_idx, exact_matches);
         }
         (None, exact_matches)
+    }
+
+    fn al_ack_block_covered_end(block: &AlAckBlock) -> Option<u8> {
+        if !block.is_selective_segment_ack() || block.is_rest_of_sdu_correctly_received() {
+            return None;
+        }
+        let sr = block.sr?;
+        Some(sr.saturating_add(block.acknowledgement_length).saturating_sub(1))
+    }
+
+    fn al_segment_acknowledged_in_block(block: &AlAckBlock, continuation_after: Option<u8>, ss: u8) -> Option<bool> {
+        if !block.is_selective_segment_ack() {
+            return None;
+        }
+        let lower_bound = continuation_after.map(|covered| covered.saturating_add(1)).unwrap_or(0);
+        if ss < lower_bound {
+            return None;
+        }
+        if block.is_rest_of_sdu_correctly_received() {
+            return Some(true);
+        }
+        let sr = block.sr?;
+        if ss < sr {
+            return Some(true);
+        }
+        if ss == sr {
+            return Some(false);
+        }
+        let offset = ss.saturating_sub(sr) as usize;
+        if offset >= block.acknowledgement_length as usize {
+            return None;
+        }
+        Some(((block.acknowledgement_bitmap >> (offset - 1)) & 1) != 0)
+    }
+
+    fn complete_outbound_al_transfer_at_index(&mut self, queue: &mut MessageQueue, idx: usize) {
+        let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {
+            return;
+        };
+        if !outbound.first_complete_report_sent {
+            Self::mark_al_current_mac_transmitted(&mut outbound);
+            outbound.t_umac_done = Some(self.dltime);
+            Self::mark_al_service_first_complete(&mut outbound);
+            Self::push_tla_report(
+                queue,
+                outbound.req_handle,
+                TLA_REPORT_FIRST_COMPLETE_TRANSMISSION,
+                Some(outbound.key.endpoint_id),
+            );
+        }
+        outbound.tx_reporter.mark_acknowledged();
+        Self::push_tla_report(
+            queue,
+            outbound.req_handle,
+            TLA_REPORT_SUCCESSFUL_TRANSFER,
+            Some(outbound.key.endpoint_id),
+        );
     }
 
     fn lowest_priority_unsubmitted_udata_below(messages: &VecDeque<QueuedUdata>, incoming_pdu_prio: Todo) -> Option<usize> {
@@ -2754,44 +2811,46 @@ impl Llc {
 
         self.apply_al_receiver_flow_control(prim.main_address, prim.endpoint_id, ack.receiver_ready);
 
-        let (match_idx, exact_matches) = self.find_outbound_al_ack_match(prim, &ack);
+        let mut last_selective_nr = None;
+        let mut last_selective_covered_end = None;
+        for block in &ack.acknowledgement_blocks {
+            let continuation_after = if last_selective_nr == Some(block.nr) {
+                last_selective_covered_end
+            } else {
+                None
+            };
+            self.rx_al_ack_block(queue, prim, &ack, block, continuation_after);
+            last_selective_nr = Some(block.nr);
+            last_selective_covered_end = Self::al_ack_block_covered_end(block);
+        }
+    }
+
+    fn rx_al_ack_block(
+        &mut self,
+        queue: &mut MessageQueue,
+        prim: &TmaUnitdataInd,
+        ack: &AlAck,
+        block: &AlAckBlock,
+        continuation_after: Option<u8>,
+    ) {
+        let (match_idx, exact_matches) = self.find_outbound_al_ack_block_match(prim, block);
         let Some(idx) = match_idx else {
             tracing::warn!(
-                "LLC: AL-ACK/RNR for SSI {} endpoint {} N(R)={} matched {} outstanding AL transfers; ignoring",
+                "LLC: AL-ACK/RNR block for SSI {} endpoint {} N(R)={} matched {} outstanding AL transfers; ignoring",
                 prim.main_address.ssi,
                 prim.endpoint_id,
-                ack.nr,
+                block.nr,
                 exact_matches
             );
             return;
         };
 
-        if ack.acknowledges_complete_tl_sdu() {
-            let Some(mut outbound) = self.outbound_al_messages.remove(idx) else {
-                return;
-            };
-            if !outbound.first_complete_report_sent {
-                Self::mark_al_current_mac_transmitted(&mut outbound);
-                outbound.t_umac_done = Some(self.dltime);
-                Self::mark_al_service_first_complete(&mut outbound);
-                Self::push_tla_report(
-                    queue,
-                    outbound.req_handle,
-                    TLA_REPORT_FIRST_COMPLETE_TRANSMISSION,
-                    Some(outbound.key.endpoint_id),
-                );
-            }
-            outbound.tx_reporter.mark_acknowledged();
-            Self::push_tla_report(
-                queue,
-                outbound.req_handle,
-                TLA_REPORT_SUCCESSFUL_TRANSFER,
-                Some(outbound.key.endpoint_id),
-            );
+        if block.acknowledges_complete_tl_sdu() {
+            self.complete_outbound_al_transfer_at_index(queue, idx);
             return;
         }
 
-        if ack.requests_repeat_entire_tl_sdu() {
+        if block.requests_repeat_entire_tl_sdu() {
             let max_retransmissions = self
                 .advanced_links
                 .get(&self.outbound_al_messages[idx].key)
@@ -2825,7 +2884,7 @@ impl Llc {
             return;
         }
 
-        if ack.is_selective_segment_ack() {
+        if block.is_selective_segment_ack() {
             let max_segment_retransmissions = self
                 .advanced_links
                 .get(&self.outbound_al_messages[idx].key)
@@ -2840,10 +2899,11 @@ impl Llc {
             let mut retransmit_segments = 0usize;
             let mut newly_requested_retransmit_segments = 0usize;
             let mut exhausted_segment = None;
+            let all_segments_acknowledged;
             {
                 let outbound = &mut self.outbound_al_messages[idx];
                 for segment in &mut outbound.segments {
-                    match ack.segment_acknowledged_in_first_block(segment.ss) {
+                    match Self::al_segment_acknowledged_in_block(block, continuation_after, segment.ss) {
                         Some(true) => {
                             if !segment.acknowledged {
                                 acknowledged_segments += 1;
@@ -2897,6 +2957,7 @@ impl Llc {
                     outbound.t_retransmissions_exhausted = None;
                 }
                 outbound.selective_segment_retry_pending = retry_pending;
+                all_segments_acknowledged = outbound.segments.iter().all(|segment| segment.acknowledged);
             }
 
             if let Some(ss) = exhausted_segment {
@@ -2939,25 +3000,36 @@ impl Llc {
             }
 
             tracing::info!(
-                "LLC: AL selective {} for SSI {} endpoint {} N(R)={} sr={:?} ack_len={} acknowledged_segments={} retransmit_segments={}",
+                "LLC: AL selective {} for SSI {} endpoint {} N(R)={} sr={:?} ack_len={} continuation_after={:?} acknowledged_segments={} retransmit_segments={}",
                 if ack.receiver_ready { "ACK" } else { "RNR" },
                 prim.main_address.ssi,
                 prim.endpoint_id,
-                ack.nr,
-                ack.sr,
-                ack.acknowledgement_length,
+                block.nr,
+                block.sr,
+                block.acknowledgement_length,
+                continuation_after,
                 acknowledged_segments,
                 retransmit_segments
             );
+            if all_segments_acknowledged {
+                tracing::info!(
+                    "LLC: AL selective {} completed TL-SDU for SSI {} endpoint {} N(R)={}",
+                    if ack.receiver_ready { "ACK" } else { "RNR" },
+                    prim.main_address.ssi,
+                    prim.endpoint_id,
+                    block.nr
+                );
+                self.complete_outbound_al_transfer_at_index(queue, idx);
+            }
             return;
         }
 
         tracing::debug!(
-            "LLC: AL-RNR/unknown AL-ACK for SSI {} endpoint {} N(R)={} ack_len={} is not actionable; waiting for retry/complete ACK",
+            "LLC: AL-RNR/unknown AL-ACK block for SSI {} endpoint {} N(R)={} ack_len={} is not actionable; waiting for retry/complete ACK",
             prim.main_address.ssi,
             prim.endpoint_id,
-            ack.nr,
-            ack.acknowledgement_length
+            block.nr,
+            block.acknowledgement_length
         );
     }
 

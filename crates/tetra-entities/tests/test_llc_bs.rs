@@ -13,7 +13,7 @@ use tetra_entities::llc::components::fcs;
 use tetra_pdus::llc::consts::consts::N252_BL_MAX_TLSDU_RETRANSMITS_ACKED;
 use tetra_pdus::llc::consts::timers::{T251_SENDER_RETRY_TIMER, T252_ACK_WAITING_TIMER, T271_RECEIVER_NOT_READY_FOR_TX_TIMER};
 use tetra_pdus::llc::enums::llc_pdu_type::LlcPduType;
-use tetra_pdus::llc::pdus::al_ack::AlAck;
+use tetra_pdus::llc::pdus::al_ack::{AlAck, AlAckBlock};
 use tetra_pdus::llc::pdus::al_data::AlData;
 use tetra_pdus::llc::pdus::al_setup::AlSetup;
 use tetra_pdus::llc::pdus::bl_ack::BlAck;
@@ -587,6 +587,30 @@ fn build_al_selective_ack_ind_with_bitmap(
 ) -> SapMsg {
     let mut pdu = BitBuffer::new_autoexpand(32);
     AlAck::selective(true, nr, sr, acknowledgement_bitmap, acknowledgement_length).to_bitbuf(&mut pdu);
+    pdu.seek(0);
+
+    SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Umac,
+        dest: TetraEntity::Llc,
+        msg: SapMsgInner::TmaUnitdataInd(TmaUnitdataInd {
+            pdu: Some(pdu),
+            main_address: addr,
+            scrambling_code: 0,
+            endpoint_id,
+            new_endpoint_id: None,
+            css_endpoint_id: None,
+            air_interface_encryption: 0,
+            chan_change_response_req: false,
+            chan_change_handle: None,
+            chan_info: None,
+        }),
+    }
+}
+
+fn build_al_ack_ind_with_blocks(addr: TetraAddress, endpoint_id: u32, receiver_ready: bool, blocks: Vec<AlAckBlock>) -> SapMsg {
+    let mut pdu = BitBuffer::new_autoexpand(128);
+    AlAck::with_blocks(receiver_ready, blocks).to_bitbuf(&mut pdu);
     pdu.seek(0);
 
     SapMsg {
@@ -2643,6 +2667,84 @@ fn test_outbound_segmented_al_selective_n274_exhaustion_restarts_complete_tl_sdu
     assert!(
         !find_tla_report(&full_retry_msgs, req_handle, TLA_REPORT_FAILED_TRANSFER),
         "N.274 exhaustion alone must not fail the TL-SDU while N.273 remains"
+    );
+}
+
+#[test]
+fn test_outbound_segmented_al_applies_multiple_ack_blocks_for_same_tl_sdu() {
+    debug::setup_logging_verbose();
+
+    let addr = TetraAddress::new(2065022, SsiType::Issi);
+    let req_handle = 7118;
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime { t: 1, f: 1, m: 1, h: 0 }));
+    test.populate_entities(vec![TetraEntity::Llc], vec![TetraEntity::Umac, TetraEntity::Mle]);
+
+    let mut setup = default_al_setup();
+    setup.max_tl_sdu_retransmissions = 0;
+    setup.max_segment_retransmissions = 2;
+    test.submit_message(build_al_setup_ind_with_setup(addr, 0, setup));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let payload = [0xa6; 446];
+    let mut req = build_tl_data_req_with_handle(addr, req_handle);
+    let SapMsgInner::TlaTlDataReqBl(prim) = &mut req.msg else {
+        panic!("expected TL-DATA request");
+    };
+    prim.link_id = 1;
+    prim.pdu_prio = 4;
+    prim.fcs_flag = false;
+    prim.tl_sdu = BitBuffer::from_bytes(&payload);
+
+    test.submit_message(req);
+    test.run_stack(Some(1));
+    let first_msgs = test.dump_sinks();
+    let first_segments = al_segment_headers(&first_msgs);
+    assert!(
+        first_segments.len() > 16,
+        "test vector should model the larger one-slot WAP response path"
+    );
+    let last_ss = first_segments
+        .iter()
+        .map(|(_, _, _, ss, _)| *ss)
+        .max()
+        .expect("large AL response should have segments");
+
+    for handle in first_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_ack_ind_with_blocks(
+        addr,
+        0,
+        true,
+        vec![AlAckBlock::selective(0, 0, 0, 1), AlAckBlock::selective(0, last_ss, 0, 1)],
+    ));
+    test.run_stack(Some(1));
+    let retry_msgs = test.dump_sinks();
+    assert_eq!(
+        al_segment_headers(&retry_msgs)
+            .iter()
+            .map(|(_, _, _, ss, _)| *ss)
+            .collect::<Vec<_>>(),
+        vec![0, last_ss],
+        "continuation acknowledgement blocks must mark the gap between blocks as received"
+    );
+
+    for handle in retry_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report_ind(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_ack_ind(addr, 0, 0));
+    test.deliver_all_messages();
+    let complete_msgs = test.dump_sinks();
+    assert!(
+        find_tla_report(&complete_msgs, req_handle, TLA_REPORT_SUCCESSFUL_TRANSFER),
+        "complete AL-ACK after multi-block selective retries must finish the large TL-SDU"
     );
 }
 

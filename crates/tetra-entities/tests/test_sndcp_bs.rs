@@ -1173,6 +1173,124 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
 }
 
 #[test]
+fn sndcp_wap_al_xhtml_suppresses_duplicate_wtp_get_while_response_pending() {
+    debug::setup_logging_verbose();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp(&mut config);
+    config
+        .cell
+        .wap_ip
+        .as_mut()
+        .expect("WAP/IP profile should be enabled")
+        .assume_pdch_ready_after_data_transmit = false;
+    let mut test = ComponentTest::from_config(config, None);
+    test.populate_entities(
+        vec![TetraEntity::Sndcp, TetraEntity::Mle, TetraEntity::Llc],
+        vec![TetraEntity::Umac],
+    );
+
+    let addr = TetraAddress::new(1000001, SsiType::Issi);
+    let endpoint_id = 1;
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_dynamic_ipv4_activation_demand(2),
+        endpoint_id,
+        0,
+    ));
+    test.run_stack(Some(1));
+    let activation_msgs = test.dump_sinks();
+    let activation_ns = activation_msgs
+        .iter()
+        .find_map(bl_data_ns_from_tma_req)
+        .expect("activation accept should be sent as BL-DATA");
+    test.submit_message(build_bl_ack_ind(addr, endpoint_id, activation_ns));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        encode_data_transmit_request(&SndcpDataTransmitRequest {
+            nsapi: 2,
+            logical_link_status: false,
+            resource_request: SndcpPacketDataResourceRequest::None,
+        })
+        .expect("SN-DATA TRANSMIT REQUEST should encode"),
+        endpoint_id,
+        0,
+    ));
+    test.run_stack(Some(1));
+    let ready_msgs = test.dump_sinks();
+    let ready_req_handle = ready_msgs
+        .iter()
+        .find_map(|msg| match &msg.msg {
+            SapMsgInner::TmaUnitdataReq(req) if req.chan_alloc.is_some() => Some(req.req_handle),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("SN-DATA TRANSMIT RESPONSE should reach UMAC with PDCH allocation: {ready_msgs:#?}"));
+    test.submit_message(build_tma_report(ready_req_handle, TmaReport::SuccessReservedOrStealing));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_setup_ind(addr, endpoint_id, 0));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let request_payload = build_wtp_wsp_get_payload(0x1234, "/status.xhtml");
+    let request_sndcp = build_wap_status_sn_data_from(2, [10, 0, 0, 2], &request_payload);
+    let request_tl_sdu = build_mle_prefixed_sndcp_sdu(request_sndcp);
+    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 0, &request_tl_sdu));
+    test.run_stack(Some(1));
+    let first_response_msgs = test.dump_sinks();
+    let first_response_segments: Vec<_> = first_response_msgs
+        .iter()
+        .filter(|msg| llc_pdu_type_from_tma_req(msg) == Some(LlcPduType::AlDataAlFinal))
+        .collect();
+    assert!(
+        first_response_segments.len() > 1,
+        "first WSP XHTML response should be segmented over AL"
+    );
+    let first_response_ns = first_response_segments
+        .iter()
+        .find_map(|msg| al_data_ns_from_tma_req(msg))
+        .expect("first WAP response should have an AL N(S)");
+
+    let mut duplicate_payload = request_payload.clone();
+    duplicate_payload[0] |= 0x01;
+    let duplicate_sndcp = build_wap_status_sn_data_from(2, [10, 0, 0, 2], &duplicate_payload);
+    let duplicate_tl_sdu = build_mle_prefixed_sndcp_sdu(duplicate_sndcp);
+    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 1, &duplicate_tl_sdu));
+    test.run_stack(Some(1));
+    let duplicate_pending_msgs = test.dump_sinks();
+    assert!(
+        duplicate_pending_msgs
+            .iter()
+            .all(|msg| llc_pdu_type_from_tma_req(msg) != Some(LlcPduType::AlDataAlFinal)),
+        "duplicate WTP GET must not spawn a second AL response while the first response is pending"
+    );
+
+    for handle in first_response_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_ack_ind(addr, endpoint_id, first_response_ns));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 2, &duplicate_tl_sdu));
+    test.run_stack(Some(1));
+    let retry_after_complete_msgs = test.dump_sinks();
+    assert!(
+        retry_after_complete_msgs
+            .iter()
+            .any(|msg| llc_pdu_type_from_tma_req(msg) == Some(LlcPduType::AlDataAlFinal)),
+        "after terminal lower-layer report clears the pending key, a WTP retry may be answered again"
+    );
+}
+
+#[test]
 fn sndcp_wap_al_connect_reply_e2e_acknowledges_segmented_response() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
