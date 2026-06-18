@@ -32,11 +32,11 @@ pornește Nexus-BS.
 ```sh
 sudo apt update
 sudo apt install -y curl ca-certificates
-cd ~
-curl -fLO https://github.com/invictus737/nexus-bs/releases/download/v0.1.66_dev/nexus-bs_0.1.66_arm64.deb
-curl -fLO https://github.com/invictus737/nexus-bs/releases/download/v0.1.66_dev/SHA256SUMS
+cd /tmp
+curl -fL -o nexus-bs_0.1.71_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.71/nexus-bs_0.1.71_arm64.deb
+curl -fL -o SHA256SUMS https://github.com/invictus737/nexus-bs/releases/download/v0.1.71/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
-sudo apt install ./nexus-bs_0.1.66_arm64.deb
+sudo apt install /tmp/nexus-bs_0.1.71_arm64.deb
 sudo chown "$USER:$USER" /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback
 chmod 600 /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback
 nexus-bs-service edit-config
