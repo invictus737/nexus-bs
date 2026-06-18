@@ -243,6 +243,7 @@ fn render_wml2_status_sector_pages(snapshot: &WapStatusSnapshot) -> Vec<WapStatu
     {
         health.push(format!("Health {summary}"));
     }
+    health.push(format!("Uptime {}", compact_browser_uptime(snapshot.uptime_secs)));
     health.extend(nonempty_lines(&snapshot.health_lines));
     if !health.is_empty() {
         pages.push(WapStatusSectorPage {
@@ -369,15 +370,25 @@ fn render_wml_status_browser_sector_page(pages: &[WapStatusSectorPage], sector: 
     let page = &pages[sector];
     let page_title = escape_xhtml_text_limited(&browser_sector_heading(page, sector, pages.len()), 14);
     let mut body = vec![page_title];
-    let lines: Vec<String> = page.lines.iter().map(|line| escape_xhtml_text_limited(line, line_limit)).collect();
+    let mut lines: Vec<String> = page
+        .lines
+        .iter()
+        .map(|line| compact_browser_sector_line(page.title, line))
+        .map(|line| escape_xhtml_text_limited(&line, line_limit))
+        .collect();
+    if page.title == "Radios" {
+        lines = vec![lines.join(" ")];
+    }
+    let mut nav = String::new();
     if sector + 1 < pages.len() {
-        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">N</a>", sector + 1));
+        nav.push_str(&format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">N</a>", sector + 1));
     }
     if sector > 0 {
-        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">P</a>", sector - 1));
+        nav.push_str(&format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">P</a>", sector - 1));
     }
-    body.push("<a href=\"/\">H</a>".to_string());
-    let nav_count = 1 + usize::from(sector + 1 < pages.len()) + usize::from(sector > 0);
+    nav.push_str("<a href=\"/\">H</a>");
+    body.push(nav);
+    let nav_count = 1;
 
     for line in lines {
         let insert_at = body.len().saturating_sub(nav_count);
@@ -407,6 +418,20 @@ fn browser_sector_heading(page: &WapStatusSectorPage, sector: usize, page_count:
         "Calls" => format!("Calls {}", page.lines.len()),
         title => format!("{} {}/{}", browser_sector_title(title), sector + 1, page_count),
     }
+}
+
+fn compact_browser_sector_line(title: &str, line: &str) -> String {
+    match title {
+        "Radios" => compact_browser_radio_line(line),
+        _ => line.to_string(),
+    }
+}
+
+fn compact_browser_radio_line(line: &str) -> String {
+    line.split_whitespace()
+        .find(|part| part.chars().all(|ch| ch.is_ascii_digit()) && part.len() >= 5)
+        .map(str::to_string)
+        .unwrap_or_else(|| line.to_string())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -755,6 +780,20 @@ fn compact_tiny_uptime(uptime_secs: u64) -> String {
     format!("{days}d{hours}h{minutes}m{seconds}s")
 }
 
+fn compact_browser_uptime(uptime_secs: u64) -> String {
+    let uptime_secs = uptime_secs.min(99 * 86_400 + 23 * 3_600 + 59 * 60 + 59);
+    let days = uptime_secs / 86_400;
+    let hours = (uptime_secs % 86_400) / 3_600;
+    let minutes = (uptime_secs % 3_600) / 60;
+    let seconds = uptime_secs % 60;
+
+    if minutes > 0 {
+        format!("{days}d{hours}h{minutes}m{seconds}s")
+    } else {
+        format!("{days}d{hours}h{seconds}s")
+    }
+}
+
 fn compact_tiny_version(version: &str) -> String {
     let version = version.trim().strip_prefix('v').unwrap_or(version.trim());
     let version = version
@@ -1004,11 +1043,43 @@ mod tests {
         let index = render_wml_status_browser_index(&snapshot, 160).expect("browser index should fit");
         assert!(index.contains("MS 1 G 0 P 1 S 2"), "index={index:?}");
 
-        let radios = render_wml_status_browser_sector(&snapshot, 128, 2).expect("radio sector should fit");
+        let radios = render_wml_status_browser_sector(&snapshot, 144, 2).expect("radio sector should fit");
         assert!(radios.contains("Radios 1"), "radios={radios:?}");
         assert!(!radios.contains("Radios 3/3"), "radios={radios:?}");
-        assert!(radios.contains("MS 2260618"), "radios={radios:?}");
-        assert!(radios.len() <= 128, "radios={radios:?}");
+        assert!(radios.contains("2260618"), "radios={radios:?}");
+        assert!(!radios.contains("MS 2260618"), "radios={radios:?}");
+        assert!(radios.len() <= 144, "radios={radios:?}");
+    }
+
+    #[test]
+    fn render_wml_status_browser_health_includes_tiny_uptime() {
+        let mut snapshot = sample_snapshot();
+        snapshot.uptime_secs = 0;
+
+        let health = render_wml_status_browser_sector(&snapshot, 144, 1).expect("health sector should fit");
+
+        assert!(health.contains("Health OK"), "health={health:?}");
+        assert!(health.contains("Uptime 0d0h0s"), "health={health:?}");
+        assert!(health.len() <= 144, "health={health:?}");
+    }
+
+    #[test]
+    fn render_wml_status_browser_radios_compacts_issis_to_fit_page() {
+        let mut snapshot = sample_snapshot();
+        snapshot.radio_lines = vec![
+            "MS 2260618 -38dB G1 SA".to_string(),
+            "MS 2260616 -27dB G1 SA".to_string(),
+            "MS 2260082 -31dB G1 SA".to_string(),
+        ];
+
+        let radios = render_wml_status_browser_sector(&snapshot, 144, 2).expect("radio sector should fit");
+
+        assert!(radios.contains("Radios 3"), "radios={radios:?}");
+        assert!(radios.contains("2260618"), "radios={radios:?}");
+        assert!(radios.contains("2260616"), "radios={radios:?}");
+        assert!(radios.contains("2260082"), "radios={radios:?}");
+        assert!(!radios.contains("-38dB"), "radios={radios:?}");
+        assert!(radios.len() <= 144, "radios={radios:?}");
     }
 
     #[test]

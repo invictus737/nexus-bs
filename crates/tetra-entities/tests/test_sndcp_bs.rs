@@ -1574,13 +1574,14 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         sector_octets.len()
     );
     assert!(
-        sector_page.len() <= 128,
+        sector_page.len() <= 144,
         "sector_page_len={} sector_page={sector_page:?}",
         sector_page.len()
     );
     assert!(sector_page.contains("2/"), "sector_page={sector_page:?}");
     assert!(sector_page.contains("<wml>"), "sector_page={sector_page:?}");
     assert!(sector_page.contains("Health OK"), "sector_page={sector_page:?}");
+    assert!(sector_page.contains("Uptime "), "sector_page={sector_page:?}");
     assert!(sector_page.contains("href=\"?s=0\""));
     assert!(sector_page.contains("href=\"/\""));
     assert!(!sector_page.contains("<script"));
