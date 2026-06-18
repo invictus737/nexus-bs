@@ -151,7 +151,7 @@ copy_dashboard() {
 set_service_name_in_file() {
     file="$1"
     tmp="${TMPDIR:-/tmp}/nexus-bs-config.$$"
-    awk -v unit="nexus-bs@${RUN_USER}.service" '
+    awk -v unit="nexus-bs.service" '
         BEGIN { done = 0 }
         /^[[:space:]]*service_name[[:space:]]*=/ && done == 0 {
             print "service_name = \"" unit "\""
@@ -201,9 +201,16 @@ link_runtime_config() {
 
 install_systemd_units() {
     as_root install -d -m 0755 "$SYSTEMD_UNIT_DIR"
-    as_root install -m 0644 "$ROOT/contrib/systemd/nexus-bs-control@.service" "$SYSTEMD_UNIT_DIR/nexus-bs-control@.service"
-    as_root install -m 0644 "$ROOT/contrib/systemd/nexus-bs@.service" "$SYSTEMD_UNIT_DIR/nexus-bs@.service"
-    as_root install -m 0644 "$ROOT/contrib/systemd/nexus-bs-dashboard@.service" "$SYSTEMD_UNIT_DIR/nexus-bs-dashboard@.service"
+    tmpdir="${TMPDIR:-/tmp}/nexus-bs-units.$$"
+    mkdir -p "$tmpdir"
+    for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
+        sed \
+            -e "s/User=chris/User=${RUN_USER}/" \
+            -e "s#/home/chris/nexus-bs#${RUN_DIR}#g" \
+            "$ROOT/contrib/systemd/$unit" > "$tmpdir/$unit"
+        as_root install -m 0644 "$tmpdir/$unit" "$SYSTEMD_UNIT_DIR/$unit"
+    done
+    rm -rf "$tmpdir"
     "$SYSTEMCTL_CMD" daemon-reload
 }
 

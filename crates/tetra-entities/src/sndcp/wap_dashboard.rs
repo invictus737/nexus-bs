@@ -31,12 +31,16 @@ impl Default for WapDashboardSnapshotOptions {
 }
 
 pub fn wap_status_snapshot_from_dashboard(state: &DashboardStateInner, options: &WapDashboardSnapshotOptions) -> WapStatusSnapshot {
+    let active_group_calls = state.calls.values().filter(|call| call.is_group).count();
+    let active_private_calls = state.calls.len().saturating_sub(active_group_calls);
     WapStatusSnapshot {
         title: options.title.clone(),
         stack_version: options.stack_version.clone(),
         service_state: dashboard_service_state(state, options),
         registered_ms: state.ms_map.len(),
         active_calls: state.calls.len(),
+        active_group_calls,
+        active_private_calls,
         queued_sds: queued_sds_from_health(state.last_health.as_ref()),
         uptime_secs: options.uptime_secs,
         last_activity: state.last_heard.front().map(last_activity_text),

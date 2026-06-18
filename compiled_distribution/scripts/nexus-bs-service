@@ -4,7 +4,6 @@
 
 set -eu
 
-RUN_USER="${NEXUS_BS_USER:-${SUDO_USER:-${USER:-$(id -un)}}}"
 CONFIG_FILE="${NEXUS_BS_CONFIG:-/etc/nexus-bs/config.toml}"
 LOG_LINES="${NEXUS_BS_LOG_LINES:-160}"
 SUDO_CMD="${NEXUS_BS_SUDO-sudo}"
@@ -12,9 +11,9 @@ SYSTEMCTL_CMD="${NEXUS_BS_SYSTEMCTL:-systemctl}"
 JOURNALCTL_CMD="${NEXUS_BS_JOURNALCTL:-journalctl}"
 EDITOR_CMD="${NEXUS_BS_EDITOR:-sudoedit}"
 
-CONTROL_UNIT="nexus-bs-control@${RUN_USER}.service"
-CORE_UNIT="nexus-bs@${RUN_USER}.service"
-DASHBOARD_UNIT="nexus-bs-dashboard@${RUN_USER}.service"
+CONTROL_UNIT="${NEXUS_BS_CONTROL_UNIT:-nexus-bs-control.service}"
+CORE_UNIT="${NEXUS_BS_CORE_UNIT:-nexus-bs.service}"
+DASHBOARD_UNIT="${NEXUS_BS_DASHBOARD_UNIT:-nexus-bs-dashboard.service}"
 
 systemctl_cmd() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -47,7 +46,7 @@ as_root() {
 }
 
 ensure_service_name() {
-    expected="nexus-bs@${RUN_USER}.service"
+    expected="$CORE_UNIT"
     [ -f "$CONFIG_FILE" ] || return 0
     command -v awk >/dev/null 2>&1 || return 0
 
@@ -70,10 +69,14 @@ ensure_service_name() {
         return 0
     fi
 
-    if [ -n "$current" ] && [ "$current" != "nexus-bs" ]; then
-        printf 'Config service_name is %s; expected %s. Keeping existing value.\n' "$current" "$expected" >&2
-        return 0
-    fi
+    case "$current" in
+        ""|"nexus-bs"|"nexus-bs.service"|nexus-bs@*.service)
+            ;;
+        *)
+            printf 'Config service_name is %s; expected %s. Keeping existing value.\n' "$current" "$expected" >&2
+            return 0
+            ;;
+    esac
 
     tmp="${TMPDIR:-/tmp}/nexus-bs-service-config.$$"
     awk -v unit="$expected" '
@@ -112,7 +115,6 @@ Commands:
   config      Print the live config path
 
 Environment:
-  NEXUS_BS_USER       Service user, default: ${RUN_USER}
   NEXUS_BS_CONFIG     Config path, default: ${CONFIG_FILE}
   NEXUS_BS_LOG_LINES  Lines for logs, default: ${LOG_LINES}
 EOF

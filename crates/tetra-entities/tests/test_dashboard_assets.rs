@@ -21,9 +21,9 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let css_path = root.join("dashboard/assets/styles.css");
     let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
-    let core_unit_path = root.join("contrib/systemd/nexus-bs@.service");
-    let control_unit_path = root.join("contrib/systemd/nexus-bs-control@.service");
-    let dashboard_unit_path = root.join("contrib/systemd/nexus-bs-dashboard@.service");
+    let core_unit_path = root.join("contrib/systemd/nexus-bs.service");
+    let control_unit_path = root.join("contrib/systemd/nexus-bs-control.service");
+    let dashboard_unit_path = root.join("contrib/systemd/nexus-bs-dashboard.service");
 
     let index = std::fs::read_to_string(&index_path).expect("dashboard index.html should exist");
     let app = std::fs::read_to_string(&app_path).expect("dashboard app.js should exist");
@@ -290,6 +290,23 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains(r#"stopgo: "/api/service/stop-go""#)
             && app.contains("function requestServiceAction"),
         "dashboard must call the core-owned service lifecycle API"
+    );
+    assert!(
+        deploy_script.contains(r#"REMOTE_SERVICE="${REMOTE_SERVICE:-nexus-bs.service}""#)
+            && deploy_script.contains(r#"REMOTE_CONTROL_SERVICE="${REMOTE_CONTROL_SERVICE:-nexus-bs-control.service}""#)
+            && deploy_script.contains(r#"REMOTE_DASHBOARD_SERVICE="${REMOTE_DASHBOARD_SERVICE:-nexus-bs-dashboard.service}""#)
+            && !deploy_script.contains("nexus-bs@.service")
+            && !deploy_script.contains("nexus-bs-control@.service")
+            && !deploy_script.contains("nexus-bs-dashboard@.service"),
+        "deploy script must use simple service names, not systemd template units"
+    );
+    assert!(
+        core_unit.contains("Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service")
+            && dashboard_unit.contains("Environment=NEXUS_BS_DASHBOARD_CORE=127.0.0.1:18080")
+            && !core_unit.contains("@%i")
+            && !control_unit.contains("@%i")
+            && !dashboard_unit.contains("@%i"),
+        "split systemd units must keep dashboard proxying to the local core while avoiding @user service names"
     );
     assert!(
         core_unit.contains("CPUAffinity=1 2") && control_unit.contains("CPUAffinity=3") && dashboard_unit.contains("CPUAffinity=3"),

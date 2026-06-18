@@ -328,14 +328,14 @@ impl Sndcp {
         }
         let pending_wap_key = self.pending_wap_transaction_key_for_decode(&prim, decode);
         if let Some(key) = pending_wap_key
-            && let Some(handle) = self.pending_wap_response_keys.get(&key)
+            && let Some(handle) = self.pending_wap_response_keys.get(&key).copied()
         {
             tracing::warn!(
-                "SNDCP/WAP-IP: suppressing duplicate WTP request while response handle={} is still pending key={:?}",
+                "SNDCP/WAP-IP: retrying duplicate WTP request while response handle={} is still pending; replacing stale pending key={:?}",
                 handle,
                 key
             );
-            return;
+            self.finish_pending_wap_response(handle, TLA_REPORT_FAILED_TRANSFER);
         }
         let response = match self.wap_pipeline.as_mut() {
             Some(pipeline) => pipeline.handle_ltpd_mle_unitdata_ind_allocating_optional(&prim, &snapshot),
@@ -542,7 +542,7 @@ impl Sndcp {
             WapUdpRequestKind::WtpWspConnect { transaction_id, .. } => (transaction_id, PendingWapTransactionKind::Connect),
             WapUdpRequestKind::WtpWspResume { transaction_id, .. } => (transaction_id, PendingWapTransactionKind::Resume),
             WapUdpRequestKind::WtpWspStatus { transaction_id, .. } => (transaction_id, PendingWapTransactionKind::Status),
-            WapUdpRequestKind::Empty | WapUdpRequestKind::Status | WapUdpRequestKind::WtpControlNoResponse { .. } => return None,
+            WapUdpRequestKind::Empty | WapUdpRequestKind::Status { .. } | WapUdpRequestKind::WtpControlNoResponse { .. } => return None,
         };
         Some(PendingWapTransactionKey {
             issi: prim.received_tetra_address.ssi,
@@ -851,9 +851,9 @@ impl Sndcp {
         let mut registered_issis: Vec<u32> = self.config.state_read().subscribers.all_registered_issis().collect();
         registered_issis.sort_unstable();
         let registered_ms = registered_issis.len();
-        let active_calls = metric_from_health(&health, crate::health::HealthDomain::Voice, "active_group_calls").saturating_add(
-            metric_from_health(&health, crate::health::HealthDomain::P2p, "active_individual_calls"),
-        );
+        let active_group_calls = metric_from_health(&health, crate::health::HealthDomain::Voice, "active_group_calls");
+        let active_private_calls = metric_from_health(&health, crate::health::HealthDomain::P2p, "active_individual_calls");
+        let active_calls = active_group_calls.saturating_add(active_private_calls);
         let queued_sds = metric_from_health(&health, crate::health::HealthDomain::Sds, "live_queue_len")
             .saturating_add(metric_from_health(&health, crate::health::HealthDomain::Sds, "pending_actions"));
 
@@ -863,13 +863,15 @@ impl Sndcp {
             service_state: service_state_from_health(health.overall).to_string(),
             registered_ms,
             active_calls,
+            active_group_calls,
+            active_private_calls,
             queued_sds,
             uptime_secs: self.started_at.elapsed().as_secs(),
             last_activity: crate::net_dashboard::state::latest_last_heard_entry()
                 .map(|entry| super::wap_dashboard::last_activity_text(&entry)),
             health_summary: Some(health_summary(&health)),
             health_lines: health_lines_from_health(&health),
-            radio_lines: registered_issis.into_iter().take(3).map(|issi| format!("MS {issi}")).collect(),
+            radio_lines: registered_issis.into_iter().take(32).map(|issi| format!("MS {issi}")).collect(),
             call_lines: call_lines_from_health(&health),
         }
     }

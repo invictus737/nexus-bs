@@ -428,6 +428,8 @@ mod tests {
             service_state: "ON AIR".to_string(),
             registered_ms: 2,
             active_calls: 1,
+            active_group_calls: 1,
+            active_private_calls: 0,
             queued_sds: 0,
             uptime_secs: 125,
             last_activity: None,

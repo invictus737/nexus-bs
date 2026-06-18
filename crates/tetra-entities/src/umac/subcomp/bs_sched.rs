@@ -75,6 +75,7 @@ const MAX_PENDING_RA_ACKS_PER_TIMESLOT: usize = 8192;
 const MAX_DLSCHED_ELEMS_PER_TIMESLOT: usize = 4096;
 const MAX_DLSCHED_NEXT_SLOT_ELEMS: usize = 4096;
 const PACKET_DATA_ASSIGNED_SCCH_TS: u8 = 2;
+const MAX_PACKET_DATA_PENDING_GRANT_WAIT_GRANTS: u8 = 24;
 // PDCH assignment lifetime is controlled by explicit channel allocation updates
 // (Replace/QuitAndGo) and voice pre-emption. Keep this as a stale-state
 // fail-safe only; a short lease makes radios visibly lose assigned SCCH slots
@@ -142,6 +143,7 @@ enum PacketDataAssignmentUpdate {
 pub struct PendingGrantDebt {
     pub res_req: ReservationRequirement,
     pub remaining_slots: usize,
+    wait_grants: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -156,7 +158,11 @@ impl PendingGrantDebt {
             ReservationRequirement::Req1Subslot => 1,
             _ => res_req.to_req_slotcount(),
         };
-        Self { res_req, remaining_slots }
+        Self {
+            res_req,
+            remaining_slots,
+            wait_grants: 0,
+        }
     }
 
     fn is_halfslot(self) -> bool {
@@ -179,6 +185,7 @@ impl PendingGrantDebt {
         Some(Self {
             res_req: ReservationRequirement::from_req_slotcount(remaining_slots),
             remaining_slots,
+            wait_grants: 0,
         })
     }
 
@@ -192,10 +199,27 @@ impl PendingGrantDebt {
 
     fn coalesce_max(self, other: Self) -> Self {
         if other.remaining_slots > self.remaining_slots {
-            other
+            Self {
+                wait_grants: self.wait_grants.max(other.wait_grants),
+                ..other
+            }
         } else {
-            self
+            Self {
+                wait_grants: self.wait_grants.max(other.wait_grants),
+                ..self
+            }
         }
+    }
+
+    fn after_wait_grant(self) -> Self {
+        Self {
+            wait_grants: self.wait_grants.saturating_add(1),
+            ..self
+        }
+    }
+
+    fn packet_data_wait_budget_exhausted(self) -> bool {
+        self.wait_grants >= MAX_PACKET_DATA_PENDING_GRANT_WAIT_GRANTS
     }
 }
 
@@ -1902,6 +1926,12 @@ impl BsChannelScheduler {
         matches!(assignment.ul_dl_assigned, UlDlAssignment::Ul | UlDlAssignment::Both).then_some(assignment.addr)
     }
 
+    pub fn packet_data_active_uplink_slot_for_addr(&self, addr: TetraAddress) -> Option<u8> {
+        self.packet_data_active_uplink_slots_for_addr_with_allocator(addr, None)
+            .into_iter()
+            .next()
+    }
+
     fn ul_get_usage(&self, ts: TdmaTime) -> AccessAssignUlUsage {
         let ul_sched = &self.ulsched[ts.t as usize - 1][self.ul_ts_to_sched_index(&ts)];
         match (ul_sched.ul1, ul_sched.ul2) {
@@ -3548,11 +3578,34 @@ impl BsChannelScheduler {
                                 debt,
                                 ts
                             );
+                            if debt.packet_data_wait_budget_exhausted() {
+                                match origin {
+                                    PendingGrantOrigin::PacketData { assigned_ts } => {
+                                        if let Some(assignment) = self.packet_data_assignments[assigned_ts as usize - 1]
+                                            && assignment.addr == addr
+                                        {
+                                            let reason = "packet-data reserved-access grant wait budget exhausted";
+                                            self.purge_packet_data_pending_grants_for_slot(addr, assigned_ts, reason);
+                                            self.purge_packet_data_queued_payload_for_addr(addr, reason);
+                                            self.packet_data_assignments[assigned_ts as usize - 1] = None;
+                                            self.queue_packet_data_common_control_release(assignment, assigned_ts, reason);
+                                        }
+                                    }
+                                    PendingGrantOrigin::CommonControl => {
+                                        tracing::warn!(
+                                            "dl_integrate_sched_elems_for_timeslot: dropping common-control pending grant for addr {} debt {:?} after wait budget exhausted",
+                                            addr,
+                                            debt
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             // EN 300 392-2 23.5.2.2.2 defines granting delay 1111 as
                             // "Wait for another slot grant", which restarts T.206
                             // without granting slots. Keep the EG-gated grant pending
                             // until a transmit window also has usable uplink capacity.
-                            self.dl_defer_pending_grant_next_frame(addr, debt, origin);
+                            self.dl_defer_pending_grant_next_frame(addr, debt.after_wait_grant(), origin);
                             let wait_grant = BasicSlotgrant {
                                 capacity_allocation: debt.wait_capacity_allocation(),
                                 granting_delay: BasicSlotgrantGrantingDelay::WaitForAnotherSlotgrantMessage,
@@ -6260,12 +6313,12 @@ mod tests {
     #[test]
     fn test_packet_data_assignment_dl_only_uses_common_and_assigned_uplink() {
         let mut sched = get_testing_slotter();
-        let now = TdmaTime { t: 3, f: 1, m: 1, h: 0 };
+        let now = TdmaTime { t: 1, f: 1, m: 1, h: 0 };
         sched.set_dl_time(now);
         sched.apply_packet_data_assignment_update(
             PacketDataAssignmentUpdate::Replace {
                 addr: TetraAddress::issi(0x5102),
-                ts_assigned: [false, false, true, false],
+                ts_assigned: [false, true, false, false],
                 ul_dl_assigned: UlDlAssignment::Dl,
                 carrier_num: 1001,
             },
@@ -6275,7 +6328,7 @@ mod tests {
         let subscribers = SubscriberRegistry::new();
         let mut energy_saving = HashMap::new();
         let maintained = sched.finalize_ts_for_tick(&subscribers, &mut energy_saving);
-        assert_eq!(maintained.ts, TdmaTime { t: 4, f: 1, m: 1, h: 0 });
+        assert_eq!(maintained.ts, TdmaTime { t: 2, f: 1, m: 1, h: 0 });
 
         let mut aach = maintained.bbk.expect("assigned PDCH should carry AACH").mac_block;
         aach.seek(0);
@@ -9404,24 +9457,116 @@ mod tests {
     }
 
     #[test]
-    fn test_packet_data_single_slot_grant_reuses_same_issi_reserved_capacity() {
+    fn test_packet_data_active_uplink_slot_is_available_for_common_control_reservation_redirect() {
         let mut sched = get_testing_slotter();
-        let grant_base = TdmaTime { t: 4, f: 1, m: 1, h: 0 };
+        let addr = TetraAddress::issi(0x2260618);
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2]);
+
+        assert_eq!(
+            sched.packet_data_active_uplink_slot_for_addr(addr),
+            Some(2),
+            "Openwave/MXP600 may send follow-up reservation requests on common control; UMAC should redirect them to the active PDCH"
+        );
+
+        open_test_dl_circuit(&mut sched, 2);
+        assert_eq!(
+            sched.packet_data_active_uplink_slot_for_addr(addr),
+            None,
+            "voice/circuit ownership must keep priority over packet-data reservation redirects"
+        );
+    }
+
+    #[test]
+    fn test_packet_data_pending_grant_wait_budget_releases_stalled_pdch() {
+        let mut sched = get_testing_slotter();
+        let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
         sched.set_dl_time(grant_base);
         let addr = TetraAddress::issi(0x2260618);
-        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2, 3, 4]);
+        let blocker = 0x2260001;
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2]);
+
+        for dist in 0..MACSCHED_NUM_FRAMES - 1 {
+            let ts = grant_base.add_timeslots(dist as i32 * 4);
+            if !ts.is_mandatory_clch() {
+                block_test_uplink_slot(&mut sched, ts, blocker);
+            }
+        }
+
+        sched.dltx_queues[1].push(DlSchedElem::PendingGrant(
+            addr,
+            PendingGrantDebt {
+                res_req: ReservationRequirement::Req1Subslot,
+                remaining_slots: 1,
+                wait_grants: MAX_PACKET_DATA_PENDING_GRANT_WAIT_GRANTS,
+            },
+            PendingGrantOrigin::PacketData { assigned_ts: 2 },
+        ));
+
+        sched.dl_integrate_sched_elems_for_timeslot(grant_base, &SubscriberRegistry::new(), &HashMap::new());
+
+        assert_eq!(
+            sched.packet_data_active_uplink_slot_for_addr(addr),
+            None,
+            "stalled WAP reserved-access debt should release PDCH so the browser can start a fresh low-priority transaction"
+        );
+        assert!(
+            sched.dltx_queues[0].iter().any(|elem| matches!(
+                elem,
+                DlSchedElem::Resource(
+                    MacResource {
+                        addr: Some(resource_addr),
+                        chan_alloc_element: Some(ChanAllocElement {
+                            alloc_type: ChanAllocType::QuitAndGo,
+                            ..
+                        }),
+                        ..
+                    },
+                    _,
+                    _,
+                    _
+                ) if *resource_addr == addr
+            )),
+            "wait-budget exhaustion must queue a common-control packet-data release"
+        );
+        assert!(
+            sched
+                .dltx_queues
+                .iter()
+                .chain(std::iter::once(&sched.dltx_next_slot_queue))
+                .flat_map(|queue| queue.iter())
+                .all(|elem| !matches!(
+                    elem,
+                    DlSchedElem::PendingGrant(
+                        pending_addr,
+                        _,
+                        PendingGrantOrigin::PacketData {
+                            assigned_ts: 2
+                        }
+                    ) if *pending_addr == addr
+                )),
+            "released PDCH must not leave stale packet-data grant debt behind"
+        );
+    }
+
+    #[test]
+    fn test_packet_data_single_slot_grant_reuses_same_issi_reserved_capacity() {
+        let mut sched = get_testing_slotter();
+        let grant_base = TdmaTime { t: 2, f: 1, m: 1, h: 0 };
+        sched.set_dl_time(grant_base);
+        let addr = TetraAddress::issi(0x2260618);
+        assign_test_packet_data_uplink_slots(&mut sched, addr, &[2]);
 
         for dist in 0..14 {
-            let ts = grant_base.add_timeslots(dist);
-            if [2, 3, 4].contains(&ts.t) && !ts.is_mandatory_clch() {
+            let ts = grant_base.add_timeslots(dist * 4);
+            if !ts.is_mandatory_clch() {
                 block_test_uplink_slot(&mut sched, ts, addr.ssi);
             }
         }
 
-        sched.dl_enqueue_reservation_grant(4, addr, ReservationRequirement::Req10Slots);
+        sched.dl_enqueue_packet_data_reservation_grant(2, addr, ReservationRequirement::Req10Slots);
         sched.dl_integrate_sched_elems_for_timeslot(grant_base, &SubscriberRegistry::new(), &HashMap::new());
 
-        let slot_grant = sched.dltx_queues[3]
+        let slot_grant = sched.dltx_queues[1]
             .iter()
             .find_map(|elem| match elem {
                 DlSchedElem::Resource(pdu, _, _, _) if pdu.addr == Some(addr) => pdu.slot_granting_element.as_ref(),

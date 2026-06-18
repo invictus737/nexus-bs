@@ -1020,7 +1020,7 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
     assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
-    assert!(page.contains("Version:"));
+    assert!(page.contains("Version "));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
     assert!(
@@ -1118,14 +1118,6 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     test.run_stack(Some(1));
     let response_msgs = test.dump_sinks();
 
-    let al_response_segments: Vec<&SapMsg> = response_msgs
-        .iter()
-        .filter(|msg| llc_pdu_type_from_tma_req(msg) == Some(LlcPduType::AlDataAlFinal))
-        .collect();
-    assert!(
-        al_response_segments.len() > 1,
-        "default WSP XHTML should be delivered as segmented AL-DATA/AL-FINAL-AR"
-    );
     let response =
         sndcp_user_data_from_al_tma_reqs(&response_msgs).expect("WAP GET over AL SN-DATA should produce a segmented SNDCP response");
     let response_octets = bitbuffer_npdu_octets(&response.n_pdu).expect("response N-PDU should be byte aligned");
@@ -1143,13 +1135,14 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert_eq!(response_udp.source_port, 9200);
     assert_eq!(response_udp.destination_port, 49_152);
     assert!(
-        response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 7,
+        response_udp.payload.len() <= DEFAULT_WAP_WSP_STATUS_MAX_BYTES + 8,
         "WSP GET response should remain inside the negotiated WAP status budget: {} bytes",
         response_udp.payload.len()
     );
     assert!(
-        response_udp.payload[7..].len() > 128,
-        "WSP GET body should no longer be capped to the legacy 128-byte tiny page"
+        response_udp.payload[7..].len() <= 220,
+        "WSP GET body should use the compact browser index: {} bytes",
+        response_udp.payload[7..].len()
     );
     assert!(
         response_octets.len() <= 576,
@@ -1159,21 +1152,18 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
-    assert!(page.contains("Version:"));
-    assert!(page.contains("Uptime"));
+    assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
+    assert!(page.contains("MS "), "page={page:?}");
+    assert!(page.contains("Up "), "page={page:?}");
+    assert!(page.contains("href=\"/status.wml?s=1\""), "page={page:?}");
     assert!(!page.contains("Voice"));
-    assert!(
-        page.matches("<br />").count() > 3,
-        "WSP GET response should carry a richer text-only page: {page:?}"
-    );
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 }
 
 #[test]
-fn sndcp_wap_al_xhtml_suppresses_duplicate_wtp_get_while_response_pending() {
+fn sndcp_wap_al_xhtml_replies_to_duplicate_wtp_get_while_response_pending() {
     debug::setup_logging_verbose();
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
     enable_wap_ip_status_mvp(&mut config);
@@ -1247,8 +1237,8 @@ fn sndcp_wap_al_xhtml_suppresses_duplicate_wtp_get_while_response_pending() {
         .filter(|msg| llc_pdu_type_from_tma_req(msg) == Some(LlcPduType::AlDataAlFinal))
         .collect();
     assert!(
-        first_response_segments.len() > 1,
-        "first WSP XHTML response should be segmented over AL"
+        !first_response_segments.is_empty(),
+        "first WSP XHTML response should use AL-DATA/AL-FINAL-AR"
     );
     let first_response_ns = first_response_segments
         .iter()
@@ -1266,15 +1256,17 @@ fn sndcp_wap_al_xhtml_suppresses_duplicate_wtp_get_while_response_pending() {
         duplicate_pending_msgs
             .iter()
             .all(|msg| llc_pdu_type_from_tma_req(msg) != Some(LlcPduType::AlDataAlFinal)),
-        "duplicate WTP GET must not spawn a second AL response while the first response is pending"
+        "same-link duplicate already handled by LLC must not spawn an extra SNDCP response"
     );
 
     test.submit_message(build_ltpd_ind_on_link(Sap::TlpdSap, duplicate_sndcp, endpoint_id, 0));
     test.run_stack(Some(1));
     let duplicate_common_control_msgs = test.dump_sinks();
     assert!(
-        duplicate_common_control_msgs.is_empty(),
-        "duplicate WTP GET on a different bearer link must still be suppressed while the first response is pending"
+        duplicate_common_control_msgs
+            .iter()
+            .any(|msg| matches!(msg.msg, SapMsgInner::TmaUnitdataReq(_))),
+        "duplicate WTP GET on a different bearer link must still receive a WSP response"
     );
 
     for handle in first_response_msgs.iter().filter_map(tma_req_handle) {
@@ -1536,18 +1528,67 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
-    assert!(page.contains("Version:"));
-    assert!(page.contains("Uptime"));
+    assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
+    assert!(page.contains("MS "), "page={page:?}");
+    assert!(page.contains("Up "), "page={page:?}");
+    assert!(page.contains("href=\"/status.wml?s=1\""), "page={page:?}");
     assert!(!page.contains("Voice"));
     assert!(
-        page.matches("<br />").count() > 3,
-        "WSP XHTML response should carry a richer text-only page: {page:?}"
+        page.len() <= 220,
+        "WSP XHTML browser index should stay compact: {} bytes",
+        page.len()
     );
-    assert!(page.len() > 128, "WSP XHTML body should exceed the legacy 128-byte cap");
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
+
+    let response_ns = response_msgs
+        .iter()
+        .find_map(al_data_ns_from_tma_req)
+        .expect("WAP response should have an AL N(S) for browser-level confirmation");
+    for handle in response_msgs.iter().filter_map(tma_req_handle) {
+        test.submit_message(build_tma_report(handle, TmaReport::SuccessReservedOrStealing));
+    }
+    test.deliver_all_messages();
+    test.dump_sinks();
+    test.submit_message(build_al_ack_ind(addr, endpoint_id, response_ns));
+    test.deliver_all_messages();
+    test.dump_sinks();
+
+    let sector_payload = build_wtp_wsp_get_payload(0x1236, "/status.wml?s=1");
+    let sector_sndcp = build_wap_status_sn_data_from(2, client_ip, &sector_payload);
+    let sector_tl_sdu = build_mle_prefixed_sndcp_sdu(sector_sndcp);
+    test.submit_message(build_al_final_ar_ind(addr, endpoint_id, 1, &sector_tl_sdu));
+    test.run_stack(Some(1));
+    let sector_response_msgs = test.dump_sinks();
+    let sector_response =
+        sndcp_user_data_from_al_tma_reqs(&sector_response_msgs).expect("browser sector WSP GET should produce a SNDCP response");
+    let sector_octets = bitbuffer_npdu_octets(&sector_response.n_pdu).expect("sector response N-PDU should be byte aligned");
+    let sector_ip = parse_ipv4_packet(&sector_octets).expect("sector response IPv4 should parse");
+    let sector_udp = parse_udp_datagram(sector_ip.payload).expect("sector response UDP should parse");
+    let sector_page = std::str::from_utf8(&sector_udp.payload[7..]).expect("sector WML response should be UTF-8");
+
+    assert_eq!(
+        &sector_udp.payload[..7],
+        &[0x12, 0x92, 0x36, 0x04, 0x20, 0x01, 0x88],
+        "sector request should receive a normal WTP Result + WSP Reply"
+    );
+    assert!(
+        sector_octets.len() <= 576,
+        "sector response N-PDU must stay within negotiated 576-octet MTU: {}",
+        sector_octets.len()
+    );
+    assert!(
+        sector_page.len() <= 220,
+        "sector_page_len={} sector_page={sector_page:?}",
+        sector_page.len()
+    );
+    assert!(sector_page.contains("2/"), "sector_page={sector_page:?}");
+    assert!(sector_page.contains("<wml>"), "sector_page={sector_page:?}");
+    assert!(sector_page.contains("Health OK"), "sector_page={sector_page:?}");
+    assert!(sector_page.contains("href=\"?s=0\""));
+    assert!(sector_page.contains("href=\"/\""));
+    assert!(!sector_page.contains("<script"));
 }
 
 #[test]

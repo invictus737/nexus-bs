@@ -24,9 +24,10 @@ pub const ENERGY_SAVING_MODE_AUTO: u8 = u8::MAX;
 pub const DEFAULT_ENERGY_SAVING_MODE: u8 = ENERGY_SAVING_MODE_AUTO;
 /// Default SDS-TL protocol identifier for text-message SDS broadcasts.
 ///
-/// EN 300 392-2 table 29.21 assigns 0x82 to text messaging. Vendor/home-screen
-/// compatibility PIDs such as 0xDC remain supported when explicitly configured.
-pub const DEFAULT_SDS_TEXT_PROTOCOL_ID: u8 = 0x82;
+/// Nexus-BS ships with the Motorola/Openwave-friendly vendor PID 0xDC (220)
+/// for home-screen text. Standard SDS-TL text PID 0x82 remains accepted when
+/// explicitly configured.
+pub const DEFAULT_SDS_TEXT_PROTOCOL_ID: u8 = 0xDC;
 pub const DEFAULT_WAP_IP_ADDRESS: [u8; 4] = [10, 0, 0, 1];
 pub const DEFAULT_WAP_IP_PORT: u16 = 9200;
 pub const DEFAULT_WAP_IP_RESPONSE_TTL: u8 = 32;
@@ -73,7 +74,7 @@ pub struct CfgHomeModeDisplay {
     pub source_issi: u32,
     /// Broadcast interval in TDMA multiframes (1 multiframe = 18 frames = 72 timeslots).
     pub interval_multiframes: u32,
-    /// SDS Type4 protocol identifier byte. Default: 0x82 (ETSI SDS-TL text messaging).
+    /// SDS Type4 protocol identifier byte. Default: 0xDC (220), Motorola/Openwave-friendly text.
     pub protocol_id: u8,
     /// Text coding scheme prepended to user data. LATIN = ISO-8859-1, UTF16 = UCS-2/UTF-16BE.
     pub text_coding_scheme: HomeModeDisplaySdsTextCodingScheme,

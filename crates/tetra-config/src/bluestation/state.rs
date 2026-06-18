@@ -26,8 +26,8 @@ pub struct LiveSdsMessage {
     pub id: u32,
     /// Text to broadcast (UTF-8; encoded as ISO-8859-1 on TX, unknown chars → '?').
     pub text: String,
-    /// SDS protocol ID. Defaults to 0x82 (ETSI SDS-TL text messaging); vendor PIDs
-    /// such as 0xDC can still be supplied explicitly.
+    /// SDS protocol ID. Defaults to 0xDC (220), the Motorola/Openwave-friendly
+    /// home-screen text PID. Standard 0x82 text can still be supplied explicitly.
     pub protocol_id: u8,
     /// Source ISSI shown on the radio. Defaults to 16777215 (0xFFFFFF, "network").
     pub source_issi: u32,

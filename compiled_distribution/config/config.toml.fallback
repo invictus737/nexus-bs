@@ -14,11 +14,8 @@ stack_mode = "Bs"
 # Uncomment to enable verbose logging. Files grow fast and generate additional load.
 # debug_log = "./verbose_log.txt"
 
-# Explicit systemd service unit name. Used by dashboard/service-control paths
-# and by optional SDS command control. Keep this aligned with your unit name:
-#   - legacy unit: "nexus-bs"
-#   - template unit: "nexus-bs@user.service"
-service_name = "nexus-bs"
+# Systemd service used by dashboard/control restart actions.
+service_name = "nexus-bs.service"
 
 ###############################################################################
 # FALLBACK CONFIG
@@ -275,18 +272,13 @@ energy_saving_mode = "auto"
 ###############################################################################
 
 ###############################################################################
-# OPTIONAL: Home Mode Display
-#
-# Periodically broadcasts a text string to all MSs on the cell via D-SDS-DATA.
-# The MS displays this text on its home screen (e.g. base station callsign).
-# Enabled by the presence of this sub-section; remove to disable.
-#
-# [cell_info.home_mode_display]
-# source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
-# interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
-# protocol_id = 220               # SDS-TL transport PID (example: 220/0xDC custom)
-# text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
-# text = "Nexus-BS"               # Text shown on radio display
+# Home Mode Display. Active by default for Motorola/Openwave terminals.
+[cell_info.home_mode_display]
+source_issi = 16777215
+interval_multiframes = 96
+protocol_id = 220
+text_coding_scheme = "LATIN"
+text = "Nexus-BS"
 ###############################################################################
 
 ###############################################################################
@@ -450,7 +442,7 @@ bind = "127.0.0.1"
 
 ###############################################################################
 
-# Local command/control WebSocket used by the split `nexus-bs-control@user`
+# Local command/control WebSocket used by the split `nexus-bs-control`
 # service and by the flat `./nexus-bs-control` helper.
 #
 [command]

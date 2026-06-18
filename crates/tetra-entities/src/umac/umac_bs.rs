@@ -521,7 +521,10 @@ impl UmacBs {
         block_num: PhyBlockNum,
         res_req: ReservationRequirement,
     ) {
-        if let Some(assigned_ts) = self.packet_data_uplink_assigned_ts_for_addr(addr, msg_dltime, block_num) {
+        let assigned_ts = self
+            .packet_data_uplink_assigned_ts_for_addr(addr, msg_dltime, block_num)
+            .or_else(|| self.channel_scheduler.packet_data_active_uplink_slot_for_addr(addr));
+        if let Some(assigned_ts) = assigned_ts {
             self.channel_scheduler
                 .dl_enqueue_packet_data_reservation_grant(assigned_ts, addr, res_req);
         } else {

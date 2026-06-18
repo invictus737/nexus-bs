@@ -3,7 +3,7 @@
 # SPDX-License-Identifier: Apache-2.0 AND PolyForm-Noncommercial-1.0.0
 # SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
-# Nexus-BS v0.1.66_dev example configuration
+# Nexus-BS v0.1.71_dev example configuration
 #
 # This file is intentionally valid as-is so it can be parsed by tests and used
 # as a clean starting point. It follows the Nexus-BS field profile while keeping
@@ -19,11 +19,8 @@ stack_mode = "Bs"
 # Uncomment to enable verbose logging. Files grow fast and generate additional load.
 # debug_log = "./verbose_log.txt"
 
-# Explicit systemd service unit name. Used by dashboard/service-control paths
-# and by optional SDS command control. Keep this aligned with your unit name:
-#   - legacy unit: "nexus-bs"
-#   - template unit: "nexus-bs@user.service"
-service_name = "nexus-bs"
+# Systemd service used by dashboard/control restart actions.
+service_name = "nexus-bs.service"
 
 ###############################################################################
 # FALLBACK CONFIG
@@ -44,7 +41,7 @@ service_name = "nexus-bs"
 
 [phy_io]
 
-# RF backend. Nexus-BS v0.1.66_dev supports the direct SoapySDR backend here.
+# RF backend. Nexus-BS v0.1.71_dev supports the direct SoapySDR backend here.
 # Keep this value exactly as shown unless a new backend is implemented.
 backend = "SoapySdr"
 
@@ -53,8 +50,7 @@ backend = "SoapySdr"
 # ul_rx_file = "./ul_output.bin"    # Debug; uncomment to save received UL RF samples
 
 [phy_io.soapysdr]
-# BlueStation reference RF profile. Downlink transmit and uplink receive
-# frequencies are in Hz and MUST match the [cell_info] carrier fields below.
+# Frecventele folosite la tine. Trebuie sa se potriveasca cu [cell_info].
 tx_freq = 438025000
 rx_freq = 433025000
 
@@ -110,17 +106,14 @@ mnc = 9999
 
 [cell_info]
 
-# Carrier plan. For this example, the values derive:
-#   DL = 438025000 Hz
-#   UL = 433025000 Hz
-# matching [phy_io.soapysdr] above.
-# See ETSI TS 100 392-15 clause 6 for duplex spacing tables.
-freq_band = 4                       # 400MHz band
-main_carrier = 1521                 # + 1521 * 25kHz = 38250kHz
-duplex_spacing = 4                  # Use 5MHz spacing between ul and dl (for 400 MHz band)
-# custom_duplex_spacing = 7600000   # Do not uncomment unless you have programmed a custom duplex spacing entry in your radios
-freq_offset = 0                     # Carrier offset. Usually 0. Options: 0, 6250, -6250, 12500 Hz.
-reverse_operation = false           # False: UL below DL. True: UL above DL.
+# Aceste valori dau exact:
+#   downlink 438025000 Hz
+#   uplink   433025000 Hz
+freq_band = 4
+main_carrier = 1521
+duplex_spacing = 4        # 5 MHz intre downlink si uplink
+freq_offset = 0
+reverse_operation = false # uplink sub downlink
 
 # Location area identifier.
 location_area = 3
@@ -280,18 +273,13 @@ energy_saving_mode = "auto"
 ###############################################################################
 
 ###############################################################################
-# OPTIONAL: Home Mode Display
-#
-# Periodically broadcasts a text string to all MSs on the cell via D-SDS-DATA.
-# The MS displays this text on its home screen (e.g. base station callsign).
-# Enabled by the presence of this sub-section; remove to disable.
-#
-# [cell_info.home_mode_display]
-# source_issi = 16777215          # ISSI shown as sender on the radio (default: 16777215)
-# interval_multiframes = 96       # Broadcast interval (1 MF ≈ 1s; default: 96 ≈ 96s)
-# protocol_id = 220               # SDS-TL transport PID (example: 220/0xDC custom)
-# text_coding_scheme = "LATIN"    # "LATIN" = ISO-8859-1, "UTF16" = UCS-2/UTF-16BE
-# text = "Nexus-BS"               # Text shown on radio display
+# Home Mode Display. Active by default for Motorola/Openwave terminals.
+[cell_info.home_mode_display]
+source_issi = 16777215
+interval_multiframes = 96
+protocol_id = 220
+text_coding_scheme = "LATIN"
+text = "Nexus-BS"
 ###############################################################################
 
 ###############################################################################
@@ -311,26 +299,9 @@ energy_saving_mode = "auto"
 ###############################################################################
 
 ###############################################################################
-# WAP/IP STATUS OVER SNDCP PACKET DATA
-#
-# Nexus-BS includes an opt-in WAP 2.0/WML2 XHTML-MP status page over the TETRA
-# SNDCP packet-data path. Leave it disabled until the terminal WAP/IP profile is
-# configured and you intentionally want the BS to advertise SNDCP service in
-# D-MLE-SYSINFO.
-#
-# Terminal WAP browser profile, aligned with the ETSI-recommended WAP over
-# UDP/IP packet-data bearer:
-#   Gateway/server IP: 10.0.0.1
-#   WAP gateway transport: WSP/WTP over UDP/IP
-#   WAP gateway port: 9200
-#   Homepage: http://10.0.0.1:9200/status.xhtml
-#   Legacy alias: http://10.0.0.1:9200/status.wml (serves XHTML-MP, not WML 1.x)
-#   Terminal IP: dynamic, assigned from 10.0.0.2..10.0.0.254
-#
-# To enable:
-#   1. Set sndcp_service = true above.
-#   2. Uncomment this [cell_info.wap_ip] block.
-#   3. Set the terminal WAP/IP homepage to the URL above.
+# WAP/IP pentru Motorola MXP600 cu Openwave Mobile Browser 6.x.
+# Pentru activare: seteaza sndcp_service = true si decomenteaza blocul.
+# Homepage in radio: http://10.0.0.1:9200/status.xhtml
 #
 # [cell_info.wap_ip]
 # enabled = true
@@ -346,8 +317,6 @@ energy_saving_mode = "auto"
 # accept_status_path = true
 # accept_status_wml_path = true
 # max_request_payload_bytes = 1024
-# Keep false for ETSI-aligned PDCH handoff: SNDCP waits for the lower-layer
-# MLE-REPORT before treating the assigned packet-data channel as ready.
 # assume_pdch_ready_after_data_transmit = false
 ###############################################################################
 
@@ -444,7 +413,7 @@ bind = "127.0.0.1"
 # password = "change-this-before-exposing-the-dashboard"
 #
 # OPTIONAL: reserved path to the Nexus-BS git source directory for future OTA
-# update support. OTA update is disabled in Nexus-BS v0.1.66_dev, and the dashboard
+# update support. OTA update is disabled in Nexus-BS v0.1.71_dev, and the dashboard
 # button is grayed out. Keep this unset unless you are testing OTA code locally.
 # source_dir = "/opt/nexus-bs"
 #
@@ -455,7 +424,7 @@ bind = "127.0.0.1"
 
 ###############################################################################
 
-# Local command/control WebSocket used by the split `nexus-bs-control@user`
+# Local command/control WebSocket used by the split `nexus-bs-control`
 # service and by the flat `./nexus-bs-control` helper.
 #
 [command]

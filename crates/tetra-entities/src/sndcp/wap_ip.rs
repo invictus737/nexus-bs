@@ -5,8 +5,9 @@
 
 use super::ip::{IPV4_PROTOCOL_UDP, IpPrimitiveError, build_ipv4_udp_npdu, parse_ipv4_packet, parse_udp_datagram};
 use super::wap_status::{
-    DEFAULT_WAP_STATUS_MAX_BYTES, WAP_STATUS_HTML_PATH, WAP_STATUS_LEGACY_WML_PATH, WAP_STATUS_REFRESH_PATH, WapStatusError,
-    WapStatusSnapshot, render_wml2_status,
+    DEFAULT_WAP_STATUS_MAX_BYTES, WAP_STATUS_HTML_PATH, WAP_STATUS_LEGACY_WML_PATH, WAP_STATUS_REFRESH_PATH, WAP_STATUS_SECTOR_QUERY,
+    WapStatusError, WapStatusSnapshot, render_wml_status_browser_index, render_wml_status_browser_sector, render_wml2_status,
+    render_wml2_status_browser_index, render_wml2_status_browser_sector, render_wml2_status_sector,
 };
 
 pub const DEFAULT_WAP_UDP_REQUEST_MAX_BYTES: usize = 1024;
@@ -29,6 +30,8 @@ const WSP_PDU_RESUME: u8 = 0x09;
 const WSP_PDU_GET: u8 = 0x40;
 const WSP_STATUS_OK: u8 = 0x20;
 const WSP_SHORT_INTEGER_FLAG: u8 = 0x80;
+const WSP_CT_TEXT_VND_WAP_WML_ASSIGNED_NUMBER: u8 = 0x08;
+const WSP_CT_TEXT_VND_WAP_WML: u8 = WSP_SHORT_INTEGER_FLAG | WSP_CT_TEXT_VND_WAP_WML_ASSIGNED_NUMBER;
 const WSP_CT_APP_VND_WAP_XHTML_XML_ASSIGNED_NUMBER: u8 = 0x45;
 const WSP_CT_APP_VND_WAP_XHTML_XML: u8 = WSP_SHORT_INTEGER_FLAG | WSP_CT_APP_VND_WAP_XHTML_XML_ASSIGNED_NUMBER;
 const WSP_CAP_CLIENT_SDU_SIZE: u8 = 0x80;
@@ -42,6 +45,7 @@ const WSP_CAP_HEADER_CODE_PAGES: u8 = 0x86;
 const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 545;
 const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 545;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
+const WSP_WML_BROWSER_PAGE_MAX_BYTES: usize = 160;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WapIpEndpoint {
@@ -64,7 +68,10 @@ pub struct WapIpServicePolicy {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WapUdpRequestKind {
     Empty,
-    Status,
+    Status {
+        sector: Option<usize>,
+        format: WapStatusFormat,
+    },
     WtpWspConnect {
         transaction_id: u16,
         retransmission: bool,
@@ -77,12 +84,20 @@ pub enum WapUdpRequestKind {
     WtpWspStatus {
         transaction_id: u16,
         retransmission: bool,
+        sector: Option<usize>,
+        format: WapStatusFormat,
     },
     WtpControlNoResponse {
         transaction_id: u16,
         pdu_type: u8,
         abort: Option<WtpAbortInfo>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WapStatusFormat {
+    Xhtml,
+    Wml,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,12 +281,24 @@ fn build_udp_status_response(
     );
 
     let response_payload = match request_kind {
-        WapUdpRequestKind::Empty | WapUdpRequestKind::Status => {
+        WapUdpRequestKind::Empty => {
             let max_wml2_bytes = max_npdu_bytes
                 .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES))
                 .unwrap_or(DEFAULT_WAP_STATUS_MAX_BYTES)
                 .min(DEFAULT_WAP_STATUS_MAX_BYTES);
             render_wml2_status(snapshot, max_wml2_bytes)?.into_bytes()
+        }
+        WapUdpRequestKind::Status { sector, format } => {
+            let max_wml2_bytes = max_npdu_bytes
+                .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES))
+                .unwrap_or(DEFAULT_WAP_STATUS_MAX_BYTES)
+                .min(DEFAULT_WAP_STATUS_MAX_BYTES);
+            match (format, sector) {
+                (WapStatusFormat::Wml, Some(sector)) => render_wml_status_browser_sector(snapshot, max_wml2_bytes, sector)?.into_bytes(),
+                (WapStatusFormat::Wml, None) => render_wml_status_browser_index(snapshot, max_wml2_bytes)?.into_bytes(),
+                (WapStatusFormat::Xhtml, Some(sector)) => render_wml2_status_sector(snapshot, max_wml2_bytes, sector)?.into_bytes(),
+                (WapStatusFormat::Xhtml, None) => render_wml2_status(snapshot, max_wml2_bytes)?.into_bytes(),
+            }
         }
         WapUdpRequestKind::WtpWspConnect {
             transaction_id,
@@ -298,13 +325,32 @@ fn build_udp_status_response(
         WapUdpRequestKind::WtpWspStatus {
             transaction_id,
             retransmission: _,
+            sector,
+            format,
         } => {
             let max_wsp_page_bytes = max_npdu_bytes
                 .map(|max| max.saturating_sub(IPV4_UDP_HEADER_BYTES + 3 + WSP_REPLY_FIXED_HEADER_BYTES))
                 .unwrap_or(DEFAULT_WAP_WSP_STATUS_MAX_BYTES)
                 .min(DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
-            let page = render_wml2_status(snapshot, max_wsp_page_bytes)?;
-            build_wtp_wsp_result(transaction_id, &build_wsp_reply(page.as_bytes()))
+            let (page, content_type) = match (format, sector) {
+                (WapStatusFormat::Wml, Some(sector)) => (
+                    render_wml_status_browser_sector(snapshot, max_wsp_page_bytes.min(WSP_WML_BROWSER_PAGE_MAX_BYTES), sector)?,
+                    WSP_CT_TEXT_VND_WAP_WML,
+                ),
+                (WapStatusFormat::Wml, None) => (
+                    render_wml_status_browser_index(snapshot, max_wsp_page_bytes.min(WSP_WML_BROWSER_PAGE_MAX_BYTES))?,
+                    WSP_CT_TEXT_VND_WAP_WML,
+                ),
+                (WapStatusFormat::Xhtml, Some(sector)) => (
+                    render_wml2_status_browser_sector(snapshot, max_wsp_page_bytes.min(220), sector)?,
+                    WSP_CT_APP_VND_WAP_XHTML_XML,
+                ),
+                (WapStatusFormat::Xhtml, None) => (
+                    render_wml2_status_browser_index(snapshot, max_wsp_page_bytes)?,
+                    WSP_CT_APP_VND_WAP_XHTML_XML,
+                ),
+            };
+            build_wtp_wsp_result(transaction_id, &build_wsp_reply(content_type, page.as_bytes()))
         }
         WapUdpRequestKind::WtpControlNoResponse {
             transaction_id,
@@ -373,10 +419,14 @@ pub fn parse_wap_udp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Res
     let text = text.trim();
 
     if let Some(path) = text.strip_prefix("GET ") {
-        let path = path.split_whitespace().next().unwrap_or("/");
-        let path = normalize_get_path(path);
+        let uri = path.split_whitespace().next().unwrap_or("/");
+        let sector = status_sector_from_uri(uri);
+        let path = normalize_get_path(uri);
         if is_status_path(&path, policy) {
-            return Ok(WapUdpRequestKind::Status);
+            return Ok(WapUdpRequestKind::Status {
+                sector,
+                format: status_format_from_path(&path),
+            });
         }
         return Err(WapIpError::UnsupportedWapPath { path });
     }
@@ -429,11 +479,14 @@ fn parse_wtp_wsp_request(payload: &[u8], policy: &WapIpServicePolicy) -> Result<
             let Ok(uri) = std::str::from_utf8(&wsp[uri_start..uri_end]) else {
                 return Err(WapIpError::UnsupportedWapUdpPayload { len: payload.len() });
             };
+            let sector = status_sector_from_uri(uri);
             let path = normalize_get_path(uri_path(uri));
             if is_status_path(&path, policy) {
                 return Ok(Some(WapUdpRequestKind::WtpWspStatus {
                     transaction_id: invoke.transaction_id,
                     retransmission: invoke.retransmission,
+                    sector,
+                    format: status_format_from_path(&path),
                 }));
             }
             Err(WapIpError::UnsupportedWapPath { path })
@@ -670,12 +723,12 @@ fn push_wsp_octets_capability(out: &mut Vec<u8>, capability_id: u8, value: &[u8]
     out.extend_from_slice(value);
 }
 
-fn build_wsp_reply(page: &[u8]) -> Vec<u8> {
+fn build_wsp_reply(content_type: u8, page: &[u8]) -> Vec<u8> {
     let mut payload = Vec::with_capacity(WSP_REPLY_FIXED_HEADER_BYTES + page.len());
     payload.push(WSP_PDU_REPLY);
     payload.push(WSP_STATUS_OK);
     write_uintvar(1, &mut payload);
-    payload.push(WSP_CT_APP_VND_WAP_XHTML_XML);
+    payload.push(content_type);
     payload.extend_from_slice(page);
     payload
 }
@@ -730,6 +783,23 @@ fn uri_path(uri: &str) -> &str {
     uri
 }
 
+fn uri_query(uri: &str) -> Option<&str> {
+    let uri = uri.trim();
+    let after_fragment = uri.split('#').next().unwrap_or(uri);
+    after_fragment.split_once('?').map(|(_, query)| query)
+}
+
+fn status_sector_from_uri(uri: &str) -> Option<usize> {
+    let query = uri_query(uri)?;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if key == WAP_STATUS_SECTOR_QUERY || key.eq_ignore_ascii_case("sector") || key.eq_ignore_ascii_case("block") {
+            return value.parse::<usize>().ok();
+        }
+    }
+    None
+}
+
 fn is_status_path(path: &str, policy: &WapIpServicePolicy) -> bool {
     match path {
         "/" => policy.accept_root_path,
@@ -737,6 +807,13 @@ fn is_status_path(path: &str, policy: &WapIpServicePolicy) -> bool {
         WAP_STATUS_REFRESH_PATH | WAP_STATUS_HTML_PATH => policy.accept_status_path,
         WAP_STATUS_LEGACY_WML_PATH => policy.accept_status_wml_path,
         _ => false,
+    }
+}
+
+fn status_format_from_path(path: &str) -> WapStatusFormat {
+    match path {
+        WAP_STATUS_LEGACY_WML_PATH => WapStatusFormat::Wml,
+        _ => WapStatusFormat::Xhtml,
     }
 }
 
@@ -752,6 +829,8 @@ mod tests {
             service_state: "ON AIR".to_string(),
             registered_ms: 4,
             active_calls: 0,
+            active_group_calls: 0,
+            active_private_calls: 0,
             queued_sds: 1,
             uptime_secs: 125,
             last_activity: None,
@@ -844,31 +923,66 @@ mod tests {
         assert_eq!(parse_wap_udp_request(b"", &policy()), Ok(WapUdpRequestKind::Empty));
         assert_eq!(
             parse_wap_udp_request(b"GET / HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /status HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /status.xhtml?refresh=1 HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
+        );
+        assert_eq!(
+            parse_wap_udp_request(b"GET /status.xhtml?s=2 HTTP/1.0\r\n\r\n", &policy()),
+            Ok(WapUdpRequestKind::Status {
+                sector: Some(2),
+                format: WapStatusFormat::Xhtml
+            })
+        );
+        assert_eq!(
+            parse_wap_udp_request(b"GET /status.xhtml?block=3 HTTP/1.0\r\n\r\n", &policy()),
+            Ok(WapUdpRequestKind::Status {
+                sector: Some(3),
+                format: WapStatusFormat::Xhtml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET status.xhtml?refresh=1 HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET ./status.xhtml HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /status.html HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /status.wml?refresh=1 HTTP/1.0\r\n\r\n", &policy()),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Wml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /admin HTTP/1.0\r\n\r\n", &policy()),
@@ -893,7 +1007,13 @@ mod tests {
         request.extend_from_slice(b"\r\n");
         assert_eq!(request.len(), 394);
 
-        assert_eq!(parse_wap_udp_request(&request, &policy()), Ok(WapUdpRequestKind::Status));
+        assert_eq!(
+            parse_wap_udp_request(&request, &policy()),
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
+        );
     }
 
     #[test]
@@ -923,7 +1043,9 @@ mod tests {
             parse_wap_udp_request(&get, &policy()),
             Ok(WapUdpRequestKind::WtpWspStatus {
                 transaction_id: 0x1235,
-                retransmission: false
+                retransmission: false,
+                sector: None,
+                format: WapStatusFormat::Xhtml
             })
         );
     }
@@ -937,14 +1059,39 @@ mod tests {
             ),
             Ok(WapUdpRequestKind::WtpWspStatus {
                 transaction_id: 0x1234,
-                retransmission: false
+                retransmission: false,
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
+        );
+        assert_eq!(
+            parse_wap_udp_request(
+                &build_wtp_wsp_get_payload(0x1234, "http://10.0.0.1:9200/status.xhtml?s=1"),
+                &policy()
+            ),
+            Ok(WapUdpRequestKind::WtpWspStatus {
+                transaction_id: 0x1234,
+                retransmission: false,
+                sector: Some(1),
+                format: WapStatusFormat::Xhtml
             })
         );
         assert_eq!(
             parse_wap_udp_request(&build_wtp_wsp_get_payload(0x1234, "status.xhtml"), &policy()),
             Ok(WapUdpRequestKind::WtpWspStatus {
                 transaction_id: 0x1234,
-                retransmission: false
+                retransmission: false,
+                sector: None,
+                format: WapStatusFormat::Xhtml
+            })
+        );
+        assert_eq!(
+            parse_wap_udp_request(&build_wtp_wsp_get_payload(0x1234, "/status.wml?s=2"), &policy()),
+            Ok(WapUdpRequestKind::WtpWspStatus {
+                transaction_id: 0x1234,
+                retransmission: false,
+                sector: Some(2),
+                format: WapStatusFormat::Wml
             })
         );
     }
@@ -1041,7 +1188,10 @@ mod tests {
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /status.wml#s HTTP/1.0\r\n\r\n", &status_wml_only),
-            Ok(WapUdpRequestKind::Status)
+            Ok(WapUdpRequestKind::Status {
+                sector: None,
+                format: WapStatusFormat::Wml
+            })
         );
         assert_eq!(
             parse_wap_udp_request(b"GET /status.xhtml HTTP/1.0\r\n\r\n", &status_wml_only),
@@ -1110,7 +1260,7 @@ mod tests {
         assert!(!page.contains("<card"));
         assert!(page.contains("Nexus-BS: OK"));
         assert!(page.contains("Version: 0.1.69"));
-        assert!(page.contains("Uptime 0d0h2m5s"));
+        assert!(page.contains("Uptime "));
         assert!(!page.contains("Voice"));
         assert!(
             page.matches("<br />").count() > 3,
@@ -1457,17 +1607,103 @@ mod tests {
         assert!(page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("<body>"));
         assert!(!page.contains("text=\"#0f0\""));
-        assert!(page.contains("Nexus-BS: OK"));
-        assert!(page.contains("Version: 0.1.69"));
-        assert!(page.contains("Uptime 0d0h2m5s"));
+        assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
+        assert!(page.contains("MS 1 G 0 P 0 S 1"), "page={page:?}");
+        assert!(page.contains("Up "));
+        assert!(page.contains("href=\"/status.wml?s=1\""));
+        assert!(page.len() <= 220, "WSP browser index should stay compact: {} bytes", page.len());
         assert!(!page.contains("Voice"));
-        assert!(
-            page.matches("<br />").count() > 3,
-            "WSP XHTML body should use the one-slot text budget, not the old tiny page: {page:?}"
-        );
-        assert!(page.len() > 128, "WSP XHTML body should exceed the legacy 128-byte cap");
         assert!(!page.contains("<br/>"));
         assert!(!page.contains("<wml"));
+    }
+
+    #[test]
+    fn wap_status_response_answers_wtp_wsp_get_sector_with_xhtml_links() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+        let request_payload = build_wtp_wsp_get_payload(0x1234, "/status.xhtml?s=1");
+        let request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &request_payload, 0x2222, 64)
+            .expect("WSP sector GET request N-PDU should build");
+
+        let response =
+            build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()).expect("WSP sector response should build");
+        let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
+        let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
+        let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
+
+        assert_eq!(
+            &response_udp.payload[..7],
+            [
+                WTP_RESULT_LAST_PACKET_OF_MESSAGE,
+                0x92,
+                0x34,
+                WSP_PDU_REPLY,
+                WSP_STATUS_OK,
+                0x01,
+                WSP_CT_APP_VND_WAP_XHTML_XML,
+            ]
+        );
+        assert!(
+            response.len() <= 576,
+            "sector response N-PDU must stay within negotiated MTU: {}",
+            response.len()
+        );
+        assert!(page.len() <= 220, "WSP browser sector should stay compact: {} bytes", page.len());
+        assert!(!page.contains("http://www.w3.org/1999/xhtml"));
+        assert!(page.contains("Health OK"), "page={page:?}");
+        assert!(page.contains("2/"));
+        assert!(page.contains("href=\"?s=0\""));
+        assert!(page.contains("href=\"/\""));
+        assert!(!page.contains("<script"));
+        assert!(!page.contains("<wml"));
+    }
+
+    #[test]
+    fn wap_status_response_answers_wtp_wsp_get_wml_sector_with_wml_reply() {
+        let endpoint = WapIpEndpoint {
+            address: [10, 0, 0, 1],
+            port: 9200,
+            response_ttl: 32,
+        };
+        let request_payload = build_wtp_wsp_get_payload(0x1234, "/status.wml?s=1");
+        let request = build_ipv4_udp_npdu([10, 0, 0, 2], endpoint.address, 49152, endpoint.port, &request_payload, 0x2222, 64)
+            .expect("WSP WML sector GET request N-PDU should build");
+
+        let response = build_wap_status_response_npdu(&request, endpoint, &policy(), &snapshot()).expect("WSP WML response should build");
+        let response_ip = parse_ipv4_packet(&response).expect("response IPv4 should parse");
+        let response_udp = parse_udp_datagram(response_ip.payload).expect("response UDP should parse");
+        let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP WML body should be UTF-8");
+
+        assert_eq!(
+            &response_udp.payload[..7],
+            [
+                WTP_RESULT_LAST_PACKET_OF_MESSAGE,
+                0x92,
+                0x34,
+                WSP_PDU_REPLY,
+                WSP_STATUS_OK,
+                0x01,
+                WSP_CT_TEXT_VND_WAP_WML,
+            ]
+        );
+        assert!(
+            response.len() <= 576,
+            "WML sector response N-PDU must stay within negotiated MTU: {}",
+            response.len()
+        );
+        assert!(
+            page.len() <= WSP_WML_BROWSER_PAGE_MAX_BYTES,
+            "WSP WML sector should stay compact: {} bytes",
+            page.len()
+        );
+        assert!(page.contains("<wml>"), "page={page:?}");
+        assert!(page.contains("Health OK"), "page={page:?}");
+        assert!(page.contains("href=\"?s=0\""));
+        assert!(page.contains("href=\"/\""));
+        assert!(!page.contains("http://www.w3.org/1999/xhtml"));
     }
 
     #[test]

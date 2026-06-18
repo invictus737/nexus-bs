@@ -766,11 +766,13 @@ allowed_gssi_ranges = [
         assert!(toml.contains("force_private_p2p_hook_signalling = false"));
         assert!(toml.contains("legacy_gssi_group_call = true"));
         assert!(toml.contains("energy_saving_mode = \"auto\""));
+        assert!(toml.contains("[cell_info.home_mode_display]"));
+        assert!(toml.contains("protocol_id = 220"));
         assert!(toml.contains("# static_dir = "));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));
-        assert!(toml.contains("BlueStation reference RF profile"));
+        assert!(toml.contains("Frecventele folosite la tine"));
         let soapy = cfg.phy_io.soapysdr.as_ref().expect("example should configure SoapySDR");
         assert_eq!(soapy.dl_freq, 438_025_000.0);
         assert_eq!(soapy.ul_freq, 433_025_000.0);
@@ -791,6 +793,10 @@ allowed_gssi_ranges = [
         assert!(!cfg.cell.force_private_p2p_hook_signalling);
         assert!(cfg.cell.legacy_gssi_group_call);
         assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
+        let hmd = cfg.cell.home_mode_display.as_ref().expect("example should enable HMD by default");
+        assert_eq!(hmd.protocol_id, 220);
+        assert_eq!(hmd.text, "Nexus-BS");
+        assert_eq!(hmd.interval_multiframes, 96);
         assert_eq!(cfg.cell.periodic_registration_secs, 0);
         assert!(!cfg.cell.sndcp_service);
         assert!(cfg.cell.wap_ip.is_none());
@@ -799,7 +805,7 @@ allowed_gssi_ranges = [
         assert_eq!(control.host, "127.0.0.1");
         assert_eq!(control.port, 9002);
         assert!(!control.use_tls);
-        assert_eq!(cfg.service_name.as_deref(), Some("nexus-bs"));
+        assert_eq!(cfg.service_name.as_deref(), Some("nexus-bs.service"));
         assert!(cfg.health.enabled);
         assert_eq!(cfg.health.snapshot_interval_secs, 1);
         assert!(!cfg.health.restart_on_core_stall);
