@@ -161,10 +161,11 @@ install_transformed_unit() {
         -e "s|/home/chris/nexus-bs/nexus-bs-dashboard|${INSTALL_PREFIX}/bin/nexus-bs-dashboard|g" \
         -e "s|/home/chris/nexus-bs/nexus-bs|${INSTALL_PREFIX}/bin/nexus-bs|g" \
         -e "s|/home/chris/nexus-bs|${INSTALL_PREFIX}|g" \
+        -e "/^User=chris$/d" \
         -e "s|^ExecStartPre=/usr/bin/install -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs-%i/config.toml$|ExecStartPre=+/usr/bin/install -o %i -g %i -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs-%i/config.toml|g" \
         -e "s|^ExecStartPre=/bin/sh -c 'if \[ -f \"\$1\" \]; then /usr/bin/install -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs-%i/config.toml.fallback$|ExecStartPre=+/bin/sh -c 'if [ -f \"\$1\" ]; then /usr/bin/install -o \"\$3\" -g \"\$3\" -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs-%i/config.toml.fallback %i|g" \
-        -e "s|^ExecStartPre=/usr/bin/install -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs/config.toml$|ExecStartPre=+/usr/bin/install -o chris -g chris -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs/config.toml|g" \
-        -e "s|^ExecStartPre=/bin/sh -c 'if \[ -f \"\$1\" \]; then /usr/bin/install -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs/config.toml.fallback$|ExecStartPre=+/bin/sh -c 'if [ -f \"\$1\" ]; then /usr/bin/install -o chris -g chris -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs/config.toml.fallback|g" \
+        -e "s|^ExecStartPre=/usr/bin/install -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs/config.toml$|ExecStartPre=/usr/bin/install -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs/config.toml|g" \
+        -e "s|^ExecStartPre=/bin/sh -c 'if \[ -f \"\$1\" \]; then /usr/bin/install -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs/config.toml.fallback$|ExecStartPre=/bin/sh -c 'if [ -f \"\$1\" ]; then /usr/bin/install -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs/config.toml.fallback|g" \
         -e "s|Nexus-BS v[0-9][0-9.]*|Nexus-BS v${version_escaped}|g" \
         "$src" > "$dst"
     chmod 0644 "$dst"
