@@ -117,8 +117,9 @@ pub fn render_wml2_status_browser_index(snapshot: &WapStatusSnapshot, max_bytes:
     }
 
     let version = compact_tiny_version(snapshot.stack_version.trim());
-    let page =
-        format!("<html><body>Welcome to Nexus-BS!<br/>v{version}<br/><a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">Next</a></body></html>");
+    let page = format!(
+        "<html><body>Welcome to Nexus-BS!<br/>v{version}<br/><a href=\"{WAP_STATUS_LEGACY_WML_PATH}?{WAP_STATUS_SECTOR_QUERY}=1\">Next</a></body></html>"
+    );
     if page.len() <= max_bytes {
         return Ok(page);
     }
@@ -166,14 +167,14 @@ pub fn render_wml2_status_browser_sector(snapshot: &WapStatusSnapshot, max_bytes
 
     let pages = render_wml2_status_sector_pages(snapshot);
     let sector = sector.min(pages.len().saturating_sub(1));
-    for line_limit in [12, 8, 4] {
-        let page = render_wml2_status_browser_sector_page(snapshot, &pages, sector, line_limit);
+    for line_limit in [16, 12, 8, 4] {
+        let page = render_wml2_status_browser_sector_page(&pages, sector, line_limit, max_bytes);
         if page.len() <= max_bytes {
             return Ok(page);
         }
     }
 
-    let page = render_wml2_status_browser_sector_page(snapshot, &pages, sector, 4);
+    let page = render_wml2_status_browser_sector_page(&pages, sector, 4, max_bytes);
     Err(WapStatusError::RenderedTooLarge {
         len: page.len(),
         max: max_bytes,
@@ -343,27 +344,44 @@ fn render_wml2_status_sector_page(
     )
 }
 
-fn render_wml2_status_browser_sector_page(
-    _snapshot: &WapStatusSnapshot,
-    pages: &[WapStatusSectorPage],
-    sector: usize,
-    line_limit: usize,
-) -> String {
+fn render_wml2_status_browser_sector_page(pages: &[WapStatusSectorPage], sector: usize, line_limit: usize, max_bytes: usize) -> String {
     let page = &pages[sector];
     let page_title = escape_xhtml_text_limited(&browser_sector_heading(page, sector, pages.len()), 14);
     let mut body = vec![page_title];
-    if line_limit > 0 {
-        body.extend(page.lines.iter().take(1).map(|line| escape_xhtml_text_limited(line, line_limit)));
+    let mut lines: Vec<String> = page
+        .lines
+        .iter()
+        .map(|line| compact_browser_sector_line(page.title, line))
+        .map(|line| escape_xhtml_text_limited(&line, line_limit))
+        .collect();
+    if page.title == "Radios" {
+        lines = vec![lines.join(" ")];
     }
+    let mut nav = String::new();
     if sector + 1 < pages.len() {
-        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">Next</a>", sector + 1));
+        nav.push_str(&format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">N</a>", sector + 1));
     }
     if sector > 0 {
-        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">Prev</a>", sector - 1));
+        nav.push_str(&format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">P</a>", sector - 1));
     }
-    body.push("<a href=\"/\">Home</a>".to_string());
+    nav.push_str("<a href=\"/\">H</a>");
+    body.push(nav);
+    let nav_count = 1;
 
-    format!("<html><body>{}</body></html>", body.join(TINY_XHTML_BR))
+    if line_limit > 0 {
+        for line in lines {
+            let insert_at = body.len().saturating_sub(nav_count);
+            let mut candidate = body.clone();
+            candidate.insert(insert_at, line);
+            let page = format!("<html><body>{}</body></html>", candidate.join("<br/>"));
+            if page.len() > max_bytes {
+                break;
+            }
+            body = candidate;
+        }
+    }
+
+    format!("<html><body>{}</body></html>", body.join("<br/>"))
 }
 
 fn render_wml_status_browser_sector_page(pages: &[WapStatusSectorPage], sector: usize, line_limit: usize, max_bytes: usize) -> String {
@@ -1025,8 +1043,8 @@ mod tests {
         assert!(page.contains("2/"));
         assert!(page.contains("Health 2/"), "page={page:?}");
         assert!(page.contains("Health OK"), "page={page:?}");
-        assert!(page.contains(">Prev<"), "page={page:?}");
-        assert!(page.contains(">Home<"), "page={page:?}");
+        assert!(page.contains(">P<"), "page={page:?}");
+        assert!(page.contains(">H<"), "page={page:?}");
         assert!(page.contains("href=\"?s=0\""));
         assert!(page.contains("href=\"/\""));
         assert!(!page.contains("http://www.w3.org/1999/xhtml"));
@@ -1052,11 +1070,40 @@ mod tests {
     }
 
     #[test]
+    fn render_wml2_status_browser_pages_keep_radio_count_consistent_with_live_lines() {
+        let mut snapshot = sample_snapshot();
+        snapshot.registered_ms = 3;
+        snapshot.radio_lines = vec!["MS 2260618".to_string()];
+
+        let index = render_wml2_status_browser_index(&snapshot, 220).expect("browser index should fit");
+        assert!(index.contains("MS 1 G 0 P 1 S 2"), "index={index:?}");
+
+        let radios = render_wml2_status_browser_sector(&snapshot, 144, 2).expect("radio sector should fit");
+        assert!(radios.contains("Radios 1"), "radios={radios:?}");
+        assert!(!radios.contains("Radios 3/3"), "radios={radios:?}");
+        assert!(radios.contains("2260618"), "radios={radios:?}");
+        assert!(!radios.contains("MS 2260618"), "radios={radios:?}");
+        assert!(radios.len() <= 144, "radios={radios:?}");
+    }
+
+    #[test]
     fn render_wml_status_browser_health_includes_tiny_uptime() {
         let mut snapshot = sample_snapshot();
         snapshot.uptime_secs = 0;
 
         let health = render_wml_status_browser_sector(&snapshot, 144, 1).expect("health sector should fit");
+
+        assert!(health.contains("Health OK"), "health={health:?}");
+        assert!(health.contains("Uptime 0d0h0s"), "health={health:?}");
+        assert!(health.len() <= 144, "health={health:?}");
+    }
+
+    #[test]
+    fn render_wml2_status_browser_health_includes_tiny_uptime() {
+        let mut snapshot = sample_snapshot();
+        snapshot.uptime_secs = 0;
+
+        let health = render_wml2_status_browser_sector(&snapshot, 144, 1).expect("health sector should fit");
 
         assert!(health.contains("Health OK"), "health={health:?}");
         assert!(health.contains("Uptime 0d0h0s"), "health={health:?}");

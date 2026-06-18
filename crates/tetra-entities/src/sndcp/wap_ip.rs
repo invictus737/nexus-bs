@@ -46,7 +46,7 @@ const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 545;
 const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 545;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
 const WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES: usize = 144;
-const WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES: usize = 96;
+const WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES: usize = 104;
 const WSP_OPENWAVE_XHTML_BROWSER_SECTOR_MAX_BYTES: usize = 144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1614,7 +1614,7 @@ mod tests {
         assert!(!page.contains("text=\"#0f0\""));
         assert!(page.contains("Welcome to Nexus-BS!"), "page={page:?}");
         assert!(page.contains("v0.1.69"), "page={page:?}");
-        assert!(page.contains("href=\"?s=1\""));
+        assert!(page.contains("href=\"/status.wml?s=1\""));
         assert!(
             page.len() <= WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES,
             "WSP browser index should stay compact: {} bytes",
