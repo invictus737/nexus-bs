@@ -412,6 +412,15 @@ impl Sndcp {
                         return;
                     }
                 }
+                if prim.link_id == 0 {
+                    tracing::info!(
+                        "SNDCP/WAP-IP: keeping packet-data handoff response on common-control link for issi={} endpoint={} link={}",
+                        issi,
+                        prim.endpoint_id,
+                        prim.link_id
+                    );
+                    response.packet_data_flag = false;
+                }
                 self.track_pending_pdch_handoff(response.handle, issi, prim.endpoint_id, prim.link_id);
                 if self.runtime_handoff.assume_pdch_ready_after_data_transmit() {
                     tracing::warn!(

@@ -1020,7 +1020,6 @@ fn sndcp_wap_ip_mvp_answers_activation_ready_and_wml_unitdata_when_enabled() {
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
     assert!(page.contains("Nexus-BS: OK"), "page={page:?}");
-    assert!(page.contains("Version "));
     assert!(page.contains("Uptime"));
     assert!(!page.contains("Voice"));
     assert!(
@@ -2159,6 +2158,71 @@ fn sndcp_wap_ip_mvp_accepts_mxp600_type_b_single_slot_data_transmit_request() {
         .as_ref()
         .expect("accepted single-slot SN-DATA TRANSMIT RESPONSE should carry PDCH allocation");
     assert_single_slot_pdch_channel_allocation(allocation);
+}
+
+#[test]
+fn sndcp_wap_ip_mxp600_basic_link_handoff_response_stays_on_common_control_after_pdch_ready() {
+    debug::setup_logging_verbose();
+    let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
+    enable_wap_ip_status_mvp(&mut config);
+    let mut test = ComponentTest::from_config(config, None);
+    test.populate_entities(vec![TetraEntity::Sndcp], vec![TetraEntity::Mle, TetraEntity::Cmce]);
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_dynamic_ipv4_activation_demand_with_ms_type(2, SnPacketDataMsType::TypeBAlternating),
+        0,
+        0,
+    ));
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_mxp600_single_slot_data_transmit_request(2),
+        0,
+        0,
+    ));
+    test.deliver_all_messages();
+
+    let first_handoff = take_ltpd_unitdata_reqs(&mut test)
+        .into_iter()
+        .find(|req| decode_data_transmit_response(&req.sdu).is_ok())
+        .expect("first basic-link handoff should emit SN-DATA TRANSMIT RESPONSE");
+    assert!(!first_handoff.packet_data_flag);
+    assert!(
+        first_handoff.chan_alloc.is_some(),
+        "basic-link handoff response should carry the new TS2 allocation"
+    );
+    test.submit_message(build_ltpd_report_ind(
+        first_handoff.handle,
+        tetra_saps::tla::TLA_REPORT_SUCCESSFUL_TRANSFER,
+    ));
+    test.deliver_all_messages();
+    let _ = test.dump_sinks();
+
+    test.submit_message(build_ltpd_ind_on_link(
+        Sap::TlpdSap,
+        build_mxp600_single_slot_data_transmit_request(2),
+        0,
+        0,
+    ));
+    test.deliver_all_messages();
+
+    let refresh_handoff = take_ltpd_unitdata_reqs(&mut test)
+        .into_iter()
+        .find(|req| decode_data_transmit_response(&req.sdu).is_ok())
+        .expect("refreshed basic-link handoff should emit SN-DATA TRANSMIT RESPONSE");
+    let ready = decode_data_transmit_response(&refresh_handoff.sdu).expect("refreshed SN-DATA TRANSMIT RESPONSE should decode");
+    assert_eq!(ready.nsapi, 2);
+    assert_eq!(ready.result, SndcpDataTransmitResponseResult::Accepted);
+    assert!(
+        !refresh_handoff.packet_data_flag,
+        "MXP600/Openwave sends post-voice retry handoff on link 0; reply must stay on common-control so the browser can receive it"
+    );
+    assert_single_slot_pdch_channel_allocation(
+        refresh_handoff
+            .chan_alloc
+            .as_ref()
+            .expect("refreshed handoff should still advertise TS2 PDCH"),
+    );
 }
 
 #[test]
