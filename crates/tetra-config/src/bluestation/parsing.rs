@@ -12,7 +12,7 @@ use serde::Deserialize;
 use toml::Value;
 
 use crate::bluestation::sec_cell::{
-    CfgNeighborCellCa, SdsCommandControlDto, sds_command_control_dto_to_cfg, validate_neighbor_sndcp_service_is_not_advertised,
+    CfgNeighborCellCa, SdsCommandControlDto, WapIpDto, sds_command_control_dto_to_cfg, validate_neighbor_sndcp_service_is_not_advertised,
 };
 use crate::bluestation::{CellInfoDto, CfgControlDto, NetInfoDto, apply_control_patch, cell_dto_to_cfg, net_dto_to_cfg};
 
@@ -78,9 +78,18 @@ pub fn from_toml_str(toml_str: &str) -> Result<StackConfig, Box<dyn std::error::
         }
     });
 
-    // Now deserialise the (mutated) Value into the typed root — neighbor_cells_ca
-    // has been removed so it will not appear in the flatten HashMap.
-    let root: TomlConfigRoot = Value::Table(raw).try_into()?;
+    // Extract wap_ip for the same reason: nested tables can be captured by the
+    // CellInfoDto flatten map before normal field matching on some TOML shapes.
+    let wap_ip_raw = raw
+        .get_mut("cell_info")
+        .and_then(|ci| if let Value::Table(t) = ci { t.remove("wap_ip") } else { None });
+
+    // Now deserialise the (mutated) Value into the typed root — extracted
+    // sub-tables have been removed so they will not appear in the flatten map.
+    let mut root: TomlConfigRoot = Value::Table(raw).try_into()?;
+    if let Some(v) = wap_ip_raw {
+        root.cell_info.wap_ip = Some(v.try_into::<WapIpDto>().map_err(|e| format!("cell_info.wap_ip: {e}"))?);
+    }
 
     // Various sanity checks
     let expected_config_version = "0.6";
@@ -765,24 +774,28 @@ allowed_gssi_ranges = [
         assert!(toml.contains("call_preemptive = false"));
         assert!(toml.contains("force_private_p2p_hook_signalling = false"));
         assert!(toml.contains("legacy_gssi_group_call = true"));
-        assert!(toml.contains("energy_saving_mode = \"auto\""));
+        assert!(toml.contains("energy_saving_mode = \"stay_alive\""));
         assert!(toml.contains("[cell_info.home_mode_display]"));
+        assert!(toml.contains("[cell_info.wap_ip]"));
         assert!(toml.contains("protocol_id = 220"));
-        assert!(toml.contains("# static_dir = "));
+        assert!(toml.contains("# [brew]"));
+        assert!(!toml.contains("\n[brew]\n"));
+        assert!(!toml.contains("\nusername = "));
+        assert!(!toml.contains("\npassword = "));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));
-        assert!(toml.contains("Frecventele folosite la tine"));
+        assert!(toml.contains("device = \"driver=sx,label=sx\""));
         let soapy = cfg.phy_io.soapysdr.as_ref().expect("example should configure SoapySDR");
-        assert_eq!(soapy.dl_freq, 438_025_000.0);
-        assert_eq!(soapy.ul_freq, 433_025_000.0);
+        assert_eq!(soapy.dl_freq, 438_362_500.0);
+        assert_eq!(soapy.ul_freq, 431_362_500.0);
         assert_eq!(soapy.fs, Some(600_000.0));
         assert_eq!(cfg.net.mcc, 901);
         assert_eq!(cfg.net.mnc, 9999);
         assert_eq!(cfg.cell.freq_band, 4);
-        assert_eq!(cfg.cell.main_carrier, 1521);
-        assert_eq!(cfg.cell.duplex_spacing_id, 4);
-        assert_eq!(cfg.cell.freq_offset_hz, 0);
+        assert_eq!(cfg.cell.main_carrier, 1534);
+        assert_eq!(cfg.cell.duplex_spacing_id, 1);
+        assert_eq!(cfg.cell.freq_offset_hz, 12500);
         assert!(!cfg.cell.reverse_operation);
         assert_eq!(cfg.cell.location_area, 3);
         assert_eq!(cfg.cell.system_code, 3);
@@ -792,14 +805,18 @@ allowed_gssi_ranges = [
         assert!(!cfg.cell.transmission_interruption_enabled);
         assert!(!cfg.cell.force_private_p2p_hook_signalling);
         assert!(cfg.cell.legacy_gssi_group_call);
-        assert_eq!(cfg.cell.energy_saving_mode, ENERGY_SAVING_MODE_AUTO);
+        assert_eq!(cfg.cell.energy_saving_mode, 0);
         let hmd = cfg.cell.home_mode_display.as_ref().expect("example should enable HMD by default");
         assert_eq!(hmd.protocol_id, 220);
         assert_eq!(hmd.text, "Nexus-BS");
         assert_eq!(hmd.interval_multiframes, 96);
         assert_eq!(cfg.cell.periodic_registration_secs, 0);
-        assert!(!cfg.cell.sndcp_service);
-        assert!(cfg.cell.wap_ip.is_none());
+        assert!(cfg.cell.sndcp_service);
+        let wap = cfg.cell.wap_ip.as_ref().expect("example should enable WAP/IP status");
+        assert!(wap.enabled);
+        assert_eq!(wap.address, [10, 0, 0, 1]);
+        assert_eq!(wap.port, 9200);
+        assert!(!wap.assume_pdch_ready_after_data_transmit);
         assert!(cfg.dashboard.is_some());
         let control = cfg.control.as_ref().expect("example should configure local control endpoint");
         assert_eq!(control.host, "127.0.0.1");
@@ -809,6 +826,27 @@ allowed_gssi_ranges = [
         assert!(cfg.health.enabled);
         assert_eq!(cfg.health.snapshot_interval_secs, 1);
         assert!(!cfg.health.restart_on_core_stall);
+    }
+
+    #[test]
+    fn test_compiled_distribution_configs_parse_without_active_credentials() {
+        for (name, toml) in [
+            (
+                "compiled_distribution/config/config.toml",
+                include_str!("../../../../compiled_distribution/config/config.toml"),
+            ),
+            (
+                "compiled_distribution/config/config.toml.fallback",
+                include_str!("../../../../compiled_distribution/config/config.toml.fallback"),
+            ),
+        ] {
+            let cfg = from_toml_str(toml).unwrap_or_else(|err| panic!("{name} should parse: {err}"));
+            assert!(cfg.cell.sndcp_service, "{name} should advertise SNDCP for WAP/IP");
+            assert!(cfg.cell.wap_ip.is_some(), "{name} should enable WAP/IP status");
+            assert!(cfg.brew.is_none(), "{name} must not include active Brew credentials");
+            assert!(!toml.contains("\nusername = "), "{name} must not contain active username");
+            assert!(!toml.contains("\npassword = "), "{name} must not contain active password");
+        }
     }
 
     #[test]
