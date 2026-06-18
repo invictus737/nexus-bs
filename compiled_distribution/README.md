@@ -5,7 +5,7 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 # Nexus-BS Compiled Distribution
 
-Minimal Linux/aarch64 binary bundle for Nexus-BS `v0.1.71_dev`.
+Minimal Linux/aarch64 binary bundle for Nexus-BS `v0.1.71`.
 
 This bundle is for manual installs. Beginners should normally use the GitHub
 Release `.deb` package instead.
@@ -14,7 +14,7 @@ Release `.deb` package instead.
 
 ```text
 bin/                         binaries
-config/                      example config and fallback
+config/                      example config
 dashboard/                   dashboard files
 scripts/nexus-bs-service     one command for start/status/logs/restart
 systemd/                     service unit files
@@ -28,36 +28,29 @@ When the config editor opens, save and close it; the next command starts
 Nexus-BS.
 
 ```sh
-NEXUS_USER="$(id -un)"
-NEXUS_GROUP="$(id -gn)"
+sudo systemctl stop nexus-bs-dashboard.service nexus-bs.service nexus-bs-control.service 2>/dev/null || true
 
-sudo install -d -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 /home/"$NEXUS_USER"/nexus-bs
-sudo install -d -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 /etc/nexus-bs
+sudo install -d -o root -g root -m 0755 /opt/nexus-bs/bin
+sudo install -d -o root -g root -m 0755 /opt/nexus-bs/dashboard
+sudo install -d -o root -g root -m 0755 /etc/nexus-bs
 
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 bin/nexus-bs /home/"$NEXUS_USER"/nexus-bs/nexus-bs
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 bin/nexus-bs-control-service /home/"$NEXUS_USER"/nexus-bs/nexus-bs-control-service
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 bin/nexus-bs-dashboard /home/"$NEXUS_USER"/nexus-bs/nexus-bs-dashboard
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 scripts/nexus-bs-service /home/"$NEXUS_USER"/nexus-bs/nexus-bs-service
+sudo install -o root -g root -m 0755 bin/nexus-bs /opt/nexus-bs/bin/nexus-bs
+sudo install -o root -g root -m 0755 bin/nexus-bs-control-service /opt/nexus-bs/bin/nexus-bs-control-service
+sudo install -o root -g root -m 0755 bin/nexus-bs-dashboard /opt/nexus-bs/bin/nexus-bs-dashboard
+sudo install -o root -g root -m 0755 scripts/nexus-bs-service /opt/nexus-bs/bin/nexus-bs-service
 
-sudo install -d -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 /home/"$NEXUS_USER"/nexus-bs/dashboard
-sudo cp -R dashboard/. /home/"$NEXUS_USER"/nexus-bs/dashboard/
-sudo chown -R "$NEXUS_USER:$NEXUS_GROUP" /home/"$NEXUS_USER"/nexus-bs/dashboard
+sudo cp -R dashboard/. /opt/nexus-bs/dashboard/
+sudo chown -R root:root /opt/nexus-bs/dashboard
 
 sudo install -d -m 0755 /etc/systemd/system /usr/local/bin
 sudo install -m 0644 systemd/nexus-bs-control.service /etc/systemd/system/nexus-bs-control.service
 sudo install -m 0644 systemd/nexus-bs.service /etc/systemd/system/nexus-bs.service
 sudo install -m 0644 systemd/nexus-bs-dashboard.service /etc/systemd/system/nexus-bs-dashboard.service
-sudo ln -sfn /home/"$NEXUS_USER"/nexus-bs/nexus-bs-service /usr/local/bin/nexus-bs-service
+sudo ln -sfn /opt/nexus-bs/bin/nexus-bs-service /usr/local/bin/nexus-bs-service
 
 if [ ! -e /etc/nexus-bs/config.toml ]; then
-  sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0600 config/config.toml /etc/nexus-bs/config.toml
+  sudo install -o root -g root -m 0600 config/config.toml /etc/nexus-bs/config.toml
 fi
-if [ ! -e /etc/nexus-bs/config.toml.fallback ]; then
-  sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0600 /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback
-fi
-
-ln -sfn /etc/nexus-bs/config.toml /home/"$NEXUS_USER"/nexus-bs/config.toml
-ln -sfn /etc/nexus-bs/config.toml.fallback /home/"$NEXUS_USER"/nexus-bs/config.toml.fallback
 
 sudo systemctl daemon-reload
 nexus-bs-service edit-config
@@ -94,17 +87,14 @@ Run this from inside the newer `compiled_distribution/`. It does not replace
 `/etc/nexus-bs/config.toml`.
 
 ```sh
-NEXUS_USER="$(id -un)"
-NEXUS_GROUP="$(id -gn)"
+sudo install -o root -g root -m 0755 bin/nexus-bs /opt/nexus-bs/bin/nexus-bs
+sudo install -o root -g root -m 0755 bin/nexus-bs-control-service /opt/nexus-bs/bin/nexus-bs-control-service
+sudo install -o root -g root -m 0755 bin/nexus-bs-dashboard /opt/nexus-bs/bin/nexus-bs-dashboard
+sudo install -o root -g root -m 0755 scripts/nexus-bs-service /opt/nexus-bs/bin/nexus-bs-service
 
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 bin/nexus-bs /home/"$NEXUS_USER"/nexus-bs/nexus-bs
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 bin/nexus-bs-control-service /home/"$NEXUS_USER"/nexus-bs/nexus-bs-control-service
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 bin/nexus-bs-dashboard /home/"$NEXUS_USER"/nexus-bs/nexus-bs-dashboard
-sudo install -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 scripts/nexus-bs-service /home/"$NEXUS_USER"/nexus-bs/nexus-bs-service
-
-sudo install -d -o "$NEXUS_USER" -g "$NEXUS_GROUP" -m 0755 /home/"$NEXUS_USER"/nexus-bs/dashboard
-sudo cp -R dashboard/. /home/"$NEXUS_USER"/nexus-bs/dashboard/
-sudo chown -R "$NEXUS_USER:$NEXUS_GROUP" /home/"$NEXUS_USER"/nexus-bs/dashboard
+sudo install -d -o root -g root -m 0755 /opt/nexus-bs/dashboard
+sudo cp -R dashboard/. /opt/nexus-bs/dashboard/
+sudo chown -R root:root /opt/nexus-bs/dashboard
 
 sudo install -m 0644 systemd/nexus-bs-control.service /etc/systemd/system/nexus-bs-control.service
 sudo install -m 0644 systemd/nexus-bs.service /etc/systemd/system/nexus-bs.service

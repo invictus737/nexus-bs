@@ -12,7 +12,7 @@ pub const PRODUCT_NAME: &str = "Nexus-BS";
 /// Cargo/package semver shared by the Nexus-BS crates.
 pub const PRODUCT_BASE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Release channel suffix encoded into runtime-visible identity strings.
-pub const PRODUCT_VERSION_SUFFIX: &str = "_dev";
+pub const PRODUCT_VERSION_SUFFIX: &str = "";
 /// Runtime-visible product version shown by dashboard/API/user-agent.
 pub const PRODUCT_VERSION: &str = const_format::formatcp!("{}{}", PRODUCT_BASE_VERSION, PRODUCT_VERSION_SUFFIX);
 /// Release-style version tag without the git suffix.
@@ -29,7 +29,7 @@ pub const GIT_HASH: &str = git_version::git_version!(
     args = ["--always", "--dirty=-modified", "--match=", "--abbrev=8"],
     fallback = "unknown"
 );
-/// Full stack version string, e.g. "v0.1.71_dev-g2aad62c"
+/// Full stack version string, e.g. "v0.1.71-g2aad62c"
 pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", PRODUCT_VERSION_TAG, GIT_HASH);
 
 pub mod address;
@@ -68,11 +68,11 @@ mod tests {
     fn product_identity_tracks_workspace_version() {
         assert_eq!(PRODUCT_NAME, "Nexus-BS");
         assert_eq!(PRODUCT_BASE_VERSION, "0.1.71");
-        assert_eq!(PRODUCT_VERSION_SUFFIX, "_dev");
-        assert_eq!(PRODUCT_VERSION, "0.1.71_dev");
-        assert_eq!(PRODUCT_VERSION_TAG, "v0.1.71_dev");
-        assert_eq!(PRODUCT_USER_AGENT, "Nexus-BS/v0.1.71_dev");
-        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.71_dev");
-        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.71_dev");
+        assert_eq!(PRODUCT_VERSION_SUFFIX, "");
+        assert_eq!(PRODUCT_VERSION, "0.1.71");
+        assert_eq!(PRODUCT_VERSION_TAG, "v0.1.71");
+        assert_eq!(PRODUCT_USER_AGENT, "Nexus-BS/v0.1.71");
+        assert_eq!(CONTROL_PROTOCOL_VERSION, "nexus-bs-control-v0.1.71");
+        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.71");
     }
 }

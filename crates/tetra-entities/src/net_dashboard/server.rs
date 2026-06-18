@@ -4,8 +4,11 @@
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
 use std::collections::HashMap;
+use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1966,7 +1969,7 @@ fn handle_connection(
         if let Err(e) = std::fs::copy(&config_path, &backup_path) {
             tracing::warn!("Dashboard: failed to write config backup: {}", e);
         }
-        match std::fs::write(&config_path, body_str.as_ref()) {
+        match write_dashboard_config_file(std::path::Path::new(&config_path), body_str.as_ref()) {
             Ok(_) => http_response(buf.into_inner(), 200, "OK"),
             Err(e) => http_response(buf.into_inner(), 500, &e.to_string()),
         }
@@ -3522,8 +3525,15 @@ fn read_active_config_marker(config_path: &str) -> Option<String> {
 
 fn write_active_config_marker(config_path: &str, profile_name: &str) -> Result<(), String> {
     let name = validate_config_profile_name(profile_name)?;
-    std::fs::write(active_config_marker_path(config_path), format!("{name}\n"))
+    write_dashboard_config_file(&active_config_marker_path(config_path), &format!("{name}\n"))
         .map_err(|e| format!("failed to write active config marker: {}", e))
+}
+
+fn write_dashboard_config_file(path: &Path, content: &str) -> std::io::Result<()> {
+    fs::write(path, content.as_bytes())?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 /// Read a specific config profile and serve its content as plain text.
@@ -3551,7 +3561,7 @@ fn save_config_profile(config_path: &str, profile_name: &str, content: &str) -> 
         return Err("cannot overwrite active config via profile editor — use the Config editor tab".to_string());
     }
 
-    std::fs::write(&profile_path, content.as_bytes()).map_err(|e| format!("failed to write profile: {}", e))
+    write_dashboard_config_file(&profile_path, content).map_err(|e| format!("failed to write profile: {}", e))
 }
 
 fn delete_config_profile(config_path: &str, profile_name: &str) -> Result<(), String> {
@@ -4182,10 +4192,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.71_dev"));
+        assert!(rendered.contains("Nexus-BS v0.1.71"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.71_dev"));
+        assert!(rendered.contains("Nexus-BS/v0.1.71"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -4333,6 +4343,33 @@ mod tests {
         assert!(validate_config_profile_name("../config.toml").is_err());
         assert!(validate_config_profile_name("config.toml.bak").is_err());
         assert!(validate_config_profile_name("bad name.toml").is_err());
+    }
+
+    #[test]
+    fn dashboard_config_profile_save_creates_private_duplicate_file() {
+        let dir = temp_config_dir("save-profile");
+        let config_path = dir.join("config.toml");
+        let duplicate_path = dir.join("config+1.toml");
+        fs::write(&config_path, "name = \"base\"\n").expect("write base config");
+
+        save_config_profile(config_path.to_string_lossy().as_ref(), "config+1.toml", "name = \"duplicate\"\n")
+            .expect("save duplicate profile");
+
+        assert_eq!(
+            fs::read_to_string(&duplicate_path).expect("read duplicate profile"),
+            "name = \"duplicate\"\n"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&duplicate_path)
+                .expect("duplicate profile metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -4539,9 +4576,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.71_dev");
-        assert_eq!(product.version_tag, "v0.1.71_dev");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.71_dev");
+        assert_eq!(product.version, "0.1.71");
+        assert_eq!(product.version_tag, "v0.1.71");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.71");
     }
 
     #[test]

@@ -2,14 +2,26 @@
 set -e
 
 if [ "$1" = "configure" ]; then
-    install -d -m 0755 /etc/nexus-bs
+    install -d -o root -g root -m 0755 /etc/nexus-bs
+
+    for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
+        legacy="/etc/systemd/system/$unit"
+        if [ -f "$legacy" ] && grep -Eq '/home/chris/nexus-bs|v0\.1\.71_dev|^User=chris$' "$legacy"; then
+            mv -f "$legacy" "$legacy.legacy-nexus-bs"
+        fi
+        rm -f "/etc/systemd/system/multi-user.target.wants/$unit"
+    done
 
     if [ ! -e /etc/nexus-bs/config.toml ]; then
-        install -m 0600 /etc/nexus-bs/examples/config.toml /etc/nexus-bs/config.toml
+        install -o root -g root -m 0600 /etc/nexus-bs/examples/config.toml /etc/nexus-bs/config.toml
     fi
 
-    if [ ! -e /etc/nexus-bs/config.toml.fallback ]; then
-        install -m 0600 /etc/nexus-bs/examples/config.toml.fallback /etc/nexus-bs/config.toml.fallback
+    chown root:root /etc/nexus-bs /etc/nexus-bs/config.toml 2>/dev/null || true
+    chmod 0755 /etc/nexus-bs 2>/dev/null || true
+    chmod 0600 /etc/nexus-bs/config.toml 2>/dev/null || true
+    if [ -f /etc/nexus-bs/config.toml.fallback ]; then
+        chown root:root /etc/nexus-bs/config.toml.fallback 2>/dev/null || true
+        chmod 0600 /etc/nexus-bs/config.toml.fallback 2>/dev/null || true
     fi
 
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then

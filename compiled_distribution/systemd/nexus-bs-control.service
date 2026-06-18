@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 [Unit]
-Description=Nexus-BS v0.1.71_dev local control service
+Description=Nexus-BS v0.1.71 local control service
 Documentation=man:systemd.service(5)
 After=network-online.target
 Wants=network-online.target
@@ -10,14 +10,13 @@ StartLimitIntervalSec=0
 
 [Service]
 Type=simple
-User=chris
-WorkingDirectory=/home/chris/nexus-bs
+WorkingDirectory=/opt/nexus-bs
 RuntimeDirectory=nexus-bs
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 ExecStartPre=/bin/rm -f /run/nexus-bs/control.commands
 ExecStartPre=/usr/bin/mkfifo -m 0600 /run/nexus-bs/control.commands
-ExecStart=/bin/sh -c 'while true; do /bin/cat /run/nexus-bs/control.commands; done | exec /home/chris/nexus-bs/nexus-bs-control-service --listen 127.0.0.1:9002'
+ExecStart=/bin/sh -c 'while true; do /bin/cat /run/nexus-bs/control.commands; done | exec /opt/nexus-bs/bin/nexus-bs-control-service --listen 127.0.0.1:9002'
 
 KillSignal=SIGINT
 TimeoutStopSec=10

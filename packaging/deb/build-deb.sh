@@ -119,6 +119,29 @@ reject_private_config_values() {
     done
 }
 
+reject_nonrelease_binaries() {
+    local file found line
+    found=0
+
+    for file in \
+        "${DIST_DIR}/bin/nexus-bs" \
+        "${DIST_DIR}/bin/nexus-bs-control-service" \
+        "${DIST_DIR}/bin/nexus-bs-dashboard"; do
+        while IFS= read -r line; do
+            if [ "$found" -eq 0 ]; then
+                printf 'Refusing to package non-release binary version strings:\n' >&2
+            fi
+            found=1
+            printf '%s: %s\n' "$file" "$line" >&2
+        done < <(strings "$file" | grep -E 'v[0-9][0-9.]*(_dev|-[0-9a-f]{8}-modified)' || true)
+    done
+
+    if [ "$found" -ne 0 ]; then
+        printf 'Commit the release source, rebuild compiled_distribution/bin from a clean tree, then rebuild the .deb.\n' >&2
+        exit 1
+    fi
+}
+
 render_template() {
     local src dst line
     src="$1"
@@ -262,6 +285,7 @@ validate_debian_field "MAINTAINER" "$MAINTAINER" '^[^<>]+ <[^<>[:space:]]+@[^<>[
 validate_debian_field "DEPENDS" "$DEPENDS" '^[0-9A-Za-z.,+~:|()<>= _-]+$'
 require_distribution_files
 reject_private_config_values
+reject_nonrelease_binaries
 
 mkdir -p "$OUT_DIR" "$WORK_DIR"
 rm -rf "$DEB_ROOT"
