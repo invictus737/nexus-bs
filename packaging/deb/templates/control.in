@@ -10,7 +10,7 @@ Description: Nexus-BS TETRA base station runtime
  Nexus-BS packaged from the compiled_distribution binary bundle.
  .
  The package installs runtime binaries and dashboard assets under
- /opt/nexus-bs, systemd service templates under /lib/systemd/system, and
+ /opt/nexus-bs, systemd service units under /lib/systemd/system, and
  example configuration under /etc/nexus-bs/examples and seeds
  /etc/nexus-bs/config.toml only when the live file is missing.
  .

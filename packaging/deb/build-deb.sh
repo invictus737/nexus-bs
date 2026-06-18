@@ -92,9 +92,9 @@ require_distribution_files() {
         "dashboard/assets/nexus-bs-logo.png"
         "config/config.toml"
         "config/config.toml.fallback"
-        "systemd/nexus-bs@.service"
-        "systemd/nexus-bs-control@.service"
-        "systemd/nexus-bs-dashboard@.service"
+        "systemd/nexus-bs.service"
+        "systemd/nexus-bs-control.service"
+        "systemd/nexus-bs-dashboard.service"
         "systemd/journald-nexus-bs-volatile.conf"
     )
 
@@ -154,8 +154,17 @@ install_transformed_unit() {
         -e "s|/home/%i/nexus-bs/nexus-bs-dashboard|${INSTALL_PREFIX}/bin/nexus-bs-dashboard|g" \
         -e "s|/home/%i/nexus-bs/nexus-bs|${INSTALL_PREFIX}/bin/nexus-bs|g" \
         -e "s|/home/%i/nexus-bs|${INSTALL_PREFIX}|g" \
+        -e "s|/home/chris/nexus-bs/config.toml.fallback|${ETC_PREFIX}/config.toml.fallback|g" \
+        -e "s|/home/chris/nexus-bs/config.toml|${ETC_PREFIX}/config.toml|g" \
+        -e "s|/home/chris/nexus-bs/dashboard|${INSTALL_PREFIX}/dashboard|g" \
+        -e "s|/home/chris/nexus-bs/nexus-bs-control-service|${INSTALL_PREFIX}/bin/nexus-bs-control-service|g" \
+        -e "s|/home/chris/nexus-bs/nexus-bs-dashboard|${INSTALL_PREFIX}/bin/nexus-bs-dashboard|g" \
+        -e "s|/home/chris/nexus-bs/nexus-bs|${INSTALL_PREFIX}/bin/nexus-bs|g" \
+        -e "s|/home/chris/nexus-bs|${INSTALL_PREFIX}|g" \
         -e "s|^ExecStartPre=/usr/bin/install -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs-%i/config.toml$|ExecStartPre=+/usr/bin/install -o %i -g %i -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs-%i/config.toml|g" \
         -e "s|^ExecStartPre=/bin/sh -c 'if \[ -f \"\$1\" \]; then /usr/bin/install -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs-%i/config.toml.fallback$|ExecStartPre=+/bin/sh -c 'if [ -f \"\$1\" ]; then /usr/bin/install -o \"\$3\" -g \"\$3\" -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs-%i/config.toml.fallback %i|g" \
+        -e "s|^ExecStartPre=/usr/bin/install -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs/config.toml$|ExecStartPre=+/usr/bin/install -o chris -g chris -m 0600 ${ETC_PREFIX}/config.toml /run/nexus-bs/config.toml|g" \
+        -e "s|^ExecStartPre=/bin/sh -c 'if \[ -f \"\$1\" \]; then /usr/bin/install -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs/config.toml.fallback$|ExecStartPre=+/bin/sh -c 'if [ -f \"\$1\" ]; then /usr/bin/install -o chris -g chris -m 0600 \"\$1\" \"\$2\"; fi' nexus-bs-copy-fallback ${ETC_PREFIX}/config.toml.fallback /run/nexus-bs/config.toml.fallback|g" \
         -e "s|Nexus-BS v[0-9][0-9.]*|Nexus-BS v${version_escaped}|g" \
         "$src" > "$dst"
     chmod 0644 "$dst"
@@ -197,9 +206,9 @@ install_payload() {
     install -m 0644 "${DIST_DIR}/systemd/journald-nexus-bs-volatile.conf" "${root}/${etc_rel}/examples/systemd/journald-nexus-bs-volatile.conf"
 
     install -d -m 0755 "${root}/${systemd_rel}"
-    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs@.service" "${root}/${systemd_rel}/nexus-bs@.service"
-    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs-control@.service" "${root}/${systemd_rel}/nexus-bs-control@.service"
-    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs-dashboard@.service" "${root}/${systemd_rel}/nexus-bs-dashboard@.service"
+    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs.service" "${root}/${systemd_rel}/nexus-bs.service"
+    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs-control.service" "${root}/${systemd_rel}/nexus-bs-control.service"
+    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs-dashboard.service" "${root}/${systemd_rel}/nexus-bs-dashboard.service"
 }
 
 generate_debian_metadata() {

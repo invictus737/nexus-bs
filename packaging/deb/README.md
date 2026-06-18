@@ -34,7 +34,7 @@ Other optional overrides:
 - `KEEP_BUILD_DIR=1`: keep the staging tree after a build.
 
 The package installs binaries and the dashboard under `/opt/nexus-bs`,
-`nexus-bs-service` on `PATH`, systemd service templates under
+`nexus-bs-service` on `PATH`, systemd service units under
 `/lib/systemd/system`, and config examples under `/etc/nexus-bs/examples`. On
 first install, `postinst` creates `/etc/nexus-bs/config.toml` and
 `/etc/nexus-bs/config.toml.fallback` from those examples only if they do not
