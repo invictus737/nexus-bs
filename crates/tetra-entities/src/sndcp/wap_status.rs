@@ -116,10 +116,7 @@ pub fn render_wml2_status_browser_index(snapshot: &WapStatusSnapshot, max_bytes:
         return Ok(page);
     }
 
-    let page = format!(
-        "<html><body><b>{title}</b><br />MS {} G {} P {} S {}<br /><a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">Next</a></body></html>",
-        registered_ms, snapshot.active_group_calls, snapshot.active_private_calls, snapshot.queued_sds
-    );
+    let page = format!("<html><body>NBS <a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">N</a></body></html>");
     if page.len() <= max_bytes {
         return Ok(page);
     }

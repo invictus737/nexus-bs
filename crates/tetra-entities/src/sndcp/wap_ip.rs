@@ -46,7 +46,8 @@ const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 545;
 const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 545;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
 const WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES: usize = 128;
-const WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES: usize = 144;
+const WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES: usize = 56;
+const WSP_OPENWAVE_XHTML_BROWSER_SECTOR_MAX_BYTES: usize = 144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WapIpEndpoint {
@@ -343,11 +344,15 @@ fn build_udp_status_response(
                     WSP_CT_TEXT_VND_WAP_WML,
                 ),
                 (WapStatusFormat::Xhtml, Some(sector)) => (
-                    render_wml2_status_browser_sector(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES), sector)?,
+                    render_wml2_status_browser_sector(
+                        snapshot,
+                        max_wsp_page_bytes.min(WSP_OPENWAVE_XHTML_BROWSER_SECTOR_MAX_BYTES),
+                        sector,
+                    )?,
                     WSP_CT_APP_VND_WAP_XHTML_XML,
                 ),
                 (WapStatusFormat::Xhtml, None) => (
-                    render_wml2_status_browser_index(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES))?,
+                    render_wml2_status_browser_index(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES))?,
                     WSP_CT_APP_VND_WAP_XHTML_XML,
                 ),
             };
@@ -1607,11 +1612,10 @@ mod tests {
         let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
         assert!(page.contains("<body>"));
         assert!(!page.contains("text=\"#0f0\""));
-        assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
-        assert!(page.contains("MS 1 G 0 P 0 S 1"), "page={page:?}");
+        assert!(page.contains("NBS"), "page={page:?}");
         assert!(page.contains("href=\"?s=1\""));
         assert!(
-            page.len() <= WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES,
+            page.len() <= WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES,
             "WSP browser index should stay compact: {} bytes",
             page.len()
         );
@@ -1655,7 +1659,7 @@ mod tests {
             response.len()
         );
         assert!(
-            page.len() <= WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES,
+            page.len() <= WSP_OPENWAVE_XHTML_BROWSER_SECTOR_MAX_BYTES,
             "WSP browser sector should stay compact: {} bytes",
             page.len()
         );
