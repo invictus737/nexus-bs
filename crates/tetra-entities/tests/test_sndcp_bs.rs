@@ -1139,7 +1139,7 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         response_udp.payload.len()
     );
     assert!(
-        response_udp.payload[7..].len() <= 220,
+        response_udp.payload[7..].len() <= 144,
         "WSP GET body should use the compact browser index: {} bytes",
         response_udp.payload[7..].len()
     );
@@ -1148,13 +1148,11 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         "single-slot WAP/IP response N-PDU should fit the negotiated 576-octet SNDCP MTU: {} bytes",
         response_octets.len()
     );
-    assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
     assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
     assert!(page.contains("MS "), "page={page:?}");
-    assert!(page.contains("Up "), "page={page:?}");
-    assert!(page.contains("href=\"/status.wml?s=1\""), "page={page:?}");
+    assert!(page.contains("href=\"?s=1\""), "page={page:?}");
     assert!(!page.contains("Voice"));
     assert!(!page.contains("<br/>"));
     assert!(!page.contains("<wml"));
@@ -1524,16 +1522,14 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         &[0x12, 0x92, 0x35, 0x04, 0x20, 0x01, 0xc5],
         "WSP GET should receive WTP Result + WSP Reply(application/vnd.wap.xhtml+xml)"
     );
-    assert!(page.contains("http://www.w3.org/1999/xhtml"));
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
     assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
     assert!(page.contains("MS "), "page={page:?}");
-    assert!(page.contains("Up "), "page={page:?}");
-    assert!(page.contains("href=\"/status.wml?s=1\""), "page={page:?}");
+    assert!(page.contains("href=\"?s=1\""), "page={page:?}");
     assert!(!page.contains("Voice"));
     assert!(
-        page.len() <= 220,
+        page.len() <= 144,
         "WSP XHTML browser index should stay compact: {} bytes",
         page.len()
     );
@@ -1578,7 +1574,7 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         sector_octets.len()
     );
     assert!(
-        sector_page.len() <= 220,
+        sector_page.len() <= 128,
         "sector_page_len={} sector_page={sector_page:?}",
         sector_page.len()
     );

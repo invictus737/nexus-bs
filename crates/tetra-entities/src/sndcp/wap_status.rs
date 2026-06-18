@@ -113,13 +113,21 @@ pub fn render_wml2_status_browser_index(snapshot: &WapStatusSnapshot, max_bytes:
         registered_ms, snapshot.active_group_calls, snapshot.active_private_calls, snapshot.queued_sds
     );
     if page.len() <= max_bytes {
-        Ok(page)
-    } else {
-        Err(WapStatusError::RenderedTooLarge {
-            len: page.len(),
-            max: max_bytes,
-        })
+        return Ok(page);
     }
+
+    let page = format!(
+        "<html><body><b>{title}</b><br />MS {} G {} P {} S {}<br /><a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">Next</a></body></html>",
+        registered_ms, snapshot.active_group_calls, snapshot.active_private_calls, snapshot.queued_sds
+    );
+    if page.len() <= max_bytes {
+        return Ok(page);
+    }
+
+    Err(WapStatusError::RenderedTooLarge {
+        len: page.len(),
+        max: max_bytes,
+    })
 }
 
 pub fn render_wml_status_browser_index(snapshot: &WapStatusSnapshot, max_bytes: usize) -> Result<String, WapStatusError> {
@@ -135,13 +143,21 @@ pub fn render_wml_status_browser_index(snapshot: &WapStatusSnapshot, max_bytes: 
         registered_ms, snapshot.active_group_calls, snapshot.active_private_calls, snapshot.queued_sds
     );
     if page.len() <= max_bytes {
-        Ok(page)
-    } else {
-        Err(WapStatusError::RenderedTooLarge {
-            len: page.len(),
-            max: max_bytes,
-        })
+        return Ok(page);
     }
+
+    let page = format!(
+        "<wml><card><p>{title}<br/>MS {} G {} P {} S {}<br/><a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">Next</a></p></card></wml>",
+        registered_ms, snapshot.active_group_calls, snapshot.active_private_calls, snapshot.queued_sds
+    );
+    if page.len() <= max_bytes {
+        return Ok(page);
+    }
+
+    Err(WapStatusError::RenderedTooLarge {
+        len: page.len(),
+        max: max_bytes,
+    })
 }
 
 pub fn render_wml2_status_browser_sector(snapshot: &WapStatusSnapshot, max_bytes: usize, sector: usize) -> Result<String, WapStatusError> {
@@ -356,12 +372,12 @@ fn render_wml_status_browser_sector_page(pages: &[WapStatusSectorPage], sector: 
     let mut body = vec![page_title];
     let lines: Vec<String> = page.lines.iter().map(|line| escape_xhtml_text_limited(line, line_limit)).collect();
     if sector + 1 < pages.len() {
-        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">Next</a>", sector + 1));
+        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">N</a>", sector + 1));
     }
     if sector > 0 {
-        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">Prev</a>", sector - 1));
+        body.push(format!("<a href=\"?{WAP_STATUS_SECTOR_QUERY}={}\">P</a>", sector - 1));
     }
-    body.push("<a href=\"/\">Home</a>".to_string());
+    body.push("<a href=\"/\">H</a>".to_string());
     let nav_count = 1 + usize::from(sector + 1 < pages.len()) + usize::from(sector > 0);
 
     for line in lines {
@@ -989,10 +1005,11 @@ mod tests {
         let index = render_wml_status_browser_index(&snapshot, 160).expect("browser index should fit");
         assert!(index.contains("MS 1 G 0 P 1 S 2"), "index={index:?}");
 
-        let radios = render_wml_status_browser_sector(&snapshot, 160, 2).expect("radio sector should fit");
+        let radios = render_wml_status_browser_sector(&snapshot, 128, 2).expect("radio sector should fit");
         assert!(radios.contains("Radios 1"), "radios={radios:?}");
         assert!(!radios.contains("Radios 3/3"), "radios={radios:?}");
         assert!(radios.contains("MS 2260618"), "radios={radios:?}");
+        assert!(radios.len() <= 128, "radios={radios:?}");
     }
 
     #[test]

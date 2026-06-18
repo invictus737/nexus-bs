@@ -45,7 +45,8 @@ const WSP_CAP_HEADER_CODE_PAGES: u8 = 0x86;
 const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 545;
 const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 545;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
-const WSP_WML_BROWSER_PAGE_MAX_BYTES: usize = 160;
+const WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES: usize = 128;
+const WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES: usize = 144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WapIpEndpoint {
@@ -334,19 +335,19 @@ fn build_udp_status_response(
                 .min(DEFAULT_WAP_WSP_STATUS_MAX_BYTES);
             let (page, content_type) = match (format, sector) {
                 (WapStatusFormat::Wml, Some(sector)) => (
-                    render_wml_status_browser_sector(snapshot, max_wsp_page_bytes.min(WSP_WML_BROWSER_PAGE_MAX_BYTES), sector)?,
+                    render_wml_status_browser_sector(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES), sector)?,
                     WSP_CT_TEXT_VND_WAP_WML,
                 ),
                 (WapStatusFormat::Wml, None) => (
-                    render_wml_status_browser_index(snapshot, max_wsp_page_bytes.min(WSP_WML_BROWSER_PAGE_MAX_BYTES))?,
+                    render_wml_status_browser_index(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES))?,
                     WSP_CT_TEXT_VND_WAP_WML,
                 ),
                 (WapStatusFormat::Xhtml, Some(sector)) => (
-                    render_wml2_status_browser_sector(snapshot, max_wsp_page_bytes.min(220), sector)?,
+                    render_wml2_status_browser_sector(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES), sector)?,
                     WSP_CT_APP_VND_WAP_XHTML_XML,
                 ),
                 (WapStatusFormat::Xhtml, None) => (
-                    render_wml2_status_browser_index(snapshot, max_wsp_page_bytes)?,
+                    render_wml2_status_browser_index(snapshot, max_wsp_page_bytes.min(WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES))?,
                     WSP_CT_APP_VND_WAP_XHTML_XML,
                 ),
             };
@@ -1604,14 +1605,16 @@ mod tests {
             response.len()
         );
         let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
-        assert!(page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("<body>"));
         assert!(!page.contains("text=\"#0f0\""));
         assert!(page.contains("<b>Nexus-BS</b>"), "page={page:?}");
         assert!(page.contains("MS 1 G 0 P 0 S 1"), "page={page:?}");
-        assert!(page.contains("Up "));
-        assert!(page.contains("href=\"/status.wml?s=1\""));
-        assert!(page.len() <= 220, "WSP browser index should stay compact: {} bytes", page.len());
+        assert!(page.contains("href=\"?s=1\""));
+        assert!(
+            page.len() <= WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES,
+            "WSP browser index should stay compact: {} bytes",
+            page.len()
+        );
         assert!(!page.contains("Voice"));
         assert!(!page.contains("<br/>"));
         assert!(!page.contains("<wml"));
@@ -1651,7 +1654,11 @@ mod tests {
             "sector response N-PDU must stay within negotiated MTU: {}",
             response.len()
         );
-        assert!(page.len() <= 220, "WSP browser sector should stay compact: {} bytes", page.len());
+        assert!(
+            page.len() <= WSP_OPENWAVE_XHTML_BROWSER_PAGE_MAX_BYTES,
+            "WSP browser sector should stay compact: {} bytes",
+            page.len()
+        );
         assert!(!page.contains("http://www.w3.org/1999/xhtml"));
         assert!(page.contains("Health OK"), "page={page:?}");
         assert!(page.contains("2/"));
@@ -1695,7 +1702,7 @@ mod tests {
             response.len()
         );
         assert!(
-            page.len() <= WSP_WML_BROWSER_PAGE_MAX_BYTES,
+            page.len() <= WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES,
             "WSP WML sector should stay compact: {} bytes",
             page.len()
         );
