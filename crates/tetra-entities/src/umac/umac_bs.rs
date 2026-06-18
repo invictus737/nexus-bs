@@ -520,10 +520,15 @@ impl UmacBs {
         msg_dltime: TdmaTime,
         block_num: PhyBlockNum,
         res_req: ReservationRequirement,
+        allow_active_pdch_redirect: bool,
     ) {
         let assigned_ts = self
             .packet_data_uplink_assigned_ts_for_addr(addr, msg_dltime, block_num)
-            .or_else(|| self.channel_scheduler.packet_data_active_uplink_slot_for_addr(addr));
+            .or_else(|| {
+                allow_active_pdch_redirect
+                    .then(|| self.channel_scheduler.packet_data_active_uplink_slot_for_addr(addr))
+                    .flatten()
+            });
         if let Some(assigned_ts) = assigned_ts {
             self.channel_scheduler
                 .dl_enqueue_packet_data_reservation_grant(assigned_ts, addr, res_req);
@@ -2136,7 +2141,7 @@ impl UmacBs {
         let msg_dltime = self.dltime.add_timeslots(-2); // Msg on uplink was sent two timeslots ago.
         self.mark_ms_signalling_activity(addr, msg_dltime);
         if let Some(res_req) = &pdu.reservation_req {
-            self.enqueue_reservation_grant_for_addr(addr, msg_dltime, prim.block_num, *res_req);
+            self.enqueue_reservation_grant_for_addr(addr, msg_dltime, prim.block_num, *res_req, true);
         };
 
         tracing::debug!("rx_mac_data: {}", prim.pdu.dump_bin_full(true));
@@ -2327,7 +2332,7 @@ impl UmacBs {
 
         // Handle reservation if present
         if let Some(res_req) = &pdu.reservation_req {
-            self.enqueue_reservation_grant_for_addr(addr, msg_dltime, prim.block_num, *res_req);
+            self.enqueue_reservation_grant_for_addr(addr, msg_dltime, prim.block_num, *res_req, !pdu.is_frag_start());
         };
 
         // tracing::debug!("rx_mac_access: {}", prim.pdu.dump_bin_full(true));

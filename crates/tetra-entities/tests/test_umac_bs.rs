@@ -675,6 +675,23 @@ fn mac_access_pdu_with_reservation(issi: u32, reservation_req: ReservationRequir
     pdu
 }
 
+fn mac_access_fragment_start_with_reservation(issi: u32, reservation_req: ReservationRequirement) -> BitBuffer {
+    let mut pdu = BitBuffer::new_autoexpand(96);
+    MacAccess {
+        fill_bits: false,
+        encrypted: false,
+        addr: Some(TetraAddress::issi(issi)),
+        event_label: None,
+        length_ind: None,
+        frag_flag: Some(true),
+        reservation_req: Some(reservation_req),
+    }
+    .to_bitbuf(&mut pdu);
+    pdu.write_zeroes(92usize.saturating_sub(pdu.get_len_written()));
+    pdu.seek(0);
+    pdu
+}
+
 fn submit_mac_access_with_reservation(test: &mut ComponentTest, issi: u32, reservation_req: ReservationRequirement) {
     test.submit_message(SapMsg {
         sap: Sap::TmvSap,
@@ -682,6 +699,22 @@ fn submit_mac_access_with_reservation(test: &mut ComponentTest, issi: u32, reser
         dest: TetraEntity::Umac,
         msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
             pdu: mac_access_pdu_with_reservation(issi, reservation_req),
+            block_num: PhyBlockNum::Block1,
+            logical_channel: LogicalChannel::SchHu,
+            crc_pass: true,
+            scrambling_code: 864282631,
+            rssi_dbfs: f32::NAN,
+        }),
+    });
+}
+
+fn submit_mac_access_fragment_start_with_reservation(test: &mut ComponentTest, issi: u32, reservation_req: ReservationRequirement) {
+    test.submit_message(SapMsg {
+        sap: Sap::TmvSap,
+        src: TetraEntity::Lmac,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmvUnitdataInd(TmvUnitdataInd {
+            pdu: mac_access_fragment_start_with_reservation(issi, reservation_req),
             block_num: PhyBlockNum::Block1,
             logical_channel: LogicalChannel::SchHu,
             crc_pass: true,
@@ -2551,6 +2584,65 @@ fn test_assigned_pdch_mac_u_blck_payload_reaches_llc_with_packet_data_owner() {
     assert_eq!(
         sdu.read_bits(3).and_then(|bits| MleProtocolDiscriminator::try_from(bits).ok()),
         Some(MleProtocolDiscriminator::Sndcp)
+    );
+}
+
+#[test]
+fn test_common_control_fragment_start_reservation_does_not_redirect_to_stale_pdch() {
+    debug::setup_logging_verbose();
+
+    let target_issi = 2_260_618;
+    let target_addr = TetraAddress::issi(target_issi);
+    let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default().add_timeslots(2)));
+    test.populate_entities(vec![TetraEntity::Umac], vec![TetraEntity::Lmac, TetraEntity::Llc]);
+
+    test.submit_message(SapMsg {
+        sap: Sap::TmaSap,
+        src: TetraEntity::Llc,
+        dest: TetraEntity::Umac,
+        msg: SapMsgInner::TmaUnitdataReq(TmaUnitdataReq {
+            req_handle: 152,
+            pdu: build_sndcp_bl_udata_sdu(),
+            main_address: target_addr,
+            endpoint_id: 1,
+            pdu_prio: 4,
+            stealing_permission: false,
+            subscriber_class: 0,
+            air_interface_encryption: None,
+            stealing_repeats_flag: None,
+            data_category: None,
+            chan_alloc: Some(CmceChanAllocReq {
+                usage: None,
+                timeslots: [false, true, false, false],
+                alloc_type: ChanAllocType::Replace,
+                ul_dl_assigned: UlDlAssignment::Both,
+                carrier: None,
+            }),
+            tx_reporter: None,
+        }),
+    });
+    test.run_stack(Some(32));
+    let _ = test.dump_sinks();
+
+    submit_mac_access_fragment_start_with_reservation(&mut test, target_issi, ReservationRequirement::Req1Subslot);
+    test.run_stack(Some(12));
+
+    let sink_msgs = test.dump_sinks();
+    let grant_slots: Vec<_> = sink_msgs
+        .iter()
+        .filter_map(|msg| match &msg.msg {
+            SapMsgInner::TmvUnitdataReq(slot) if slot_carries_mac_resource_for_addr(slot, target_addr) => Some(slot.ts.t),
+            _ => None,
+        })
+        .collect();
+
+    assert!(
+        !grant_slots.is_empty(),
+        "MAC-ACCESS fragment start with reservation must receive a random-access ACK/slot grant"
+    );
+    assert!(
+        grant_slots.iter().all(|ts| *ts != 2),
+        "common-control fragmented attach/restart reservation must not be redirected to stale TS2 PDCH: {grant_slots:?}"
     );
 }
 
