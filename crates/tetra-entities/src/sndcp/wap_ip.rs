@@ -46,7 +46,7 @@ const WSP_CONNECT_REPLY_CLIENT_SDU_SIZE_BYTES: usize = 545;
 const WSP_CONNECT_REPLY_SERVER_SDU_SIZE_BYTES: usize = 545;
 const WSP_REPLY_FIXED_HEADER_BYTES: usize = 4;
 const WSP_OPENWAVE_WML_BROWSER_PAGE_MAX_BYTES: usize = 128;
-const WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES: usize = 56;
+const WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES: usize = 96;
 const WSP_OPENWAVE_XHTML_BROWSER_SECTOR_MAX_BYTES: usize = 144;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1612,7 +1612,8 @@ mod tests {
         let page = std::str::from_utf8(&response_udp.payload[7..]).expect("WSP XHTML body should be UTF-8");
         assert!(page.contains("<body>"));
         assert!(!page.contains("text=\"#0f0\""));
-        assert!(page.contains("NBS"), "page={page:?}");
+        assert!(page.contains("Welcome to Nexus-BS!"), "page={page:?}");
+        assert!(page.contains("v0.1.69"), "page={page:?}");
         assert!(page.contains("href=\"?s=1\""));
         assert!(
             page.len() <= WSP_OPENWAVE_XHTML_BROWSER_INDEX_MAX_BYTES,
@@ -1620,7 +1621,7 @@ mod tests {
             page.len()
         );
         assert!(!page.contains("Voice"));
-        assert!(!page.contains("<br/>"));
+        assert!(page.contains("<br/>"));
         assert!(!page.contains("<wml"));
     }
 

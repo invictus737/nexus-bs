@@ -1139,7 +1139,7 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
         response_udp.payload.len()
     );
     assert!(
-        response_udp.payload[7..].len() <= 56,
+        response_udp.payload[7..].len() <= 96,
         "WSP GET body should use the compact browser index: {} bytes",
         response_udp.payload[7..].len()
     );
@@ -1150,10 +1150,11 @@ fn sndcp_wap_al_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     );
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("NBS"), "page={page:?}");
+    assert!(page.contains("Welcome to Nexus-BS!"), "page={page:?}");
+    assert!(page.contains("v0.1."), "page={page:?}");
     assert!(page.contains("href=\"?s=1\""), "page={page:?}");
     assert!(!page.contains("Voice"));
-    assert!(!page.contains("<br/>"));
+    assert!(page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 }
@@ -1523,15 +1524,16 @@ fn sndcp_wap_al_udp_wsp_xhtml_e2e_waits_for_pdch_report_and_responds_over_al() {
     );
     assert!(page.contains("<body>"));
     assert!(!page.contains("text=\"#0f0\""));
-    assert!(page.contains("NBS"), "page={page:?}");
+    assert!(page.contains("Welcome to Nexus-BS!"), "page={page:?}");
+    assert!(page.contains("v0.1."), "page={page:?}");
     assert!(page.contains("href=\"?s=1\""), "page={page:?}");
     assert!(!page.contains("Voice"));
     assert!(
-        page.len() <= 56,
+        page.len() <= 96,
         "WSP XHTML browser index should stay compact: {} bytes",
         page.len()
     );
-    assert!(!page.contains("<br/>"));
+    assert!(page.contains("<br/>"));
     assert!(!page.contains("<wml"));
     assert!(!page.contains("<card"));
 

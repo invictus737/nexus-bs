@@ -116,7 +116,9 @@ pub fn render_wml2_status_browser_index(snapshot: &WapStatusSnapshot, max_bytes:
         return Ok(page);
     }
 
-    let page = format!("<html><body>NBS <a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">N</a></body></html>");
+    let version = compact_tiny_version(snapshot.stack_version.trim());
+    let page =
+        format!("<html><body>Welcome to Nexus-BS!<br/>v{version}<br/><a href=\"?{WAP_STATUS_SECTOR_QUERY}=1\">Next</a></body></html>");
     if page.len() <= max_bytes {
         return Ok(page);
     }
