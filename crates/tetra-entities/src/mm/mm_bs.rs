@@ -154,7 +154,7 @@ impl GroupIdentityAddress {
 
 impl MmBs {
     const MAX_AIR_INTERFACE_SSI: u32 = 0x00FF_FFFF;
-    const MAX_GROUPS_PER_ATTACH: usize = 12;
+    const MAX_GROUPS_PER_ATTACH: usize = 20;
     // EN 300 392-2 clause 23.7.6 / timer T.210: after signalling activity,
     // the MS remains awake for 18 TDMA frames before returning to energy economy.
     const T210_AWAKE_FRAMES: i32 = 18;

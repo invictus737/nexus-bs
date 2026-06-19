@@ -85,7 +85,18 @@ pub fn try_start(calibration_path: &str) -> Result<(), String> {
     if s.phase.is_active() {
         return Err(format!("calibration already running: {}", s.phase.as_str()));
     }
-    let _ = std::fs::remove_file(tx_calibration_run_report_path(calibration_path));
+    let run_report_path = tx_calibration_run_report_path(calibration_path);
+    match std::fs::remove_file(&run_report_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(format!(
+                "failed to remove stale calibration run report '{}': {}",
+                run_report_path.display(),
+                err
+            ));
+        }
+    }
     s.phase = CalibrationPhase::Inhibiting;
     s.calibration_path = calibration_path.to_string();
     s.error.clear();

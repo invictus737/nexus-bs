@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 [Unit]
-Description=Nexus-BS v0.1.71 TETRA base station service
+Description=Nexus-BS v0.1.72 TETRA base station service
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs-control.service
 Wants=network-online.target nexus-bs-control.service
@@ -16,9 +16,6 @@ RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service
 Environment=NEXUS_BS_PERSISTENT_CONFIG=/etc/nexus-bs/config.toml
-Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/opt/nexus-bs/dashboard
-Environment=NEXUS_BS_CORE_DASHBOARD_BIND=127.0.0.1
-Environment=NEXUS_BS_CORE_DASHBOARD_PORT=18080
 Environment=RUST_LOG=info,tetra_entities::messagerouter=warn,tetra_entities::phy::phy_bs=warn,tetra_entities::mm::components::client_state=warn
 
 ExecStartPre=/usr/bin/install -m 0600 /etc/nexus-bs/config.toml /run/nexus-bs/config.toml

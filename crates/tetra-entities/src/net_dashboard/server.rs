@@ -10,6 +10,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
@@ -571,7 +572,6 @@ pub struct DashboardServer {
     pub state: DashboardState,
     clients: WsClients,
     config_path: String,
-    runtime_config_path: Option<String>,
     /// Shared stack config — used to read live_sds_queue from StackState.
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     cmd_tx: Option<CmdSender>,
@@ -603,7 +603,6 @@ impl DashboardServer {
             state: Arc::new(RwLock::new(DashboardStateInner::new(config_path.clone()))),
             clients: Arc::new(Mutex::new(Vec::new())),
             config_path,
-            runtime_config_path: None,
             shared_config: None,
             cmd_tx: None,
             rf_cmd_tx: None,
@@ -646,12 +645,6 @@ impl DashboardServer {
         self.static_dir = static_dir;
     }
 
-    /// Record the runtime config path used by the core stack when it differs
-    /// from the editable/persistent config path exposed by dashboard APIs.
-    pub fn set_runtime_config_path(&mut self, runtime_config_path: String) {
-        self.runtime_config_path = Some(runtime_config_path);
-    }
-
     /// Configure dashboard form-login credentials.
     pub fn set_auth(&mut self, auth: Option<(String, String)>) {
         self.auth = auth;
@@ -670,7 +663,6 @@ impl DashboardServer {
         let state = Arc::clone(&self.state);
         let clients = Arc::clone(&self.clients);
         let config_path = self.config_path.clone();
-        let runtime_config_path = self.runtime_config_path.clone();
         let cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.cmd_tx.take()));
         let rf_cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.rf_cmd_tx.take()));
         let phy_cmd_tx: Arc<Mutex<Option<CmdSender>>> = Arc::new(Mutex::new(self.phy_cmd_tx.take()));
@@ -712,7 +704,6 @@ impl DashboardServer {
                     let state = Arc::clone(&state);
                     let clients = Arc::clone(&clients);
                     let config_path = config_path.clone();
-                    let runtime_config_path = runtime_config_path.clone();
                     let cmd_tx = Arc::clone(&cmd_tx);
                     let rf_cmd_tx = Arc::clone(&rf_cmd_tx);
                     let phy_cmd_tx = Arc::clone(&phy_cmd_tx);
@@ -732,7 +723,6 @@ impl DashboardServer {
                             state,
                             clients,
                             config_path,
-                            runtime_config_path,
                             cmd_tx,
                             rf_cmd_tx,
                             phy_cmd_tx,
@@ -1235,6 +1225,319 @@ fn serve_service_command(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>
     }
 }
 
+fn nmcli_available() -> bool {
+    Command::new("nmcli")
+        .arg("--version")
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false)
+}
+
+fn nmcli_output(args: &[&str]) -> Result<String, String> {
+    let output = Command::new("nmcli")
+        .args(args)
+        .output()
+        .map_err(|e| format!("nmcli unavailable: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("nmcli exited with status {}", output.status)
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn split_nmcli_terse_line(line: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for ch in line.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == ':' {
+            fields.push(current);
+            current = String::new();
+        } else {
+            current.push(ch);
+        }
+    }
+    if escaped {
+        current.push('\\');
+    }
+    fields.push(current);
+    fields
+}
+
+fn wifi_devices_json() -> Result<Vec<serde_json::Value>, String> {
+    let text = nmcli_output(&["-t", "-f", "DEVICE,TYPE,STATE,CONNECTION", "device", "status"])?;
+    let devices = text
+        .lines()
+        .filter_map(|line| {
+            let fields = split_nmcli_terse_line(line);
+            if fields.get(1).map(String::as_str) != Some("wifi") {
+                return None;
+            }
+            Some(serde_json::json!({
+                "name": fields.first().cloned().unwrap_or_default(),
+                "type": fields.get(1).cloned().unwrap_or_default(),
+                "state": fields.get(2).cloned().unwrap_or_default(),
+                "connection": fields.get(3).cloned().unwrap_or_default(),
+            }))
+        })
+        .collect();
+    Ok(devices)
+}
+
+fn wifi_networks_json(rescan: bool) -> Result<Vec<serde_json::Value>, String> {
+    let rescan_arg = if rescan { "yes" } else { "no" };
+    let text = nmcli_output(&[
+        "-t",
+        "-f",
+        "ACTIVE,SSID,SIGNAL,SECURITY,DEVICE,CHAN,RATE",
+        "device",
+        "wifi",
+        "list",
+        "--rescan",
+        rescan_arg,
+    ])?;
+    let mut best_by_ssid: HashMap<String, serde_json::Value> = HashMap::new();
+    for line in text.lines() {
+        let fields = split_nmcli_terse_line(line);
+        let ssid = fields.get(1).cloned().unwrap_or_default();
+        if ssid.trim().is_empty() {
+            continue;
+        }
+        let signal = fields.get(2).and_then(|s| s.parse::<u32>().ok()).unwrap_or(0);
+        let security = fields.get(3).cloned().unwrap_or_default();
+        let active = fields.first().map(|s| s == "yes").unwrap_or(false);
+        let row = serde_json::json!({
+            "active": active,
+            "ssid": ssid,
+            "signal": signal,
+            "security": security,
+            "secure": !security.trim().is_empty(),
+            "device": fields.get(4).cloned().unwrap_or_default(),
+            "channel": fields.get(5).cloned().unwrap_or_default(),
+            "rate": fields.get(6).cloned().unwrap_or_default(),
+        });
+        let replace = best_by_ssid
+            .get(row["ssid"].as_str().unwrap_or_default())
+            .and_then(|old| old.get("signal").and_then(serde_json::Value::as_u64))
+            .map(|old_signal| active || u64::from(signal) > old_signal)
+            .unwrap_or(true);
+        if replace {
+            best_by_ssid.insert(row["ssid"].as_str().unwrap_or_default().to_string(), row);
+        }
+    }
+    let mut networks: Vec<_> = best_by_ssid.into_values().collect();
+    networks.sort_by(|a, b| {
+        b.get("active")
+            .and_then(serde_json::Value::as_bool)
+            .cmp(&a.get("active").and_then(serde_json::Value::as_bool))
+            .then_with(|| {
+                b.get("signal")
+                    .and_then(serde_json::Value::as_u64)
+                    .cmp(&a.get("signal").and_then(serde_json::Value::as_u64))
+            })
+            .then_with(|| {
+                a.get("ssid")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("")
+                    .cmp(b.get("ssid").and_then(serde_json::Value::as_str).unwrap_or(""))
+            })
+    });
+    Ok(networks)
+}
+
+fn wifi_status_json(rescan: bool) -> serde_json::Value {
+    if !nmcli_available() {
+        return serde_json::json!({
+            "ok": false,
+            "available": false,
+            "status": "unavailable",
+            "message": "NetworkManager nmcli is not installed or not executable",
+            "devices": [],
+            "networks": [],
+        });
+    }
+    let devices = match wifi_devices_json() {
+        Ok(devices) => devices,
+        Err(err) => {
+            return serde_json::json!({
+                "ok": false,
+                "available": false,
+                "status": "unavailable",
+                "message": err,
+                "devices": [],
+                "networks": [],
+            });
+        }
+    };
+    let device = devices.first().cloned().unwrap_or_else(|| serde_json::json!({}));
+    let networks = wifi_networks_json(rescan).unwrap_or_default();
+    let active_scanned_ssid = networks
+        .iter()
+        .find(|network| network.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false))
+        .and_then(|network| network.get("ssid").and_then(serde_json::Value::as_str))
+        .unwrap_or("");
+    let connection_name = device
+        .get("connection")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty() && *value != "--")
+        .unwrap_or("")
+        .to_string();
+    let current_ssid = if active_scanned_ssid.is_empty() {
+        connection_name.clone()
+    } else {
+        active_scanned_ssid.to_string()
+    };
+    serde_json::json!({
+        "ok": true,
+        "available": !devices.is_empty(),
+        "status": if devices.is_empty() { "no wifi device" } else { "ready" },
+        "message": if devices.is_empty() { "No Wi-Fi device found" } else { "" },
+        "device": device,
+        "device_name": device.get("name").and_then(serde_json::Value::as_str).unwrap_or(""),
+        "devices": devices,
+        "connection_name": connection_name,
+        "current_ssid": current_ssid,
+        "networks": networks,
+    })
+}
+
+fn serve_wifi_status(stream: TcpStream, rescan: bool) {
+    let body = serde_json::to_string(&wifi_status_json(rescan)).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+    http_json_response(stream, 200, &body);
+}
+
+fn parse_wifi_connect_request(value: &serde_json::Value) -> Result<(String, String, bool), String> {
+    let ssid = value
+        .get("ssid")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if ssid.is_empty() || ssid.len() > 32 {
+        return Err("ssid required, max 32 bytes/chars".to_string());
+    }
+    let password = value.get("password").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
+    if password.len() > 128 {
+        return Err("password too long".to_string());
+    }
+    let hidden = value.get("hidden").and_then(serde_json::Value::as_bool).unwrap_or(false);
+    Ok((ssid, password, hidden))
+}
+
+fn saved_wifi_uuid_for_ssid(ssid: &str) -> Option<String> {
+    let suffix = format!("-{}", ssid);
+    crate::wifi::list_saved().ok()?.into_iter().find_map(|profile| {
+        if profile.name == ssid || profile.name.ends_with(&suffix) || (profile.active && profile.name.contains(ssid)) {
+            Some(profile.uuid)
+        } else {
+            None
+        }
+    })
+}
+
+fn scanned_wifi_security_for_ssid(status: &serde_json::Value, ssid: &str) -> Option<String> {
+    status
+        .get("networks")
+        .and_then(serde_json::Value::as_array)?
+        .iter()
+        .find(|network| network.get("ssid").and_then(serde_json::Value::as_str) == Some(ssid))
+        .and_then(|network| network.get("security").and_then(serde_json::Value::as_str))
+        .map(str::to_string)
+}
+
+fn update_saved_wifi_password(uuid: &str, ssid: &str, password: &str) -> Result<(), String> {
+    nmcli_output(&[
+        "connection",
+        "modify",
+        "uuid",
+        uuid,
+        "802-11-wireless.ssid",
+        ssid,
+        "802-11-wireless-security.key-mgmt",
+        "wpa-psk",
+        "802-11-wireless-security.psk",
+        password,
+    ])
+    .map(|_| ())
+}
+
+fn serve_wifi_connect(stream: TcpStream, value: &serde_json::Value) {
+    let (ssid, password, hidden) = match parse_wifi_connect_request(value) {
+        Ok(req) => req,
+        Err(err) => {
+            http_json_response(
+                stream,
+                400,
+                &serde_json::to_string(&serde_json::json!({"ok": false, "error": err})).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            );
+            return;
+        }
+    };
+    let status = wifi_status_json(false);
+    if !status.get("available").and_then(serde_json::Value::as_bool).unwrap_or(false) {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": status.get("message").and_then(serde_json::Value::as_str).unwrap_or("Wi-Fi unavailable"),
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 503, &body);
+        return;
+    }
+
+    let result = if password.is_empty() {
+        if let Some(uuid) = saved_wifi_uuid_for_ssid(&ssid) {
+            crate::wifi::connect_saved(&uuid).map_err(|e| e.to_string())
+        } else {
+            let security = scanned_wifi_security_for_ssid(&status, &ssid).unwrap_or_default();
+            if !security.trim().is_empty() {
+                Err(format!("password required for secured Wi-Fi network '{}'", ssid))
+            } else {
+                crate::wifi::connect_new(&ssid, "", hidden).map_err(|e| e.to_string())
+            }
+        }
+    } else if let Some(uuid) = saved_wifi_uuid_for_ssid(&ssid) {
+        update_saved_wifi_password(&uuid, &ssid, &password).and_then(|_| crate::wifi::connect_saved(&uuid).map_err(|e| e.to_string()))
+    } else {
+        crate::wifi::connect_new(&ssid, &password, hidden).map_err(|e| e.to_string())
+    };
+
+    match result {
+        Ok(_) => {
+            tracing::info!("Dashboard: Wi-Fi connect requested ssid='{}'", ssid);
+            let mut body = wifi_status_json(false);
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("message".to_string(), serde_json::Value::String(format!("connected {}", ssid)));
+            }
+            http_json_response(
+                stream,
+                200,
+                &serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":true}"#.to_string()),
+            );
+        }
+        Err(err) => {
+            tracing::warn!("Dashboard: Wi-Fi connect failed ssid='{}': {}", ssid, err);
+            let body = serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "error": err,
+            }))
+            .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+            http_json_response(stream, 500, &body);
+        }
+    }
+}
+
 fn parse_rf_carrier_inhibited(value: &serde_json::Value) -> Result<bool, String> {
     value
         .get("inhibited")
@@ -1265,15 +1568,28 @@ fn serve_rf_carrier_post(stream: TcpStream, rf_cmd_tx: &Arc<Mutex<Option<CmdSend
     }
 
     tracing::warn!("Dashboard: RF carrier {} requested", if inhibited { "inhibit" } else { "enable" });
+    let mut restart_queued = false;
     if !inhibited {
-        tracing::warn!("Dashboard: scheduling service restart after RF carrier enable to reinitialize SDR TX/RX state");
-        crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
+        restart_queued = send_control_cmd(rf_cmd_tx, ControlCommand::RestartService);
+        if restart_queued {
+            tracing::warn!("Dashboard: core service restart queued after RF carrier enable for SDR reinit");
+        } else {
+            tracing::warn!("Dashboard: core service restart was not queued after RF carrier enable");
+        }
+        crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
     }
     let body = serde_json::to_string(&serde_json::json!({
         "ok": true,
         "inhibited": inhibited,
-        "state": if inhibited { "carrier_inhibit_queued" } else { "carrier_enable_restart_queued" },
-        "message": if inhibited { "RF carrier inhibit queued" } else { "RF carrier enable queued; service restart follows for SDR reinit" },
+        "restart_queued": restart_queued,
+        "state": if inhibited { "carrier_inhibit_queued" } else if restart_queued { "carrier_enable_restart_queued" } else { "carrier_enable_queued" },
+        "message": if inhibited {
+            "RF carrier inhibit queued"
+        } else if restart_queued {
+            "RF carrier enable queued; core service restart follows for SDR reinit"
+        } else {
+            "RF carrier enable queued; core restart was not accepted"
+        },
     }))
     .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
     http_json_response(stream, 200, &body);
@@ -1373,24 +1689,29 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         return;
     }
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    crate::rf_calibration::append_log("PHY calibration command queued; waiting for run report from core");
+    let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
     loop {
-        match crate::rf_calibration::current_phase() {
-            crate::rf_calibration::CalibrationPhase::Calibrated => break,
-            crate::rf_calibration::CalibrationPhase::Failed => {
-                schedule_restart_after_rf_calibration("failed calibration");
-                return;
-            }
-            _ if std::time::Instant::now() >= deadline => {
-                crate::rf_calibration::mark_failed("timeout waiting for PHY calibration");
-                schedule_restart_after_rf_calibration("calibration timeout");
-                return;
-            }
-            _ => std::thread::sleep(std::time::Duration::from_millis(250)),
+        if run_report_path.exists() {
+            crate::rf_calibration::mark_calibrated("PHY calibration report available");
+            break;
         }
+        if matches!(
+            crate::rf_calibration::current_phase(),
+            crate::rf_calibration::CalibrationPhase::Failed
+        ) {
+            request_core_restart_after_rf_calibration(&rf_sender, "failed calibration");
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            crate::rf_calibration::mark_failed("timeout waiting for PHY calibration report");
+            request_core_restart_after_rf_calibration(&rf_sender, "calibration timeout");
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
     let report_path = if run_report_path.exists() {
         &run_report_path
     } else {
@@ -1400,37 +1721,51 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String
         Ok(report) => report,
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration run report was not readable after PHY finished: {}", err));
-            schedule_restart_after_rf_calibration("unreadable calibration file");
+            request_core_restart_after_rf_calibration(&rf_sender, "unreadable calibration file");
             return;
         }
     };
     if !report.report.accepted {
         crate::rf_calibration::mark_failed(format!("calibration rejected; config not changed: {}", report.report.summary));
-        schedule_restart_after_rf_calibration("rejected calibration");
+        request_core_restart_after_rf_calibration(&rf_sender, "rejected calibration");
         return;
     }
 
     match enable_tx_calibration_in_config(&config_path) {
         Ok(()) => {
             crate::rf_calibration::mark_restarting("calibration accepted; config.toml updated; restarting service");
-            crate::service_control::schedule_service_action(
-                crate::service_control::ServiceAction::Restart,
-                std::time::Duration::from_secs(2),
-            );
+            request_core_restart_after_rf_calibration(&rf_sender, "accepted calibration");
         }
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration accepted but config update failed: {}", err));
-            schedule_restart_after_rf_calibration("config update failure");
+            request_core_restart_after_rf_calibration(&rf_sender, "config update failure");
         }
     }
 }
 
-fn schedule_restart_after_rf_calibration(reason: &str) {
-    crate::rf_calibration::mark_restarting(format!(
-        "service restart scheduled after {}; full SDR reinit required after destructive calibration",
+fn request_core_restart_after_rf_calibration(sender: &Option<CmdSender>, reason: &str) {
+    let restart_message = format!(
+        "core service restart requested after {}; full SDR reinit required after destructive calibration",
         reason
-    ));
-    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
+    );
+    if matches!(
+        crate::rf_calibration::current_phase(),
+        crate::rf_calibration::CalibrationPhase::Failed
+    ) {
+        crate::rf_calibration::append_log(restart_message);
+    } else {
+        crate::rf_calibration::mark_restarting(restart_message);
+    }
+    let Some(sender) = sender else {
+        crate::rf_calibration::append_log("ERROR: core restart unavailable after calibration; restart nexus-bs.service manually");
+        return;
+    };
+    match sender.try_send(ControlCommand::RestartService) {
+        Ok(()) => crate::rf_calibration::append_log("core restart command queued"),
+        Err(_) => crate::rf_calibration::append_log("ERROR: core restart command queue failed after calibration"),
+    }
+    crate::rf_calibration::append_log("core restart fallback scheduled through systemd");
+    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
 }
 
 fn restore_rf_carrier_after_calibration(rf_sender: &Option<CmdSender>, reason: &str) {
@@ -1550,7 +1885,6 @@ fn handle_connection(
     state: DashboardState,
     clients: WsClients,
     config_path: String,
-    runtime_config_path: Option<String>,
     cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     rf_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     phy_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
@@ -1728,7 +2062,7 @@ fn handle_connection(
                 break;
             }
         }
-        serve_system_info(buf.into_inner(), &config_path, runtime_config_path.as_deref(), bs_started_at);
+        serve_system_info(buf.into_inner(), &config_path, bs_started_at);
     } else if request_matches(&req_line, "GET", "/api/snapshot") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -1758,7 +2092,7 @@ fn handle_connection(
                 break;
             }
         }
-        serve_dashboard_site(buf.into_inner(), &state, &shared_config);
+        serve_dashboard_site(buf.into_inner(), &state, &shared_config, &config_path);
     } else if request_matches(&req_line, "GET", "/api/radioid") {
         let issi = request_query_param(&req_line, "id").and_then(|id| id.parse::<u32>().ok());
         let mut buf = BufReader::new(stream);
@@ -1798,6 +2132,30 @@ fn handle_connection(
     } else if request_matches(&req_line, "GET", "/api/rf/calibration/status") {
         drain_http_headers(&mut stream);
         serve_rf_calibration_status(stream, &config_path);
+    } else if request_matches(&req_line, "GET", "/api/wifi") {
+        drain_http_headers(&mut stream);
+        serve_wifi_status(stream, false);
+    } else if request_matches(&req_line, "POST", "/api/wifi/scan") {
+        drain_http_headers(&mut stream);
+        serve_wifi_status(stream, true);
+    } else if request_matches(&req_line, "POST", "/api/wifi/connect") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
+            }
+        };
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => serve_wifi_connect(buf.into_inner(), &value),
+            Err(e) => http_json_response(
+                buf.into_inner(),
+                400,
+                &serde_json::to_string(&serde_json::json!({"ok": false, "error": format!("invalid JSON: {}", e)}))
+                    .unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            ),
+        }
     } else if request_matches(&req_line, "POST", "/api/logs/clear") {
         drain_http_headers(&mut stream);
         serve_clear_dashboard_logs(stream, &state);
@@ -2416,7 +2774,11 @@ fn gain_map_json(gains: &std::collections::HashMap<String, f64>) -> serde_json::
     )
 }
 
-fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_config::bluestation::SharedConfig>) -> String {
+fn dashboard_site_json(
+    state: &DashboardState,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    config_path: &str,
+) -> String {
     let (calls, last_tx_visual, last_tx_quality, last_sdr_health, last_sys_health, last_health, radio_count, brew_online, brew_version) = {
         let s = state.read().unwrap();
         (
@@ -2431,6 +2793,8 @@ fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_conf
             s.brew_version,
         )
     };
+
+    let active_brew_config = active_profile_brew_json(config_path);
 
     let config = if let Some(shared) = shared_config {
         let cfg = shared.config();
@@ -2542,6 +2906,12 @@ fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_conf
                 "tx_gains": gain_map_json(&s.tx_gains),
                 "frequency_match": frequency_match,
             })),
+            "brew": active_brew_config.or_else(|| cfg.brew.as_ref().map(|brew| serde_json::json!({
+                "configured": true,
+                "host": brew.host,
+                "port": brew.port,
+                "tls": brew.tls,
+            }))),
             "timeslot_owners": timeslot_owners,
             "rf_control": {
                 "carrier_inhibited": carrier_inhibited,
@@ -2608,8 +2978,13 @@ fn dashboard_site_json(state: &DashboardState, shared_config: &Option<tetra_conf
     .unwrap_or_else(|_| r#"{"type":"site","config":{"available":false}}"#.to_string())
 }
 
-fn serve_dashboard_site(stream: TcpStream, state: &DashboardState, shared_config: &Option<tetra_config::bluestation::SharedConfig>) {
-    let body = dashboard_site_json(state, shared_config);
+fn serve_dashboard_site(
+    stream: TcpStream,
+    state: &DashboardState,
+    shared_config: &Option<tetra_config::bluestation::SharedConfig>,
+    config_path: &str,
+) {
+    let body = dashboard_site_json(state, shared_config, config_path);
     http_json_response(stream, 200, &body);
 }
 
@@ -3230,7 +3605,7 @@ fn detect_cpu_descriptor() -> CpuDescriptor {
     )
 }
 
-fn serve_system_info(stream: TcpStream, config_path: &str, runtime_config_path: Option<&str>, bs_started_at: Instant) {
+fn serve_system_info(stream: TcpStream, config_path: &str, bs_started_at: Instant) {
     let product = dashboard_product_identity();
     let hostname = std::process::Command::new("hostname")
         .output()
@@ -3259,6 +3634,11 @@ fn serve_system_info(stream: TcpStream, config_path: &str, runtime_config_path: 
         .parent()
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|| ".".to_string());
+    let active_config_name = read_active_config_marker(config_path).unwrap_or_else(|| active_config_filename(config_path));
+    let active_config_path = std::path::Path::new(&config_dir)
+        .join(&active_config_name)
+        .to_string_lossy()
+        .to_string();
 
     let cpu = detect_cpu_descriptor();
 
@@ -3398,7 +3778,10 @@ fn serve_system_info(stream: TcpStream, config_path: &str, runtime_config_path: 
 
     // Auto-detected SDR name — set by `phy::components::soapy_settings::get_settings()`
     // at stack startup. None if no SoapySDR-backed phy is in use (file backend etc).
-    let sdr_name = crate::phy::components::soapy_settings::detected_sdr_name().unwrap_or_else(|| "unknown".to_string());
+    let sdr_name = crate::phy::components::soapy_settings::detected_sdr_name()
+        .filter(|name| !name.trim().is_empty() && !name.eq_ignore_ascii_case("unknown"))
+        .or_else(|| infer_sdr_name_from_soapy_info(&soapy_info))
+        .unwrap_or_else(|| "unknown".to_string());
 
     let body = serde_json::to_string(&serde_json::json!({
         "hostname": hostname,
@@ -3407,7 +3790,8 @@ fn serve_system_info(stream: TcpStream, config_path: &str, runtime_config_path: 
         "uptime_secs": uptime_secs,
         "os": os_info,
         "config_path": config_path,
-        "runtime_config_path": runtime_config_path.unwrap_or(config_path),
+        "active_config_name": active_config_name,
+        "active_config_path": active_config_path,
         "config_dir": config_dir,
         "product_name": product.name,
         "product_version": product.version,
@@ -3442,6 +3826,23 @@ fn dashboard_product_identity() -> DashboardProductIdentity {
         version: tetra_core::PRODUCT_VERSION,
         version_tag: tetra_core::PRODUCT_VERSION_TAG,
         user_agent: tetra_core::PRODUCT_USER_AGENT,
+    }
+}
+
+fn infer_sdr_name_from_soapy_info(soapy_info: &str) -> Option<String> {
+    let lower = soapy_info.to_lowercase();
+    if lower.contains("driver = sx") || lower.contains("label = sx") || lower.contains("soapysx") {
+        Some("SXceiver".to_string())
+    } else if lower.contains("driver = plutosdr") || lower.contains("adalm-pluto") {
+        Some("ADALM-Pluto".to_string())
+    } else if lower.contains("driver = hackrf") {
+        Some("HackRF".to_string())
+    } else if lower.contains("driver = lime") {
+        Some("LimeSDR".to_string())
+    } else if lower.contains("driver = rtlsdr") {
+        Some("RTL-SDR".to_string())
+    } else {
+        None
     }
 }
 
@@ -3521,6 +3922,34 @@ fn read_active_config_marker(config_path: &str) -> Option<String> {
     let name = validate_config_profile_name(marker.trim()).ok()?;
     let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
     if config_dir.join(&name).is_file() { Some(name) } else { None }
+}
+
+fn active_profile_path(config_path: &str) -> PathBuf {
+    let active_name = read_active_config_marker(config_path).unwrap_or_else(|| active_config_filename(config_path));
+    let config_dir = std::path::Path::new(config_path).parent().unwrap_or(std::path::Path::new("."));
+    config_dir.join(active_name)
+}
+
+fn active_profile_brew_json(config_path: &str) -> Option<serde_json::Value> {
+    let active_path = active_profile_path(config_path);
+    match tetra_config::bluestation::parsing::from_file(&active_path) {
+        Ok(cfg) => cfg.brew.as_ref().map(|brew| {
+            serde_json::json!({
+                "configured": true,
+                "host": brew.host,
+                "port": brew.port,
+                "tls": brew.tls,
+            })
+        }),
+        Err(e) => {
+            tracing::warn!(
+                "Dashboard: failed to read active config '{}' for Brew status: {}",
+                active_path.display(),
+                e
+            );
+            None
+        }
+    }
 }
 
 fn write_active_config_marker(config_path: &str, profile_name: &str) -> Result<(), String> {
@@ -4192,10 +4621,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.71"));
+        assert!(rendered.contains("Nexus-BS v0.1.72"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.71"));
+        assert!(rendered.contains("Nexus-BS/v0.1.72"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -4304,6 +4733,9 @@ mod tests {
             "/api/service/stop-go"
         ));
         assert!(request_matches("POST /api/rf/carrier HTTP/1.1", "POST", "/api/rf/carrier"));
+        assert!(request_matches("GET /api/wifi HTTP/1.1", "GET", "/api/wifi"));
+        assert!(request_matches("POST /api/wifi/scan HTTP/1.1", "POST", "/api/wifi/scan"));
+        assert!(request_matches("POST /api/wifi/connect HTTP/1.1", "POST", "/api/wifi/connect"));
         assert!(request_matches("POST /api/logs/clear HTTP/1.1", "POST", "/api/logs/clear"));
         assert!(request_path_has_prefix(
             "GET /api/configs/profile.toml HTTP/1.1",
@@ -4331,6 +4763,18 @@ mod tests {
         );
         assert!(parse_rf_carrier_inhibited(&json!({})).is_err());
         assert!(parse_rf_carrier_inhibited(&json!({ "inhibited": "true" })).is_err());
+    }
+
+    #[test]
+    fn nmcli_terse_parser_handles_escaped_colons() {
+        assert_eq!(
+            split_nmcli_terse_line(r"yes:Shop\:Office:87:WPA2:wlan0"),
+            vec!["yes", "Shop:Office", "87", "WPA2", "wlan0"]
+        );
+        assert_eq!(
+            split_nmcli_terse_line(r"no:Back\\slash:40::wlan1"),
+            vec!["no", "Back\\slash", "40", "", "wlan1"]
+        );
     }
 
     #[test]
@@ -4576,9 +5020,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.71");
-        assert_eq!(product.version_tag, "v0.1.71");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.71");
+        assert_eq!(product.version, "0.1.72");
+        assert_eq!(product.version_tag, "v0.1.72");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.72");
     }
 
     #[test]
@@ -4653,7 +5097,7 @@ mod tests {
         assert!(snapshot_json.contains("\"last_health\""));
         assert!(snapshot_json.contains("\"overall\""));
 
-        let site_json = dashboard_site_json(&dashboard.state, &None);
+        let site_json = dashboard_site_json(&dashboard.state, &None, "test.toml");
         assert!(site_json.contains("\"health\""));
         assert!(site_json.contains("\"rf_cached\""));
     }
@@ -4824,6 +5268,17 @@ main_carrier = 1
         assert!(updated.contains("tx_calibration_apply_dc = true"));
         assert!(updated.contains("tx_calibration_apply_iq = false"));
         assert!(!updated.contains("tx_calibration_apply_iq = true"));
+    }
+
+    #[test]
+    fn system_info_infers_sxceiver_from_soapy_find_output() {
+        let soapy_info = "\
+Lib Version: v0.8.1
+Found device 0
+  driver = sx
+  label = sx";
+
+        assert_eq!(infer_sdr_name_from_soapy_info(soapy_info).as_deref(), Some("SXceiver"));
     }
 
     #[test]

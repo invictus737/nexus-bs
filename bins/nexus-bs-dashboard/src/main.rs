@@ -4,133 +4,229 @@
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
 use clap::Parser;
-use std::fs;
+use crossbeam_channel::{Receiver, bounded};
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::{Component, Path, PathBuf};
+use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
+use tetra_config::bluestation::{SharedConfig, StackConfig, parsing};
+use tetra_entities::net_control::codec::ControlCodecJson;
+use tetra_entities::net_control::commands::ControlCommand;
+use tetra_entities::net_dashboard::DashboardServer;
+use tetra_entities::net_telemetry::codec::TelemetryCodecJson;
+use tetra_entities::net_telemetry::{TELEMETRY_PROTOCOL_VERSION, select_telemetry_subprotocol};
+use tungstenite::Message;
+use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 
-const HTTP_HEADER_MAX: usize = 64 * 1024;
-const STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
-const CONNECTION_MAX: usize = 128;
-const AUTH_STATUS_RESPONSE_MAX: usize = 16 * 1024;
-const CORE_AUTH_STATUS_TIMEOUT: Duration = Duration::from_millis(500);
-const SECURITY_HEADERS: &str = concat!(
-    "X-Content-Type-Options: nosniff\r\n",
-    "X-Frame-Options: DENY\r\n",
-    "Referrer-Policy: no-referrer\r\n",
-    "Content-Security-Policy: frame-ancestors 'none'; object-src 'none'; base-uri 'none'\r\n",
-);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StaticAuthAccess {
-    Allow,
-    LoginRequired,
-}
+const DASHBOARD_CONTROL_QUEUE_CAPACITY: usize = 2048;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "nexus-bs-dashboard",
     author,
     version,
-    about = "Nexus-BS external dashboard front-end",
-    long_about = "Serves Nexus-BS dashboard assets from a separate process and proxies API/WebSocket traffic to the loopback-only Nexus-BS core dashboard API"
+    about = "Nexus-BS external dashboard/API service",
+    long_about = "Serves the Nexus-BS dashboard API, WebSocket and static assets from a separate process. Runtime telemetry is received from the core over the telemetry link; commands are submitted to nexus-bs-control-service."
 )]
 struct Args {
-    #[arg(long, help = "Public dashboard bind address; default NEXUS_BS_DASHBOARD_BIND or 0.0.0.0")]
-    bind: Option<String>,
-    #[arg(long, help = "Public dashboard port; default NEXUS_BS_DASHBOARD_PORT or 8080")]
-    port: Option<u16>,
-    #[arg(long, help = "Core dashboard API address; default NEXUS_BS_DASHBOARD_CORE or 127.0.0.1:18080")]
-    core: Option<String>,
     #[arg(
         long,
-        help = "Dashboard static asset directory; default NEXUS_BS_DASHBOARD_STATIC_DIR or ./dashboard"
+        help = "Dashboard bind address; default NEXUS_BS_DASHBOARD_BIND or [dashboard].bind or 0.0.0.0"
+    )]
+    bind: Option<String>,
+    #[arg(long, help = "Dashboard port; default NEXUS_BS_DASHBOARD_PORT or [dashboard].port or 8080")]
+    port: Option<u16>,
+    #[arg(
+        long,
+        help = "Persistent config path; default NEXUS_BS_PERSISTENT_CONFIG or /etc/nexus-bs/config.toml"
+    )]
+    config: Option<String>,
+    #[arg(
+        long,
+        help = "Dashboard static asset directory; default NEXUS_BS_DASHBOARD_STATIC_DIR or [dashboard].static_dir or ./dashboard"
     )]
     static_dir: Option<String>,
+    #[arg(
+        long,
+        help = "Telemetry listen address for core connection; default NEXUS_BS_DASHBOARD_TELEMETRY_LISTEN or 127.0.0.1:9001"
+    )]
+    telemetry_listen: Option<String>,
+    #[arg(
+        long,
+        help = "Control-service HTTP command endpoint; default NEXUS_BS_DASHBOARD_CONTROL_URL or http://127.0.0.1:9003/command"
+    )]
+    control_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]
-struct DashboardFrontendConfig {
+struct DashboardRuntimeConfig {
     bind: String,
     port: u16,
-    core: String,
-    static_dir: PathBuf,
+    config_path: String,
+    static_dir: Option<String>,
+    source_dir: Option<String>,
+    auth: Option<(String, String)>,
+    telemetry_listen: String,
+    control_url: String,
 }
 
 fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
         .init();
 
     let args = Args::parse();
-    let config = DashboardFrontendConfig {
+    let config_path = args
+        .config
+        .or_else(|| non_empty_env("NEXUS_BS_PERSISTENT_CONFIG"))
+        .unwrap_or_else(|| "/etc/nexus-bs/config.toml".to_string());
+    let stack_config = load_optional_stack_config(&config_path);
+    let dash_cfg = stack_config.as_ref().and_then(|cfg| cfg.dashboard.clone());
+
+    let runtime = DashboardRuntimeConfig {
         bind: args
             .bind
             .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_BIND"))
+            .or_else(|| dash_cfg.as_ref().map(|cfg| cfg.bind.clone()))
             .unwrap_or_else(|| "0.0.0.0".to_string()),
         port: args
             .port
             .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_PORT").and_then(|value| value.parse::<u16>().ok()))
+            .or_else(|| dash_cfg.as_ref().map(|cfg| cfg.port))
             .unwrap_or(8080),
-        core: args
-            .core
-            .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_CORE"))
-            .unwrap_or_else(|| "127.0.0.1:18080".to_string()),
-        static_dir: PathBuf::from(
-            args.static_dir
-                .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_STATIC_DIR"))
-                .unwrap_or_else(|| "dashboard".to_string()),
-        ),
+        config_path,
+        static_dir: args
+            .static_dir
+            .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_STATIC_DIR"))
+            .or_else(|| dash_cfg.as_ref().and_then(|cfg| cfg.static_dir.clone()))
+            .or_else(|| Some("dashboard".to_string())),
+        source_dir: dash_cfg.as_ref().and_then(|cfg| cfg.source_dir.clone()),
+        auth: dash_cfg.as_ref().and_then(|cfg| match (&cfg.username, &cfg.password) {
+            (Some(user), Some(pass)) => Some((user.clone(), pass.clone())),
+            _ => None,
+        }),
+        telemetry_listen: args
+            .telemetry_listen
+            .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_TELEMETRY_LISTEN"))
+            .unwrap_or_else(|| "127.0.0.1:9001".to_string()),
+        control_url: args
+            .control_url
+            .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_CONTROL_URL"))
+            .unwrap_or_else(|| "http://127.0.0.1:9003/command".to_string()),
     };
 
-    let addr = format!("{}:{}", config.bind, config.port);
-    let listener = match TcpListener::bind(&addr) {
-        Ok(listener) => listener,
-        Err(error) => {
-            tracing::error!("Dashboard front-end failed to bind {}: {}", addr, error);
-            std::process::exit(1);
-        }
-    };
+    let (cmd_tx, cmd_rx) = bounded::<ControlCommand>(DASHBOARD_CONTROL_QUEUE_CAPACITY);
+    start_control_bridge(runtime.control_url.clone(), cmd_rx);
+
+    let mut dashboard = DashboardServer::new(runtime.config_path.clone());
+    dashboard.set_source_dir(runtime.source_dir.clone());
+    dashboard.set_static_dir(runtime.static_dir.clone());
+    dashboard.set_auth(runtime.auth.clone());
+    if let Some(config) = stack_config {
+        dashboard.set_shared_config(SharedConfig::from_parts(config, None));
+    }
+    dashboard.set_cmd_sender(cmd_tx.clone());
+    dashboard.set_rf_cmd_sender(cmd_tx.clone());
+    dashboard.set_phy_cmd_sender(cmd_tx);
+    dashboard.start(&runtime.bind, runtime.port);
+
+    let dashboard = Arc::new(dashboard);
+    start_telemetry_listener(runtime.telemetry_listen.clone(), Arc::clone(&dashboard));
+    start_journal_log_bridge(Arc::clone(&dashboard));
 
     tracing::info!(
-        "Nexus-BS dashboard front-end listening on http://{} (core={}, static_dir={})",
-        addr,
-        config.core,
-        config.static_dir.display()
+        "Nexus-BS external dashboard listening on http://{}:{} (config={}, static_dir={}, telemetry={}, control={})",
+        runtime.bind,
+        runtime.port,
+        runtime.config_path,
+        runtime.static_dir.as_deref().unwrap_or("<embedded>"),
+        runtime.telemetry_listen,
+        runtime.control_url
     );
 
-    let active = Arc::new(AtomicUsize::new(0));
-    let config = Arc::new(config);
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let current = active.fetch_add(1, Ordering::AcqRel);
-        if current >= CONNECTION_MAX {
-            active.fetch_sub(1, Ordering::AcqRel);
-            text_response(stream, 503, "dashboard front-end connection limit reached");
-            continue;
-        }
-
-        let active_for_guard = Arc::clone(&active);
-        let active_for_error = Arc::clone(&active);
-        let config = Arc::clone(&config);
-        if let Err(error) = std::thread::Builder::new().name("dashboard-front-conn".into()).spawn(move || {
-            let _guard = ConnectionGuard(active_for_guard);
-            handle_connection(stream, &config);
-        }) {
-            tracing::warn!("Dashboard front-end failed to spawn connection handler: {}", error);
-            active_for_error.fetch_sub(1, Ordering::AcqRel);
-        }
+    loop {
+        std::thread::park();
     }
 }
 
-struct ConnectionGuard(Arc<AtomicUsize>);
+fn start_journal_log_bridge(dashboard: Arc<DashboardServer>) {
+    let units = non_empty_env("NEXUS_BS_DASHBOARD_JOURNAL_UNITS")
+        .unwrap_or_else(|| "nexus-bs.service,nexus-bs-control.service,nexus-bs-dashboard.service".to_string());
+    std::thread::Builder::new()
+        .name("dashboard-journal-log".into())
+        .spawn(move || {
+            let unit_args: Vec<String> = units
+                .split(',')
+                .map(str::trim)
+                .filter(|unit| !unit.is_empty())
+                .flat_map(|unit| ["-u".to_string(), unit.to_string()])
+                .collect();
+            if unit_args.is_empty() {
+                return;
+            }
+            loop {
+                let mut command = Command::new("journalctl");
+                command
+                    .arg("-f")
+                    .arg("-n")
+                    .arg("120")
+                    .arg("--no-pager")
+                    .args(&unit_args)
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::null());
+                let mut child = match command.spawn() {
+                    Ok(child) => child,
+                    Err(error) => {
+                        dashboard.push_log("WARN", format!("journal log bridge unavailable: {error}"));
+                        std::thread::sleep(Duration::from_secs(15));
+                        continue;
+                    }
+                };
+                let Some(stdout) = child.stdout.take() else {
+                    let _ = child.kill();
+                    std::thread::sleep(Duration::from_secs(15));
+                    continue;
+                };
+                let reader = std::io::BufReader::new(stdout);
+                for line in std::io::BufRead::lines(reader) {
+                    match line {
+                        Ok(line) if !line.trim().is_empty() => {
+                            let level = journal_level_hint(&line);
+                            dashboard.push_log(level, line);
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        })
+        .expect("failed to spawn dashboard journal log bridge");
+}
 
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+fn journal_level_hint(line: &str) -> &'static str {
+    if line.contains(" ERROR ") || line.contains(" error:") || line.contains(" failed") || line.contains("Failed") {
+        "ERROR"
+    } else if line.contains(" WARN ") || line.contains("WARNING") || line.contains(" warning") {
+        "WARN"
+    } else {
+        "INFO"
+    }
+}
+
+fn load_optional_stack_config(path: &str) -> Option<StackConfig> {
+    match parsing::from_file(path) {
+        Ok(config) => Some(config),
+        Err(error) => {
+            tracing::warn!("Dashboard: config '{}' could not be loaded for dashboard settings: {}", path, error);
+            None
+        }
     }
 }
 
@@ -141,306 +237,148 @@ fn non_empty_env(name: &str) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
-fn handle_connection(mut client: TcpStream, config: &DashboardFrontendConfig) {
-    let _ = client.set_read_timeout(Some(Duration::from_secs(3)));
-    let header = match read_http_header(&mut client) {
-        Ok(header) => header,
-        Err(error) => {
-            text_response(client, 400, &error);
-            return;
-        }
-    };
-    let header_text = String::from_utf8_lossy(&header);
-    let req_line = header_text.lines().next().unwrap_or("");
-    let method = request_method(req_line).unwrap_or("");
-    let path = request_path(req_line).unwrap_or_else(|| "/".to_string());
-
-    if is_backend_route(&path) {
-        proxy_to_core(client, header, &config.core);
-        return;
-    }
-
-    if method != "GET" && method != "HEAD" {
-        text_response(client, 405, "method not allowed");
-        return;
-    }
-
-    match authorize_static_request(&header_text, &config.core) {
-        Ok(StaticAuthAccess::Allow) => {}
-        Ok(StaticAuthAccess::LoginRequired) => {
-            if should_redirect_unauthenticated_static(&path) {
-                redirect_response(client, "/login");
-            } else {
-                text_response(client, 401, "Unauthorized - please log in");
+fn start_control_bridge(control_url: String, rx: Receiver<ControlCommand>) {
+    std::thread::Builder::new()
+        .name("dashboard-control-bridge".into())
+        .spawn(move || {
+            let codec = ControlCodecJson;
+            while let Ok(command) = rx.recv() {
+                let body = codec.encode_command(&command);
+                if let Err(error) = post_control_command(&control_url, &body) {
+                    tracing::warn!("Dashboard control command dropped: {}", error);
+                }
             }
-            return;
-        }
-        Err(error) => {
-            tracing::warn!("Dashboard front-end auth status check failed: {}", error);
-            text_response(client, 502, "Nexus-BS core dashboard auth status unavailable");
-            return;
-        }
-    }
-
-    serve_static(client, &config.static_dir, &path, method == "HEAD");
+        })
+        .expect("failed to spawn dashboard control bridge");
 }
 
-fn read_http_header(stream: &mut TcpStream) -> Result<Vec<u8>, String> {
-    let mut header = Vec::with_capacity(2048);
-    let mut byte = [0u8; 1];
-    loop {
-        let n = stream.read(&mut byte).map_err(|_| "failed to read request".to_string())?;
-        if n == 0 {
-            return Err("empty request".to_string());
-        }
-        header.push(byte[0]);
-        if header.len() > HTTP_HEADER_MAX {
-            return Err(format!("request headers too large (max {HTTP_HEADER_MAX} bytes)"));
-        }
-        if header.ends_with(b"\r\n\r\n") {
-            return Ok(header);
-        }
-    }
-}
-
-fn request_method(req_line: &str) -> Option<&str> {
-    req_line.split_whitespace().next()
-}
-
-fn request_path(req_line: &str) -> Option<String> {
-    let target = req_line.split_whitespace().nth(1)?;
-    let path = target.split('?').next().unwrap_or(target);
-    Some(path.to_string())
-}
-
-fn is_backend_route(path: &str) -> bool {
-    path == "/ws" || path == "/login" || path == "/logout" || path.starts_with("/api/")
-}
-
-fn authorize_static_request(headers: &str, core: &str) -> Result<StaticAuthAccess, String> {
-    let mut backend = TcpStream::connect(core).map_err(|error| format!("connect core {core}: {error}"))?;
-    let _ = backend.set_read_timeout(Some(CORE_AUTH_STATUS_TIMEOUT));
-    let _ = backend.set_write_timeout(Some(CORE_AUTH_STATUS_TIMEOUT));
-
+fn post_control_command(url: &str, body: &[u8]) -> Result<(), String> {
+    let (host_port, path) = parse_http_url(url)?;
+    let mut stream = TcpStream::connect(&host_port).map_err(|error| format!("connect {host_port}: {error}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
     let request = format!(
-        "GET /api/auth/status HTTP/1.1\r\nHost: nexus-bs-core\r\nConnection: close\r\n{}\r\n",
-        cookie_headers_for_core(headers)
+        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
     );
-    backend
+    stream
         .write_all(request.as_bytes())
-        .map_err(|error| format!("write auth status request: {error}"))?;
+        .and_then(|_| stream.write_all(body))
+        .map_err(|error| format!("write control request: {error}"))?;
 
     let mut response = Vec::new();
-    backend
-        .take(AUTH_STATUS_RESPONSE_MAX as u64)
+    stream
+        .take(4096)
         .read_to_end(&mut response)
-        .map_err(|error| format!("read auth status response: {error}"))?;
-    parse_auth_status_response(&response)
+        .map_err(|error| format!("read control response: {error}"))?;
+    let status = String::from_utf8_lossy(&response).lines().next().unwrap_or("").to_string();
+    if status.contains(" 200 ") || status.contains(" 202 ") {
+        Ok(())
+    } else {
+        Err(format!("control service rejected command: {status}"))
+    }
 }
 
-fn cookie_headers_for_core(headers: &str) -> String {
-    let mut out = String::new();
-    for line in headers.lines() {
-        if line.to_ascii_lowercase().starts_with("cookie:") {
-            out.push_str(line.trim_end_matches('\r'));
-            out.push_str("\r\n");
+fn parse_http_url(url: &str) -> Result<(String, String), String> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| "only http:// control URLs are supported on localhost".to_string())?;
+    let (host_port, path) = rest.split_once('/').unwrap_or((rest, "command"));
+    if host_port.trim().is_empty() {
+        return Err("control URL host is empty".to_string());
+    }
+    let path = format!("/{}", path.trim_start_matches('/'));
+    Ok((host_port.to_string(), path))
+}
+
+fn start_telemetry_listener(listen: String, dashboard: Arc<DashboardServer>) {
+    std::thread::Builder::new()
+        .name("dashboard-telemetry-listener".into())
+        .spawn(move || {
+            let listener = match TcpListener::bind(&listen) {
+                Ok(listener) => listener,
+                Err(error) => {
+                    tracing::error!("Dashboard telemetry listener failed to bind {}: {}", listen, error);
+                    return;
+                }
+            };
+            tracing::info!("Dashboard telemetry listener on {}", listen);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let dashboard = Arc::clone(&dashboard);
+                        let peer = stream
+                            .peer_addr()
+                            .map(|addr| addr.to_string())
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        std::thread::Builder::new()
+                            .name("dashboard-telemetry-conn".into())
+                            .spawn(move || handle_telemetry_connection(stream, &peer, dashboard))
+                            .ok();
+                    }
+                    Err(error) => tracing::warn!("Dashboard telemetry accept failed: {}", error),
+                }
+            }
+        })
+        .expect("failed to spawn dashboard telemetry listener");
+}
+
+fn handle_telemetry_connection(stream: TcpStream, peer: &str, dashboard: Arc<DashboardServer>) {
+    let callback = |req: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+        let proto = req
+            .headers()
+            .get("Sec-WebSocket-Protocol")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if let Some(selected_protocol) = select_telemetry_subprotocol(proto) {
+            response
+                .headers_mut()
+                .insert("Sec-WebSocket-Protocol", selected_protocol.parse().unwrap());
+            Ok(response)
+        } else {
+            Err(ErrorResponse::new(Some(format!(
+                "unsupported subprotocol; expected {}",
+                TELEMETRY_PROTOCOL_VERSION
+            ))))
         }
-    }
-    out
-}
+    };
 
-fn parse_auth_status_response(response: &[u8]) -> Result<StaticAuthAccess, String> {
-    let text = String::from_utf8_lossy(response);
-    let status = text.lines().next().unwrap_or("");
-    if !status.starts_with("HTTP/1.") || !status.contains(" 200 ") {
-        return Err(format!("unexpected auth status response: {status}"));
-    }
-    let body = text
-        .split_once("\r\n\r\n")
-        .map(|(_, body)| body)
-        .or_else(|| text.split_once("\n\n").map(|(_, body)| body))
-        .ok_or_else(|| "auth status response missing body".to_string())?;
-    let auth_required = json_bool_field(body, "auth_required").ok_or_else(|| "auth_required missing".to_string())?;
-    let session_valid = json_bool_field(body, "session_valid").ok_or_else(|| "session_valid missing".to_string())?;
-
-    if !auth_required || session_valid {
-        Ok(StaticAuthAccess::Allow)
-    } else {
-        Ok(StaticAuthAccess::LoginRequired)
-    }
-}
-
-fn json_bool_field(body: &str, key: &str) -> Option<bool> {
-    let needle = format!("\"{key}\"");
-    let idx = body.find(&needle)?;
-    let after_key = &body[idx + needle.len()..];
-    let colon = after_key.find(':')?;
-    let value = after_key[colon + 1..].trim_start();
-    if value.starts_with("true") {
-        Some(true)
-    } else if value.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn should_redirect_unauthenticated_static(path: &str) -> bool {
-    path == "/" || Path::new(path.trim_start_matches('/')).extension().is_none()
-}
-
-fn proxy_to_core(mut client: TcpStream, header: Vec<u8>, core: &str) {
-    let mut backend = match TcpStream::connect(core) {
-        Ok(stream) => stream,
+    let mut ws = match tungstenite::accept_hdr(stream, callback) {
+        Ok(ws) => ws,
         Err(error) => {
-            tracing::warn!("Dashboard front-end failed to connect core {}: {}", core, error);
-            text_response(client, 502, "Nexus-BS core dashboard API unavailable");
+            tracing::warn!("[{}] telemetry websocket rejected: {}", peer, error);
             return;
         }
     };
-
-    if backend.write_all(&header).is_err() {
-        text_response(client, 502, "failed to forward request to core");
-        return;
-    }
-
-    let Ok(mut client_reader) = client.try_clone() else {
-        text_response(client, 500, "failed to clone client stream");
-        return;
-    };
-    let Ok(mut backend_writer) = backend.try_clone() else {
-        text_response(client, 500, "failed to clone backend stream");
-        return;
-    };
-
-    let uplink = std::thread::Builder::new().name("dashboard-front-uplink".into()).spawn(move || {
-        let _ = std::io::copy(&mut client_reader, &mut backend_writer);
-        let _ = backend_writer.shutdown(Shutdown::Write);
-    });
-
-    let _ = std::io::copy(&mut backend, &mut client);
-    let _ = client.shutdown(Shutdown::Write);
-    if let Ok(join) = uplink {
-        let _ = join.join();
-    }
-}
-
-fn serve_static(mut stream: TcpStream, static_dir: &Path, path: &str, head_only: bool) {
-    let asset = match resolve_static_path(static_dir, path) {
-        Ok(path) => path,
-        Err(status) => {
-            text_response(stream, status, if status == 400 { "bad request" } else { "not found" });
-            return;
-        }
-    };
-
-    let Ok(meta) = fs::metadata(&asset) else {
-        text_response(stream, 404, "not found");
-        return;
-    };
-    if !meta.is_file() {
-        text_response(stream, 404, "not found");
-        return;
-    }
-    if meta.len() > STATIC_FILE_MAX {
-        text_response(stream, 413, "static asset too large");
-        return;
-    }
-
-    let body = if head_only {
-        Vec::new()
-    } else {
-        match fs::read(&asset) {
-            Ok(body) => body,
+    let codec = TelemetryCodecJson;
+    tracing::info!("[{}] telemetry connected", peer);
+    loop {
+        match ws.read() {
+            Ok(Message::Binary(data)) => match codec.decode(&data) {
+                Ok(event) => dashboard.handle_telemetry(event),
+                Err(error) => tracing::warn!("[{}] telemetry decode failed: {}", peer, error),
+            },
+            Ok(Message::Text(text)) => tracing::warn!("[{}] unexpected telemetry text frame ({} bytes)", peer, text.len()),
+            Ok(Message::Ping(_)) => {
+                let _ = ws.flush();
+            }
+            Ok(Message::Pong(_)) => {}
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(tungstenite::Error::ConnectionClosed) => break,
             Err(error) => {
-                text_response(stream, 500, &error.to_string());
-                return;
+                tracing::warn!("[{}] telemetry websocket error: {}", peer, error);
+                break;
             }
         }
-    };
-    let content_len = if head_only { meta.len() as usize } else { body.len() };
-    let header = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {}\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        content_type(&asset),
-        SECURITY_HEADERS,
-        content_len
-    );
-    let _ = stream.write_all(header.as_bytes());
-    if !head_only {
-        let _ = stream.write_all(&body);
     }
 }
 
-fn resolve_static_path(static_dir: &Path, request_path: &str) -> Result<PathBuf, u16> {
-    if request_path == "/" || request_path.is_empty() {
-        return Ok(static_dir.join("index.html"));
-    }
-
-    let trimmed = request_path.trim_start_matches('/');
-    if trimmed.is_empty() {
-        return Ok(static_dir.join("index.html"));
-    }
-
-    let mut relative = PathBuf::new();
-    for component in Path::new(trimmed).components() {
-        match component {
-            Component::Normal(part) => relative.push(part),
-            Component::CurDir => {}
-            _ => return Err(400),
-        }
-    }
-
-    let candidate = static_dir.join(&relative);
-    if candidate.is_file() {
-        return Ok(candidate);
-    }
-    Ok(static_dir.join("index.html"))
-}
-
-fn content_type(path: &Path) -> &'static str {
-    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
-        "html" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" => "application/javascript; charset=utf-8",
-        "json" => "application/json; charset=utf-8",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "ico" => "image/x-icon",
-        _ => "application/octet-stream",
-    }
-}
-
-fn text_response(mut stream: TcpStream, code: u16, body: &str) {
-    let status = match code {
-        200 => "OK",
-        302 => "Found",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        405 => "Method Not Allowed",
-        413 => "Payload Too Large",
-        502 => "Bad Gateway",
-        503 => "Service Unavailable",
-        _ => "Error",
-    };
-    let response = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\n{}Cache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-        code,
-        status,
-        SECURITY_HEADERS,
-        body.len(),
-        body
-    );
-    let _ = stream.write_all(response.as_bytes());
-}
-
-fn redirect_response(mut stream: TcpStream, location: &str) {
-    let response = format!(
-        "HTTP/1.1 302 Found\r\nLocation: {}\r\n{}Cache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        location, SECURITY_HEADERS
-    );
-    let _ = stream.write_all(response.as_bytes());
+#[allow(dead_code)]
+fn ensure_static_dir_path(path: Option<String>) -> Option<String> {
+    path.map(PathBuf::from)
+        .map(|p| p.to_string_lossy().to_string())
+        .filter(|p| !p.is_empty())
 }
 
 #[cfg(test)]
@@ -448,132 +386,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backend_routes_are_proxied_to_core() {
-        assert!(is_backend_route("/api/calls"));
-        assert!(is_backend_route("/api/system"));
-        assert!(is_backend_route("/api/auth/status"));
-        assert!(is_backend_route("/ws"));
-        assert!(is_backend_route("/login"));
-        assert!(!is_backend_route("/"));
-        assert!(!is_backend_route("/assets/app.js"));
+    fn parse_http_control_url_defaults_path_when_absent() {
+        assert_eq!(
+            parse_http_url("http://127.0.0.1:9003").unwrap(),
+            ("127.0.0.1:9003".to_string(), "/command".to_string())
+        );
     }
 
     #[test]
-    fn static_path_rejects_traversal() {
-        let root = Path::new("/tmp/dashboard");
-        assert_eq!(resolve_static_path(root, "/../config.toml").unwrap_err(), 400);
-        assert_eq!(resolve_static_path(root, "/assets/../../config.toml").unwrap_err(), 400);
+    fn parse_http_control_url_keeps_explicit_path() {
+        assert_eq!(
+            parse_http_url("http://127.0.0.1:9003/api/control").unwrap(),
+            ("127.0.0.1:9003".to_string(), "/api/control".to_string())
+        );
     }
 
     #[test]
-    fn auth_status_parser_allows_open_dashboard() {
-        let response = br#"HTTP/1.1 200 OK
-Content-Type: application/json
-
-{"auth_required":false,"session_valid":true}"#;
-
-        assert_eq!(parse_auth_status_response(response).unwrap(), StaticAuthAccess::Allow);
-    }
-
-    #[test]
-    fn auth_status_parser_requires_login_without_session() {
-        let response = br#"HTTP/1.1 200 OK
-Content-Type: application/json
-
-{"auth_required":true,"session_valid":false}"#;
-
-        assert_eq!(parse_auth_status_response(response).unwrap(), StaticAuthAccess::LoginRequired);
-    }
-
-    #[test]
-    fn auth_status_parser_allows_valid_session() {
-        let response = br#"HTTP/1.1 200 OK
-Content-Type: application/json
-
-{"auth_required":true,"session_valid":true}"#;
-
-        assert_eq!(parse_auth_status_response(response).unwrap(), StaticAuthAccess::Allow);
-    }
-
-    #[test]
-    fn auth_status_parser_rejects_malformed_response() {
-        let response = b"HTTP/1.1 200 OK\r\n\r\n{\"auth_required\":true}";
-
-        assert!(parse_auth_status_response(response).is_err());
-    }
-
-    #[test]
-    fn unauthenticated_static_redirect_policy_separates_pages_from_assets() {
-        assert!(should_redirect_unauthenticated_static("/"));
-        assert!(should_redirect_unauthenticated_static("/traffic"));
-        assert!(!should_redirect_unauthenticated_static("/assets/app.js"));
-        assert!(!should_redirect_unauthenticated_static("/favicon.ico"));
-    }
-
-    #[test]
-    fn cookie_headers_forward_only_cookie_to_core_auth_probe() {
-        let headers = "GET / HTTP/1.1\r\nHost: example\r\nCookie: fs_session=abc; fs_auth=1\r\nX-Test: no\r\n\r\n";
-
-        let forwarded = cookie_headers_for_core(headers);
-
-        assert_eq!(forwarded, "Cookie: fs_session=abc; fs_auth=1\r\n");
-    }
-
-    #[test]
-    fn frontend_security_headers_lock_down_static_responses() {
-        assert!(SECURITY_HEADERS.contains("X-Content-Type-Options: nosniff"));
-        assert!(SECURITY_HEADERS.contains("X-Frame-Options: DENY"));
-        assert!(SECURITY_HEADERS.contains("frame-ancestors 'none'"));
-    }
-
-    fn spawn_fake_core_auth_status(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake core");
-        let addr = listener.local_addr().expect("fake core addr").to_string();
-        let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept fake core request");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("set fake core read timeout");
-            let mut request = Vec::new();
-            let mut byte = [0u8; 1];
-            while stream.read(&mut byte).expect("read fake core request") != 0 {
-                request.push(byte[0]);
-                if request.ends_with(b"\r\n\r\n") {
-                    break;
-                }
-            }
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                body.len(),
-                body
-            );
-            stream.write_all(response.as_bytes()).expect("write fake core response");
-            String::from_utf8_lossy(&request).to_string()
-        });
-        (addr, handle)
-    }
-
-    #[test]
-    fn split_frontend_auth_probe_allows_when_core_accepts_session() {
-        let (core, handle) = spawn_fake_core_auth_status(r#"{"auth_required":true,"session_valid":true}"#);
-        let headers = "GET / HTTP/1.1\r\nHost: dashboard\r\nCookie: fs_session=abc; fs_auth=1\r\nX-Ignore: no\r\n\r\n";
-
-        let access = authorize_static_request(headers, &core).expect("auth probe should parse");
-        let request = handle.join().expect("fake core should return request");
-
-        assert_eq!(access, StaticAuthAccess::Allow);
-        assert!(request.starts_with("GET /api/auth/status HTTP/1.1"));
-        assert!(request.contains("Cookie: fs_session=abc; fs_auth=1\r\n"));
-        assert!(!request.contains("X-Ignore"));
-    }
-
-    #[test]
-    fn split_frontend_auth_probe_blocks_when_core_requires_login() {
-        let (core, handle) = spawn_fake_core_auth_status(r#"{"auth_required":true,"session_valid":false}"#);
-
-        let access = authorize_static_request("GET / HTTP/1.1\r\nHost: dashboard\r\n\r\n", &core).expect("auth probe should parse");
-        let _ = handle.join().expect("fake core should complete");
-
-        assert_eq!(access, StaticAuthAccess::LoginRequired);
+    fn parse_http_control_url_rejects_tls_for_local_bridge() {
+        assert!(parse_http_url("https://127.0.0.1:9003/command").is_err());
     }
 }

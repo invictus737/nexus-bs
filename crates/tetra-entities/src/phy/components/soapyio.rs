@@ -652,6 +652,13 @@ impl SoapyIo {
                     &reference_meas,
                     &mut timing,
                 )?
+            } else if dc_best != TxCalibrationCoefficients::default() {
+                tracing::warn!(
+                    "SoapySDR: TX calibration rejected candidate dc=({:+.5},{:+.5}) will be reported for diagnostics but not applied",
+                    dc_best.dc_i,
+                    dc_best.dc_q
+                );
+                (CalibrationConfirmation::default(), dc_best_meas)
             } else {
                 tracing::warn!("SoapySDR: TX calibration found no safe candidate; preserving neutral reference as final report");
                 (CalibrationConfirmation::default(), reference_meas)
@@ -743,7 +750,16 @@ impl SoapyIo {
                 },
                 limits,
                 reference: reference_meas.into_point("neutral_no_calibration", neutral),
-                calibrated: final_meas.into_point("applied_candidate", applied),
+                calibrated: final_meas.into_point(
+                    if accepted {
+                        "applied_candidate"
+                    } else if applied == TxCalibrationCoefficients::default() && dc_best != TxCalibrationCoefficients::default() {
+                        "rejected_dc_candidate"
+                    } else {
+                        "neutral_no_safe_candidate"
+                    },
+                    if accepted { applied } else { dc_best },
+                ),
                 applied,
                 report: TxCalibrationReport {
                     carrier_leakage_improvement_db: carrier_improvement,

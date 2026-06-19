@@ -407,6 +407,11 @@ impl<D: RxTxDev> PhyBs<D> {
                             crate::rf_calibration::mark_failed(err);
                         }
                     }
+                    tracing::warn!("PHY: scheduling core restart after destructive TX DC/IQ calibration");
+                    crate::service_control::force_process_restart_after(
+                        std::time::Duration::from_secs(2),
+                        "destructive TX DC/IQ calibration completed",
+                    );
                 }
                 other => tracing::warn!("PHY: ignoring unsupported control command {:?}", other),
             }

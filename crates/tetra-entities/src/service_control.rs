@@ -238,6 +238,23 @@ pub fn schedule_service_action(action: ServiceAction, delay: Duration) {
         .ok();
 }
 
+pub fn force_process_restart_after(delay: Duration, reason: &'static str) {
+    tracing::warn!(
+        "Service control: forcing process restart with exit code {} in {:?}: {}",
+        RESTART_EXIT_CODE,
+        delay,
+        reason
+    );
+    std::thread::Builder::new()
+        .name("service-force-restart".into())
+        .spawn(move || {
+            std::thread::sleep(delay);
+            tracing::warn!("Service control: exiting process for forced restart: {}", reason);
+            std::process::exit(RESTART_EXIT_CODE);
+        })
+        .ok();
+}
+
 pub fn resolve_service_unit() -> String {
     if let Ok(value) = std::env::var(SERVICE_UNIT_ENV) {
         if let Some(unit) = normalize_service_unit(&value) {

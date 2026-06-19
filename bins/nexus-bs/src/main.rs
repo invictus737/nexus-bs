@@ -4,7 +4,6 @@
 // SPDX-FileComment: Modified by Nexus-BS Project; see CHANGES-NEXUS.md for change notices.
 
 use clap::Parser;
-use crossbeam_channel;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,7 +19,6 @@ use tetra_core::{PRODUCT_NAME, PRODUCT_USER_AGENT, PRODUCT_VERSION_TAG, TdmaTime
 use tetra_entities::MessageRouter;
 use tetra_entities::net_brew::entity::BrewEntity;
 use tetra_entities::net_brew::new_websocket_transport;
-use tetra_entities::net_dashboard::DashboardServer;
 use tetra_entities::net_telemetry::worker::TelemetryWorker;
 use tetra_entities::net_telemetry::{
     TELEMETRY_HEARTBEAT_INTERVAL, TELEMETRY_HEARTBEAT_TIMEOUT, TELEMETRY_PROTOCOL_VERSION, TelemetrySource, telemetry_channel,
@@ -36,8 +34,6 @@ use tetra_entities::{
     sndcp::sndcp_bs::Sndcp,
     umac::umac_bs::UmacBs,
 };
-
-const DASHBOARD_LOG_CHANNEL_CAPACITY: usize = 2048;
 
 /// Result of loading config — either primary or fallback.
 enum ConfigLoadResult {
@@ -84,39 +80,6 @@ fn load_config_with_fallback(cfg_path: &str) -> ConfigLoadResult {
             }
         }
     }
-}
-
-fn dashboard_editable_config_path(runtime_config_path: &str) -> String {
-    std::env::var("NEXUS_BS_PERSISTENT_CONFIG")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| runtime_config_path.to_string())
-}
-
-fn dashboard_static_dir(config_static_dir: Option<String>) -> Option<String> {
-    config_static_dir.or_else(|| {
-        std::env::var("NEXUS_BS_DASHBOARD_STATIC_DIR")
-            .ok()
-            .map(|v| v.trim().to_string())
-            .filter(|v| !v.is_empty())
-    })
-}
-
-fn dashboard_core_bind(config_bind: String) -> String {
-    std::env::var("NEXUS_BS_CORE_DASHBOARD_BIND")
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-        .unwrap_or(config_bind)
-}
-
-fn dashboard_core_port(config_port: u16) -> u16 {
-    std::env::var("NEXUS_BS_CORE_DASHBOARD_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .unwrap_or(config_port)
 }
 
 fn start_telemetry_worker(cfg: SharedConfig, telemetry_source: TelemetrySource) -> thread::JoinHandle<()> {
@@ -189,8 +152,8 @@ fn start_control_worker(cfg: SharedConfig, command_dispatchers: HashMap<TetraEnt
 fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySource>, HashMap<TetraEntity, CommandDispatcher>) {
     let mut router = MessageRouter::new(cfg.clone());
 
-    // Build telemetry sink/source — always create if either telemetry or dashboard is enabled
-    let needs_telemetry = cfg.config().telemetry.is_some() || cfg.config().dashboard.is_some();
+    // Build telemetry sink/source only for the external telemetry/dashboard link.
+    let needs_telemetry = cfg.config().telemetry.is_some();
     let (tsink, tsource) = if needs_telemetry {
         let (a, b) = telemetry_channel();
         (Some(a), Some(b))
@@ -328,15 +291,6 @@ fn main() {
     stack_state.subscriber_recovery_path = Some(format!("{}.subscribers", args.config));
     let mut cfg = SharedConfig::from_parts(stack_cfg, Some(stack_state));
 
-    // If dashboard is enabled, set up log capture channel BEFORE logging initialises
-    let dashboard_log_rx = if cfg.config().dashboard.is_some() {
-        let (tx, rx) = crossbeam_channel::bounded::<(String, String)>(DASHBOARD_LOG_CHANNEL_CAPACITY);
-        debug::set_dashboard_log_sender(tx);
-        Some(rx)
-    } else {
-        None
-    };
-
     let _log_guards = debug::setup_logging_default(cfg.config().debug_log.clone());
 
     // Apply explicit systemd service name from config, if provided.
@@ -359,135 +313,11 @@ fn main() {
 
     let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);
 
-    // Start Telemetry and Control threads, if enabled
-    // If dashboard is also enabled, tee the telemetry events to both.
+    // Start external Telemetry and Control threads, if enabled. The dashboard
+    // API now runs only in nexus-bs-dashboard; core never binds an HTTP
+    // dashboard listener.
     if let Some(telemetry_source) = tsource {
-        let has_telemetry_server = cfg.config().telemetry.is_some();
-        let has_dashboard = cfg.config().dashboard.is_some();
-
-        if has_dashboard {
-            let mut dash_cfg = cfg.config().dashboard.clone().unwrap();
-            dash_cfg.bind = dashboard_core_bind(dash_cfg.bind);
-            dash_cfg.port = dashboard_core_port(dash_cfg.port);
-            let editable_config_path = dashboard_editable_config_path(&args.config);
-            if editable_config_path != args.config {
-                tracing::info!(
-                    "Dashboard: editing persistent config '{}' while core runs runtime config '{}'",
-                    editable_config_path,
-                    args.config
-                );
-            }
-            let mut dashboard = DashboardServer::new(editable_config_path);
-            dashboard.set_runtime_config_path(args.config.clone());
-
-            // Propagate optional source_dir override for OTA updates.
-            dashboard.set_source_dir(dash_cfg.source_dir.clone());
-            dashboard.set_static_dir(dashboard_static_dir(dash_cfg.static_dir.clone()));
-
-            // Propagate optional HTTP Basic Auth credentials.
-            if let (Some(user), Some(pass)) = (dash_cfg.username.clone(), dash_cfg.password.clone()) {
-                tracing::info!("Dashboard: HTTP Basic Auth enabled (user: {})", user);
-                dashboard.set_auth(Some((user, pass)));
-            }
-
-            // Propagate SharedConfig so the dashboard can read live SDS queue state.
-            dashboard.set_shared_config(cfg.clone());
-
-            // Create control links so dashboard can send ordinary commands to
-            // CMCE and RF carrier lifecycle commands directly to MM.
-            let dash_cmd_tx = {
-                use tetra_core::tetra_entities::TetraEntity;
-                cdispatchers.get(&TetraEntity::Cmce).map(|d| d.clone_sender())
-            };
-            let dash_rf_cmd_tx = {
-                use tetra_core::tetra_entities::TetraEntity;
-                cdispatchers.get(&TetraEntity::Mm).map(|d| d.clone_sender())
-            };
-            let dash_phy_cmd_tx = {
-                use tetra_core::tetra_entities::TetraEntity;
-                cdispatchers.get(&TetraEntity::Phy).map(|d| d.clone_sender())
-            };
-
-            if let Some(tx) = dash_cmd_tx {
-                dashboard.set_cmd_sender(tx);
-            }
-            if let Some(tx) = dash_rf_cmd_tx {
-                dashboard.set_rf_cmd_sender(tx);
-            }
-            if let Some(tx) = dash_phy_cmd_tx {
-                dashboard.set_phy_cmd_sender(tx);
-            }
-
-            // start() must be called before Arc::new() because it takes &mut self
-            dashboard.start(&dash_cfg.bind, dash_cfg.port);
-            eprintln!(" -> Dashboard enabled on http://{}:{}", dash_cfg.bind, dash_cfg.port);
-
-            // If we started on fallback config, tell the dashboard to show the warning banner.
-            if let Some((ref fb_path, ref fb_reason)) = fallback_info {
-                let reason = format!(
-                    "Primary config '{}' failed to load: {}. Running on fallback '{}'.",
-                    args.config, fb_reason, fb_path
-                );
-                tracing::warn!("{}", reason);
-                dashboard.set_fallback_config(reason);
-            }
-
-            let dashboard = std::sync::Arc::new(dashboard);
-            let dash_clone = std::sync::Arc::clone(&dashboard);
-
-            // Forward log entries to dashboard
-            if let Some(log_rx) = dashboard_log_rx {
-                let dash_log = std::sync::Arc::clone(&dashboard);
-                thread::Builder::new()
-                    .name("dashboard-log".into())
-                    .spawn(move || {
-                        while let Ok((level, msg)) = log_rx.recv() {
-                            // Filter out debug/trace noise from dashboard log tab
-                            if level == "DEBUG" || level == "TRACE" {
-                                continue;
-                            }
-                            // Filter out TDMA tick noise — thousands per second
-                            if msg.contains("tick dl") || msg.contains("tick ul") || msg.starts_with("--- tick") {
-                                continue;
-                            }
-                            dash_log.push_log(&level, msg);
-                        }
-                    })
-                    .expect("failed to spawn dashboard-log thread");
-            }
-
-            if has_telemetry_server {
-                let cfg2 = cfg.clone();
-                let (tee_sink, tee_source) = telemetry_channel();
-                thread::Builder::new()
-                    .name("telemetry-tee".into())
-                    .spawn(move || {
-                        loop {
-                            match telemetry_source.recv() {
-                                Some(event) => {
-                                    dash_clone.handle_telemetry(event.clone());
-                                    let _ = tee_sink.send(event);
-                                }
-                                None => break,
-                            }
-                        }
-                    })
-                    .expect("failed to spawn telemetry-tee thread");
-                start_telemetry_worker(cfg2, tee_source);
-            } else {
-                thread::Builder::new()
-                    .name("telemetry-dash".into())
-                    .spawn(move || {
-                        loop {
-                            match telemetry_source.recv() {
-                                Some(event) => dash_clone.handle_telemetry(event),
-                                None => break,
-                            }
-                        }
-                    })
-                    .expect("failed to spawn telemetry-dash thread");
-            }
-        } else if has_telemetry_server {
+        if cfg.config().telemetry.is_some() {
             start_telemetry_worker(cfg.clone(), telemetry_source);
         }
     };

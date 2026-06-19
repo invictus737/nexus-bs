@@ -9,6 +9,7 @@ cd "$ROOT"
 
 REMOTE="${REMOTE:-chris@192.168.1.179}"
 REMOTE_BASE="${REMOTE_BASE:-/home/chris/nexus-bs}"
+INSTALL_PREFIX="${INSTALL_PREFIX:-/opt/nexus-bs}"
 REMOTE_SERVICE="${REMOTE_SERVICE:-nexus-bs.service}"
 REMOTE_CONTROL_SERVICE="${REMOTE_CONTROL_SERVICE:-nexus-bs-control.service}"
 REMOTE_DASHBOARD_SERVICE="${REMOTE_DASHBOARD_SERVICE:-nexus-bs-dashboard.service}"
@@ -41,6 +42,7 @@ dashboard_sha="$(shasum -a 256 "$DASHBOARD_BIN" | awk '{print $1}')"
 commit="$(git rev-parse --short=8 HEAD)"
 
 ssh $SSH_OPTS "$REMOTE" "timeout 12s sh -lc '
+sudo -n systemctl daemon-reload || true
 sudo -n systemctl stop \"$REMOTE_DASHBOARD_SERVICE\" || true
 sudo -n systemctl stop \"$REMOTE_SERVICE\"
 sudo -n systemctl stop \"$REMOTE_CONTROL_SERVICE\"
@@ -84,10 +86,25 @@ ssh $SSH_OPTS "$REMOTE" "timeout 15s sh -lc '
 chmod 755 \"$REMOTE_BASE/nexus-bs\"
 chmod 755 \"$REMOTE_BASE/nexus-bs-control-service\"
 chmod 755 \"$REMOTE_BASE/nexus-bs-dashboard\"
+sudo -n install -d -m 0755 \"$INSTALL_PREFIX/bin\" \"$INSTALL_PREFIX/dashboard/assets\"
+sudo -n install -m 0755 \"$REMOTE_BASE/nexus-bs\" \"$INSTALL_PREFIX/bin/nexus-bs\"
+sudo -n install -m 0755 \"$REMOTE_BASE/nexus-bs-control-service\" \"$INSTALL_PREFIX/bin/nexus-bs-control-service\"
+sudo -n install -m 0755 \"$REMOTE_BASE/nexus-bs-dashboard\" \"$INSTALL_PREFIX/bin/nexus-bs-dashboard\"
+sudo -n install -m 0644 \"$REMOTE_BASE/dashboard/index.html\" \"$INSTALL_PREFIX/dashboard/index.html\"
+sudo -n install -m 0644 \"$REMOTE_BASE/dashboard/assets/app.js\" \"$INSTALL_PREFIX/dashboard/assets/app.js\"
+sudo -n install -m 0644 \"$REMOTE_BASE/dashboard/assets/styles.css\" \"$INSTALL_PREFIX/dashboard/assets/styles.css\"
+sudo -n install -m 0644 \"$REMOTE_BASE/dashboard/assets/nexus-bs-logo.svg\" \"$INSTALL_PREFIX/dashboard/assets/nexus-bs-logo.svg\"
 sudo -n install -m 0644 /tmp/nexus-bs.service /etc/systemd/system/nexus-bs.service
 sudo -n install -m 0644 /tmp/nexus-bs-control.service /etc/systemd/system/nexus-bs-control.service
 sudo -n install -m 0644 /tmp/nexus-bs-dashboard.service /etc/systemd/system/nexus-bs-dashboard.service
-sudo -n sed -i -E \"s/^[[:space:]]*service_name[[:space:]]*=.*/service_name = \\\"nexus-bs.service\\\"/\" /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback
+for cfg in /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback; do
+    if [ -f \"\$cfg\" ]; then
+        sudo -n sed -i -E \"s/^[[:space:]]*service_name[[:space:]]*=.*/service_name = \\\"nexus-bs.service\\\"/\" \"\$cfg\"
+        if ! sudo -n grep -q \"^\\[telemetry\\]\" \"\$cfg\"; then
+            printf \"\\n[telemetry]\\nhost = \\\"127.0.0.1\\\"\\nport = 9001\\nuse_tls = false\\n\" | sudo -n tee -a \"\$cfg\" >/dev/null
+        fi
+    fi
+done
 sudo -n systemctl daemon-reload
 sudo -n systemctl restart --no-block \"$REMOTE_CONTROL_SERVICE\"
 sudo -n systemctl restart --no-block \"$REMOTE_SERVICE\"

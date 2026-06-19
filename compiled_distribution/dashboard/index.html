@@ -30,7 +30,7 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
       <div class="rail-status" aria-label="Live status">
         <div class="status-line"><span>Console</span><strong id="railConsoleState">START</strong></div>
-        <div class="status-line"><span>Telemetry</span><strong id="railTelemetryState">SYNC</strong></div>
+        <div class="status-line"><span>Network</span><strong id="railTelemetryState">SYNC</strong></div>
       </div>
     </aside>
 
@@ -69,10 +69,10 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
             <strong id="brewState">OFFLINE</strong>
             <small>Brew and local routing state</small>
           </div>
-          <div class="strip-cell" id="telemetryStatusStrip">
-            <span>Telemetry</span>
-            <strong id="systemTelemetryState">SYNC</strong>
-            <small>Snapshot and WebSocket feeds</small>
+          <div class="strip-cell" id="networkStatusStrip">
+            <span>Network</span>
+            <strong id="networkCoreState">LOCAL</strong>
+            <small id="networkCoreHint">Core routing identity</small>
           </div>
         </section>
 
@@ -169,8 +169,8 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
               <dt>Temperature</dt><dd id="cpuTemp">--</dd>
               <dt>BS Uptime</dt><dd id="bsUptime">--</dd>
               <dt>Host Uptime</dt><dd id="hostUptime">--</dd>
-              <dt>Config</dt><dd id="configPath">--</dd>
-              <dt>Runtime Config</dt><dd id="runtimeConfigPath">--</dd>
+              <dt>Active Config</dt><dd id="activeConfigPath">--</dd>
+              <dt>Config Store</dt><dd id="configPath">--</dd>
             </dl>
           </section>
 
@@ -310,6 +310,47 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
               <button class="action-btn danger" id="calibrationRunBtn" type="button">Calibrate TX DC/IQ</button>
               <span id="calibrationActionStatus">traffic outage required</span>
               <pre id="calibrationLog" class="calibration-log"></pre>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel wifi-panel" id="wifiPanel">
+          <div class="panel-head">
+            <h2>Wi-Fi</h2>
+            <div class="panel-actions">
+              <button class="action-btn secondary compact" id="wifiScanBtn" type="button">Scan</button>
+              <button class="action-btn secondary compact" id="wifiClearBtn" type="button">Clear list</button>
+              <span id="wifiStatus">loading</span>
+            </div>
+          </div>
+          <div class="wifi-grid">
+            <div class="wifi-list" id="wifiNetworkList"></div>
+            <div class="wifi-form">
+              <dl class="facts compact-facts">
+                <dt>Device</dt><dd id="wifiDevice">--</dd>
+                <dt>State</dt><dd id="wifiState">--</dd>
+                <dt>Current</dt><dd id="wifiCurrent">--</dd>
+              </dl>
+              <label class="field">
+                <span>SSID</span>
+                <input id="wifiSsid" type="text" autocomplete="off" spellcheck="false">
+              </label>
+              <label class="field">
+                <span>Password</span>
+                <input id="wifiPassword" type="password" autocomplete="new-password">
+              </label>
+              <label class="check-field">
+                <input id="wifiShowPassword" type="checkbox">
+                <span>Show password</span>
+              </label>
+              <label class="check-field">
+                <input id="wifiHidden" type="checkbox">
+                <span>Hidden network</span>
+              </label>
+              <div class="wifi-actions">
+                <button class="action-btn primary" id="wifiConnectBtn" type="button">Save &amp; Connect</button>
+                <span id="wifiActionStatus">idle</span>
+              </div>
             </div>
           </div>
         </section>

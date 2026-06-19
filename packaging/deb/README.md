@@ -68,7 +68,7 @@ then prints service status and logs:
 
 ```sh
 cd /tmp
-curl -fL -o nexus-bs_0.1.71_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.71/nexus-bs_0.1.71_arm64.deb
+curl -fL -o nexus-bs_0.1.72_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.72/nexus-bs_0.1.72_arm64.deb
 curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/main/scripts/tetrahs-reinstall-nexus-bs.sh
 sudo bash /tmp/nexus-bs-reinstall.sh
 ```

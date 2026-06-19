@@ -16,9 +16,10 @@
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, bounded};
@@ -33,6 +34,8 @@ use tungstenite::Message;
 use tungstenite::handshake::server::{ErrorResponse, Request, Response};
 
 const CONTROL_CLI_CLIENT_QUEUE_CAPACITY: usize = 1024;
+const CONTROL_HTTP_BODY_MAX: usize = 512 * 1024;
+const CONTROL_HTTP_HEADER_MAX: usize = 16 * 1024;
 
 #[derive(Parser)]
 #[command(name = "nexus-bs-control", version, about = "Nexus-BS TETRA control service")]
@@ -40,6 +43,10 @@ struct Args {
     /// Listen address (host:port)
     #[arg(short, long, default_value = "127.0.0.1:9002")]
     listen: String,
+
+    /// Local HTTP endpoint used by nexus-bs-dashboard to submit JSON encoded commands.
+    #[arg(long, default_value = "127.0.0.1:9003")]
+    command_listen: String,
 
     /// Path to PEM-encoded server certificate chain for TLS
     #[arg(long)]
@@ -161,6 +168,24 @@ static HANDLE_COUNTER: AtomicU32 = AtomicU32::new(1);
 
 fn next_handle() -> u32 {
     HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+fn dispatch_command(clients: &ClientRegistry, cmd: ControlCommand) -> u32 {
+    let registry = clients.lock().unwrap();
+    if registry.is_empty() {
+        warn!("no connected base stations — command dropped");
+        return 0;
+    }
+    let mut delivered = 0u32;
+    for (id, tx) in registry.iter() {
+        if tx.try_send(cmd.clone()).is_ok() {
+            delivered += 1;
+        } else {
+            warn!("client {} command queue full or closed", id);
+        }
+    }
+    info!("command dispatched to {} client(s)", delivered);
+    delivered
 }
 
 /// Parse a single stdin line into a [`ControlCommand`].
@@ -611,24 +636,147 @@ fn spawn_stdin_reader(clients: ClientRegistry) {
                 }
             };
             if let Some(cmd) = parse_command(&line) {
-                let registry = clients.lock().unwrap();
-                if registry.is_empty() {
-                    warn!("no connected base stations — command dropped");
-                    continue;
-                }
-                let mut delivered = 0u32;
-                for (id, tx) in registry.iter() {
-                    if tx.try_send(cmd.clone()).is_ok() {
-                        delivered += 1;
-                    } else {
-                        warn!("client {} command queue full or closed", id);
-                    }
-                }
-                info!("command dispatched to {} client(s)", delivered);
+                dispatch_command(&clients, cmd);
             }
         }
         info!("stdin closed");
     });
+}
+
+fn spawn_http_command_listener(listen: String, clients: ClientRegistry) {
+    std::thread::Builder::new()
+        .name("control-http-command".into())
+        .spawn(move || {
+            let listener = TcpListener::bind(&listen).unwrap_or_else(|e| {
+                error!("Failed to bind dashboard command endpoint {}: {}", listen, e);
+                std::process::exit(1);
+            });
+            info!("Dashboard command endpoint listening on http://{}/command", listen);
+            for stream in listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        let clients = Arc::clone(&clients);
+                        std::thread::spawn(move || handle_http_command(stream, clients));
+                    }
+                    Err(e) => warn!("dashboard command accept failed: {}", e),
+                }
+            }
+        })
+        .expect("failed to spawn dashboard command endpoint");
+}
+
+fn handle_http_command(mut stream: TcpStream, clients: ClientRegistry) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
+    let (header, body_start) = match read_http_request_head(&mut stream) {
+        Ok(parts) => parts,
+        Err(error) => {
+            http_text_response(stream, 400, &error);
+            return;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&header);
+    let request_line = header_text.lines().next().unwrap_or("");
+    if !request_line.starts_with("POST /command ") && !request_line.starts_with("POST /api/control ") {
+        http_text_response(stream, 404, "not found");
+        return;
+    }
+    let content_length = match content_length(&header_text) {
+        Some(len) if len <= CONTROL_HTTP_BODY_MAX => len,
+        Some(_) => {
+            http_text_response(stream, 413, "command body too large");
+            return;
+        }
+        None => {
+            http_text_response(stream, 411, "content-length required");
+            return;
+        }
+    };
+    let mut body = body_start;
+    if body.len() > content_length {
+        body.truncate(content_length);
+    }
+    while body.len() < content_length {
+        let mut chunk = [0u8; 4096];
+        let n = match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => {
+                http_text_response(stream, 400, "failed to read request body");
+                return;
+            }
+        };
+        body.extend_from_slice(&chunk[..n]);
+    }
+    if body.len() != content_length {
+        http_text_response(stream, 400, "incomplete request body");
+        return;
+    }
+
+    let codec = ControlCodecJson;
+    let command = match codec.decode_command(&body) {
+        Ok(command) => command,
+        Err(error) => {
+            http_text_response(stream, 400, &format!("invalid command JSON: {error}"));
+            return;
+        }
+    };
+    let delivered = dispatch_command(&clients, command);
+    if delivered == 0 {
+        http_text_response(stream, 503, "no connected base station");
+    } else {
+        http_text_response(stream, 202, "accepted");
+    }
+}
+
+fn read_http_request_head(stream: &mut TcpStream) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let mut request = Vec::with_capacity(2048);
+    let mut byte = [0u8; 1];
+    loop {
+        let n = stream.read(&mut byte).map_err(|_| "failed to read request".to_string())?;
+        if n == 0 {
+            return Err("empty request".to_string());
+        }
+        request.push(byte[0]);
+        if request.len() > CONTROL_HTTP_HEADER_MAX {
+            return Err("request headers too large".to_string());
+        }
+        if let Some(pos) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+            let body_start = request.split_off(pos + 4);
+            return Ok((request, body_start));
+        }
+    }
+}
+
+fn content_length(headers: &str) -> Option<usize> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if name.eq_ignore_ascii_case("content-length") {
+            value.trim().parse::<usize>().ok()
+        } else {
+            None
+        }
+    })
+}
+
+fn http_text_response(mut stream: TcpStream, status: u16, body: &str) {
+    let reason = match status {
+        202 => "Accepted",
+        400 => "Bad Request",
+        404 => "Not Found",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        503 => "Service Unavailable",
+        _ => "OK",
+    };
+    let response = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status,
+        reason,
+        body.len(),
+        body
+    );
+    let _ = stream.write_all(response.as_bytes());
 }
 
 fn main() {
@@ -651,6 +799,7 @@ fn main() {
     let next_client_id = Arc::new(AtomicU32::new(0));
 
     spawn_stdin_reader(Arc::clone(&clients));
+    spawn_http_command_listener(args.command_listen.clone(), Arc::clone(&clients));
 
     let tls_config = match (&args.cert, &args.key) {
         (Some(cert_path), Some(key_path)) => Some(build_tls_config(cert_path, key_path)),

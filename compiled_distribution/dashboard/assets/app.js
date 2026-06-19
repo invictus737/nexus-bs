@@ -28,6 +28,7 @@ const state = {
   snapshotInflight: false,
   callsInflight: false,
   siteInflight: false,
+  siteReloadingUntilMs: 0,
   callsPayloadKey: "",
   configProfiles: [],
   configProfilesLoaded: false,
@@ -38,8 +39,15 @@ const state = {
   configEditorStatus: "idle",
   configBusy: false,
   rfCarrierBusy: false,
+  rfCarrierPendingInhibited: null,
+  rfCarrierPendingUntilMs: 0,
   calibration: null,
   calibrationBusy: false,
+  wifi: null,
+  wifiBusy: false,
+  wifiSelectedSsid: "",
+  wifiScanVisible: false,
+  wifiActionStatus: "idle",
   serviceBusy: false,
   serviceStatus: "idle",
   logAutoScroll: true,
@@ -77,6 +85,8 @@ const CALLS_REFRESH_MS = 1000;
 const CALLS_FETCH_TIMEOUT_MS = 2500;
 const SNAPSHOT_REFRESH_MS = 10000;
 const SITE_REFRESH_MS = 10000;
+const SITE_FETCH_TIMEOUT_MS = 3500;
+const COMMAND_FETCH_TIMEOUT_MS = 5000;
 const CORE_ONLINE_GRACE_MS = 5000;
 const CORE_RECONNECT_GRACE_MS = 12000;
 const SLOT_ACTIVITY_MS = 2000;
@@ -123,6 +133,49 @@ function setIndustrialTone(id, tone) {
   if (!node) return;
   for (const cls of ["is-ok", "is-warn", "is-bad", "is-idle", "is-on"]) node.classList.remove(cls);
   node.classList.add(`is-${tone || "idle"}`);
+}
+
+function compactHostLabel(host) {
+  return String(host || "")
+    .trim()
+    .replace(/^wss?:\/\//i, "")
+    .replace(/^https?:\/\//i, "")
+    .replace(/\/.*$/, "")
+    .replace(/:\d+$/, "");
+}
+
+function inferNetworkCore() {
+  if (!state.site && Date.now() < state.siteReloadingUntilMs) {
+    return { label: "Reloading", hint: "waiting for active config", tone: "warn" };
+  }
+  const brew = state.site?.config?.brew || {};
+  const host = compactHostLabel(brew.host);
+  const haystack = host.toLowerCase();
+  let label = "";
+
+  if (haystack.includes("tetrapack")) {
+    label = "TETRAPACK Core";
+  } else if (haystack.includes("tetralink") || haystack.includes("tetra-link")) {
+    label = "TETRALink Core";
+  } else if (haystack.includes("tetraflow") || haystack.includes("flowstation") || haystack.includes("tetra-flow")) {
+    label = "TETRAFlow Core";
+  } else if (haystack.includes("tmo.services") || haystack.includes("tmoservices") || haystack.includes("tmo-services")) {
+    label = "TMO.Services Core";
+  } else if (haystack.includes("brandmeister")) {
+    label = "BrandMeister Core";
+  } else if (brew.configured || state.brewOnline) {
+    label = "Brew Core";
+  } else {
+    label = "Local Core";
+  }
+
+  const hint = host
+    ? `${host}${brew.port ? `:${brew.port}` : ""}`
+    : state.brewOnline
+      ? `BREW v${state.brewVersion || 1}`
+      : "local routing";
+  const tone = state.brewOnline || !brew.configured ? "ok" : "warn";
+  return { label, hint, tone };
 }
 
 function currentScrollY() {
@@ -218,12 +271,16 @@ function esc(value) {
 }
 
 async function fetchDashboardJson(url, options = {}, timeoutMs = CALLS_FETCH_TIMEOUT_MS) {
+  const res = await fetchWithTimeout(url, options, timeoutMs);
+  if (!res.ok) throw new Error(`${url} ${res.status}`);
+  return await res.json();
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = COMMAND_FETCH_TIMEOUT_MS) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const res = await fetch(url, { ...options, signal: controller.signal });
-    if (!res.ok) throw new Error(`${url} ${res.status}`);
-    return await res.json();
+    return await fetch(url, { ...options, signal: controller.signal });
   } finally {
     clearTimeout(timeout);
   }
@@ -886,6 +943,7 @@ async function activateSelectedConfig() {
   state.configBusy = true;
   setConfigStatus("activating");
   try {
+    invalidateSiteConfig("config activation");
     const res = await fetch("/api/configs/activate", {
       method: "POST",
       credentials: "same-origin",
@@ -897,11 +955,33 @@ async function activateSelectedConfig() {
     setConfigStatus(`activated ${name}`);
     await loadConfigProfiles();
     await loadSystem();
+    scheduleSiteReloads();
   } catch (error) {
     setConfigStatus(`activate failed: ${String(error.message || error).slice(0, 120)}`);
   } finally {
     state.configBusy = false;
     renderConfigProfiles();
+  }
+}
+
+function invalidateSiteConfig(reason = "config reload") {
+  state.site = null;
+  state.siteInflight = false;
+  state.siteReloadingUntilMs = Date.now() + 30000;
+  state.callsPayloadKey = "";
+  setText("networkCoreState", "Reloading");
+  setText("networkCoreHint", reason);
+  setStatusTone("networkStatusStrip", "warn");
+  renderStatus();
+}
+
+function scheduleSiteReloads() {
+  for (const delay of [250, 750, 1500, 3000, 6000, 10000, 15000, 22000, 30000]) {
+    window.setTimeout(() => {
+      loadSystem();
+      loadSite({ force: true });
+      loadSnapshot();
+    }, delay);
   }
 }
 
@@ -973,6 +1053,199 @@ function renderServiceControls() {
   setText("serviceActionStatus", state.serviceStatus || "idle");
 }
 
+function setWifiStatus(message) {
+  state.wifiActionStatus = message || "idle";
+  setText("wifiActionStatus", state.wifiActionStatus);
+}
+
+function wifiSecurityLabel(network) {
+  const security = String(network?.security || "").trim();
+  return security || (network?.secure ? "secured" : "open");
+}
+
+function wifiBandLabel(network) {
+  const raw = String(network?.frequency || "").toLowerCase();
+  const mhz = Number((raw.match(/\d+/) || [])[0]);
+  if (Number.isFinite(mhz) && mhz > 0) {
+    if (mhz >= 4900) return "5 GHz";
+    if (mhz >= 2400) return "2.4 GHz";
+  }
+  const channel = Number(network?.channel);
+  if (Number.isFinite(channel) && channel > 0) return channel > 14 ? "5 GHz" : "2.4 GHz";
+  return "--";
+}
+
+function wifiNetworkDetail(network) {
+  const details = [];
+  const security = wifiSecurityLabel(network);
+  if (security) details.push(security);
+  const band = wifiBandLabel(network);
+  if (band !== "--") details.push(band);
+  if (network?.channel) details.push(`ch ${network.channel}`);
+  if (network?.rate) details.push(network.rate);
+  return details.join(" / ") || "--";
+}
+
+function renderWifiCurrentCard(currentNetwork, currentSsid) {
+  const ssid = currentSsid || currentNetwork?.ssid || "--";
+  const signal = Number(currentNetwork?.signal);
+  const signalLabel = Number.isFinite(signal) ? `${signal}%` : "--";
+  return `<div class="wifi-current-card">
+    <div>
+      <span>Connected network</span>
+      <strong>${esc(ssid)}</strong>
+      <small>${esc(wifiNetworkDetail(currentNetwork))}</small>
+    </div>
+    <dl>
+      <dt>Signal</dt><dd>${esc(signalLabel)}</dd>
+      <dt>Band</dt><dd>${esc(wifiBandLabel(currentNetwork))}</dd>
+      <dt>Channel</dt><dd>${esc(currentNetwork?.channel || "--")}</dd>
+      <dt>Rate</dt><dd>${esc(currentNetwork?.rate || "--")}</dd>
+    </dl>
+  </div>`;
+}
+
+function renderWifi() {
+  const wifi = state.wifi || {};
+  const networks = Array.isArray(wifi.networks) ? wifi.networks : [];
+  const device = wifi.device || {};
+  const currentSsid = wifi.current_ssid || device.connection || "";
+  const selected = state.wifiSelectedSsid || currentSsid || "";
+  const currentNetwork = networks.find((network) => network.active || (currentSsid && network.ssid === currentSsid));
+
+  setText("wifiStatus", wifi.available === false ? "unavailable" : state.wifiBusy ? "working" : wifi.status || "ready");
+  setText("wifiDevice", device.name || wifi.device_name || "--");
+  setText("wifiState", device.state || wifi.message || "--");
+  setText("wifiCurrent", currentSsid || "--");
+  setText("wifiActionStatus", state.wifiActionStatus || "idle");
+
+  const ssidInput = $("wifiSsid");
+  if (ssidInput && document.activeElement !== ssidInput && selected) ssidInput.value = selected;
+
+  if (!state.wifiScanVisible) {
+    setHtml("wifiNetworkList", renderWifiCurrentCard(currentNetwork, currentSsid));
+  } else {
+    const rows = networks.map((network) => {
+    const ssid = String(network.ssid || "");
+    const isCurrent = !!network.active || (currentSsid && ssid === currentSsid);
+    const isSelected = selected && ssid === selected;
+    const signal = Number(network.signal);
+    const signalLabel = Number.isFinite(signal) ? `${signal}%` : "--";
+    return `<button class="wifi-network${isCurrent ? " current" : ""}${isSelected ? " selected" : ""}" type="button" data-ssid="${esc(ssid)}">
+      <span>
+        <strong>${esc(ssid || "(hidden)")}</strong>
+        <small>${esc(wifiNetworkDetail(network))}${isCurrent ? " / connected" : ""}</small>
+      </span>
+      <em>${esc(signalLabel)}</em>
+    </button>`;
+    });
+    setHtml("wifiNetworkList", rows.length ? rows.join("") : '<div class="empty wifi-empty">No Wi-Fi networks scanned</div>');
+    for (const node of document.querySelectorAll(".wifi-network[data-ssid]")) {
+      node.addEventListener("click", () => {
+        state.wifiSelectedSsid = node.dataset.ssid || "";
+        const input = $("wifiSsid");
+        if (input) input.value = state.wifiSelectedSsid;
+        renderWifi();
+      });
+    }
+  }
+
+  for (const id of ["wifiScanBtn", "wifiClearBtn", "wifiConnectBtn"]) {
+    const button = $(id);
+    if (button) button.disabled = !!state.wifiBusy || wifi.available === false;
+  }
+}
+
+async function loadWifiStatus() {
+  try {
+    const res = await fetch("/api/wifi", { credentials: "same-origin", cache: "no-store" });
+    if (!res.ok) throw new Error(await res.text());
+    state.wifi = await res.json();
+    if (!state.wifiSelectedSsid && state.wifi?.current_ssid) state.wifiSelectedSsid = state.wifi.current_ssid;
+  } catch (error) {
+    state.wifi = {
+      ok: false,
+      available: false,
+      status: "unavailable",
+      message: String(error.message || error).slice(0, 120),
+      networks: [],
+    };
+  } finally {
+    renderWifi();
+  }
+}
+
+async function scanWifiNetworks() {
+  if (state.wifiBusy) return;
+  state.wifiBusy = true;
+  setWifiStatus("scanning");
+  renderWifi();
+  try {
+    const res = await fetchWithTimeout("/api/wifi/scan", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+    }, 20000);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    state.wifi = body;
+    state.wifiScanVisible = true;
+    setWifiStatus(`found ${(body.networks || []).length} networks`);
+  } catch (error) {
+    setWifiStatus(`scan failed: ${String(error.message || error).slice(0, 100)}`);
+  } finally {
+    state.wifiBusy = false;
+    renderWifi();
+  }
+}
+
+function clearWifiScanList() {
+  state.wifiScanVisible = false;
+  setWifiStatus("ready");
+  renderWifi();
+}
+
+async function connectWifiNetwork() {
+  if (state.wifiBusy) return;
+  const ssid = String($("wifiSsid")?.value || "").trim();
+  const password = String($("wifiPassword")?.value || "");
+  const hidden = !!$("wifiHidden")?.checked;
+  if (!ssid) {
+    setWifiStatus("SSID required");
+    return;
+  }
+  state.wifiBusy = true;
+  state.wifiSelectedSsid = ssid;
+  setWifiStatus("connecting");
+  renderWifi();
+  try {
+    const res = await fetchWithTimeout("/api/wifi/connect", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ssid, password, hidden }),
+    }, 30000);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    state.wifi = body;
+    const passwordInput = $("wifiPassword");
+    if (passwordInput) passwordInput.value = "";
+    setWifiStatus(body.message || `connected ${ssid}`);
+  } catch (error) {
+    setWifiStatus(`connect failed: ${String(error.message || error).slice(0, 100)}`);
+  } finally {
+    state.wifiBusy = false;
+    renderWifi();
+  }
+}
+
+function syncWifiPasswordVisibility() {
+  const input = $("wifiPassword");
+  const show = !!$("wifiShowPassword")?.checked;
+  if (input) input.type = show ? "text" : "password";
+}
+
 async function requestServiceAction(action) {
   const endpoints = {
     restart: "/api/service/restart",
@@ -992,6 +1265,7 @@ async function requestServiceAction(action) {
   if (!endpoint || state.serviceBusy) return;
   if (action !== "restart" && !window.confirm(confirmations[action] || `${labels[action]} BS?`)) return;
   state.serviceBusy = true;
+  if (action === "restart" || action === "stopgo") invalidateSiteConfig(`${labels[action]} queued`);
   renderServiceControls();
   setServiceStatus(`${labels[action]} queued`);
   try {
@@ -1003,6 +1277,7 @@ async function requestServiceAction(action) {
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
     setServiceStatus(body.message || `${labels[action]} accepted`);
+    if (action === "restart" || action === "stopgo") scheduleSiteReloads();
   } catch (error) {
     setServiceStatus(`${labels[action]} failed: ${String(error.message || error).slice(0, 90)}`);
   } finally {
@@ -1021,9 +1296,18 @@ function setSiteCarrierInhibited(inhibited) {
   state.site.config.rf_control.carrier_state = inhibited ? "carrier_inhibited" : "carrier_active";
 }
 
+function effectiveCarrierInhibited() {
+  if (state.rfCarrierPendingInhibited !== null && Date.now() < state.rfCarrierPendingUntilMs) {
+    return !!state.rfCarrierPendingInhibited;
+  }
+  state.rfCarrierPendingInhibited = null;
+  state.rfCarrierPendingUntilMs = 0;
+  return !!state.site?.config?.rf_control?.carrier_inhibited;
+}
+
 async function requestRfCarrierToggle() {
   if (state.rfCarrierBusy || !state.site?.config?.available) return;
-  const current = !!state.site?.config?.rf_control?.carrier_inhibited;
+  const current = effectiveCarrierInhibited();
   const next = !current;
   if (next && !window.confirm("Inhibit RF carrier?\nThe BS stays running, but on-air service will stop until RF Carrier is enabled again.")) {
     return;
@@ -1032,16 +1316,20 @@ async function requestRfCarrierToggle() {
   state.rfCarrierBusy = true;
   renderStatus();
   try {
-    const res = await fetch("/api/rf/carrier", {
+    const res = await fetchWithTimeout("/api/rf/carrier", {
       method: "POST",
       credentials: "same-origin",
       cache: "no-store",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ inhibited: next }),
-    });
+    }, COMMAND_FETCH_TIMEOUT_MS);
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
-    setSiteCarrierInhibited(!!body.inhibited);
+    const inhibited = !!body.inhibited;
+    state.rfCarrierPendingInhibited = inhibited;
+    state.rfCarrierPendingUntilMs = Date.now() + 15000;
+    setSiteCarrierInhibited(inhibited);
+    renderAll();
     await loadSite();
   } catch (error) {
     state.logs.push({
@@ -1068,11 +1356,11 @@ async function requestTxCalibration() {
   renderCalibration();
   setCalibrationStatus("starting calibration");
   try {
-    const res = await fetch("/api/rf/calibration/run", {
+    const res = await fetchWithTimeout("/api/rf/calibration/run", {
       method: "POST",
       credentials: "same-origin",
       cache: "no-store",
-    });
+    }, COMMAND_FETCH_TIMEOUT_MS);
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
     state.calibration = body;
@@ -1533,7 +1821,7 @@ function renderStatus() {
   setStatusTone("brewStatusStrip", state.brewOnline ? "ok" : "warn");
 
   const rfOnline = !!(state.site?.config?.available || state.txVisual || state.sdrHealth);
-  const carrierInhibited = !!state.site?.config?.rf_control?.carrier_inhibited;
+  const carrierInhibited = effectiveCarrierInhibited();
   const rfTone = carrierInhibited ? "bad" : rfOnline ? "ok" : "warn";
   setText("rfState", carrierInhibited ? "INHIBITED" : rfOnline ? "READY" : "WAITING");
   setText("diagramRfState", carrierInhibited ? "INHIBITED" : rfOnline ? "READY" : "WAITING");
@@ -1558,13 +1846,15 @@ function renderStatus() {
   setStatusTone("rfOpsStatusStrip", rfTone);
 
   const lastOkAge = state.lastHttpOkMs ? Math.floor((Date.now() - state.lastHttpOkMs) / 1000) : null;
-  setText("systemTelemetryState", lastOkAge === null ? state.wsState.toUpperCase() : `${lastOkAge}s`);
+  const networkCore = inferNetworkCore();
+  setText("networkCoreState", networkCore.label);
+  setText("networkCoreHint", networkCore.hint);
   setText("railTelemetryState", lastOkAge === null ? state.wsState.toUpperCase() : `${lastOkAge}s`);
-  setClass("systemTelemetryState", "ok", lastOkAge !== null && lastOkAge <= 5);
-  setClass("systemTelemetryState", "warn", lastOkAge === null || lastOkAge > 5);
+  setClass("networkCoreState", "ok", networkCore.tone === "ok");
+  setClass("networkCoreState", "warn", networkCore.tone === "warn");
   setClass("railTelemetryState", "ok", lastOkAge !== null && lastOkAge <= 5);
   setClass("railTelemetryState", "warn", lastOkAge === null || lastOkAge > 5);
-  setStatusTone("telemetryStatusStrip", lastOkAge !== null && lastOkAge <= 5 ? "ok" : "warn");
+  setStatusTone("networkStatusStrip", networkCore.tone);
 }
 
 function renderMetrics() {
@@ -1768,8 +2058,9 @@ function renderSite() {
   );
   setText("diagramProgram", cell.main_carrier !== undefined ? `carrier ${cell.main_carrier}` : "local carrier");
 
-  setText("rfDevice", soapy.device || state.system?.sdr_name || "auto");
-  setText("diagramRfDevice", soapy.device || state.system?.sdr_name || "auto");
+  const sdrName = state.system?.sdr_name && state.system.sdr_name !== "unknown" ? state.system.sdr_name : "";
+  setText("rfDevice", sdrName || soapy.device || "auto");
+  setText("diagramRfDevice", sdrName || soapy.device || "auto");
   setText(
     "diagramPhyState",
     carrierInhibited
@@ -1813,7 +2104,7 @@ function renderSite() {
   setText("settingsEnergyEconomy", cell.energy_saving_label || "auto");
   setText("settingsRadioIdEndpoint", radioIdEndpoint() || "disabled");
   setText("settingsConfigMode", cfg.available ? "live core config" : "unavailable");
-  setText("adminAccessMode", "external dashboard proxy");
+  setText("adminAccessMode", "external API/WS");
   setText("adminUpdateChannel", "disabled");
   setText("adminAuditSink", "volatile runtime log");
   setText("adminCoreProcess", "nexus-bs core service");
@@ -1833,8 +2124,8 @@ function renderSystem() {
   setText("memoryUse", sys.ram_total_mb ? `${sys.ram_used_mb || 0} / ${sys.ram_total_mb} MB` : "--");
   setText("cpuTemp", sys.cpu_temp_c !== null && sys.cpu_temp_c !== undefined ? `${Number(sys.cpu_temp_c).toFixed(1)} C` : "--");
   renderSystemUptime();
-  setText("configPath", sys.config_path || "--");
-  setText("runtimeConfigPath", sys.runtime_config_path || sys.config_path || "--");
+  setText("activeConfigPath", sys.active_config_name || sys.active_config_path || sys.config_path || "--");
+  setText("configPath", sys.config_dir || sys.config_path || "--");
   setText("sdrName", sys.sdr_name || "--");
   setText("soapyInfo", sys.soapy_info || "--");
   setText("aboutVersion", sys.product_version_tag || sys.stack_version || "--");
@@ -1877,6 +2168,7 @@ function renderAll() {
     if (state.activePage === "logs") renderLogs();
     renderSystem();
     renderConfigProfiles();
+    renderWifi();
   });
 }
 
@@ -2064,14 +2356,15 @@ async function loadSystem() {
   }
 }
 
-async function loadSite() {
-  if (state.siteInflight) return;
+async function loadSite(options = {}) {
+  if (state.siteInflight && !options.force) return;
+  if (options.force) state.siteInflight = false;
   state.siteInflight = true;
   try {
-    const res = await fetch("/api/site", {
+    const res = await fetchWithTimeout("/api/site", {
       credentials: "same-origin",
       cache: "no-store",
-    });
+    }, SITE_FETCH_TIMEOUT_MS);
     if (!res.ok) {
       markHttpFail();
       return;
@@ -2152,6 +2445,7 @@ function refreshDashboardData() {
   loadCallsSnapshot();
   loadCalibrationStatus();
   loadConfigProfiles();
+  loadWifiStatus();
 }
 
 function connectWs() {
@@ -2165,6 +2459,8 @@ function connectWs() {
     state.lastWsOpenMs = Date.now();
     state.lastWsMessageMs = Date.now();
     renderAll();
+    loadSite({ force: true });
+    loadSystem();
   });
 
   ws.addEventListener("message", (event) => {
@@ -2244,6 +2540,13 @@ function initNav() {
   $("serviceShutdownBtn")?.addEventListener("click", () => requestServiceAction("shutdown"));
   $("serviceStopGoBtn")?.addEventListener("click", () => requestServiceAction("stopgo"));
   $("calibrationRunBtn")?.addEventListener("click", requestTxCalibration);
+  $("wifiScanBtn")?.addEventListener("click", scanWifiNetworks);
+  $("wifiClearBtn")?.addEventListener("click", clearWifiScanList);
+  $("wifiConnectBtn")?.addEventListener("click", connectWifiNetwork);
+  $("wifiSsid")?.addEventListener("input", (event) => {
+    state.wifiSelectedSsid = event.target.value || "";
+  });
+  $("wifiShowPassword")?.addEventListener("change", syncWifiPasswordVisibility);
   $("diagramPathToggle")?.addEventListener("click", requestRfCarrierToggle);
   $("logAutoScrollBtn")?.addEventListener("click", () => {
     state.logAutoScroll = !state.logAutoScroll;
@@ -2277,4 +2580,5 @@ setInterval(() => {
   if (state.calibrationBusy || state.calibration?.active) loadCalibrationStatus();
 }, 1000);
 setInterval(loadCalibrationStatus, 30000);
+setInterval(loadWifiStatus, 60000);
 setInterval(renderLiveTick, 1000);

@@ -236,17 +236,19 @@ assume_pdch_ready_after_data_transmit = false
 
 ###############################################################################
 
-# OPTIONAL: Web dashboard
+# Web dashboard
 #
-# Live view of terminals, active calls and log. Config editing and control commands
-# are opt-in because configs may contain secrets and control can stop the service.
+# The HTTP/API dashboard runs in nexus-bs-dashboard, not in the RF core process.
+# Core sends runtime state to it through the local telemetry link below.
 #
 [dashboard]
 port = 8080
 bind = "0.0.0.0"
-allow_config_api = false
-allow_control_commands = false
-# auth_token = "change-me-to-a-long-random-token"
+
+[telemetry]
+host = "127.0.0.1"
+port = 9001
+use_tls = false
 
 [command]
 host = "127.0.0.1"

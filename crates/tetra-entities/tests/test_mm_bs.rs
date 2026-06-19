@@ -3143,7 +3143,7 @@ fn test_group_report_request_from_known_ms_without_groups_reports_complete_empty
 fn test_group_report_request_from_known_ms_segments_large_group_list() {
     debug::setup_logging_verbose();
     let issi = 2040814;
-    let groups: Vec<u32> = (0..14).map(|idx| 3000 + idx).collect();
+    let groups: Vec<u32> = (0..22).map(|idx| 3000 + idx).collect();
 
     let mut test = ComponentTest::new(StackMode::Bs, Some(TdmaTime::default()));
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle, TetraEntity::Cmce]);
@@ -3152,12 +3152,12 @@ fn test_group_report_request_from_known_ms_segments_large_group_list() {
         &mut test,
         issi,
         LocationUpdateType::ItsiAttach,
-        groups.iter().copied().take(12).collect(),
+        groups.iter().copied().take(20).collect(),
     );
     test.run_stack(Some(1));
     let _ = test.dump_sinks();
 
-    submit_attach_detach_group_identity(&mut test, issi, false, Some(groups.iter().copied().skip(12).collect()));
+    submit_attach_detach_group_identity(&mut test, issi, false, Some(groups.iter().copied().skip(20).collect()));
     test.run_stack(Some(1));
     let _ = test.dump_sinks();
 
@@ -3185,7 +3185,7 @@ fn test_group_report_request_from_known_ms_segments_large_group_list() {
         .iter()
         .map(|gid| gid.gssi.expect("GSSI should be present"))
         .collect();
-    assert_eq!(first_groups, groups[..12].to_vec());
+    assert_eq!(first_groups, groups[..20].to_vec());
 
     let (last, last_l2) = &reports[1];
     assert!(!last.group_identity_report);
@@ -3205,7 +3205,7 @@ fn test_group_report_request_from_known_ms_segments_large_group_list() {
         .iter()
         .map(|gid| gid.gssi.expect("GSSI should be present"))
         .collect();
-    assert_eq!(last_groups, groups[12..].to_vec());
+    assert_eq!(last_groups, groups[20..].to_vec());
 
     assert!(!contains_attach_detach_ack(&sink_msgs));
     assert!(subscriber_updates(&sink_msgs).is_empty());
@@ -6458,7 +6458,7 @@ fn test_rejected_location_update_abandons_pending_swmi_group_transaction() {
 fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
     debug::setup_logging_verbose();
     let issi = 2260618;
-    let groups: Vec<u32> = (226300..=226312).collect();
+    let groups: Vec<u32> = (226300..=226322).collect();
     let path = unique_restart_recovery_path("cached-scan-list-segments");
     let cached_groups = groups.iter().map(|gssi| format!("{gssi}:0:4")).collect::<Vec<String>>().join(",");
     std::fs::write(&path, format!("{issi} {cached_groups}\n")).expect("failed to seed recovery cache");
@@ -6482,12 +6482,12 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
     assert_eq!(first_refreshes.len(), 1);
     assert_eq!(
         first_refreshes[0].groups,
-        groups[..12].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
+        groups[..20].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
     );
     assert_eq!(first_refreshes[0].layer2service, Layer2Service::Acknowledged);
     assert_ne!(first_refreshes[0].handle, 0);
 
-    for gssi in &groups[..12] {
+    for gssi in &groups[..20] {
         assert_eq!(
             test.config.state_read().subscribers.group_members(*gssi),
             vec![issi],
@@ -6495,7 +6495,7 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
         );
     }
     assert!(
-        test.config.state_read().subscribers.group_members(groups[12]).is_empty(),
+        test.config.state_read().subscribers.group_members(groups[20]).is_empty(),
         "unsent cached scan-list group must not be locally restored before its over-air refresh"
     );
     let cache_after_first = std::fs::read_to_string(&path).expect("pending segmented refresh should preserve cache");
@@ -6511,14 +6511,17 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
     let second_msgs = test.dump_sinks();
     let second_refreshes = swmi_group_attach_refresh_details(&second_msgs);
     assert_eq!(second_refreshes.len(), 1);
-    assert_eq!(second_refreshes[0].groups, vec![(groups[12], 0, 4)]);
+    assert_eq!(
+        second_refreshes[0].groups,
+        groups[20..].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
+    );
     assert!(
         subscriber_updates(&second_msgs)
             .iter()
-            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == vec![groups[12]]),
+            .any(|update| update.action == BrewSubscriberAction::Affiliate && update.groups == groups[20..]),
         "ACK for first scan-list batch should restore and advertise the next batch"
     );
-    assert_eq!(test.config.state_read().subscribers.group_members(groups[12]), vec![issi]);
+    assert_eq!(test.config.state_read().subscribers.group_members(groups[20]), vec![issi]);
     assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
 
     submit_swmi_group_ack(&mut test, issi, 123_457, false, vec![]);
@@ -6546,7 +6549,7 @@ fn test_restart_recovery_group_less_demand_segments_cached_scan_list_refresh() {
 fn test_restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_groups() {
     debug::setup_logging_verbose();
     let issi = 2260618;
-    let groups: Vec<u32> = (226300..=226312).collect();
+    let groups: Vec<u32> = (226300..=226322).collect();
     let path = unique_restart_recovery_path("cached-scan-list-segment-t353-preserves-remaining");
     let cached_groups = groups.iter().map(|gssi| format!("{gssi}:0:4")).collect::<Vec<String>>().join(",");
     std::fs::write(&path, format!("{issi} {cached_groups}\n")).expect("failed to seed recovery cache");
@@ -6570,7 +6573,7 @@ fn test_restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_gr
     assert_eq!(first_refreshes.len(), 1);
     assert_eq!(
         first_refreshes[0].groups,
-        groups[..12].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
+        groups[..20].iter().map(|gssi| (*gssi, 0, 4)).collect::<Vec<_>>()
     );
     assert!(debug_mm_swmi_group_transaction_pending(&mut test, issi));
 
@@ -6579,7 +6582,7 @@ fn test_restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_gr
     assert!(
         subscriber_updates(&expired_msgs)
             .iter()
-            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups.as_slice() == &groups[..12]),
+            .any(|update| update.action == BrewSubscriberAction::Deaffiliate && update.groups.as_slice() == &groups[..20]),
         "T353 expiry should roll back only the unconfirmed first scan-list batch"
     );
     assert!(
@@ -6594,16 +6597,16 @@ fn test_restart_recovery_segmented_group_refresh_t353_preserves_unsent_cached_gr
     }
 
     let cache = std::fs::read_to_string(&path).expect("T353 segmented rollback should persist cache");
-    for gssi in &groups[..12] {
+    for gssi in &groups[..20] {
         assert!(
             !cache.lines().any(|line| line.contains(&gssi.to_string())),
             "unconfirmed first-batch GSSI {gssi} should be removed after T353, got {cache:?}"
         );
     }
     assert!(
-        cache.lines().any(|line| line.contains(&groups[12].to_string())),
+        cache.lines().any(|line| line.contains(&groups[20].to_string())),
         "unsent cached scan-list GSSI {} should stay in restart cache, got {cache:?}",
-        groups[12]
+        groups[20]
     );
 
     let _ = std::fs::remove_file(&path);

@@ -871,7 +871,6 @@ td .pill {
 }
 
 #configPath,
-#runtimeConfigPath,
 #soapyInfo {
   display: block;
   max-height: 84px;
@@ -997,6 +996,208 @@ td .pill {
   font-size: 11px;
   line-height: 1.45;
   white-space: pre-wrap;
+}
+
+.wifi-panel {
+  margin-top: 14px;
+}
+
+.wifi-grid {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(280px, 38%);
+  gap: 0;
+}
+
+.wifi-list {
+  min-width: 0;
+  max-height: 280px;
+  overflow: auto;
+  border-right: 1px solid var(--line-soft);
+}
+
+.wifi-current-card {
+  min-height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(170px, 0.42fr);
+  gap: 12px;
+  padding: 16px 18px;
+  background: linear-gradient(180deg, rgba(232, 241, 243, 0.88), rgba(196, 212, 216, 0.82));
+  border-left: 4px solid var(--green);
+  color: var(--text);
+}
+
+.wifi-current-card span {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.wifi-current-card strong {
+  display: block;
+  min-width: 0;
+  margin-top: 8px;
+  overflow: hidden;
+  color: #061923;
+  font-size: 1.65rem;
+  font-weight: 950;
+  line-height: 1;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wifi-current-card small {
+  display: block;
+  min-width: 0;
+  margin-top: 8px;
+  overflow: hidden;
+  color: #183c4c;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 750;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wifi-current-card dl {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 7px 10px;
+  align-content: start;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid rgba(94, 113, 119, 0.35);
+  background: rgba(255,255,255,0.38);
+}
+
+.wifi-current-card dt,
+.wifi-current-card dd {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wifi-current-card dt {
+  color: var(--muted);
+  font-weight: 850;
+}
+
+.wifi-current-card dd {
+  color: #061923;
+  font-weight: 900;
+  text-align: right;
+}
+
+.wifi-network {
+  width: 100%;
+  min-width: 0;
+  min-height: 48px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  border: 0;
+  border-bottom: 1px solid var(--line-soft);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  padding: 8px 12px;
+  text-align: left;
+}
+
+.wifi-network:hover,
+.wifi-network.selected {
+  background: rgba(80, 172, 210, 0.18);
+}
+
+.wifi-network.current {
+  background: rgba(123, 211, 74, 0.18);
+  box-shadow: inset 3px 0 0 var(--green);
+}
+
+.wifi-network span {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.wifi-network strong,
+.wifi-network small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.wifi-network strong {
+  font-size: 13px;
+}
+
+.wifi-network small {
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.wifi-network em {
+  flex: 0 0 auto;
+  color: var(--cyan);
+  font-family: var(--mono);
+  font-size: 12px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.wifi-empty {
+  padding: 16px;
+}
+
+.wifi-form {
+  min-width: 0;
+  display: grid;
+  gap: 10px;
+  align-content: start;
+  padding: 12px;
+}
+
+.check-field {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.check-field input {
+  width: 16px;
+  height: 16px;
+}
+
+.wifi-actions {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(132px, auto) minmax(0, 1fr);
+  gap: 8px;
+  align-items: end;
+}
+
+.wifi-actions span {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .config-manager {
@@ -1173,7 +1374,8 @@ td .pill {
   .grid.two,
   .grid.traffic-grid,
   .status-strip,
-  .slot-grid {
+  .slot-grid,
+  .wifi-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
@@ -1205,6 +1407,8 @@ td .pill {
   .service-controls,
   .calibration-grid,
   .calibration-actions,
+  .wifi-grid,
+  .wifi-actions,
   .config-controls,
   .config-editor-bar,
   .config-footer {
@@ -1214,6 +1418,11 @@ td .pill {
   .calibration-actions {
     border-left: 0;
     border-top: 1px solid var(--line-soft);
+  }
+
+  .wifi-list {
+    border-right: 0;
+    border-bottom: 1px solid var(--line-soft);
   }
 
   .action-btn {
@@ -1720,6 +1929,10 @@ h1 {
 .meter-scale i:nth-child(6),
 .meter-scale i:nth-child(7) {
   background: #73d24e;
+}
+
+.map-meter.is-bad .meter-scale i {
+  background: #e53226;
 }
 
 .component-stage {

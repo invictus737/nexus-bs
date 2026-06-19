@@ -159,6 +159,21 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "Settings must expose service lifecycle controls and config profile deletion"
     );
     assert!(
+        index.contains(r#"id="wifiPanel""#)
+            && index.contains(r#"id="wifiScanBtn""#)
+            && index.contains(r#"id="wifiClearBtn""#)
+            && index.contains(r#"id="wifiConnectBtn""#)
+            && index.contains(r#"id="wifiShowPassword""#)
+            && app.contains("function renderWifiCurrentCard")
+            && app.contains("function clearWifiScanList")
+            && app.contains("wifiBandLabel")
+            && app.contains("wifiNetworkDetail")
+            && app.contains(r#"fetch("/api/wifi""#)
+            && app.contains(r#"fetchWithTimeout("/api/wifi/scan""#)
+            && app.contains(r#"fetchWithTimeout("/api/wifi/connect""#),
+        "Settings must expose Wi-Fi scan/select/connect controls backed by dashboard API endpoints"
+    );
+    assert!(
         index.contains(r#"id="logAutoScrollBtn""#) && index.contains(r#"id="logExportBtn""#) && index.contains(r#"id="logClearBtn""#),
         "Logs page must expose pause/play autoscroll, export, and clear controls"
     );
@@ -176,15 +191,29 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         app.contains(r#"fetch("/api/system""#),
-        "external dashboard must keep using the core-owned system API"
+        "external dashboard must expose the system API"
     );
     assert!(
-        app.contains(r#"fetch("/api/site""#) && app.contains("SITE_REFRESH_MS"),
-        "external dashboard must read RF/cell/timeslot state from the core-owned site API"
+        app.contains(r#"fetchWithTimeout("/api/site""#) && app.contains("SITE_REFRESH_MS"),
+        "external dashboard must expose RF/cell/timeslot state through the site API"
+    );
+    assert!(
+        index.contains(r#"id="networkStatusStrip""#)
+            && index.contains(r#"id="networkCoreState""#)
+            && index.contains(r#"id="networkCoreHint""#)
+            && app.contains("function inferNetworkCore")
+            && app.contains("SITE_FETCH_TIMEOUT_MS")
+            && app.contains("loadSite({ force: true })")
+            && app.contains("state.siteInflight = false")
+            && app.contains("TETRAPACK Core")
+            && app.contains("TETRALink Core")
+            && app.contains("TETRAFlow Core")
+            && app.contains("TMO.Services Core"),
+        "System status strip must identify the configured Brew network core without exposing credentials"
     );
     assert!(
         app.contains(r#"fetch("/api/snapshot""#) && app.contains("SNAPSHOT_REFRESH_MS"),
-        "external dashboard must periodically reconcile active calls from the core-owned snapshot API"
+        "external dashboard must periodically reconcile active calls from the snapshot API"
     );
     assert!(
         app.contains(r#"fetchDashboardJson("/api/calls""#)
@@ -225,7 +254,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         app.contains(r#"/ws`"#),
-        "external dashboard must keep using the core-owned WebSocket endpoint"
+        "browser dashboard must keep using the external dashboard WebSocket endpoint"
     );
     assert!(
         app.contains("RADIOID_MIN_INTERVAL_MS") && app.contains("RADIOID_MAX_QUEUE"),
@@ -258,14 +287,28 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "rail status must be live data, not static LOCAL/LIVE labels"
     );
     assert!(
+        index.contains(r#"id="activeConfigPath""#)
+            && index.contains("Active Config")
+            && !index.contains("Runtime Config")
+            && !index.contains(r#"id="runtimeConfigPath""#)
+            && !app.contains("runtime_config_path")
+            && index.contains("Config Store")
+            && app.contains("active_config_name")
+            && app.contains("active_config_path"),
+        "Host panel must show the selected active profile without separate runtime config state"
+    );
+    assert!(
         app.contains("function setIndustrialTone")
             && app.contains("diagramRfState")
             && app.contains("diagramBrewState")
             && app.contains("diagramPhyState")
             && app.contains("requestRfCarrierToggle")
+            && app.contains("effectiveCarrierInhibited")
+            && app.contains("rfCarrierPendingInhibited")
             && app.contains("Scan list")
             && index.contains("Groups / Scan List")
-            && app.contains(r#"fetch("/api/rf/carrier""#)
+            && app.contains(r#"fetchWithTimeout("/api/rf/carrier""#)
+            && app.contains("COMMAND_FETCH_TIMEOUT_MS")
             && index.contains(r#"id="nodePhy""#)
             && index.contains(r#"id="diagramPathToggle""#)
             && index.contains(r#"<button type="button" class="path-toggle"#)
@@ -302,11 +345,15 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         core_unit.contains("Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service")
-            && dashboard_unit.contains("Environment=NEXUS_BS_DASHBOARD_CORE=127.0.0.1:18080")
+            && !core_unit.contains("NEXUS_BS_CORE_DASHBOARD")
+            && !dashboard_unit.contains("NEXUS_BS_DASHBOARD_CORE")
+            && dashboard_unit.contains("Environment=NEXUS_BS_DASHBOARD_TELEMETRY_LISTEN=127.0.0.1:9001")
+            && dashboard_unit.contains("Environment=NEXUS_BS_DASHBOARD_CONTROL_URL=http://127.0.0.1:9003/command")
+            && control_unit.contains("--command-listen 127.0.0.1:9003")
             && !core_unit.contains("@%i")
             && !control_unit.contains("@%i")
             && !dashboard_unit.contains("@%i"),
-        "split systemd units must keep dashboard proxying to the local core while avoiding @user service names"
+        "split systemd units must run dashboard API externally and avoid @user service names"
     );
     assert!(
         core_unit.contains("CPUAffinity=1 2") && control_unit.contains("CPUAffinity=3") && dashboard_unit.contains("CPUAffinity=3"),

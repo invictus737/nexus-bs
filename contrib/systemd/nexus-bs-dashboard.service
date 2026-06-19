@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 [Unit]
-Description=Nexus-BS v0.1.71 external dashboard front-end
+Description=Nexus-BS v0.1.72 external dashboard front-end
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs.service
 Wants=network-online.target nexus-bs.service
@@ -13,8 +13,11 @@ Type=simple
 WorkingDirectory=/opt/nexus-bs
 Environment=NEXUS_BS_DASHBOARD_BIND=0.0.0.0
 Environment=NEXUS_BS_DASHBOARD_PORT=8080
-Environment=NEXUS_BS_DASHBOARD_CORE=127.0.0.1:18080
 Environment=NEXUS_BS_DASHBOARD_STATIC_DIR=/opt/nexus-bs/dashboard
+Environment=NEXUS_BS_PERSISTENT_CONFIG=/etc/nexus-bs/config.toml
+Environment=NEXUS_BS_DASHBOARD_TELEMETRY_LISTEN=127.0.0.1:9001
+Environment=NEXUS_BS_DASHBOARD_CONTROL_URL=http://127.0.0.1:9003/command
+Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service
 Environment=RUST_LOG=info
 ExecStart=/opt/nexus-bs/bin/nexus-bs-dashboard
 
