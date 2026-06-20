@@ -752,7 +752,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
         match cc.call_state {
             CALL_STATE_GROUP_TX => {
                 if let BrewCallPayload::GroupTransmission(gt) = cc.payload {
-                    tracing::info!(
+                    tracing::debug!(
                         "BrewWorker: GROUP_TX uuid={} src={} dst={} prio={} service={} mnemonic={}",
                         cc.identifier,
                         gt.source,
@@ -780,7 +780,7 @@ impl<T: NetworkTransport> BrewWorker<T> {
             }
             CALL_STATE_GROUP_IDLE => {
                 let cause = if let BrewCallPayload::Cause(c) = cc.payload { c } else { 0 };
-                tracing::info!("BrewWorker: GROUP_IDLE uuid={} cause={}", cc.identifier, cause);
+                tracing::debug!("BrewWorker: GROUP_IDLE uuid={} cause={}", cc.identifier, cause);
                 // TODO FIXME we could check whether this call is indeed a brew call here
                 self.enqueue_event(BrewEvent::GroupCallEnd {
                     uuid: cc.identifier,

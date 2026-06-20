@@ -419,7 +419,7 @@ impl BrewEntity {
                     priority,
                     service,
                 } => {
-                    tracing::info!("BrewEntity: GROUP_TX service={} (0=TETRA ACELP, expect 0)", service);
+                    tracing::debug!("BrewEntity: GROUP_TX service={} (0=TETRA ACELP, expect 0)", service);
                     self.handle_group_call_start(queue, uuid, source_issi, dest_gssi, priority);
                 }
                 BrewEvent::GroupCallEnd { uuid, cause } => {
@@ -994,7 +994,7 @@ impl BrewEntity {
         }
 
         // New call - track it and request CMCE to allocate and set up
-        tracing::info!(
+        tracing::debug!(
             "BrewEntity: requesting new network call uuid={} src={} gssi={}",
             uuid,
             source_issi,
@@ -1428,7 +1428,7 @@ impl BrewEntity {
                 self.remove_circuit_ul_forwarders(brew_uuid);
                 return;
             }
-            tracing::info!(
+            tracing::debug!(
                 "BrewEntity: dropping network call uuid={} gssi={} (CMCE request)",
                 brew_uuid,
                 call.dest_gssi
