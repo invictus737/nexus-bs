@@ -1695,6 +1695,7 @@ fn easy_start_preview_json(req: &EasyStartRequest, plan: EasyStartCellPlan, incl
             "main_carrier": plan.main_carrier,
             "freq_offset": plan.freq_offset,
             "duplex_spacing": req.duplex_spacing,
+            "duplex_shift_hz": plan.spacing_hz,
             "custom_spacing_hz": if req.custom_spacing_enabled { Some(plan.spacing_hz) } else { None },
             "brew": if req.brew_enabled {
                 format!("{}:{} ({})", req.brew_host, req.brew_port, if req.brew_tls { "TLS" } else { "plain" })

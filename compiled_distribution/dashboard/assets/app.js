@@ -1104,6 +1104,39 @@ function easyStartDraftFromInputs() {
   };
 }
 
+function easyStartSpacingHz(draft) {
+  if (draft.custom_spacing_enabled) return Number(draft.custom_spacing_hz) || 7000000;
+  const code = Number(draft.duplex_spacing);
+  if (code === 1) return 7000000;
+  if (code === 2) return 10000000;
+  if (code === 3) return 45000000;
+  return 7000000;
+}
+
+function easyStartCellEstimate(draft) {
+  const tx = Number(draft.tx_freq);
+  if (!Number.isFinite(tx) || tx <= 0) return {};
+  const freqBand = Math.floor(tx / 100000000);
+  const bandBase = freqBand * 100000000;
+  const offsets = [0, 6250, -6250, 12500];
+  let best = null;
+  for (const offset of offsets) {
+    const carrier = Math.round((tx - bandBase - offset) / 25000);
+    if (carrier < 0) continue;
+    const reconstructed = bandBase + offset + carrier * 25000;
+    const error = Math.abs(reconstructed - tx);
+    const candidate = { error, freq_band: freqBand, main_carrier: carrier, freq_offset: offset };
+    if (!best || candidate.error < best.error) best = candidate;
+  }
+  const shift = easyStartSpacingHz(draft);
+  return {
+    ...(best || {}),
+    tx_freq: tx,
+    rx_freq: tx > shift ? tx - shift : null,
+    duplex_shift_hz: shift,
+  };
+}
+
 function saveEasyStartInputs() {
   if ($("easyStartModal")?.classList.contains("hidden")) return;
   state.easyStartDraft = easyStartDraftFromInputs();
@@ -1164,14 +1197,17 @@ function renderEasyStartWizard() {
         ${easyField("easyBrewPassword", "Password", draft.brew_password, 'type="password" autocomplete="new-password"')}
       </div>`;
   } else {
-    const summary = state.easyStartPreview?.summary || {};
+    const estimate = easyStartCellEstimate(draft);
+    const summary = { ...estimate, ...(state.easyStartPreview?.summary || {}) };
     body = `<p class="wizard-copy">Verify checks the generated config with the same parser Nexus-BS uses at startup. Commit writes config.toml and restarts the BS.</p>
       <div class="wizard-review">
         <div class="wizard-review-row"><span>Network</span><strong>${esc(summary.network || `${draft.mcc} / ${draft.mnc}`)}</strong></div>
         <div class="wizard-review-row"><span>TX</span><strong>${esc(summary.tx_freq || draft.tx_freq)} Hz</strong></div>
         <div class="wizard-review-row"><span>RX</span><strong>${esc(summary.rx_freq || "--")} Hz</strong></div>
+        <div class="wizard-review-row"><span>Duplex spacing</span><strong>code ${esc(draft.duplex_spacing)} / ${esc(summary.duplex_shift_hz || easyStartSpacingHz(draft))} Hz</strong></div>
         <div class="wizard-review-row"><span>Carrier</span><strong>${esc(summary.main_carrier ?? "--")}</strong></div>
         <div class="wizard-review-row"><span>Offset</span><strong>${esc(summary.freq_offset ?? "--")}</strong></div>
+        <div class="wizard-review-row"><span>Freq band</span><strong>${esc(summary.freq_band ?? "--")}</strong></div>
         <div class="wizard-review-row"><span>Timezone</span><strong>${esc(summary.timezone || draft.timezone)}</strong></div>
         <div class="wizard-review-row"><span>Brew</span><strong>${esc(summary.brew || (draft.brew_enabled ? `${draft.brew_host}:${draft.brew_port}` : "disabled"))}</strong></div>
       </div>`;
@@ -1290,8 +1326,11 @@ function nextEasyStartStep() {
   saveEasyStartInputs();
   state.easyStartStep = Math.min(3, state.easyStartStep + 1);
   if (state.easyStartStep === 3) state.easyStartPreview = null;
-  setEasyStartMessage(state.easyStartStep === 3 ? "Press Verify Config before committing." : "Fill the fields on this step.");
+  setEasyStartMessage(state.easyStartStep === 3 ? "Calculated values are shown now. Verify confirms them with the Nexus-BS parser." : "Fill the fields on this step.");
   renderEasyStartWizard();
+  if (state.easyStartStep === 3) {
+    window.setTimeout(() => verifyEasyStartConfig(), 0);
+  }
 }
 
 function previousEasyStartStep() {
