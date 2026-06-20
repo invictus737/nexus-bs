@@ -46,10 +46,6 @@ sudo -n systemctl daemon-reload || true
 sudo -n systemctl stop \"$REMOTE_DASHBOARD_SERVICE\" || true
 sudo -n systemctl stop \"$REMOTE_SERVICE\"
 sudo -n systemctl stop \"$REMOTE_CONTROL_SERVICE\"
-sudo -n systemctl stop nexus-bs-dashboard@chris.service || true
-sudo -n systemctl stop nexus-bs@chris.service || true
-sudo -n systemctl stop nexus-bs-control@chris.service || true
-sudo -n systemctl disable nexus-bs-dashboard@chris.service nexus-bs@chris.service nexus-bs-control@chris.service || true
 '"
 
 ssh $SSH_OPTS "$REMOTE" "timeout 10s sh -lc '

@@ -352,6 +352,7 @@ fn handle_telemetry_connection(stream: TcpStream, peer: &str, dashboard: Arc<Das
     };
     let codec = TelemetryCodecJson;
     tracing::info!("[{}] telemetry connected", peer);
+    dashboard.reset_runtime_snapshot(&format!("telemetry connected from {peer}"));
     loop {
         match ws.read() {
             Ok(Message::Binary(data)) => match codec.decode(&data) {
@@ -372,6 +373,8 @@ fn handle_telemetry_connection(stream: TcpStream, peer: &str, dashboard: Arc<Das
             }
         }
     }
+    tracing::info!("[{}] telemetry disconnected", peer);
+    dashboard.reset_runtime_snapshot(&format!("telemetry disconnected from {peer}"));
 }
 
 #[allow(dead_code)]

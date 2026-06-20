@@ -958,6 +958,26 @@ impl DashboardServer {
         }
     }
 
+    pub fn reset_runtime_snapshot(&self, reason: &str) {
+        {
+            let mut s = self.state.write().unwrap();
+            s.ms_map.clear();
+            s.calls.clear();
+            s.last_heard.clear();
+            s.brew_online = false;
+            s.brew_version = 0;
+            s.fallback_config_active = false;
+            s.fallback_config_reason.clear();
+            s.last_tx_visual = None;
+            s.last_tx_quality = None;
+            s.last_sdr_health = None;
+            s.last_sys_health = None;
+            s.last_health = None;
+            s.push_log("INFO", format!("Dashboard runtime snapshot reset: {}", reason));
+        }
+        self.broadcast(&dashboard_snapshot_json(&self.state));
+    }
+
     pub fn push_log(&self, level: &str, msg: String) {
         let entry = {
             let mut s = self.state.write().unwrap();
@@ -5100,6 +5120,44 @@ mod tests {
         let site_json = dashboard_site_json(&dashboard.state, &None, "test.toml");
         assert!(site_json.contains("\"health\""));
         assert!(site_json.contains("\"rf_cached\""));
+    }
+
+    #[test]
+    fn dashboard_runtime_snapshot_reset_clears_stale_core_records() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        dashboard.handle_telemetry(TelemetryEvent::MsRegistration { issi: 2260618 });
+        dashboard.handle_telemetry(TelemetryEvent::MsGroupsSnapshot {
+            issi: 2260618,
+            gssis: vec![91],
+        });
+        dashboard.handle_telemetry(TelemetryEvent::GroupCallStarted {
+            call_id: 7,
+            gssi: 91,
+            caller_issi: 2260618,
+            ts: 2,
+        });
+        dashboard.handle_telemetry(TelemetryEvent::BrewConnected {
+            connected: true,
+            server_version: 1,
+        });
+        dashboard.handle_telemetry(TelemetryEvent::HealthSnapshot(crate::health::registry().snapshot()));
+
+        dashboard.reset_runtime_snapshot("test restart");
+
+        let state = dashboard.state.read().unwrap();
+        assert!(state.ms_map.is_empty());
+        assert!(state.calls.is_empty());
+        assert!(state.last_heard.is_empty());
+        assert!(!state.brew_online);
+        assert_eq!(state.brew_version, 0);
+        assert!(state.last_health.is_none());
+        drop(state);
+
+        let snapshot_json = dashboard_snapshot_json(&dashboard.state);
+        assert!(snapshot_json.contains("\"ms\":[]"));
+        assert!(snapshot_json.contains("\"calls\":[]"));
+        assert!(snapshot_json.contains("\"last_heard\":[]"));
+        assert!(snapshot_json.contains("Dashboard runtime snapshot reset"));
     }
 
     #[test]
