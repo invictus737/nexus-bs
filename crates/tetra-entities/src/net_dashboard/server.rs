@@ -931,10 +931,9 @@ impl DashboardServer {
                     }
                 }
                 TelemetryEvent::MsRssi { issi, rssi_dbfs } => {
-                    if let Some(e) = s.ms_map.get_mut(issi) {
-                        e.rssi_dbfs = Some(*rssi_dbfs);
-                        e.last_seen = Instant::now();
-                    }
+                    let e = s.ms_map.entry(*issi).or_insert_with(|| empty_ms_entry(*issi));
+                    e.rssi_dbfs = Some(*rssi_dbfs);
+                    e.last_seen = Instant::now();
                 }
                 TelemetryEvent::MsEnergySaving {
                     issi,
@@ -954,6 +953,11 @@ impl DashboardServer {
                     caller_issi,
                     ts,
                 } => {
+                    let e = s.ms_map.entry(*caller_issi).or_insert_with(|| empty_ms_entry(*caller_issi));
+                    e.last_seen = Instant::now();
+                    if !e.groups.contains(gssi) {
+                        e.groups.push(*gssi);
+                    }
                     s.calls.insert(
                         *call_id,
                         CallEntry {
@@ -981,6 +985,11 @@ impl DashboardServer {
                     gssi,
                     speaker_issi,
                 } => {
+                    let e = s.ms_map.entry(*speaker_issi).or_insert_with(|| empty_ms_entry(*speaker_issi));
+                    e.last_seen = Instant::now();
+                    if !e.groups.contains(gssi) {
+                        e.groups.push(*gssi);
+                    }
                     if let Some(c) = s.calls.get_mut(call_id) {
                         c.speaker_issi = Some(*speaker_issi);
                         c.caller_issi = *speaker_issi;
@@ -996,6 +1005,10 @@ impl DashboardServer {
                     ts,
                     secondary_ts,
                 } => {
+                    let caller = s.ms_map.entry(*calling_issi).or_insert_with(|| empty_ms_entry(*calling_issi));
+                    caller.last_seen = Instant::now();
+                    let called = s.ms_map.entry(*called_issi).or_insert_with(|| empty_ms_entry(*called_issi));
+                    called.last_seen = Instant::now();
                     s.calls.insert(
                         *call_id,
                         CallEntry {
@@ -1025,6 +1038,8 @@ impl DashboardServer {
                     }
                 }
                 TelemetryEvent::SdsActivity { source_issi, dest_issi } => {
+                    let source = s.ms_map.entry(*source_issi).or_insert_with(|| empty_ms_entry(*source_issi));
+                    source.last_seen = Instant::now();
                     s.push_last_heard(*source_issi, "sds", *dest_issi);
                 }
                 TelemetryEvent::TsVoiceActivity { .. } => {
@@ -6148,6 +6163,29 @@ mod tests {
 
         let snapshot = dashboard.state.read().unwrap().snapshot_ms();
         let ms = snapshot.iter().find(|ms| ms.issi == issi).expect("radio should be visible");
+        assert_eq!(ms.groups, vec![gssi]);
+    }
+
+    #[test]
+    fn dashboard_reconstructs_radio_from_activity_without_registration_event() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+        let issi = 2260618;
+        let gssi = 91;
+
+        dashboard.handle_telemetry(TelemetryEvent::MsRssi { issi, rssi_dbfs: -47.5 });
+        dashboard.handle_telemetry(TelemetryEvent::GroupCallStarted {
+            call_id: 7,
+            gssi,
+            caller_issi: issi,
+            ts: 2,
+        });
+
+        let snapshot = dashboard.state.read().unwrap().snapshot_ms();
+        let ms = snapshot
+            .iter()
+            .find(|ms| ms.issi == issi)
+            .expect("radio should be visible from activity");
+        assert_eq!(ms.rssi_dbfs, Some(-47.5));
         assert_eq!(ms.groups, vec![gssi]);
     }
 

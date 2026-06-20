@@ -2726,6 +2726,7 @@ function ensureRadio(issi) {
 
 function pushHeard(entry) {
   if (!entry) return;
+  if (entry.issi) ensureRadio(entry.issi)._lastSeenMs = Date.now();
   state.heard.unshift(entry);
   state.heard = state.heard.slice(0, 80);
 }
@@ -2769,6 +2770,13 @@ function applyMessage(msg) {
       });
       break;
     case "call_started":
+      if (msg.caller_issi) {
+        const radio = ensureRadio(msg.caller_issi);
+        radio._lastSeenMs = Date.now();
+        if (msg.call_type === "group" && msg.gssi && !(radio.groups || []).includes(msg.gssi)) {
+          radio.groups = [...(radio.groups || []), msg.gssi];
+        }
+      }
       upsertCall({
         ...msg,
         active_speaker:
@@ -2782,6 +2790,13 @@ function applyMessage(msg) {
       pushHeard(msg.last_heard);
       break;
     case "speaker_changed":
+      if (msg.speaker_issi) {
+        const radio = ensureRadio(msg.speaker_issi);
+        radio._lastSeenMs = Date.now();
+        if (msg.gssi && !(radio.groups || []).includes(msg.gssi)) {
+          radio.groups = [...(radio.groups || []), msg.gssi];
+        }
+      }
       if (state.calls.has(msg.call_id)) {
         const call = state.calls.get(msg.call_id);
         upsertCall({
