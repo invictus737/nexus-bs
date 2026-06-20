@@ -393,6 +393,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
         dashboard_server.contains(r#"run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str])"#)
             && dashboard_server.contains("run_update_post_install_restart")
             && dashboard_server.contains("same action as Settings/Admin Restart BS")
+            && dashboard_server.contains("update_process_runs_as_root")
             && deb_postinst.contains("install_dashboard_sudoers")
             && deb_postinst.contains("/usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb")
             && deb_postinst.contains("/usr/bin/systemctl restart nexus-bs-dashboard.service")

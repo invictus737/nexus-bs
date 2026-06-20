@@ -619,10 +619,21 @@ fn run_update_command(update: &SharedUpdateState, program: &str, args: &[&str]) 
     }
 }
 
+fn update_process_runs_as_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "0")
+        .unwrap_or(false)
+}
+
 fn run_update_command_privileged(update: &SharedUpdateState, program: &str, args: &[&str]) -> bool {
-    if run_update_command(update, program, args) {
-        return true;
+    if update_process_runs_as_root() {
+        return run_update_command(update, program, args);
     }
+
     let mut sudo_args = Vec::with_capacity(args.len() + 2);
     sudo_args.push("-n");
     sudo_args.push(program);
