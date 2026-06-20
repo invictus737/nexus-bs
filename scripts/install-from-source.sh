@@ -205,7 +205,9 @@ install_systemd_units() {
     mkdir -p "$tmpdir"
     for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
         sed \
-            -e "s/User=chris/User=${RUN_USER}/" \
+            -e "/^\\[Service\\]$/a\\
+User=${RUN_USER}\\
+Group=${RUN_GROUP}" \
             -e "s#/home/chris/nexus-bs#${RUN_DIR}#g" \
             "$ROOT/contrib/systemd/$unit" > "$tmpdir/$unit"
         as_root install -m 0644 "$tmpdir/$unit" "$SYSTEMD_UNIT_DIR/$unit"

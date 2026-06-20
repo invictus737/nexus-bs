@@ -1095,18 +1095,20 @@ function renderWifiCurrentCard(currentNetwork, currentSsid) {
   const ssid = currentSsid || currentNetwork?.ssid || "--";
   const signal = Number(currentNetwork?.signal);
   const signalLabel = Number.isFinite(signal) ? `${signal}%` : "--";
+  const band = wifiBandLabel(currentNetwork);
+  const detailParts = [];
+  const security = wifiSecurityLabel(currentNetwork);
+  if (security && security !== "--") detailParts.push(security);
+  if (band !== "--") detailParts.push(band);
+  if (currentNetwork?.channel) detailParts.push(`ch ${currentNetwork.channel}`);
+  const detail = detailParts.join(" / ") || "connected";
   return `<div class="wifi-current-card">
     <div>
-      <span>Connected network</span>
+      <span>Connected</span>
       <strong>${esc(ssid)}</strong>
-      <small>${esc(wifiNetworkDetail(currentNetwork))}</small>
+      <small>${esc(detail)}</small>
     </div>
-    <dl>
-      <dt>Signal</dt><dd>${esc(signalLabel)}</dd>
-      <dt>Band</dt><dd>${esc(wifiBandLabel(currentNetwork))}</dd>
-      <dt>Channel</dt><dd>${esc(currentNetwork?.channel || "--")}</dd>
-      <dt>Rate</dt><dd>${esc(currentNetwork?.rate || "--")}</dd>
-    </dl>
+    <em>${esc(signalLabel)}</em>
   </div>`;
 }
 
@@ -1165,7 +1167,17 @@ async function loadWifiStatus() {
   try {
     const res = await fetch("/api/wifi", { credentials: "same-origin", cache: "no-store" });
     if (!res.ok) throw new Error(await res.text());
-    state.wifi = await res.json();
+    const fresh = await res.json();
+    if (state.wifiScanVisible && Array.isArray(state.wifi?.networks) && state.wifi.networks.length) {
+      const freshNetworks = Array.isArray(fresh.networks) ? fresh.networks : [];
+      const keepScannedNetworks = state.wifi.networks.length > freshNetworks.length;
+      state.wifi = {
+        ...fresh,
+        networks: keepScannedNetworks ? state.wifi.networks : freshNetworks,
+      };
+    } else {
+      state.wifi = fresh;
+    }
     if (!state.wifiSelectedSsid && state.wifi?.current_ssid) state.wifiSelectedSsid = state.wifi.current_ssid;
   } catch (error) {
     state.wifi = {

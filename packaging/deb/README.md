@@ -37,9 +37,11 @@ The package installs binaries and the dashboard under `/opt/nexus-bs`,
 `nexus-bs-service` on `PATH`, systemd service units under
 `/lib/systemd/system`, and config examples under `/etc/nexus-bs/examples`. On
 first install, `postinst` creates `/etc/nexus-bs/config.toml` from the example
-only if the live file is missing. The fallback example is shipped under
-`/etc/nexus-bs/examples` but is not created as a live config unless an operator
-chooses to install it.
+only if the live file is missing. It detects the local operator user, makes
+`/etc/nexus-bs` writable by that user, and installs small systemd drop-ins so
+the core, control, and dashboard services run as the same user. The fallback
+example is shipped under `/etc/nexus-bs/examples` but is not created as a live
+config unless an operator chooses to install it.
 
 Package upgrades, `apt remove`, and `apt purge` intentionally leave the live
 `/etc/nexus-bs/config.toml` file in place. Review the global live config before
@@ -70,12 +72,12 @@ then prints service status and logs:
 cd /tmp
 curl -fL -o nexus-bs_0.1.72_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.72/nexus-bs_0.1.72_arm64.deb
 curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/main/scripts/tetrahs-reinstall-nexus-bs.sh
-sudo bash /tmp/nexus-bs-reinstall.sh
+sudo env DEB_PATH=/tmp/nexus-bs_0.1.72_arm64.deb bash /tmp/nexus-bs-reinstall.sh
 ```
 
 Expected live config permissions after install:
 
 ```text
-/etc/nexus-bs             root:root 0755
-/etc/nexus-bs/config.toml root:root 0600
+/etc/nexus-bs             <user>:<user> 0750
+/etc/nexus-bs/config.toml <user>:<user> 0600
 ```

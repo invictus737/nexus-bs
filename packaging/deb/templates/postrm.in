@@ -2,6 +2,15 @@
 set -e
 
 case "$1" in
+    purge)
+        for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
+            rm -f "/etc/systemd/system/$unit.d/10-nexus-bs-user.conf"
+            rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
+        done
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl daemon-reload >/dev/null 2>&1 || true
+        fi
+        ;;
     remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload >/dev/null 2>&1 || true

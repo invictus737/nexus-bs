@@ -463,6 +463,15 @@ h1 {
   grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+.settings-grid {
+  align-items: stretch;
+  grid-auto-flow: dense;
+}
+
+.settings-grid > .panel {
+  min-width: 0;
+}
+
 .grid.traffic-grid {
   grid-template-columns: minmax(240px, 0.85fr) minmax(0, 1.15fr) minmax(0, 1.15fr);
   align-items: stretch;
@@ -1075,20 +1084,16 @@ td .pill {
   white-space: pre-wrap;
 }
 
-.wifi-panel {
-  margin-top: 14px;
-}
-
 .wifi-grid {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(260px, 1fr) minmax(280px, 38%);
+  grid-template-columns: minmax(240px, 1fr) minmax(260px, 1fr);
   gap: 0;
 }
 
 .wifi-list {
   min-width: 0;
-  max-height: 280px;
+  max-height: clamp(180px, 28vh, 340px);
   overflow: auto;
   border-right: 1px solid var(--line-soft);
 }
@@ -1096,11 +1101,12 @@ td .pill {
 .wifi-current-card {
   min-height: 100%;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(170px, 0.42fr);
-  gap: 12px;
-  padding: 16px 18px;
-  background: linear-gradient(180deg, rgba(232, 241, 243, 0.88), rgba(196, 212, 216, 0.82));
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 14px;
+  padding: 14px 16px;
   border-left: 4px solid var(--green);
+  background: rgba(123, 211, 74, 0.08);
   color: var(--text);
 }
 
@@ -1116,10 +1122,10 @@ td .pill {
 .wifi-current-card strong {
   display: block;
   min-width: 0;
-  margin-top: 8px;
+  margin-top: 7px;
   overflow: hidden;
   color: #061923;
-  font-size: 1.65rem;
+  font-size: 1.35rem;
   font-weight: 950;
   line-height: 1;
   text-overflow: ellipsis;
@@ -1139,36 +1145,14 @@ td .pill {
   white-space: nowrap;
 }
 
-.wifi-current-card dl {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
-  gap: 7px 10px;
-  align-content: start;
-  margin: 0;
-  padding: 10px;
-  border: 1px solid rgba(94, 113, 119, 0.35);
-  background: rgba(255,255,255,0.38);
-}
-
-.wifi-current-card dt,
-.wifi-current-card dd {
-  min-width: 0;
-  margin: 0;
-  overflow: hidden;
+.wifi-current-card em {
+  min-width: 54px;
+  color: var(--green);
   font-family: var(--mono);
-  font-size: 11px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.wifi-current-card dt {
-  color: var(--muted);
-  font-weight: 850;
-}
-
-.wifi-current-card dd {
-  color: #061923;
-  font-weight: 900;
+  font-size: 14px;
+  font-style: normal;
+  font-weight: 950;
+  line-height: 1.2;
   text-align: right;
 }
 
@@ -1239,9 +1223,14 @@ td .pill {
 .wifi-form {
   min-width: 0;
   display: grid;
-  gap: 10px;
+  gap: 8px;
   align-content: start;
-  padding: 12px;
+  padding: 11px 12px 12px;
+}
+
+.wifi-form .compact-facts dt,
+.wifi-form .compact-facts dd {
+  min-height: 28px;
 }
 
 .check-field {

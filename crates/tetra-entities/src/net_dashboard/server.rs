@@ -1446,18 +1446,25 @@ fn wifi_devices_json() -> Result<Vec<serde_json::Value>, String> {
     Ok(devices)
 }
 
-fn wifi_networks_json(rescan: bool) -> Result<Vec<serde_json::Value>, String> {
-    let rescan_arg = if rescan { "yes" } else { "no" };
-    let text = nmcli_output(&[
-        "-t",
-        "-f",
-        "ACTIVE,SSID,SIGNAL,SECURITY,DEVICE,CHAN,RATE",
-        "device",
-        "wifi",
-        "list",
-        "--rescan",
-        rescan_arg,
-    ])?;
+fn wifi_rescan_devices(devices: &[serde_json::Value]) {
+    let mut requested = false;
+    for device in devices
+        .iter()
+        .filter_map(|device| device.get("name").and_then(serde_json::Value::as_str))
+        .filter(|name| !name.trim().is_empty())
+    {
+        requested = true;
+        if let Err(err) = nmcli_output(&["device", "wifi", "rescan", "ifname", device]) {
+            tracing::warn!("Dashboard Wi-Fi: rescan on {} failed: {}", device, err);
+        }
+    }
+    if !requested {
+        let _ = nmcli_output(&["device", "wifi", "rescan"]);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(1800));
+}
+
+fn parse_wifi_networks(text: &str) -> Vec<serde_json::Value> {
     let mut best_by_ssid: HashMap<String, serde_json::Value> = HashMap::new();
     for line in text.lines() {
         let fields = split_nmcli_terse_line(line);
@@ -1504,6 +1511,35 @@ fn wifi_networks_json(rescan: bool) -> Result<Vec<serde_json::Value>, String> {
                     .cmp(b.get("ssid").and_then(serde_json::Value::as_str).unwrap_or(""))
             })
     });
+    networks
+}
+
+fn wifi_networks_text(rescan_arg: &str) -> Result<String, String> {
+    nmcli_output(&[
+        "-t",
+        "-f",
+        "ACTIVE,SSID,SIGNAL,SECURITY,DEVICE,CHAN,RATE",
+        "device",
+        "wifi",
+        "list",
+        "--rescan",
+        rescan_arg,
+    ])
+}
+
+fn wifi_networks_json(rescan: bool, devices: &[serde_json::Value]) -> Result<Vec<serde_json::Value>, String> {
+    if rescan {
+        wifi_rescan_devices(devices);
+    }
+    let mut networks = parse_wifi_networks(&wifi_networks_text("no")?);
+    if rescan && networks.len() <= 1 {
+        if let Ok(text) = wifi_networks_text("yes") {
+            let fallback = parse_wifi_networks(&text);
+            if fallback.len() > networks.len() {
+                networks = fallback;
+            }
+        }
+    }
     Ok(networks)
 }
 
@@ -1532,7 +1568,7 @@ fn wifi_status_json(rescan: bool) -> serde_json::Value {
         }
     };
     let device = devices.first().cloned().unwrap_or_else(|| serde_json::json!({}));
-    let networks = wifi_networks_json(rescan).unwrap_or_default();
+    let networks = wifi_networks_json(rescan, &devices).unwrap_or_default();
     let active_scanned_ssid = networks
         .iter()
         .find(|network| network.get("active").and_then(serde_json::Value::as_bool).unwrap_or(false))

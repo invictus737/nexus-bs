@@ -21,6 +21,9 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let css_path = root.join("dashboard/assets/styles.css");
     let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
+    let deb_postinst_path = root.join("packaging/deb/templates/postinst.in");
+    let deb_reinstall_path = root.join("scripts/tetrahs-reinstall-nexus-bs.sh");
+    let source_install_path = root.join("scripts/install-from-source.sh");
     let core_unit_path = root.join("contrib/systemd/nexus-bs.service");
     let control_unit_path = root.join("contrib/systemd/nexus-bs-control.service");
     let dashboard_unit_path = root.join("contrib/systemd/nexus-bs-dashboard.service");
@@ -29,6 +32,9 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let app = std::fs::read_to_string(&app_path).expect("dashboard app.js should exist");
     let css = std::fs::read_to_string(&css_path).expect("dashboard styles.css should exist");
     let deploy_script = std::fs::read_to_string(&deploy_script_path).expect("deploy script should exist");
+    let deb_postinst = std::fs::read_to_string(&deb_postinst_path).expect("deb postinst template should exist");
+    let deb_reinstall = std::fs::read_to_string(&deb_reinstall_path).expect("clean reinstall script should exist");
+    let source_install = std::fs::read_to_string(&source_install_path).expect("source installer should exist");
     let core_unit = std::fs::read_to_string(&core_unit_path).expect("core systemd unit should exist");
     let control_unit = std::fs::read_to_string(&control_unit_path).expect("control systemd unit should exist");
     let dashboard_unit = std::fs::read_to_string(&dashboard_unit_path).expect("dashboard systemd unit should exist");
@@ -364,6 +370,23 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && core_unit.contains("CPUSchedulingPriority=80")
             && core_unit.contains("LimitRTPRIO=80"),
         "RF core must run with systemd RT scheduling equivalent to chrt -r 80"
+    );
+    assert!(
+        deb_postinst.contains("detect_run_user")
+            && deb_postinst.contains("install_service_user_dropins")
+            && deb_postinst.contains("User=%s")
+            && deb_postinst.contains("Group=%s")
+            && deb_postinst.contains("chown -R \"$run_user:$run_group\" /etc/nexus-bs")
+            && deb_postinst.contains("find /etc/nexus-bs -type f -name '*.toml' -exec chmod 0600")
+            && deb_postinst.contains("find /etc/nexus-bs -type f -name '*.toml.active' -exec chmod 0600")
+            && !deb_postinst.contains("chown root:root /etc/nexus-bs")
+            && !deb_postinst.contains("install -d -o root -g root -m 0755 /etc/nexus-bs")
+            && deb_reinstall.contains("RUN_USER")
+            && deb_reinstall.contains("chown -R \"$RUN_USER:$RUN_GROUP\" /etc/nexus-bs")
+            && !deb_reinstall.contains("chown root:root /etc/nexus-bs")
+            && source_install.contains("User=${RUN_USER}")
+            && source_install.contains("Group=${RUN_GROUP}"),
+        "Debian install and recovery flows must keep /etc/nexus-bs owned by the runtime user so dashboard config writes, calibration, profile duplicate, and restart flows work"
     );
     assert!(
         app.contains(r#"fetch("/api/logs/clear""#)

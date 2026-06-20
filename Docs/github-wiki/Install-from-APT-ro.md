@@ -26,8 +26,6 @@ curl -fL -o nexus-bs_0.1.71_arm64.deb https://github.com/invictus737/nexus-bs/re
 curl -fL -o SHA256SUMS https://github.com/invictus737/nexus-bs/releases/download/v0.1.71/SHA256SUMS
 sha256sum -c SHA256SUMS --ignore-missing
 sudo apt install /tmp/nexus-bs_0.1.71_arm64.deb
-sudo chown "$USER:$USER" /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback
-chmod 600 /etc/nexus-bs/config.toml /etc/nexus-bs/config.toml.fallback
 nexus-bs-service edit-config
 nexus-bs-service start
 ```

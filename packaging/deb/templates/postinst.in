@@ -1,10 +1,72 @@
 #!/bin/sh
 set -e
 
-if [ "$1" = "configure" ]; then
-    install -d -o root -g root -m 0755 /etc/nexus-bs
+service_units="nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service"
 
-    for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
+user_exists() {
+    [ -n "$1" ] && getent passwd "$1" >/dev/null 2>&1
+}
+
+detect_run_user() {
+    if user_exists "${NEXUS_BS_RUN_USER:-}"; then
+        printf '%s\n' "$NEXUS_BS_RUN_USER"
+        return 0
+    fi
+    if [ -e /etc/nexus-bs/config.toml ]; then
+        owner="$(stat -c '%U' /etc/nexus-bs/config.toml 2>/dev/null || true)"
+        if user_exists "$owner" && [ "$owner" != "root" ]; then
+            printf '%s\n' "$owner"
+            return 0
+        fi
+    fi
+    if user_exists "${SUDO_USER:-}" && [ "$SUDO_USER" != "root" ]; then
+        printf '%s\n' "$SUDO_USER"
+        return 0
+    fi
+    awk -F: '($3 >= 1000 && $3 < 60000 && $1 != "nobody") { print $1; exit }' /etc/passwd
+}
+
+install_service_user_dropins() {
+    run_user="$1"
+    run_group="$2"
+    [ -n "$run_user" ] || return 0
+    user_exists "$run_user" || return 0
+
+    for unit in $service_units; do
+        dropin_dir="/etc/systemd/system/$unit.d"
+        install -d -o root -g root -m 0755 "$dropin_dir"
+        {
+            printf '[Service]\n'
+            printf 'User=%s\n' "$run_user"
+            printf 'Group=%s\n' "$run_group"
+        } > "$dropin_dir/10-nexus-bs-user.conf"
+        chmod 0644 "$dropin_dir/10-nexus-bs-user.conf"
+    done
+}
+
+fix_config_permissions() {
+    run_user="$1"
+    run_group="$2"
+    [ -n "$run_user" ] || return 0
+    user_exists "$run_user" || return 0
+
+    chown -R "$run_user:$run_group" /etc/nexus-bs 2>/dev/null || true
+    find /etc/nexus-bs -type d -exec chmod 0750 {} + 2>/dev/null || true
+    find /etc/nexus-bs -type f -name '*.toml' -exec chmod 0600 {} + 2>/dev/null || true
+    find /etc/nexus-bs -type f -name '*.toml.active' -exec chmod 0600 {} + 2>/dev/null || true
+}
+
+if [ "$1" = "configure" ]; then
+    run_user="$(detect_run_user)"
+    run_group="$(id -gn "$run_user" 2>/dev/null || printf '%s' "$run_user")"
+    if ! user_exists "$run_user"; then
+        run_user="root"
+        run_group="root"
+    fi
+
+    install -d -o "$run_user" -g "$run_group" -m 0750 /etc/nexus-bs
+
+    for unit in $service_units; do
         legacy="/etc/systemd/system/$unit"
         if [ -f "$legacy" ] && grep -Eq '/home/chris/nexus-bs|v0\.1\.71_dev|^User=chris$' "$legacy"; then
             mv -f "$legacy" "$legacy.legacy-nexus-bs"
@@ -13,16 +75,11 @@ if [ "$1" = "configure" ]; then
     done
 
     if [ ! -e /etc/nexus-bs/config.toml ]; then
-        install -o root -g root -m 0600 /etc/nexus-bs/examples/config.toml /etc/nexus-bs/config.toml
+        install -o "$run_user" -g "$run_group" -m 0600 /etc/nexus-bs/examples/config.toml /etc/nexus-bs/config.toml
     fi
 
-    chown root:root /etc/nexus-bs /etc/nexus-bs/config.toml 2>/dev/null || true
-    chmod 0755 /etc/nexus-bs 2>/dev/null || true
-    chmod 0600 /etc/nexus-bs/config.toml 2>/dev/null || true
-    if [ -f /etc/nexus-bs/config.toml.fallback ]; then
-        chown root:root /etc/nexus-bs/config.toml.fallback 2>/dev/null || true
-        chmod 0600 /etc/nexus-bs/config.toml.fallback 2>/dev/null || true
-    fi
+    fix_config_permissions "$run_user" "$run_group"
+    install_service_user_dropins "$run_user" "$run_group"
 
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
