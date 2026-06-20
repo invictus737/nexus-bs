@@ -1461,7 +1461,10 @@ fn wifi_rescan_devices(devices: &[serde_json::Value]) {
     if !requested {
         let _ = nmcli_output(&["device", "wifi", "rescan"]);
     }
-    std::thread::sleep(std::time::Duration::from_millis(1800));
+    // On Raspberry Pi / NetworkManager, `nmcli device wifi rescan` can return
+    // before the scan cache is repopulated. User-observed scans on wlan0 take
+    // roughly 3.4s, so wait past that before reading the cached list.
+    std::thread::sleep(std::time::Duration::from_millis(4200));
 }
 
 fn parse_wifi_networks(text: &str) -> Vec<serde_json::Value> {
