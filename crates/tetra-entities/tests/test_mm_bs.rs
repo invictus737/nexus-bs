@@ -5110,46 +5110,55 @@ fn test_restart_recovery_explicit_seed_sends_location_update_command_on_startup(
     let sink_msgs = test.dump_sinks();
     let commands = location_update_commands(&sink_msgs);
     assert_eq!(commands.len(), 1);
-    assert_eq!(commands[0].0, seeded_issi);
+    assert_eq!(commands[0].0, cached_issi);
     assert_eq!(commands[0].1, 0);
     assert!(commands[0].2.group_identity_report);
 
     test.run_stack(Some(72));
-    assert!(
-        location_update_commands(&test.dump_sinks()).is_empty(),
-        "auto-managed restart recovery cache must not act as an implicit startup probe list"
-    );
+    let sink_msgs = test.dump_sinks();
+    let commands = location_update_commands(&sink_msgs);
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, seeded_issi);
+    assert_eq!(commands[0].1, 0);
+    assert!(commands[0].2.group_identity_report);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));
 }
 
 #[test]
-fn test_restart_recovery_cache_does_not_probe_without_explicit_seed() {
+fn test_restart_recovery_cache_probes_without_explicit_seed() {
     debug::setup_logging_verbose();
     let cached_issi = 2260618;
     let path = unique_restart_recovery_path("startup-cache-with-brew-exceptions");
     std::fs::write(&path, format!("{cached_issi} 91:0:4\n")).expect("failed to seed recovery cache");
 
     let mut config = ComponentTest::get_default_test_config(StackMode::Bs);
-    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(1, 90), (226333, 226333)]);
+    config.cell.local_ssi_ranges = SortedDisjointSsiRanges::from_vec_tuple(vec![(2260000, 2269999)]);
     config.security.issi_whitelist.clear();
 
     let mut test = ComponentTest::from_config(config, Some(TdmaTime::default()));
     test.config.state_write().subscriber_recovery_path = Some(path.clone());
     test.populate_entities(vec![TetraEntity::Mm], vec![TetraEntity::Mle]);
 
-    // EN 300 392-2 clause 16.4.4 permits SwMI-initiated registration with
-    // D-LOCATION UPDATE COMMAND, but Nexus-BS must not turn an auto-managed
-    // stale cache into a startup probe list. Only operator-configured
-    // restart_recovery_issis may initiate commands after restart.
-    test.run_stack(Some(73));
+    // ETSI TS 100 392-2 clause 16.4.3 permits the SwMI to initiate
+    // registration at any time and request a group report. After a BS process
+    // restart, the in-memory group state is gone, so Nexus-BS asks cached local
+    // ISSIs to re-state registration/groups over the air instead of trusting
+    // stale disk groups as truth.
+    test.run_stack(Some(72));
+    assert!(
+        location_update_commands(&test.dump_sinks()).is_empty(),
+        "restart recovery must hold the startup guard before probing cached ISSIs"
+    );
+
+    test.run_stack(Some(1));
     let sink_msgs = test.dump_sinks();
     let commands = location_update_commands(&sink_msgs);
-    assert!(
-        commands.is_empty(),
-        "stale auto-managed cache entry must not trigger D-LOCATION-UPDATE-COMMAND at startup"
-    );
+    assert_eq!(commands.len(), 1);
+    assert_eq!(commands[0].0, cached_issi);
+    assert_eq!(commands[0].1, 0);
+    assert!(commands[0].2.group_identity_report);
 
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}.tmp"));

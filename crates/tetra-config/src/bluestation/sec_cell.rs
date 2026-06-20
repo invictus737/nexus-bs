@@ -262,10 +262,9 @@ pub struct CfgCellInfo {
     /// Explicit local ISSIs to probe after a Nexus-BS process restart.
     ///
     /// These are operator bootstrap hints, not an ETSI air-interface IE. MM
-    /// uses only this explicit list to send ETSI EN 300 392-2 clause 16.4.4
-    /// D-LOCATION-UPDATE-COMMAND PDUs after startup. The auto-managed
-    /// subscriber recovery cache is used after a real attach response, not as
-    /// an implicit startup probe list.
+    /// also uses its auto-managed subscriber recovery cache to re-probe known
+    /// local ISSIs after startup with ETSI TS 100 392-2 clause 16.4.3
+    /// D-LOCATION-UPDATE-COMMAND(group report request) PDUs.
     pub restart_recovery_issis: Vec<u32>,
     /// Optional GSSI provisioning policy for MM group attachment. None keeps
     /// compatibility with dynamic scan-list systems and accepts any plain GSSI;

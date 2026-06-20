@@ -198,7 +198,7 @@ impl MmBs {
             .as_deref()
             .map(Self::read_restart_recovery_cache)
             .unwrap_or_default();
-        let restart_recovery_entries: Vec<_> = Self::load_restart_recovery_candidates(&config)
+        let restart_recovery_entries: Vec<_> = Self::load_restart_recovery_candidates(&config, &restart_recovery_cache)
             .into_iter()
             .enumerate()
             .map(|(index, issi)| {
@@ -396,12 +396,18 @@ impl MmBs {
         std::fs::rename(&tmp, path)
     }
 
-    fn load_restart_recovery_candidates(config: &SharedConfig) -> BTreeSet<u32> {
+    fn load_restart_recovery_candidates(config: &SharedConfig, cache: &RestartRecoveryCache) -> BTreeSet<u32> {
         if !config.config().cell.registration {
             return BTreeSet::new();
         }
 
         let mut issis = BTreeSet::new();
+        for issi in cache.keys() {
+            if Self::restart_recovery_eligible(config, *issi) {
+                issis.insert(*issi);
+            }
+        }
+
         for issi in &config.config().cell.restart_recovery_issis {
             if Self::restart_recovery_eligible(config, *issi) {
                 issis.insert(*issi);
@@ -409,7 +415,7 @@ impl MmBs {
         }
 
         if !issis.is_empty() {
-            tracing::info!("MM: explicit restart recovery armed for {} local ISSI(s): {:?}", issis.len(), issis);
+            tracing::info!("MM: restart recovery armed for {} local ISSI(s): {:?}", issis.len(), issis);
         }
 
         issis
