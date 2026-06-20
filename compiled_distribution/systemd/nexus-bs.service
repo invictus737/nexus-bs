@@ -16,7 +16,7 @@ RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
 Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service
 Environment=NEXUS_BS_PERSISTENT_CONFIG=/etc/nexus-bs/config.toml
-Environment=RUST_LOG=info,tetra_entities::messagerouter=warn,tetra_entities::phy::phy_bs=warn,tetra_entities::mm::components::client_state=warn
+Environment=RUST_LOG=info,tetra_entities::umac=warn,tetra_entities::llc=warn,tetra_entities::mle=warn,tetra_entities::mm=warn,tetra_entities::cmce=warn,tetra_entities::sndcp=warn,tetra_entities::lmac=warn,tetra_entities::phy=warn,tetra_entities::network=warn,tetra_entities::net_telemetry=warn,tetra_entities::messagerouter=warn
 
 ExecStartPre=/usr/bin/install -m 0600 /etc/nexus-bs/config.toml /run/nexus-bs/config.toml
 ExecStartPre=/bin/sh -c 'if [ -f "$1" ]; then /usr/bin/install -m 0600 "$1" "$2"; fi' nexus-bs-copy-fallback /etc/nexus-bs/config.toml.fallback /run/nexus-bs/config.toml.fallback

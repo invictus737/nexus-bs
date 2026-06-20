@@ -197,6 +197,13 @@ impl UpdateState {
 
 type SharedUpdateState = Arc<Mutex<UpdateState>>;
 
+#[derive(Debug, Clone)]
+struct DebUpdateRequest {
+    version: String,
+    asset_name: String,
+    url: String,
+}
+
 /// In-memory session store for cookie-based authentication.
 ///
 /// We deliberately don't use Basic Auth from the browser any more: on iOS Safari and
@@ -566,6 +573,129 @@ fn run_update(update: SharedUpdateState, config_path: String, source_dir_overrid
     update.lock().unwrap().finish(true);
 
     crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
+}
+
+fn update_log(update: &SharedUpdateState, line: impl AsRef<str>) {
+    let line = line.as_ref();
+    tracing::info!("UPDATE: {}", line);
+    update.lock().unwrap().append(line);
+}
+
+fn run_update_command(update: &SharedUpdateState, program: &str, args: &[&str]) -> bool {
+    update_log(update, format!("$ {} {}", program, args.join(" ")));
+    match Command::new(program).args(args).output() {
+        Ok(out) => {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                update.lock().unwrap().append(line);
+            }
+            for line in String::from_utf8_lossy(&out.stderr).lines() {
+                update.lock().unwrap().append(line);
+            }
+            if out.status.success() {
+                true
+            } else {
+                update_log(update, format!("ERROR: exited with {}", out.status));
+                false
+            }
+        }
+        Err(e) => {
+            update_log(update, format!("ERROR: failed to run '{}': {}", program, e));
+            false
+        }
+    }
+}
+
+fn run_update_command_capture(update: &SharedUpdateState, program: &str, args: &[&str]) -> Option<String> {
+    update_log(update, format!("$ {} {}", program, args.join(" ")));
+    match Command::new(program).args(args).output() {
+        Ok(out) => {
+            let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+            for line in stdout.lines() {
+                update.lock().unwrap().append(line);
+            }
+            for line in stderr.lines() {
+                update.lock().unwrap().append(line);
+            }
+            if out.status.success() {
+                Some(stdout)
+            } else {
+                update_log(update, format!("ERROR: exited with {}", out.status));
+                None
+            }
+        }
+        Err(e) => {
+            update_log(update, format!("ERROR: failed to run '{}': {}", program, e));
+            None
+        }
+    }
+}
+
+fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
+    update_log(&update, "=== Nexus-BS Debian package update ===");
+    update_log(&update, format!("Selected version: {}", deb.version));
+    update_log(&update, format!("Asset: {}", deb.asset_name));
+
+    let work_dir = PathBuf::from("/tmp/nexus-bs-update");
+    if let Err(e) = fs::create_dir_all(&work_dir) {
+        update_log(&update, format!("ERROR: failed to create {}: {}", work_dir.display(), e));
+        update.lock().unwrap().finish(false);
+        return;
+    }
+    let deb_path = work_dir.join(&deb.asset_name);
+    let Some(deb_path_str) = deb_path.to_str() else {
+        update_log(&update, "ERROR: update path is not valid UTF-8");
+        update.lock().unwrap().finish(false);
+        return;
+    };
+    let _ = fs::remove_file(&deb_path);
+
+    if !run_update_command(
+        &update,
+        "curl",
+        &["-fL", "--connect-timeout", "10", "--max-time", "180", "-o", deb_path_str, &deb.url],
+    ) {
+        update.lock().unwrap().finish(false);
+        return;
+    }
+
+    let package = run_update_command_capture(&update, "dpkg-deb", &["-f", deb_path_str, "Package"]).unwrap_or_default();
+    let version = run_update_command_capture(&update, "dpkg-deb", &["-f", deb_path_str, "Version"]).unwrap_or_default();
+    let arch = run_update_command_capture(&update, "dpkg-deb", &["-f", deb_path_str, "Architecture"]).unwrap_or_default();
+    if package.trim() != "nexus-bs" {
+        update_log(&update, format!("ERROR: unexpected package '{}'", package.trim()));
+        update.lock().unwrap().finish(false);
+        return;
+    }
+    let runtime_arch = debian_arch();
+    if arch.trim() != runtime_arch {
+        update_log(
+            &update,
+            format!(
+                "ERROR: package architecture '{}' does not match host '{}'",
+                arch.trim(),
+                runtime_arch
+            ),
+        );
+        update.lock().unwrap().finish(false);
+        return;
+    }
+    update_log(&update, format!("Installing nexus-bs {} ({})", version.trim(), arch.trim()));
+
+    if !run_update_command(&update, "apt", &["install", "-y", deb_path_str]) {
+        update.lock().unwrap().finish(false);
+        return;
+    }
+    let _ = run_update_command(&update, "systemctl", &["daemon-reload"]);
+    let _ = run_update_command(&update, "systemctl", &["restart", "nexus-bs-control.service"]);
+    let _ = run_update_command(&update, "systemctl", &["restart", "nexus-bs.service"]);
+    update_log(&update, "Restarting dashboard service to load the installed version");
+    update.lock().unwrap().finish(true);
+
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 2; systemctl restart nexus-bs-dashboard.service")
+        .spawn();
 }
 
 pub struct DashboardServer {
@@ -2304,6 +2434,44 @@ fn handle_connection(
             .spawn(move || run_update(update_clone, cfg_clone, src_override))
             .ok();
         http_response(buf.into_inner(), 200, "OK");
+    } else if request_matches(&req_line, "POST", "/api/update/deb") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                http_response(buf.into_inner(), 400, &format!("Invalid update request: {e:?}"));
+                return;
+            }
+        };
+        let body = match std::str::from_utf8(&body) {
+            Ok(body) => body,
+            Err(_) => {
+                http_response(buf.into_inner(), 400, "Invalid update request: body is not UTF-8");
+                return;
+            }
+        };
+        let deb = match parse_deb_update_request(body) {
+            Ok(deb) => deb,
+            Err(e) => {
+                http_response(buf.into_inner(), 400, &e);
+                return;
+            }
+        };
+        {
+            let mut u = update_state.lock().unwrap();
+            if u.phase == UpdatePhase::Running {
+                http_response(buf.into_inner(), 409, "Update already in progress");
+                return;
+            }
+            u.start();
+        }
+        tracing::info!("Dashboard: Debian package update triggered for {}", deb.version);
+        let update_clone = Arc::clone(&update_state);
+        std::thread::Builder::new()
+            .name("deb-update".into())
+            .spawn(move || run_deb_update(update_clone, deb))
+            .ok();
+        http_json_response(buf.into_inner(), 200, r#"{"ok":true,"message":"package update started"}"#);
     } else if request_matches(&req_line, "GET", "/api/config/backup") {
         let mut buf = BufReader::new(stream);
         loop {
@@ -3192,17 +3360,64 @@ fn serve_update_status(stream: TcpStream, update_state: &SharedUpdateState) {
 /// version than the running build exists. Best-effort; on any failure returns
 /// check_failed=true so the dashboard simply hides the badge.
 fn serve_update_check(stream: TcpStream) {
-    if !DASHBOARD_OTA_UPDATE_ENABLED {
-        let body = format!(
-            "{{\"current\":\"{}\",\"latest\":null,\"update_available\":false,\"release_url\":null,\"check_failed\":true,\"disabled\":true}}",
-            tetra_core::STACK_VERSION
-        );
-        http_json_response(stream, 200, &body);
-        return;
-    }
-    let result = crate::net_dashboard::update_check::check_for_update(tetra_core::STACK_VERSION);
+    let result = crate::net_dashboard::update_check::list_deb_releases(tetra_core::STACK_VERSION, &debian_arch());
     let body = result.to_json();
     http_json_response(stream, 200, &body);
+}
+
+fn debian_arch() -> String {
+    Command::new("dpkg")
+        .arg("--print-architecture")
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
+        .filter(|arch| !arch.is_empty())
+        .unwrap_or_else(|| match std::env::consts::ARCH {
+            "aarch64" => "arm64".to_string(),
+            "x86_64" => "amd64".to_string(),
+            "arm" => "armhf".to_string(),
+            other => other.to_string(),
+        })
+}
+
+fn parse_deb_update_request(body: &str) -> Result<DebUpdateRequest, String> {
+    let v: serde_json::Value = serde_json::from_str(body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let version = v.get("version").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let asset_name = v.get("asset_name").and_then(|v| v.as_str()).unwrap_or("").trim().to_string();
+    let url = v
+        .get("url")
+        .or_else(|| v.get("deb_url"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    validate_deb_update_request(&version, &asset_name, &url)?;
+    Ok(DebUpdateRequest { version, asset_name, url })
+}
+
+fn validate_deb_update_request(version: &str, asset_name: &str, url: &str) -> Result<(), String> {
+    let arch = debian_arch();
+    if version.is_empty() || asset_name.is_empty() || url.is_empty() {
+        return Err("version, asset_name and url are required".to_string());
+    }
+    if version.contains("_dev") || asset_name.contains("_dev") || url.contains("_dev") {
+        return Err("development releases are not installable from dashboard".to_string());
+    }
+    if !asset_name.ends_with(".deb") || !asset_name.starts_with("nexus-bs_") || !asset_name.contains(&format!("_{arch}.deb")) {
+        return Err(format!("asset must be a nexus-bs {arch} .deb package"));
+    }
+    if asset_name.contains('/') || asset_name.contains('\\') || asset_name.contains("..") {
+        return Err("invalid asset name".to_string());
+    }
+    let allowed_prefix = "https://github.com/invictus737/nexus-bs/releases/download/";
+    if !url.starts_with(allowed_prefix) {
+        return Err("release URL is not a trusted Nexus-BS GitHub release asset".to_string());
+    }
+    if !url.ends_with(asset_name) {
+        return Err("release URL does not match selected asset".to_string());
+    }
+    Ok(())
 }
 
 /// GET /api/whitelist — return the effective whitelist as JSON:

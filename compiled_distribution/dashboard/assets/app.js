@@ -48,6 +48,11 @@ const state = {
   wifiSelectedSsid: "",
   wifiScanVisible: false,
   wifiActionStatus: "idle",
+  updateCatalog: null,
+  updateBusy: false,
+  updateStatus: "checking",
+  updateLog: "",
+  selectedUpdateUrl: "",
   serviceBusy: false,
   serviceStatus: "idle",
   logAutoScroll: true,
@@ -1288,6 +1293,102 @@ async function requestServiceAction(action) {
   }
 }
 
+function updateRelationLabel(release) {
+  const rel = release?.relation || "available";
+  if (rel === "newer") return "update";
+  if (rel === "older") return "downgrade";
+  if (rel === "current") return "installed";
+  return rel;
+}
+
+function selectedUpdateRelease() {
+  const url = $("updateReleaseSelect")?.value || state.selectedUpdateUrl || "";
+  return (state.updateCatalog?.releases || []).find((release) => release.deb_url === url) || null;
+}
+
+async function loadUpdateCatalog() {
+  state.updateStatus = "checking";
+  renderUpdatePanel();
+  try {
+    const catalog = await fetchDashboardJson(
+      "/api/update/check",
+      { credentials: "same-origin", cache: "no-store" },
+      14000
+    );
+    state.updateCatalog = catalog;
+    const releases = catalog.releases || [];
+    const preferred = releases.find((release) => release.update_available) || releases.find((release) => release.relation === "current") || releases[0];
+    state.selectedUpdateUrl = preferred?.deb_url || "";
+    state.updateStatus = catalog.check_failed ? "check_failed" : catalog.update_available ? "update_available" : "latest";
+    if (catalog.check_failed) state.updateLog = catalog.error || "Update check failed.";
+  } catch (error) {
+    state.updateCatalog = null;
+    state.updateStatus = "check_failed";
+    state.updateLog = `Update check failed: ${String(error.message || error)}`;
+  }
+  renderUpdatePanel();
+}
+
+async function loadUpdateStatus() {
+  try {
+    const status = await fetchDashboardJson(
+      "/api/update/status",
+      { credentials: "same-origin", cache: "no-store" },
+      5000
+    );
+    state.updateLog = status.log || state.updateLog || "";
+    if (status.status === "running") state.updateStatus = "running";
+    if (status.status === "done_ok") state.updateStatus = "done_ok";
+    if (status.status === "done_err") state.updateStatus = "done_err";
+    state.updateBusy = status.status === "running";
+    renderUpdatePanel();
+  } catch {
+    // Status polling is best-effort; release catalog remains useful.
+  }
+}
+
+async function applySelectedUpdate() {
+  const release = selectedUpdateRelease();
+  if (!release || state.updateBusy) return;
+  const action = release.relation === "older" ? "Downgrade" : release.relation === "current" ? "Reinstall" : "Update";
+  if (!window.confirm(`${action} Nexus-BS to ${release.tag}?\n\nThe package will be downloaded from GitHub and services will restart.`)) return;
+  state.updateBusy = true;
+  state.updateStatus = "running";
+  state.updateLog = `Starting ${action.toLowerCase()} to ${release.tag}...`;
+  renderUpdatePanel();
+  try {
+    const res = await fetchWithTimeout(
+      "/api/update/deb",
+      {
+        method: "POST",
+        credentials: "same-origin",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          version: release.tag,
+          asset_name: release.deb_asset_name,
+          url: release.deb_url,
+        }),
+      },
+      8000
+    );
+    const body = await res.json().catch(async () => ({ error: await res.text().catch(() => "") }));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    state.updateLog = body.message || "Package update started.";
+    pollUpdateStatus();
+  } catch (error) {
+    state.updateBusy = false;
+    state.updateStatus = "done_err";
+    state.updateLog = `Update request failed: ${String(error.message || error)}`;
+    renderUpdatePanel();
+  }
+}
+
+function pollUpdateStatus() {
+  loadUpdateStatus();
+  if (state.updateBusy) window.setTimeout(pollUpdateStatus, 1500);
+}
+
 function setSiteCarrierInhibited(inhibited) {
   if (!state.site) state.site = {};
   if (!state.site.config) state.site.config = {};
@@ -2105,14 +2206,69 @@ function renderSite() {
   setText("settingsRadioIdEndpoint", radioIdEndpoint() || "disabled");
   setText("settingsConfigMode", cfg.available ? "live core config" : "unavailable");
   setText("adminAccessMode", "external API/WS");
-  setText("adminUpdateChannel", "disabled");
+  setText("adminUpdateChannel", state.updateCatalog?.check_failed ? "check failed" : "GitHub releases");
   setText("adminAuditSink", "volatile runtime log");
   setText("adminCoreProcess", "nexus-bs core service");
   setText("adminDashboardProcess", "nexus-bs-dashboard service");
   renderServiceControls();
+  renderUpdatePanel();
   renderCalibration();
   setText("slotSummary", "TS1 control, TS2-TS4 traffic");
   setText("diagramSlotState", "TS1 control, TS2-TS4 traffic");
+}
+
+function renderUpdatePanel() {
+  const catalog = state.updateCatalog || {};
+  const releases = catalog.releases || [];
+  const top = $("topUpdateBtn");
+  const topState = $("topUpdateState");
+  const statusText =
+    state.updateStatus === "running"
+      ? "Updating"
+      : state.updateStatus === "update_available"
+        ? "Update available"
+        : state.updateStatus === "check_failed"
+          ? "Check failed"
+          : state.updateStatus === "done_err"
+            ? "Update failed"
+            : state.updateStatus === "done_ok"
+              ? "Installed"
+              : catalog.latest
+                ? catalog.latest
+                : "checking";
+  if (topState) topState.textContent = statusText;
+  if (top) {
+    top.classList.toggle("has-update", state.updateStatus === "update_available");
+    top.classList.toggle("is-unknown", state.updateStatus === "check_failed" || state.updateStatus === "done_err");
+  }
+  setText("updatePanelStatus", statusText);
+  setText("updateCurrentVersion", catalog.current || state.system?.stack_version || "--");
+  setText("updateLatestVersion", catalog.latest || "--");
+
+  const select = $("updateReleaseSelect");
+  if (select) {
+    const selected = state.selectedUpdateUrl || select.value;
+    select.innerHTML = releases.length
+      ? releases
+          .map((release) => {
+            const relation = updateRelationLabel(release);
+            const size = release.deb_size ? `, ${Math.round(release.deb_size / 1024 / 1024)} MB` : "";
+            return `<option value="${esc(release.deb_url)}">${esc(release.tag)} - ${relation} (${esc(release.deb_asset_name)}${size})</option>`;
+          })
+          .join("")
+      : `<option value="">No .deb releases found</option>`;
+    select.value = releases.some((release) => release.deb_url === selected) ? selected : releases[0]?.deb_url || "";
+    state.selectedUpdateUrl = select.value;
+  }
+  const selectedRelease = selectedUpdateRelease();
+  const apply = $("updateApplyBtn");
+  if (apply) {
+    apply.disabled = state.updateBusy || !selectedRelease;
+    apply.textContent = selectedRelease?.relation === "older" ? "Downgrade" : selectedRelease?.relation === "current" ? "Reinstall" : "Apply Update";
+  }
+  const check = $("updateRefreshBtn");
+  if (check) check.disabled = state.updateBusy;
+  setText("updateLog", state.updateLog || (catalog.check_failed ? catalog.error : "No update activity."));
 }
 
 function renderSystem() {
@@ -2446,6 +2602,7 @@ function refreshDashboardData() {
   loadCalibrationStatus();
   loadConfigProfiles();
   loadWifiStatus();
+  loadUpdateCatalog();
 }
 
 function connectWs() {
@@ -2507,6 +2664,10 @@ function switchPage(page) {
   $(`page-${page}`)?.classList.add("active");
   setText("pageTitle", pages[page] || "Overview");
   if (page === "logs") renderLogs();
+  if (page === "settings") {
+    loadUpdateStatus();
+    if (!state.updateCatalog) loadUpdateCatalog();
+  }
   restorePageScroll(page, 0);
 }
 
@@ -2528,7 +2689,10 @@ function initNav() {
   for (const node of document.querySelectorAll(".nav-item")) {
     node.addEventListener("click", () => switchPage(node.dataset.page));
   }
-  $("refreshBtn").addEventListener("click", refreshDashboardData);
+  $("topUpdateBtn")?.addEventListener("click", () => {
+    switchPage("settings");
+    loadUpdateCatalog();
+  });
   $("configRefreshBtn")?.addEventListener("click", loadConfigProfiles);
   $("configLoadCurrentBtn")?.addEventListener("click", () => loadConfigText("config.toml"));
   $("configLoadSelectedBtn")?.addEventListener("click", () => loadConfigText(selectedConfigName()));
@@ -2539,6 +2703,12 @@ function initNav() {
   $("serviceRestartBtn")?.addEventListener("click", () => requestServiceAction("restart"));
   $("serviceShutdownBtn")?.addEventListener("click", () => requestServiceAction("shutdown"));
   $("serviceStopGoBtn")?.addEventListener("click", () => requestServiceAction("stopgo"));
+  $("updateRefreshBtn")?.addEventListener("click", loadUpdateCatalog);
+  $("updateApplyBtn")?.addEventListener("click", applySelectedUpdate);
+  $("updateReleaseSelect")?.addEventListener("change", (event) => {
+    state.selectedUpdateUrl = event.target.value || "";
+    renderUpdatePanel();
+  });
   $("calibrationRunBtn")?.addEventListener("click", requestTxCalibration);
   $("wifiScanBtn")?.addEventListener("click", scanWifiNetworks);
   $("wifiClearBtn")?.addEventListener("click", clearWifiScanList);

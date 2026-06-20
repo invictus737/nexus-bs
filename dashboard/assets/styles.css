@@ -224,6 +224,53 @@ h1 {
   gap: 8px;
 }
 
+.update-badge {
+  min-width: 154px;
+  min-height: 38px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  display: grid;
+  justify-items: start;
+  gap: 2px;
+  background: var(--panel);
+  color: var(--text);
+  cursor: default;
+  padding: 5px 10px;
+  text-align: left;
+}
+
+.update-badge span {
+  color: var(--muted);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.update-badge strong {
+  max-width: 160px;
+  overflow: hidden;
+  color: var(--green);
+  font-family: var(--mono);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.update-badge.has-update {
+  border-color: #3d6e76;
+  background: #1c3a40;
+  cursor: pointer;
+}
+
+.update-badge.has-update strong {
+  color: #e9fbff;
+}
+
+.update-badge.is-unknown strong {
+  color: var(--amber);
+}
+
 .icon-btn {
   width: 36px;
   height: 34px;
@@ -944,6 +991,36 @@ td .pill {
   white-space: nowrap;
 }
 
+.update-panel-body {
+  min-width: 0;
+  display: grid;
+  gap: 0;
+}
+
+.update-controls {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) auto auto;
+  gap: 8px;
+  align-items: end;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.update-log {
+  min-height: 92px;
+  max-height: 220px;
+  margin: 0;
+  padding: 10px 12px;
+  overflow: auto;
+  border-top: 1px solid var(--line-soft);
+  background: var(--panel-3);
+  color: #c9d6df;
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: pre-wrap;
+}
+
 .calibration-panel {
   margin-top: 14px;
 }
@@ -1405,6 +1482,7 @@ td .pill {
   .grid.traffic-grid,
   .slot-grid,
   .service-controls,
+  .update-controls,
   .calibration-grid,
   .calibration-actions,
   .wifi-grid,

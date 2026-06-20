@@ -41,7 +41,10 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
           <p id="subtitle">Local TETRA eBTS operations console</p>
         </div>
         <div class="top-actions">
-          <button class="icon-btn" id="refreshBtn" title="Refresh system state" aria-label="Refresh system state" type="button">↻</button>
+          <button class="update-badge" id="topUpdateBtn" type="button" aria-label="Release update status">
+            <span>Latest version</span>
+            <strong id="topUpdateState">checking</strong>
+          </button>
         </div>
       </header>
 
@@ -273,6 +276,26 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
               <dt>Config Mode</dt><dd id="settingsConfigMode">flat local config</dd>
               <dt>RadioID</dt><dd id="settingsRadioIdEndpoint">/api/radioid</dd>
             </dl>
+          </section>
+
+          <section class="panel" id="updateSection">
+            <div class="panel-head"><h2>Software Update</h2><span id="updatePanelStatus">checking</span></div>
+            <div class="update-panel-body">
+              <div class="ops-list">
+                <div class="ops-row"><span>Installed</span><strong id="updateCurrentVersion">--</strong></div>
+                <div class="ops-row"><span>Latest Release</span><strong id="updateLatestVersion">--</strong></div>
+                <div class="ops-row"><span>Package Source</span><strong>GitHub Releases</strong></div>
+              </div>
+              <div class="update-controls">
+                <label class="field">
+                  <span>Release package</span>
+                  <select id="updateReleaseSelect"></select>
+                </label>
+                <button class="action-btn primary" id="updateApplyBtn" type="button">Apply Package</button>
+                <button class="action-btn secondary" id="updateRefreshBtn" type="button">Check</button>
+              </div>
+              <pre class="update-log" id="updateLog">No update activity.</pre>
+            </div>
           </section>
 
           <section class="panel" id="adminSection">

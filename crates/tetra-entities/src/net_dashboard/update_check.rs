@@ -13,9 +13,11 @@
 //! The check is best-effort: any network/parse failure yields `UpdateCheck::unknown()`
 //! rather than an error, so a flaky connection never breaks the dashboard.
 
+use serde::Serialize;
 use std::time::Duration;
 
-const GITHUB_API_LATEST: &str = "https://api.github.com/repos/Nexus-BS/nexus-bs/releases/latest";
+const GITHUB_API_LATEST: &str = "https://api.github.com/repos/invictus737/nexus-bs/releases/latest";
+const GITHUB_API_RELEASES: &str = "https://api.github.com/repos/invictus737/nexus-bs/releases?per_page=50";
 // GitHub requires a User-Agent on all API requests.
 const USER_AGENT: &str = tetra_core::PRODUCT_USER_AGENT;
 
@@ -60,6 +62,31 @@ pub struct UpdateCheck {
     pub check_failed: bool,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DebRelease {
+    pub tag: String,
+    pub version: String,
+    pub name: String,
+    pub published_at: Option<String>,
+    pub html_url: Option<String>,
+    pub deb_asset_name: String,
+    pub deb_url: String,
+    pub deb_size: Option<u64>,
+    pub update_available: bool,
+    pub relation: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ReleaseCatalog {
+    pub current: String,
+    pub arch: String,
+    pub latest: Option<String>,
+    pub update_available: bool,
+    pub releases: Vec<DebRelease>,
+    pub check_failed: bool,
+    pub error: Option<String>,
+}
+
 impl UpdateCheck {
     fn unknown(current: &str) -> Self {
         UpdateCheck {
@@ -91,6 +118,30 @@ impl UpdateCheck {
             url,
             self.check_failed
         )
+    }
+}
+
+impl ReleaseCatalog {
+    fn failed(current: &str, arch: &str, error: impl Into<String>) -> Self {
+        Self {
+            current: current.to_string(),
+            arch: arch.to_string(),
+            latest: None,
+            update_available: false,
+            releases: Vec::new(),
+            check_failed: true,
+            error: Some(error.into()),
+        }
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::to_string(self).unwrap_or_else(|_| {
+            format!(
+                "{{\"current\":\"{}\",\"arch\":\"{}\",\"latest\":null,\"update_available\":false,\"releases\":[],\"check_failed\":true}}",
+                json_escape(&self.current),
+                json_escape(&self.arch)
+            )
+        })
     }
 }
 
@@ -144,6 +195,106 @@ pub fn check_for_update(current_version: &str) -> UpdateCheck {
         update_available,
         release_url: html_url,
         check_failed: false,
+    }
+}
+
+pub fn list_deb_releases(current_version: &str, arch: &str) -> ReleaseCatalog {
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(12))
+        .user_agent(USER_AGENT)
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return ReleaseCatalog::failed(current_version, arch, format!("http client: {e}")),
+    };
+
+    let resp = match client
+        .get(GITHUB_API_RELEASES)
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .and_then(|r| r.error_for_status())
+    {
+        Ok(r) => r,
+        Err(e) => return ReleaseCatalog::failed(current_version, arch, format!("github releases: {e}")),
+    };
+
+    let json: serde_json::Value = match resp.json() {
+        Ok(j) => j,
+        Err(e) => return ReleaseCatalog::failed(current_version, arch, format!("github json: {e}")),
+    };
+    let Some(items) = json.as_array() else {
+        return ReleaseCatalog::failed(current_version, arch, "github releases response was not an array");
+    };
+
+    let current_semver = SemVer::parse(current_version);
+    let mut releases = Vec::new();
+
+    for release in items {
+        if release.get("draft").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue;
+        }
+        let Some(tag) = release.get("tag_name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if tag.contains("_dev") {
+            continue;
+        }
+        let Some(version) = SemVer::parse(tag) else {
+            continue;
+        };
+        let Some(assets) = release.get("assets").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        let Some(asset) = assets.iter().find(|asset| {
+            let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            name.ends_with(".deb") && name.contains(arch) && !name.contains("_dev")
+        }) else {
+            continue;
+        };
+        let Some(deb_url) = asset.get("browser_download_url").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let relation = match current_semver {
+            Some(current) if version > current => "newer",
+            Some(current) if version < current => "older",
+            Some(_) => "current",
+            None => "available",
+        };
+        releases.push(DebRelease {
+            tag: tag.to_string(),
+            version: tag.trim_start_matches(['v', 'V']).to_string(),
+            name: release
+                .get("name")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(tag)
+                .to_string(),
+            published_at: release.get("published_at").and_then(|v| v.as_str()).map(str::to_string),
+            html_url: release.get("html_url").and_then(|v| v.as_str()).map(str::to_string),
+            deb_asset_name: asset.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            deb_url: deb_url.to_string(),
+            deb_size: asset.get("size").and_then(|v| v.as_u64()),
+            update_available: relation == "newer",
+            relation: relation.to_string(),
+        });
+    }
+
+    releases.sort_by(|a, b| {
+        SemVer::parse(&b.tag)
+            .cmp(&SemVer::parse(&a.tag))
+            .then_with(|| b.published_at.cmp(&a.published_at))
+    });
+    let latest = releases.first().map(|release| release.tag.clone());
+    let update_available = releases.iter().any(|release| release.update_available);
+
+    ReleaseCatalog {
+        current: current_version.to_string(),
+        arch: arch.to_string(),
+        latest,
+        update_available,
+        releases,
+        check_failed: false,
+        error: None,
     }
 }
 
