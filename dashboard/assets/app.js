@@ -1086,21 +1086,29 @@ function defaultEasyStartDraft() {
 
 function easyStartDraftFromInputs() {
   const draft = state.easyStartDraft || defaultEasyStartDraft();
+  const valueOr = (id, fallback) => {
+    const node = $(id);
+    return node ? node.value : fallback;
+  };
+  const checkedOr = (id, fallback) => {
+    const node = $(id);
+    return node ? !!node.checked : fallback;
+  };
   return {
     ...draft,
-    mcc: Number($("easyMcc")?.value || draft.mcc),
-    mnc: Number($("easyMnc")?.value || draft.mnc),
-    timezone: String($("easyTimezone")?.value || draft.timezone).trim(),
-    tx_freq: Number($("easyTxFreq")?.value || draft.tx_freq),
-    duplex_spacing: Number($("easyDuplexSpacing")?.value || draft.duplex_spacing),
-    custom_spacing_enabled: !!$("easyCustomSpacingEnabled")?.checked,
-    custom_spacing_hz: Number($("easyCustomSpacingHz")?.value || draft.custom_spacing_hz),
-    brew_enabled: !!$("easyBrewEnabled")?.checked,
-    brew_host: String($("easyBrewHost")?.value || draft.brew_host).trim(),
-    brew_port: Number($("easyBrewPort")?.value || draft.brew_port),
-    brew_tls: !!$("easyBrewTls")?.checked,
-    brew_username: Number($("easyBrewUsername")?.value || draft.brew_username),
-    brew_password: String($("easyBrewPassword")?.value || draft.brew_password),
+    mcc: Number(valueOr("easyMcc", draft.mcc)),
+    mnc: Number(valueOr("easyMnc", draft.mnc)),
+    timezone: String(valueOr("easyTimezone", draft.timezone)).trim(),
+    tx_freq: Number(valueOr("easyTxFreq", draft.tx_freq)),
+    duplex_spacing: Number(valueOr("easyDuplexSpacing", draft.duplex_spacing)),
+    custom_spacing_enabled: checkedOr("easyCustomSpacingEnabled", !!draft.custom_spacing_enabled),
+    custom_spacing_hz: Number(valueOr("easyCustomSpacingHz", draft.custom_spacing_hz)),
+    brew_enabled: checkedOr("easyBrewEnabled", !!draft.brew_enabled),
+    brew_host: String(valueOr("easyBrewHost", draft.brew_host)).trim(),
+    brew_port: Number(valueOr("easyBrewPort", draft.brew_port)),
+    brew_tls: checkedOr("easyBrewTls", !!draft.brew_tls),
+    brew_username: Number(valueOr("easyBrewUsername", draft.brew_username)),
+    brew_password: String(valueOr("easyBrewPassword", draft.brew_password)),
   };
 }
 
