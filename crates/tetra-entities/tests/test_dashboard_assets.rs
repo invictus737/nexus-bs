@@ -22,8 +22,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
     let deb_postinst_path = root.join("packaging/deb/templates/postinst.in");
+    let deb_postrm_path = root.join("packaging/deb/templates/postrm.in");
     let deb_reinstall_path = root.join("scripts/tetrahs-reinstall-nexus-bs.sh");
     let source_install_path = root.join("scripts/install-from-source.sh");
+    let dashboard_server_path = root.join("crates/tetra-entities/src/net_dashboard/server.rs");
     let core_unit_path = root.join("contrib/systemd/nexus-bs.service");
     let control_unit_path = root.join("contrib/systemd/nexus-bs-control.service");
     let dashboard_unit_path = root.join("contrib/systemd/nexus-bs-dashboard.service");
@@ -33,8 +35,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let css = std::fs::read_to_string(&css_path).expect("dashboard styles.css should exist");
     let deploy_script = std::fs::read_to_string(&deploy_script_path).expect("deploy script should exist");
     let deb_postinst = std::fs::read_to_string(&deb_postinst_path).expect("deb postinst template should exist");
+    let deb_postrm = std::fs::read_to_string(&deb_postrm_path).expect("deb postrm template should exist");
     let deb_reinstall = std::fs::read_to_string(&deb_reinstall_path).expect("clean reinstall script should exist");
     let source_install = std::fs::read_to_string(&source_install_path).expect("source installer should exist");
+    let dashboard_server = std::fs::read_to_string(&dashboard_server_path).expect("dashboard server source should exist");
     let core_unit = std::fs::read_to_string(&core_unit_path).expect("core systemd unit should exist");
     let control_unit = std::fs::read_to_string(&control_unit_path).expect("control systemd unit should exist");
     let dashboard_unit = std::fs::read_to_string(&dashboard_unit_path).expect("dashboard systemd unit should exist");
@@ -384,6 +388,17 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && core_unit.contains("CPUSchedulingPriority=80")
             && core_unit.contains("LimitRTPRIO=80"),
         "RF core must run with systemd RT scheduling equivalent to chrt -r 80"
+    );
+    assert!(
+        dashboard_server.contains(r#"run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str])"#)
+            && deb_postinst.contains("install_dashboard_sudoers")
+            && deb_postinst.contains("/usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb")
+            && deb_postinst.contains("/usr/bin/systemctl restart nexus-bs-dashboard.service")
+            && deb_postinst.contains("/usr/bin/systemctl --no-block poweroff")
+            && deb_postrm.contains("rm -f /etc/sudoers.d/nexus-bs-dashboard")
+            && dashboard_unit.contains("NoNewPrivileges=no")
+            && !dashboard_unit.contains("NoNewPrivileges=yes"),
+        "dashboard package update, downgrade, and factory reset need a narrow sudoers path and must not be blocked by NoNewPrivileges"
     );
     assert!(
         deb_postinst.contains("detect_run_user")

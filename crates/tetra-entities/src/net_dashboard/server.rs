@@ -12,8 +12,8 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::{Instant, SystemTime};
 
 use tungstenite::{
     Message, accept_hdr,
@@ -35,6 +35,16 @@ type CmdSender = crossbeam_channel::Sender<ControlCommand>;
 // broadcast() sends to all of them; dead connections are pruned automatically.
 type WsBroadcastTx = crossbeam_channel::Sender<String>;
 type WsClients = Arc<Mutex<Vec<WsBroadcastTx>>>;
+
+#[derive(Clone)]
+struct CachedDashboardConfig {
+    config_path: PathBuf,
+    modified: Option<SystemTime>,
+    len: u64,
+    config: tetra_config::bluestation::StackConfig,
+}
+
+static DASHBOARD_CONFIG_CACHE: OnceLock<Mutex<HashMap<String, CachedDashboardConfig>>> = OnceLock::new();
 
 const MAX_AIR_INTERFACE_SSI: u64 = 0x00FF_FFFF;
 const DASHBOARD_WAP_SOURCE_SSI: u32 = 0x00FF_FFFF;
@@ -609,6 +619,17 @@ fn run_update_command(update: &SharedUpdateState, program: &str, args: &[&str]) 
     }
 }
 
+fn run_update_command_privileged(update: &SharedUpdateState, program: &str, args: &[&str]) -> bool {
+    if run_update_command(update, program, args) {
+        return true;
+    }
+    let mut sudo_args = Vec::with_capacity(args.len() + 2);
+    sudo_args.push("-n");
+    sudo_args.push(program);
+    sudo_args.extend_from_slice(args);
+    run_update_command(update, "sudo", &sudo_args)
+}
+
 fn run_update_command_capture(update: &SharedUpdateState, program: &str, args: &[&str]) -> Option<String> {
     update_log(update, format!("$ {} {}", program, args.join(" ")));
     match Command::new(program).args(args).output() {
@@ -686,19 +707,19 @@ fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
     }
     update_log(&update, format!("Installing nexus-bs {} ({})", version.trim(), arch.trim()));
 
-    if !run_update_command(&update, "apt", &["install", "-y", deb_path_str]) {
+    if !run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str]) {
         update.lock().unwrap().finish(false);
         return;
     }
-    let _ = run_update_command(&update, "systemctl", &["daemon-reload"]);
-    let _ = run_update_command(&update, "systemctl", &["restart", "nexus-bs-control.service"]);
-    let _ = run_update_command(&update, "systemctl", &["restart", "nexus-bs.service"]);
+    let _ = run_update_command_privileged(&update, "systemctl", &["daemon-reload"]);
+    let _ = run_update_command_privileged(&update, "systemctl", &["restart", "nexus-bs-control.service"]);
+    let _ = run_update_command_privileged(&update, "systemctl", &["restart", "nexus-bs.service"]);
     update_log(&update, "Restarting dashboard service to load the installed version");
     update.lock().unwrap().finish(true);
 
     let _ = Command::new("sh")
         .arg("-c")
-        .arg("sleep 2; systemctl restart nexus-bs-dashboard.service")
+        .arg("sleep 2; systemctl restart nexus-bs-dashboard.service || sudo -n systemctl restart nexus-bs-dashboard.service")
         .spawn();
 }
 
@@ -1780,63 +1801,164 @@ fn serve_easy_start_skip(stream: TcpStream, config_path: &str) {
     );
 }
 
-fn clean_factory_reset_configs(config_path: &str) -> Vec<String> {
-    let config_dir = config_dir_for(config_path);
-    let mut removed = Vec::new();
-    if let Ok(entries) = fs::read_dir(&config_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                continue;
-            }
-            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let remove = name.ends_with(".toml")
-                || name.ends_with(".toml.bak")
-                || name.ends_with(".toml.active")
-                || name == EASY_START_DONE_MARKER
-                || name == EASY_START_SKIP_MARKER;
-            if remove && fs::remove_file(&path).is_ok() {
-                removed.push(name);
-            }
-        }
-    }
-    removed
+#[derive(Debug, Default)]
+struct FactoryResetCleanup {
+    wifi_removed: Vec<String>,
+    config_removed: Vec<String>,
+    ssh_removed: Vec<String>,
 }
 
-fn clean_factory_reset_wifi() -> Vec<String> {
+fn clean_factory_reset_configs(config_path: &str) -> Result<Vec<String>, Vec<String>> {
+    let config_dir = config_dir_for(config_path);
     let mut removed = Vec::new();
-    for profile in crate::wifi::list_saved().unwrap_or_default() {
-        if crate::wifi::forget(&profile.uuid).is_ok() {
-            removed.push(profile.name);
+    let mut errors = Vec::new();
+    let entries = match fs::read_dir(&config_dir) {
+        Ok(entries) => entries,
+        Err(e) => return Err(vec![format!("config dir {} not readable: {}", config_dir.display(), e)]),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                errors.push(format!("config dir entry read failed: {}", e));
+                continue;
+            }
+        };
+        let path = entry.path();
+        if path.is_dir() {
+            continue;
+        }
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let remove = name.ends_with(".toml")
+            || name.ends_with(".toml.bak")
+            || name.ends_with(".toml.active")
+            || name == EASY_START_DONE_MARKER
+            || name == EASY_START_SKIP_MARKER;
+        if !remove {
+            continue;
+        }
+        match fs::remove_file(&path) {
+            Ok(_) => removed.push(name),
+            Err(e) => errors.push(format!("failed to remove config {}: {}", path.display(), e)),
         }
     }
-    removed
+    if errors.is_empty() { Ok(removed) } else { Err(errors) }
+}
+
+fn clean_factory_reset_wifi() -> Result<Vec<String>, Vec<String>> {
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    let profiles = match crate::wifi::list_saved() {
+        Ok(profiles) => profiles,
+        Err(e) => return Err(vec![format!("could not list saved Wi-Fi profiles: {}", e)]),
+    };
+    for profile in profiles {
+        match crate::wifi::forget(&profile.uuid) {
+            Ok(_) => removed.push(profile.name),
+            Err(e) => errors.push(format!("failed to forget Wi-Fi profile {}: {}", profile.name, e)),
+        }
+    }
+    if errors.is_empty() { Ok(removed) } else { Err(errors) }
 }
 
 #[cfg(unix)]
-fn clean_factory_reset_ssh_keys() -> Vec<String> {
-    let mut removed = Vec::new();
+fn current_user_home_dir() -> Result<PathBuf, String> {
     let home = std::env::var("HOME").unwrap_or_default();
-    if home.is_empty() || home == "/" {
-        return removed;
+    if !home.trim().is_empty() && home != "/" {
+        return Ok(PathBuf::from(home));
     }
-    let ssh_dir = Path::new(&home).join(".ssh");
-    if let Ok(entries) = fs::read_dir(&ssh_dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_file() {
-                if fs::remove_file(&path).is_ok() {
-                    removed.push(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-                }
-            }
-        }
+    let id_output = Command::new("id")
+        .arg("-un")
+        .output()
+        .map_err(|e| format!("could not determine service user: {}", e))?;
+    if !id_output.status.success() {
+        return Err("could not determine service user with id -un".to_string());
     }
-    removed
+    let user = String::from_utf8_lossy(&id_output.stdout).trim().to_string();
+    if user.is_empty() || user == "root" {
+        return Err("refusing to erase SSH keys without a non-root service user home".to_string());
+    }
+    let passwd_output = Command::new("getent")
+        .args(["passwd", &user])
+        .output()
+        .map_err(|e| format!("could not query passwd database for {}: {}", user, e))?;
+    if !passwd_output.status.success() {
+        return Err(format!("could not query passwd database for {}", user));
+    }
+    let passwd = String::from_utf8_lossy(&passwd_output.stdout);
+    let home = passwd
+        .split(':')
+        .nth(5)
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && *value != "/")
+        .ok_or_else(|| format!("could not determine home directory for {}", user))?;
+    Ok(PathBuf::from(home))
+}
+
+#[cfg(unix)]
+fn clean_factory_reset_ssh_keys() -> Result<Vec<String>, Vec<String>> {
+    let mut removed = Vec::new();
+    let home = match current_user_home_dir() {
+        Ok(home) => home,
+        Err(e) => return Err(vec![e]),
+    };
+    let ssh_dir = home.join(".ssh");
+    if !ssh_dir.exists() {
+        return Ok(removed);
+    }
+    let entries = match fs::read_dir(&ssh_dir) {
+        Ok(entries) => entries,
+        Err(e) => return Err(vec![format!("SSH dir {} not readable: {}", ssh_dir.display(), e)]),
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => return Err(vec![format!("SSH dir entry read failed: {}", e)]),
+        };
+        let path = entry.path();
+        removed.push(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+    }
+    fs::remove_dir_all(&ssh_dir).map_err(|e| vec![format!("failed to remove SSH dir {}: {}", ssh_dir.display(), e)])?;
+    Ok(removed)
 }
 
 #[cfg(not(unix))]
-fn clean_factory_reset_ssh_keys() -> Vec<String> {
-    Vec::new()
+fn clean_factory_reset_ssh_keys() -> Result<Vec<String>, Vec<String>> {
+    Ok(Vec::new())
+}
+
+fn clean_factory_reset(config_path: &str) -> Result<FactoryResetCleanup, Vec<String>> {
+    let mut errors = Vec::new();
+    let wifi_removed = match clean_factory_reset_wifi() {
+        Ok(removed) => removed,
+        Err(mut step_errors) => {
+            errors.append(&mut step_errors);
+            Vec::new()
+        }
+    };
+    let config_removed = match clean_factory_reset_configs(config_path) {
+        Ok(removed) => removed,
+        Err(mut step_errors) => {
+            errors.append(&mut step_errors);
+            Vec::new()
+        }
+    };
+    let ssh_removed = match clean_factory_reset_ssh_keys() {
+        Ok(removed) => removed,
+        Err(mut step_errors) => {
+            errors.append(&mut step_errors);
+            Vec::new()
+        }
+    };
+    if errors.is_empty() {
+        Ok(FactoryResetCleanup {
+            wifi_removed,
+            config_removed,
+            ssh_removed,
+        })
+    } else {
+        Err(errors)
+    }
 }
 
 fn serve_factory_reset(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
@@ -1853,29 +1975,42 @@ fn serve_factory_reset(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<
         );
     }
 
-    let wifi_removed = clean_factory_reset_wifi();
-    let config_removed = clean_factory_reset_configs(config_path);
-    let ssh_removed = clean_factory_reset_ssh_keys();
+    let cleanup = match clean_factory_reset(config_path) {
+        Ok(cleanup) => cleanup,
+        Err(errors) => {
+            tracing::error!("Dashboard: factory reset refused after cleanup errors: {:?}", errors);
+            let body = serde_json::json!({
+                "ok": false,
+                "error": "Factory reset did not complete cleanly. Host shutdown was not queued.",
+                "errors": errors,
+            });
+            return http_json_response(
+                stream,
+                500,
+                &serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            );
+        }
+    };
     let poweroff_accepted = send_control_cmd(cmd_tx, ControlCommand::PowerOffHost);
-    if !poweroff_accepted {
-        crate::service_control::schedule_service_action(
-            crate::service_control::ServiceAction::PowerOffHost,
-            std::time::Duration::from_secs(3),
-        );
-    }
+    crate::service_control::schedule_service_action(
+        crate::service_control::ServiceAction::PowerOffHost,
+        std::time::Duration::from_secs(3),
+    );
     tracing::warn!(
         "Dashboard: factory reset requested; removed {} wifi profiles, {} config files, {} ssh key files",
-        wifi_removed.len(),
-        config_removed.len(),
-        ssh_removed.len()
+        cleanup.wifi_removed.len(),
+        cleanup.config_removed.len(),
+        cleanup.ssh_removed.len()
     );
     let body = serde_json::json!({
         "ok": true,
         "message": "Factory reset accepted. Wi-Fi, configs, and SSH keys were cleared. Host shutdown queued.",
-        "wifi_removed": wifi_removed,
-        "config_removed": config_removed,
-        "ssh_removed": ssh_removed,
+        "wifi_removed": cleanup.wifi_removed,
+        "config_removed": cleanup.config_removed,
+        "ssh_removed": cleanup.ssh_removed,
         "poweroff_queued": true,
+        "control_poweroff_queued": poweroff_accepted,
+        "local_poweroff_fallback_queued": true,
     });
     http_json_response(
         stream,
@@ -3570,6 +3705,33 @@ fn gain_map_json(gains: &std::collections::HashMap<String, f64>) -> serde_json::
     )
 }
 
+fn cached_active_dashboard_config(config_path: &str) -> Result<tetra_config::bluestation::StackConfig, String> {
+    let active_path = active_profile_path(config_path);
+    let metadata = fs::metadata(&active_path).map_err(|e| format!("active config metadata failed for {}: {}", active_path.display(), e))?;
+    let modified = metadata.modified().ok();
+    let len = metadata.len();
+    let cache_key = config_path.to_string();
+    let cache = DASHBOARD_CONFIG_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = cache.lock().map_err(|_| "dashboard config cache lock poisoned".to_string())?;
+    if let Some(cached) = guard.get(&cache_key) {
+        if cached.config_path == active_path && cached.modified == modified && cached.len == len {
+            return Ok(cached.config.clone());
+        }
+    }
+    let config = tetra_config::bluestation::parsing::from_file(&active_path)
+        .map_err(|e| format!("active config parse failed for {}: {}", active_path.display(), e))?;
+    guard.insert(
+        cache_key,
+        CachedDashboardConfig {
+            config_path: active_path,
+            modified,
+            len,
+            config: config.clone(),
+        },
+    );
+    Ok(config)
+}
+
 fn dashboard_site_json(
     state: &DashboardState,
     shared_config: &Option<tetra_config::bluestation::SharedConfig>,
@@ -3590,69 +3752,71 @@ fn dashboard_site_json(
         )
     };
 
-    let active_brew_config = active_profile_brew_json(config_path);
-
-    let config = if let Some(shared) = shared_config {
-        let cfg = shared.config();
-        let freq_info = tetra_core::freqs::FreqInfo::from_components(
-            cfg.cell.freq_band,
-            cfg.cell.main_carrier,
-            cfg.cell.freq_offset_hz,
-            cfg.cell.reverse_operation,
-            cfg.cell.duplex_spacing_id,
-            cfg.cell.custom_duplex_spacing,
-        )
-        .ok();
-        let (derived_dl_hz, derived_ul_hz, duplex_spacing_hz) = freq_info
-            .as_ref()
-            .map(|freq| {
-                let (dl, ul) = freq.get_freqs();
-                (Some(dl), Some(ul), Some(freq.duplex_spacing_val))
-            })
-            .unwrap_or((None, None, None));
-
-        let soapy = cfg.phy_io.soapysdr.as_ref();
-        let soapy_tx_hz = soapy.map(|s| s.dl_freq);
-        let soapy_rx_hz = soapy.map(|s| s.ul_freq);
-        let (soapy_tx_corrected_hz, soapy_tx_ppm_error_hz) = soapy
-            .map(|s| {
-                let (corrected, error) = s.dl_freq_corrected();
-                (Some(corrected), Some(error))
-            })
-            .unwrap_or((None, None));
-        let (soapy_rx_corrected_hz, soapy_rx_ppm_error_hz) = soapy
-            .map(|s| {
-                let (corrected, error) = s.ul_freq_corrected();
-                (Some(corrected), Some(error))
-            })
-            .unwrap_or((None, None));
-        let frequency_match = match (derived_dl_hz, derived_ul_hz, soapy_tx_hz, soapy_rx_hz) {
-            (Some(dl), Some(ul), Some(tx), Some(rx)) => (tx.round() as u32 == dl) && (rx.round() as u32 == ul),
-            _ => false,
-        };
-
-        let stack_state = shared.state_read();
-        let timeslot_owners: Vec<_> = (2..=4)
-            .map(|ts| {
-                serde_json::json!({
-                    "ts": ts,
-                    "owner": stack_state.timeslot_alloc.owner(ts).map(|owner| format!("{:?}", owner)),
-                    "free": stack_state.timeslot_alloc.is_free(ts),
+    let config = match cached_active_dashboard_config(config_path) {
+        Ok(cfg) => {
+            let freq_info = tetra_core::freqs::FreqInfo::from_components(
+                cfg.cell.freq_band,
+                cfg.cell.main_carrier,
+                cfg.cell.freq_offset_hz,
+                cfg.cell.reverse_operation,
+                cfg.cell.duplex_spacing_id,
+                cfg.cell.custom_duplex_spacing,
+            )
+            .ok();
+            let (derived_dl_hz, derived_ul_hz, duplex_spacing_hz) = freq_info
+                .as_ref()
+                .map(|freq| {
+                    let (dl, ul) = freq.get_freqs();
+                    (Some(dl), Some(ul), Some(freq.duplex_spacing_val))
                 })
-            })
-            .collect();
-        let live_sds_queue_len = stack_state.live_sds_queue.len();
-        let whitelist_override = stack_state.issi_whitelist_override.clone();
-        let carrier_inhibited = stack_state.carrier_inhibited;
-        drop(stack_state);
+                .unwrap_or((None, None, None));
 
-        let whitelist_count = whitelist_override
-            .as_ref()
-            .map(|list| list.len())
-            .unwrap_or_else(|| cfg.security.issi_whitelist.len());
-        let whitelist_source = if whitelist_override.is_some() { "runtime" } else { "config" };
+            let soapy = cfg.phy_io.soapysdr.as_ref();
+            let soapy_tx_hz = soapy.map(|s| s.dl_freq);
+            let soapy_rx_hz = soapy.map(|s| s.ul_freq);
+            let (soapy_tx_corrected_hz, soapy_tx_ppm_error_hz) = soapy
+                .map(|s| {
+                    let (corrected, error) = s.dl_freq_corrected();
+                    (Some(corrected), Some(error))
+                })
+                .unwrap_or((None, None));
+            let (soapy_rx_corrected_hz, soapy_rx_ppm_error_hz) = soapy
+                .map(|s| {
+                    let (corrected, error) = s.ul_freq_corrected();
+                    (Some(corrected), Some(error))
+                })
+                .unwrap_or((None, None));
+            let frequency_match = match (derived_dl_hz, derived_ul_hz, soapy_tx_hz, soapy_rx_hz) {
+                (Some(dl), Some(ul), Some(tx), Some(rx)) => (tx.round() as u32 == dl) && (rx.round() as u32 == ul),
+                _ => false,
+            };
 
-        serde_json::json!({
+            let (timeslot_owners, live_sds_queue_len, whitelist_override, carrier_inhibited) = if let Some(shared) = shared_config {
+                let stack_state = shared.state_read();
+                let timeslot_owners: Vec<_> = (2..=4)
+                    .map(|ts| {
+                        serde_json::json!({
+                            "ts": ts,
+                            "owner": stack_state.timeslot_alloc.owner(ts).map(|owner| format!("{:?}", owner)),
+                            "free": stack_state.timeslot_alloc.is_free(ts),
+                        })
+                    })
+                    .collect();
+                let live_sds_queue_len = stack_state.live_sds_queue.len();
+                let whitelist_override = stack_state.issi_whitelist_override.clone();
+                let carrier_inhibited = stack_state.carrier_inhibited;
+                (timeslot_owners, live_sds_queue_len, whitelist_override, carrier_inhibited)
+            } else {
+                (Vec::new(), 0, None, false)
+            };
+
+            let whitelist_count = whitelist_override
+                .as_ref()
+                .map(|list| list.len())
+                .unwrap_or_else(|| cfg.security.issi_whitelist.len());
+            let whitelist_source = if whitelist_override.is_some() { "runtime" } else { "config" };
+
+            serde_json::json!({
             "available": true,
             "stack_mode": format!("{:?}", cfg.stack_mode),
             "phy_backend": format!("{:?}", cfg.phy_io.backend),
@@ -3702,12 +3866,12 @@ fn dashboard_site_json(
                 "tx_gains": gain_map_json(&s.tx_gains),
                 "frequency_match": frequency_match,
             })),
-            "brew": active_brew_config.or_else(|| cfg.brew.as_ref().map(|brew| serde_json::json!({
+            "brew": cfg.brew.as_ref().map(|brew| serde_json::json!({
                 "configured": true,
                 "host": brew.host,
                 "port": brew.port,
                 "tls": brew.tls,
-            }))),
+            })),
             "timeslot_owners": timeslot_owners,
             "rf_control": {
                 "carrier_inhibited": carrier_inhibited,
@@ -3730,12 +3894,12 @@ fn dashboard_site_json(
                 "restart_after_critical_secs": cfg.health.restart_after_critical_secs,
                 "restart_cooldown_secs": cfg.health.restart_cooldown_secs,
             },
-        })
-    } else {
-        serde_json::json!({
+            })
+        }
+        Err(reason) => serde_json::json!({
             "available": false,
-            "reason": "shared config unavailable",
-        })
+            "reason": reason,
+        }),
     };
 
     let mut timeslots = Vec::new();
@@ -5641,6 +5805,44 @@ mod tests {
         assert!(toml.contains("rx_freq = 431025000"));
         assert!(toml.contains("main_carrier = 1521"));
         assert!(toml.contains("freq_offset = 0"));
+    }
+
+    #[test]
+    fn dashboard_site_config_cache_reloads_when_active_config_changes() {
+        let dir = temp_config_dir("site-config-cache");
+        let config_path = dir.join("config.toml");
+        let mut req = EasyStartRequest {
+            mcc: 901,
+            mnc: 9999,
+            timezone: "Europe/Bucharest".to_string(),
+            tx_freq: 438_362_500,
+            duplex_spacing: 1,
+            custom_spacing_enabled: false,
+            custom_spacing_hz: None,
+            brew_enabled: false,
+            brew_host: "core.tetrapack.online".to_string(),
+            brew_port: 443,
+            brew_tls: true,
+            brew_username: 226_008_299,
+            brew_password: "changeme123".to_string(),
+        };
+        let (first, _) = render_easy_start_config(&req).expect("first config");
+        fs::write(&config_path, first).expect("write first config");
+        let dashboard = DashboardServer::new(config_path.to_string_lossy().to_string());
+
+        let first_site = dashboard_site_json(&dashboard.state, &None, config_path.to_string_lossy().as_ref());
+        assert!(first_site.contains("\"main_carrier\":1534"));
+        assert!(first_site.contains("\"tx_hz\":438362500.0"));
+
+        req.tx_freq = 438_625_000;
+        let (second, _) = render_easy_start_config(&req).expect("second config");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&config_path, second).expect("write second config");
+
+        let second_site = dashboard_site_json(&dashboard.state, &None, config_path.to_string_lossy().as_ref());
+        assert!(second_site.contains("\"main_carrier\":1545"));
+        assert!(second_site.contains("\"tx_hz\":438625000.0"));
+        assert!(!second_site.contains("\"main_carrier\":1534"));
     }
 
     #[test]

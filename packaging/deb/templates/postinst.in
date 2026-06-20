@@ -56,6 +56,31 @@ fix_config_permissions() {
     find /etc/nexus-bs -type f -name '*.toml.active' -exec chmod 0600 {} + 2>/dev/null || true
 }
 
+install_dashboard_sudoers() {
+    run_user="$1"
+    [ -n "$run_user" ] || return 0
+    user_exists "$run_user" || return 0
+    [ "$run_user" != "root" ] || return 0
+    command -v visudo >/dev/null 2>&1 || return 0
+
+    sudoers="/etc/sudoers.d/nexus-bs-dashboard"
+    {
+        printf '# Installed by nexus-bs. Allows the dashboard to apply Nexus-BS updates and host service actions.\n'
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /bin/systemctl daemon-reload\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs-control.service, /bin/systemctl restart nexus-bs-control.service\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs.service, /bin/systemctl restart nexus-bs.service\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs-dashboard.service, /bin/systemctl restart nexus-bs-dashboard.service\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block poweroff, /bin/systemctl --no-block poweroff\n' "$run_user"
+    } > "$sudoers.tmp"
+    chmod 0440 "$sudoers.tmp"
+    if visudo -cf "$sudoers.tmp" >/dev/null 2>&1; then
+        mv -f "$sudoers.tmp" "$sudoers"
+    else
+        rm -f "$sudoers.tmp"
+    fi
+}
+
 if [ "$1" = "configure" ]; then
     run_user="$(detect_run_user)"
     run_group="$(id -gn "$run_user" 2>/dev/null || printf '%s' "$run_user")"
@@ -80,6 +105,7 @@ if [ "$1" = "configure" ]; then
 
     fix_config_permissions "$run_user" "$run_group"
     install_service_user_dropins "$run_user" "$run_group"
+    install_dashboard_sudoers "$run_user"
 
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true

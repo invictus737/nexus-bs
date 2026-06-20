@@ -2,7 +2,14 @@
 set -e
 
 case "$1" in
-    purge)
+    remove|purge)
+        rm -f /etc/sudoers.d/nexus-bs-dashboard
+        if [ "$1" != "purge" ]; then
+            if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+                systemctl daemon-reload >/dev/null 2>&1 || true
+            fi
+            exit 0
+        fi
         for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
             rm -f "/etc/systemd/system/$unit.d/10-nexus-bs-user.conf"
             rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
