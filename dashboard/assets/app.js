@@ -475,7 +475,7 @@ function activeCallIdentityHtml(issi, options = {}) {
 function destinationHtml(entry) {
   const dest = entry?.dest;
   if (!dest) return "--";
-  if (entry.activity === "call_group") return `GSSI ${esc(dest)}`;
+  if (entry.activity === "call_group") return `<span class="identity target-group"><span class="identity-primary">GSSI ${esc(dest)}</span></span>`;
   return radioIdentityHtml(dest);
 }
 
@@ -2724,9 +2724,17 @@ function ensureRadio(issi) {
   return state.radios.get(issi);
 }
 
+function touchRegisteredRadio(issi, update) {
+  const radio = state.radios.get(issi);
+  if (!radio) return null;
+  if (update) Object.assign(radio, update);
+  radio._lastSeenMs = Date.now();
+  return radio;
+}
+
 function pushHeard(entry) {
   if (!entry) return;
-  if (entry.issi) ensureRadio(entry.issi)._lastSeenMs = Date.now();
+  if (entry.issi) touchRegisteredRadio(entry.issi);
   state.heard.unshift(entry);
   state.heard = state.heard.slice(0, 80);
 }
@@ -2771,9 +2779,8 @@ function applyMessage(msg) {
       break;
     case "call_started":
       if (msg.caller_issi) {
-        const radio = ensureRadio(msg.caller_issi);
-        radio._lastSeenMs = Date.now();
-        if (msg.call_type === "group" && msg.gssi && !(radio.groups || []).includes(msg.gssi)) {
+        const radio = touchRegisteredRadio(msg.caller_issi);
+        if (radio && msg.call_type === "group" && msg.gssi && !(radio.groups || []).includes(msg.gssi)) {
           radio.groups = [...(radio.groups || []), msg.gssi];
         }
       }
@@ -2791,9 +2798,8 @@ function applyMessage(msg) {
       break;
     case "speaker_changed":
       if (msg.speaker_issi) {
-        const radio = ensureRadio(msg.speaker_issi);
-        radio._lastSeenMs = Date.now();
-        if (msg.gssi && !(radio.groups || []).includes(msg.gssi)) {
+        const radio = touchRegisteredRadio(msg.speaker_issi);
+        if (radio && msg.gssi && !(radio.groups || []).includes(msg.gssi)) {
           radio.groups = [...(radio.groups || []), msg.gssi];
         }
       }

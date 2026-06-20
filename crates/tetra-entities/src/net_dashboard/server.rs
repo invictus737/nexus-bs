@@ -953,10 +953,11 @@ impl DashboardServer {
                     caller_issi,
                     ts,
                 } => {
-                    let e = s.ms_map.entry(*caller_issi).or_insert_with(|| empty_ms_entry(*caller_issi));
-                    e.last_seen = Instant::now();
-                    if !e.groups.contains(gssi) {
-                        e.groups.push(*gssi);
+                    if let Some(e) = s.ms_map.get_mut(caller_issi) {
+                        e.last_seen = Instant::now();
+                        if !e.groups.contains(gssi) {
+                            e.groups.push(*gssi);
+                        }
                     }
                     s.calls.insert(
                         *call_id,
@@ -985,10 +986,11 @@ impl DashboardServer {
                     gssi,
                     speaker_issi,
                 } => {
-                    let e = s.ms_map.entry(*speaker_issi).or_insert_with(|| empty_ms_entry(*speaker_issi));
-                    e.last_seen = Instant::now();
-                    if !e.groups.contains(gssi) {
-                        e.groups.push(*gssi);
+                    if let Some(e) = s.ms_map.get_mut(speaker_issi) {
+                        e.last_seen = Instant::now();
+                        if !e.groups.contains(gssi) {
+                            e.groups.push(*gssi);
+                        }
                     }
                     if let Some(c) = s.calls.get_mut(call_id) {
                         c.speaker_issi = Some(*speaker_issi);
@@ -1005,10 +1007,12 @@ impl DashboardServer {
                     ts,
                     secondary_ts,
                 } => {
-                    let caller = s.ms_map.entry(*calling_issi).or_insert_with(|| empty_ms_entry(*calling_issi));
-                    caller.last_seen = Instant::now();
-                    let called = s.ms_map.entry(*called_issi).or_insert_with(|| empty_ms_entry(*called_issi));
-                    called.last_seen = Instant::now();
+                    if let Some(caller) = s.ms_map.get_mut(calling_issi) {
+                        caller.last_seen = Instant::now();
+                    }
+                    if let Some(called) = s.ms_map.get_mut(called_issi) {
+                        called.last_seen = Instant::now();
+                    }
                     s.calls.insert(
                         *call_id,
                         CallEntry {
@@ -1038,8 +1042,9 @@ impl DashboardServer {
                     }
                 }
                 TelemetryEvent::SdsActivity { source_issi, dest_issi } => {
-                    let source = s.ms_map.entry(*source_issi).or_insert_with(|| empty_ms_entry(*source_issi));
-                    source.last_seen = Instant::now();
+                    if let Some(source) = s.ms_map.get_mut(source_issi) {
+                        source.last_seen = Instant::now();
+                    }
                     s.push_last_heard(*source_issi, "sds", *dest_issi);
                 }
                 TelemetryEvent::TsVoiceActivity { .. } => {
@@ -6187,6 +6192,39 @@ mod tests {
             .expect("radio should be visible from activity");
         assert_eq!(ms.rssi_dbfs, Some(-47.5));
         assert_eq!(ms.groups, vec![gssi]);
+    }
+
+    #[test]
+    fn dashboard_call_activity_does_not_create_external_subscriber_rows() {
+        let dashboard = DashboardServer::new("test.toml".to_string());
+
+        dashboard.handle_telemetry(TelemetryEvent::GroupCallStarted {
+            call_id: 7,
+            gssi: 91,
+            caller_issi: 2320567,
+            ts: 2,
+        });
+        dashboard.handle_telemetry(TelemetryEvent::GroupCallSpeakerChanged {
+            call_id: 7,
+            gssi: 91,
+            speaker_issi: 3110797,
+        });
+        dashboard.handle_telemetry(TelemetryEvent::IndividualCallStarted {
+            call_id: 8,
+            calling_issi: 2260618,
+            called_issi: 99999,
+            simplex: true,
+            ts: 2,
+            secondary_ts: None,
+        });
+
+        let state = dashboard.state.read().unwrap();
+        assert!(
+            state.ms_map.is_empty(),
+            "Subscriber Registry must show only RF/MM known local MS entries, not external Brew callers or services"
+        );
+        assert_eq!(state.last_heard.len(), 3);
+        assert_eq!(state.calls.len(), 2);
     }
 
     #[test]

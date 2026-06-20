@@ -2647,11 +2647,21 @@ tbody tr:hover {
 
 .identity-primary {
   color: #061923;
+  font-size: 0.95rem;
+  font-weight: 850;
 }
 
 .identity-issi,
 .empty {
   color: #465c65;
+}
+
+.identity-issi {
+  font-family: var(--mono);
+  font-feature-settings: "tnum" 1;
+  font-size: 0.78rem;
+  font-weight: 850;
+  letter-spacing: 0;
 }
 
 .identity.resolved .identity-primary {
@@ -3326,7 +3336,69 @@ button {
 }
 
 .subscriber-registry-panel table {
-  min-width: 48rem;
+  min-width: 54rem;
+}
+
+.subscriber-registry-panel th:first-child,
+.subscriber-registry-panel td:first-child {
+  width: 13.75rem;
+}
+
+.subscriber-registry-panel th:nth-child(2),
+.subscriber-registry-panel td:nth-child(2) {
+  width: auto;
+}
+
+.subscriber-registry-panel .identity {
+  gap: 0.2rem;
+}
+
+.subscriber-registry-panel .identity-primary,
+.overview-heard-panel td:nth-child(2) .identity-primary,
+.overview-heard-panel td:nth-child(4) .identity-primary {
+  font-size: 1rem;
+  font-weight: 900;
+  line-height: 1.12;
+}
+
+.subscriber-registry-panel .identity-issi,
+.overview-heard-panel td:nth-child(2) .identity-issi,
+.overview-heard-panel td:nth-child(4) .identity-issi {
+  color: #263f4a;
+  font-size: 0.86rem;
+  font-weight: 950;
+  line-height: 1.08;
+}
+
+.subscriber-registry-panel .subscriber-groups {
+  min-width: 18rem;
+}
+
+.subscriber-registry-panel .group-list {
+  align-items: flex-start;
+  gap: 0.35rem 0.45rem;
+}
+
+.subscriber-registry-panel .group-chips {
+  flex: 1 1 18rem;
+  min-width: 12rem;
+}
+
+.subscriber-registry-panel .pill {
+  max-width: 7.5rem;
+}
+
+.overview-heard-panel td:nth-child(2),
+.overview-heard-panel td:nth-child(4) {
+  font-size: 0.95rem;
+  font-weight: 850;
+  line-height: 1.15;
+}
+
+.overview-heard-panel .target-group .identity-primary {
+  color: #203943;
+  font-family: var(--mono);
+  font-feature-settings: "tnum" 1;
 }
 
 .panel {
