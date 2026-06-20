@@ -1079,8 +1079,8 @@ function defaultEasyStartDraft() {
     brew_host: defaults.brew_host || "core.tetrapack.online",
     brew_port: defaults.brew_port ?? 443,
     brew_tls: defaults.brew_tls !== false,
-    brew_username: defaults.brew_username ?? 226008299,
-    brew_password: defaults.brew_password || "changeme123",
+    brew_username: defaults.brew_username ?? 123456789,
+    brew_password: defaults.brew_password || "",
   };
 }
 
@@ -1255,6 +1255,18 @@ function openEasyStartWizard() {
   $("easyStartModal")?.classList.remove("hidden");
   setEasyStartMessage("Fill the basic fields. Advanced TETRA values are calculated automatically.");
   renderEasyStartWizard();
+}
+
+function easyStartRequestedByUrl() {
+  return window.location.pathname === "/easy-start" || window.location.hash === "#easy-start";
+}
+
+function openEasyStartWizardFromUrl() {
+  if (!easyStartRequestedByUrl()) return;
+  openEasyStartWizard();
+  if (window.location.pathname === "/easy-start") {
+    window.history.replaceState({}, "", `${window.location.origin}/${window.location.hash || ""}`);
+  }
 }
 
 async function skipEasyStartWizard() {
@@ -3111,6 +3123,7 @@ initNav();
 refreshDashboardData();
 loadConfigText("config.toml");
 connectWs();
+openEasyStartWizardFromUrl();
 setInterval(loadSystem, 15000);
 setInterval(loadSite, SITE_REFRESH_MS);
 setInterval(loadSnapshot, SNAPSHOT_REFRESH_MS);

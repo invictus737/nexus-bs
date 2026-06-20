@@ -1713,8 +1713,8 @@ fn serve_easy_start_status(stream: TcpStream, config_path: &str) {
             "brew_host": "core.tetrapack.online",
             "brew_port": 443,
             "brew_tls": true,
-            "brew_username": 226008299_u32,
-            "brew_password": "changeme123"
+            "brew_username": 123456789_u32,
+            "brew_password": ""
         }
     });
     http_json_response(
@@ -5648,10 +5648,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.73"));
+        assert!(rendered.contains("Nexus-BS v0.1.74"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.73"));
+        assert!(rendered.contains("Nexus-BS/v0.1.74"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -5813,8 +5813,8 @@ mod tests {
             brew_host: "core.tetrapack.online".to_string(),
             brew_port: 443,
             brew_tls: true,
-            brew_username: 226_008_299,
-            brew_password: "changeme123".to_string(),
+            brew_username: 123_456_789,
+            brew_password: "".to_string(),
         };
         let (toml, plan) = render_easy_start_config(&req).expect("easy start config should validate");
         assert_eq!(plan.freq_band, 4);
@@ -5843,8 +5843,8 @@ mod tests {
             brew_host: "core.tetrapack.online".to_string(),
             brew_port: 443,
             brew_tls: true,
-            brew_username: 226_008_299,
-            brew_password: "changeme123".to_string(),
+            brew_username: 123_456_789,
+            brew_password: "".to_string(),
         };
         let (first, _) = render_easy_start_config(&req).expect("first config");
         fs::write(&config_path, first).expect("write first config");
@@ -6134,9 +6134,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.73");
-        assert_eq!(product.version_tag, "v0.1.73");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.73");
+        assert_eq!(product.version, "0.1.74");
+        assert_eq!(product.version_tag, "v0.1.74");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.74");
     }
 
     #[test]

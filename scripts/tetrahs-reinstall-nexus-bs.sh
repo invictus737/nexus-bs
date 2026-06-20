@@ -4,7 +4,7 @@
 
 set -Eeuo pipefail
 
-DEB_PATH="${DEB_PATH:-/tmp/nexus-bs_0.1.73_arm64.deb}"
+DEB_PATH="${DEB_PATH:-/tmp/nexus-bs_0.1.74_arm64.deb}"
 EXPECTED_SHA256="${EXPECTED_SHA256:-}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="/tmp/nexus-bs-reinstall-backup-${STAMP}"

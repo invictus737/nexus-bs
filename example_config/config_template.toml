@@ -207,8 +207,8 @@ tls = true
 # HTTP Digest auth credentials, as registered in BrandMeister
 # Username should be your SSID (DMR ID + 2-digit suffix).
 # Password is your BrandMeister hotspot password.
-username = 226008299
-password = "changeme123"
+username = 123456789
+password = ""
 
 # Reconnection delay (seconds)
 reconnect_delay_secs = 15

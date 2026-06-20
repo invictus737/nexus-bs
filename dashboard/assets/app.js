@@ -1079,8 +1079,8 @@ function defaultEasyStartDraft() {
     brew_host: defaults.brew_host || "core.tetrapack.online",
     brew_port: defaults.brew_port ?? 443,
     brew_tls: defaults.brew_tls !== false,
-    brew_username: defaults.brew_username ?? 226008299,
-    brew_password: defaults.brew_password || "changeme123",
+    brew_username: defaults.brew_username ?? 123456789,
+    brew_password: defaults.brew_password || "",
   };
 }
 
