@@ -311,6 +311,33 @@ h1 {
   display: block;
 }
 
+#page-logs.active {
+  height: calc(100dvh - 70px);
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  overflow: hidden;
+}
+
+#page-logs .page-head {
+  min-height: 34px;
+  margin-bottom: 8px;
+}
+
+#page-logs .page-head h2 {
+  font-size: 15px;
+}
+
+#page-logs .page-head p {
+  margin-top: 3px;
+}
+
+#page-logs > .panel {
+  min-height: 0;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+}
+
 .page-head {
   min-width: 0;
   min-height: 38px;
@@ -848,11 +875,14 @@ td .pill {
 }
 
 .log-list {
-  height: calc(100vh - 170px);
+  height: auto;
+  min-height: 0;
   overflow: auto;
-  padding: 8px 0;
+  overscroll-behavior: contain;
+  padding: 4px 0;
   font-family: var(--mono);
   font-size: 12px;
+  user-select: text;
 }
 
 .log-row {
@@ -860,7 +890,7 @@ td .pill {
   display: grid;
   grid-template-columns: minmax(88px, 116px) 64px minmax(0, 1fr);
   gap: 8px;
-  padding: 5px 12px;
+  padding: 4px 12px;
   border-bottom: 1px solid var(--line-soft);
 }
 
@@ -1017,17 +1047,20 @@ td .pill {
 }
 
 .update-log {
-  min-height: 92px;
-  max-height: 220px;
+  min-height: 104px;
+  max-height: none;
   margin: 0;
   padding: 10px 12px;
-  overflow: auto;
+  overflow: visible;
   border-top: 1px solid var(--line-soft);
-  background: var(--panel-3);
-  color: #c9d6df;
+  background: #f5f9fa;
+  color: #071923;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
+  line-height: 1.45;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .calibration-panel {
@@ -1070,18 +1103,20 @@ td .pill {
 .calibration-log {
   grid-column: 1 / -1;
   min-height: 104px;
-  max-height: 180px;
+  max-height: none;
   margin: 0;
   padding: 10px;
-  overflow: auto;
+  overflow: visible;
   border: 1px solid var(--line-soft);
   border-radius: 6px;
-  background: var(--panel-3);
-  color: #c9d6df;
+  background: #f5f9fa;
+  color: #071923;
   font-family: var(--mono);
-  font-size: 11px;
+  font-size: 12px;
   line-height: 1.45;
   white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .wifi-grid {
@@ -2820,6 +2855,10 @@ tbody tr:hover {
   .topbar,
   .top-title {
     min-height: 76px;
+  }
+
+  #page-logs.active {
+    height: calc(100dvh - 76px);
   }
 
   .component-stage {

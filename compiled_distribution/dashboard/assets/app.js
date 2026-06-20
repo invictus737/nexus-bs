@@ -65,10 +65,6 @@ const state = {
   logAutoScroll: true,
   logBusy: false,
   activePage: "system",
-  pageScroll: new Map(),
-  scrollRestoreFrame: 0,
-  scrollRestoreSecondFrame: 0,
-  lastScrollInputMs: 0,
 };
 
 const radioId = {
@@ -102,7 +98,6 @@ const COMMAND_FETCH_TIMEOUT_MS = 5000;
 const CORE_ONLINE_GRACE_MS = 5000;
 const CORE_RECONNECT_GRACE_MS = 12000;
 const SLOT_ACTIVITY_MS = 2000;
-const SCROLL_INPUT_GRACE_MS = 180;
 
 const pages = {
   system: "System",
@@ -188,90 +183,6 @@ function inferNetworkCore() {
       : "local routing";
   const tone = state.brewOnline || !brew.configured ? "ok" : "warn";
   return { label, hint, tone };
-}
-
-function currentScrollY() {
-  return window.scrollY || document.documentElement.scrollTop || document.body.scrollTop || 0;
-}
-
-function maxScrollY() {
-  return Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
-}
-
-function clampScrollY(value) {
-  return Math.min(Math.max(0, Number(value) || 0), maxScrollY());
-}
-
-function scrollClock() {
-  return window.performance?.now?.() || Date.now();
-}
-
-function markScrollInput() {
-  state.lastScrollInputMs = scrollClock();
-}
-
-function recentScrollInput() {
-  return scrollClock() - state.lastScrollInputMs < SCROLL_INPUT_GRACE_MS;
-}
-
-function cancelScrollRestore() {
-  if (state.scrollRestoreFrame) cancelAnimationFrame(state.scrollRestoreFrame);
-  if (state.scrollRestoreSecondFrame) cancelAnimationFrame(state.scrollRestoreSecondFrame);
-  state.scrollRestoreFrame = 0;
-  state.scrollRestoreSecondFrame = 0;
-}
-
-function applyScrollY(top) {
-  window.scrollTo({ top: clampScrollY(top), left: 0, behavior: "auto" });
-}
-
-function scheduleScrollRestore(page, target, inputToken) {
-  cancelScrollRestore();
-  const restore = () => {
-    if (state.activePage !== page || state.lastScrollInputMs !== inputToken) {
-      cancelScrollRestore();
-      return false;
-    }
-    applyScrollY(target);
-    state.pageScroll.set(page, clampScrollY(target));
-    return true;
-  };
-  state.scrollRestoreFrame = requestAnimationFrame(() => {
-    state.scrollRestoreFrame = 0;
-    if (!restore()) return;
-    state.scrollRestoreSecondFrame = requestAnimationFrame(() => {
-      state.scrollRestoreSecondFrame = 0;
-      restore();
-    });
-  });
-}
-
-function rememberPageScroll(page = state.activePage) {
-  if (!pages[page]) return;
-  state.pageScroll.set(page, currentScrollY());
-}
-
-function restorePageScroll(page = state.activePage, fallback = 0) {
-  if (!pages[page]) return;
-  const target = state.pageScroll.has(page) ? state.pageScroll.get(page) : fallback;
-  scheduleScrollRestore(page, target, state.lastScrollInputMs);
-}
-
-function preserveActivePageScroll(renderFn) {
-  // Live telemetry updates must not fight manual operator scrolling. They do,
-  // however, replace dynamic DOM blocks; preserve the viewport unless fresh
-  // wheel/touch/key input arrives while the render is in progress.
-  const page = state.activePage;
-  const beforeY = currentScrollY();
-  const inputToken = state.lastScrollInputMs;
-  renderFn();
-  if (state.activePage !== page || state.lastScrollInputMs !== inputToken || recentScrollInput()) {
-    rememberPageScroll(page);
-    return;
-  }
-  const target = clampScrollY(beforeY);
-  if (Math.abs(currentScrollY() - target) > 1) applyScrollY(target);
-  scheduleScrollRestore(page, target, inputToken);
 }
 
 function esc(value) {
@@ -2377,7 +2288,7 @@ function renderHeard() {
   setHtml("overviewHeard", rowsOrEmpty(heardRows(30), 4, "No recent voice or SDS activity"));
 }
 
-function renderLogs() {
+function renderLogs(options = {}) {
   setText("logCount", `${state.logs.length} lines`);
   const list = $("logList");
   const previousScrollTop = list ? list.scrollTop : 0;
@@ -2392,12 +2303,15 @@ function renderLogs() {
   });
   setHtml("logList", rows.length ? rows.join("") : '<div class="log-row"><span>--</span><span class="level">INFO</span><span class="msg">No log entries</span></div>');
   const scrollButton = $("logAutoScrollBtn");
-  if (scrollButton) scrollButton.textContent = state.logAutoScroll ? "Pause" : "Play";
+  if (scrollButton) {
+    scrollButton.textContent = state.logAutoScroll ? "Pause" : "Play";
+    scrollButton.setAttribute("aria-pressed", state.logAutoScroll ? "true" : "false");
+  }
   for (const id of ["logClearBtn", "logExportBtn", "logAutoScrollBtn"]) {
     const button = $(id);
     if (button) button.disabled = !!state.logBusy;
   }
-  if (state.activePage === "logs" && state.logAutoScroll && list) {
+  if (state.activePage === "logs" && list && (state.logAutoScroll || options.forceBottom)) {
     list.scrollTop = list.scrollHeight;
   } else if (state.activePage === "logs" && list) {
     list.scrollTop = Math.min(previousScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
@@ -2657,26 +2571,22 @@ function renderCallSeconds() {
 }
 
 function renderLiveTick() {
-  preserveActivePageScroll(() => {
-    renderStatus();
-    renderCallSeconds();
-    renderSystemUptime();
-    renderSlots();
-  });
+  renderStatus();
+  renderCallSeconds();
+  renderSystemUptime();
+  renderSlots();
 }
 
 function renderAll() {
-  preserveActivePageScroll(() => {
-    renderStatus();
-    renderMetrics();
-    renderRadios();
-    renderCalls();
-    renderHeard();
-    if (state.activePage === "logs") renderLogs();
-    renderSystem();
-    renderConfigProfiles();
-    renderWifi();
-  });
+  renderStatus();
+  renderMetrics();
+  renderRadios();
+  renderCalls();
+  renderHeard();
+  if (state.activePage === "logs") renderLogs();
+  renderSystem();
+  renderConfigProfiles();
+  renderWifi();
 }
 
 function reconcileCalls(incomingCalls, options = {}) {
@@ -2952,12 +2862,10 @@ async function loadCallsSnapshot() {
     }
     state.callsPayloadKey = key;
     applyCallsSnapshot(msg, { preserveHangtime: true, quiet: false });
-    preserveActivePageScroll(() => {
-      renderStatus();
-      renderMetrics();
-      renderCalls();
-      renderHeard();
-    });
+    renderStatus();
+    renderMetrics();
+    renderCalls();
+    renderHeard();
   } catch {
     markHttpFail();
     // WebSocket events remain primary; this path is a cheap one-second guard.
@@ -3022,7 +2930,6 @@ function connectWs() {
 
 function switchPage(page) {
   if (!pages[page]) return;
-  rememberPageScroll();
   state.activePage = page;
   for (const node of document.querySelectorAll(".page")) node.classList.remove("active");
   for (const node of document.querySelectorAll(".nav-item")) {
@@ -3041,24 +2948,9 @@ function switchPage(page) {
     loadUpdateStatus();
     if (!state.updateCatalog) loadUpdateCatalog();
   }
-  restorePageScroll(page, 0);
 }
 
 function initNav() {
-  if ("scrollRestoration" in history) history.scrollRestoration = "manual";
-  window.addEventListener("wheel", markScrollInput, { passive: true });
-  window.addEventListener("touchstart", markScrollInput, { passive: true });
-  window.addEventListener("touchmove", markScrollInput, { passive: true });
-  window.addEventListener(
-    "keydown",
-    (event) => {
-      if (["ArrowUp", "ArrowDown", "PageUp", "PageDown", "Home", "End", " "].includes(event.key)) {
-        markScrollInput();
-      }
-    },
-    { passive: true }
-  );
-  window.addEventListener("scroll", () => rememberPageScroll(), { passive: true });
   for (const node of document.querySelectorAll(".nav-item")) {
     node.addEventListener("click", () => switchPage(node.dataset.page));
   }
@@ -3101,7 +2993,7 @@ function initNav() {
   $("diagramPathToggle")?.addEventListener("click", requestRfCarrierToggle);
   $("logAutoScrollBtn")?.addEventListener("click", () => {
     state.logAutoScroll = !state.logAutoScroll;
-    renderLogs();
+    renderLogs({ forceBottom: state.logAutoScroll });
   });
   $("logExportBtn")?.addEventListener("click", exportLogs);
   $("logClearBtn")?.addEventListener("click", clearLogs);

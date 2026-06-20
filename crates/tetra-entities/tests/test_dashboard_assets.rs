@@ -198,7 +198,10 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "Settings must expose Wi-Fi scan/select/connect controls backed by dashboard API endpoints"
     );
     assert!(
-        index.contains(r#"id="logAutoScrollBtn""#) && index.contains(r#"id="logExportBtn""#) && index.contains(r#"id="logClearBtn""#),
+        index.contains(r#"id="logAutoScrollBtn""#)
+            && index.contains(r#"aria-pressed="true""#)
+            && index.contains(r#"id="logExportBtn""#)
+            && index.contains(r#"id="logClearBtn""#),
         "Logs page must expose pause/play autoscroll, export, and clear controls"
     );
     assert!(
@@ -261,20 +264,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
     assert!(
         !app.contains("renderCurrentFloor")
             && app.contains("activePage: \"system\"")
-            && app.contains("pageScroll: new Map()")
-            && app.contains("function preserveActivePageScroll")
-            && app.contains("SCROLL_INPUT_GRACE_MS")
-            && app.contains("history.scrollRestoration = \"manual\"")
-            && app.contains("function scheduleScrollRestore")
-            && app.contains("function markScrollInput")
-            && app.contains("function recentScrollInput")
-            && app.contains("Live telemetry updates must not fight manual operator scrolling")
-            && app.contains("replace dynamic DOM blocks; preserve the viewport")
-            && app.contains("restorePageScroll(page, 0)")
-            && app.contains("cancelAnimationFrame(state.scrollRestoreFrame)")
-            && app.contains("cancelAnimationFrame(state.scrollRestoreSecondFrame)")
-            && app.contains(r#"state.activePage === "logs" && state.logAutoScroll"#),
-        "dashboard tab changes and live renders must preserve per-page scroll without fighting fresh operator scroll input"
+            && !app.contains("window.scrollTo")
+            && !app.contains("scrollIntoView")
+            && !app.contains("pageScroll: new Map()")
+            && !app.contains("function preserveActivePageScroll")
+            && !app.contains("history.scrollRestoration")
+            && app.contains(r#"state.activePage === "logs" && list && (state.logAutoScroll || options.forceBottom)"#)
+            && app.contains("renderLogs({ forceBottom: state.logAutoScroll })"),
+        "dashboard live renders must not move page scroll; only the logs list may auto-scroll under Play/Pause control"
     );
     assert!(
         app.contains(r#"/ws`"#),
@@ -425,7 +422,9 @@ fn external_dashboard_asset_manifest_is_coherent() {
         app.contains(r#"fetch("/api/logs/clear""#)
             && app.contains("function exportLogs")
             && app.contains("Log${logTimestampForFile()}.log")
-            && app.contains("logAutoScroll"),
+            && app.contains("logAutoScroll")
+            && app.contains("scrollButton.setAttribute(\"aria-pressed\"")
+            && app.contains("list.scrollTop = list.scrollHeight"),
         "dashboard logs must support clear, export, and pause/play autoscroll"
     );
     assert!(
@@ -501,6 +500,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && css.contains("--dash-page-pad")
             && !css.contains("Legacy structural baseline"),
         "dashboard CSS must use one explicit page visibility contract and disable scroll anchoring on live panels"
+    );
+    assert!(
+        css.contains("#page-logs.active")
+            && css.contains("height: calc(100dvh - 70px)")
+            && css.contains("height: calc(100dvh - 76px)")
+            && css.contains("overscroll-behavior: contain")
+            && css.contains("user-select: text"),
+        "logs page must fit the viewport with a single readable, selectable scrolling log list"
     );
     assert!(
         css.contains("@media (pointer: coarse)") && css.contains("@media (min-resolution: 2dppx)"),
