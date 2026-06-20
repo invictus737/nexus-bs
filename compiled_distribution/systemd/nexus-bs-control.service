@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 [Unit]
-Description=Nexus-BS v0.1.74 local control service
+Description=Nexus-BS v0.1.75 local control service
 Documentation=man:systemd.service(5)
 After=network-online.target
 Wants=network-online.target

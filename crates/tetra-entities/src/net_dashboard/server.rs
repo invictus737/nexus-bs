@@ -711,16 +711,37 @@ fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
         update.lock().unwrap().finish(false);
         return;
     }
-    let _ = run_update_command_privileged(&update, "systemctl", &["daemon-reload"]);
-    let _ = run_update_command_privileged(&update, "systemctl", &["restart", "nexus-bs-control.service"]);
-    let _ = run_update_command_privileged(&update, "systemctl", &["restart", "nexus-bs.service"]);
-    update_log(&update, "Restarting dashboard service to load the installed version");
+    if !run_update_post_install_restart(&update) {
+        update.lock().unwrap().finish(false);
+        return;
+    }
     update.lock().unwrap().finish(true);
 
     let _ = Command::new("sh")
         .arg("-c")
         .arg("sleep 2; systemctl restart nexus-bs-dashboard.service || sudo -n systemctl restart nexus-bs-dashboard.service")
         .spawn();
+}
+
+fn run_update_post_install_restart(update: &SharedUpdateState) -> bool {
+    update_log(update, "Reloading systemd units after package install");
+    let _ = run_update_command_privileged(update, "systemctl", &["daemon-reload"]);
+
+    update_log(update, "Restarting Nexus-BS control service after package install");
+    if !run_update_command_privileged(update, "systemctl", &["restart", "nexus-bs-control.service"]) {
+        return false;
+    }
+
+    update_log(
+        update,
+        "Restarting Nexus-BS core service (same action as Settings/Admin Restart BS)",
+    );
+    if !run_update_command_privileged(update, "systemctl", &["restart", "nexus-bs.service"]) {
+        return false;
+    }
+
+    update_log(update, "Restarting dashboard service to load the installed version");
+    true
 }
 
 pub struct DashboardServer {
@@ -5648,10 +5669,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.74"));
+        assert!(rendered.contains("Nexus-BS v0.1.75"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.74"));
+        assert!(rendered.contains("Nexus-BS/v0.1.75"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -6134,9 +6155,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.74");
-        assert_eq!(product.version_tag, "v0.1.74");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.74");
+        assert_eq!(product.version, "0.1.75");
+        assert_eq!(product.version_tag, "v0.1.75");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.75");
     }
 
     #[test]
