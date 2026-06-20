@@ -44,6 +44,12 @@ install_service_user_dropins() {
     done
 }
 
+legacy_unit_needs_replacement() {
+    unit_path="$1"
+    [ -f "$unit_path" ] || return 1
+    grep -Eq '/home/[^/]+/nexus-bs|/home/%i/nexus-bs|v0\.1\.71_dev|^User=chris$' "$unit_path"
+}
+
 fix_config_permissions() {
     run_user="$1"
     run_group="$2"
@@ -68,6 +74,9 @@ install_dashboard_sudoers() {
         printf '# Installed by nexus-bs. Allows the dashboard to apply Nexus-BS updates and host service actions.\n'
         printf '%s ALL=(root) NOPASSWD: /usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /bin/systemctl daemon-reload\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl stop nexus-bs.service nexus-bs-control.service, /bin/systemctl stop nexus-bs.service nexus-bs-control.service\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start nexus-bs-control.service, /bin/systemctl start nexus-bs-control.service\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl start nexus-bs.service, /bin/systemctl start nexus-bs.service\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs-control.service, /bin/systemctl restart nexus-bs-control.service\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs.service, /bin/systemctl restart nexus-bs.service\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs-dashboard.service, /bin/systemctl restart nexus-bs-dashboard.service\n' "$run_user"
@@ -84,6 +93,7 @@ install_dashboard_sudoers() {
 if [ "$1" = "configure" ]; then
     run_user="$(detect_run_user)"
     run_group="$(id -gn "$run_user" 2>/dev/null || printf '%s' "$run_user")"
+    enable_after_legacy_replace=""
     if ! user_exists "$run_user"; then
         run_user="root"
         run_group="root"
@@ -93,10 +103,14 @@ if [ "$1" = "configure" ]; then
 
     for unit in $service_units; do
         legacy="/etc/systemd/system/$unit"
-        if [ -f "$legacy" ] && grep -Eq '/home/chris/nexus-bs|v0\.1\.71_dev|^User=chris$' "$legacy"; then
+        want_link="/etc/systemd/system/multi-user.target.wants/$unit"
+        if legacy_unit_needs_replacement "$legacy"; then
+            if [ -e "$want_link" ]; then
+                enable_after_legacy_replace="$enable_after_legacy_replace $unit"
+            fi
             mv -f "$legacy" "$legacy.legacy-nexus-bs"
+            rm -f "$want_link"
         fi
-        rm -f "/etc/systemd/system/multi-user.target.wants/$unit"
     done
 
     if [ ! -e /etc/nexus-bs/config.toml ]; then
@@ -109,6 +123,9 @@ if [ "$1" = "configure" ]; then
 
     if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload >/dev/null 2>&1 || true
+        if [ -n "$enable_after_legacy_replace" ]; then
+            systemctl enable $enable_after_legacy_replace >/dev/null 2>&1 || true
+        fi
     fi
 fi
 
