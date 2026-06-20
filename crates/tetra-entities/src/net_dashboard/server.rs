@@ -730,7 +730,7 @@ fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
 
     let _ = Command::new("sh")
         .arg("-c")
-        .arg("sleep 2; systemctl restart nexus-bs-dashboard.service || sudo -n systemctl restart nexus-bs-dashboard.service")
+        .arg("sleep 2; if [ \"$(id -u)\" = 0 ]; then systemctl restart nexus-bs-dashboard.service; else sudo -n systemctl restart nexus-bs-dashboard.service; fi")
         .spawn();
 }
 
