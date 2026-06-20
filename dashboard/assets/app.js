@@ -1257,6 +1257,18 @@ function openEasyStartWizard() {
   renderEasyStartWizard();
 }
 
+function easyStartRequestedByUrl() {
+  return window.location.pathname === "/easy-start" || window.location.hash === "#easy-start";
+}
+
+function openEasyStartWizardFromUrl() {
+  if (!easyStartRequestedByUrl()) return;
+  openEasyStartWizard();
+  if (window.location.pathname === "/easy-start") {
+    window.history.replaceState({}, "", `${window.location.origin}/${window.location.hash || ""}`);
+  }
+}
+
 async function skipEasyStartWizard() {
   if (state.easyStartBusy) return;
   state.easyStartBusy = true;
@@ -3111,6 +3123,7 @@ initNav();
 refreshDashboardData();
 loadConfigText("config.toml");
 connectWs();
+openEasyStartWizardFromUrl();
 setInterval(loadSystem, 15000);
 setInterval(loadSite, SITE_REFRESH_MS);
 setInterval(loadSnapshot, SNAPSHOT_REFRESH_MS);
