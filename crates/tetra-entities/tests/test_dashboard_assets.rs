@@ -388,8 +388,14 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         dashboard_server.contains(r#"run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str])"#)
-            && dashboard_server.contains("run_update_post_install_restart")
-            && dashboard_server.contains("same action as Settings/Admin Restart BS")
+            && dashboard_server.contains("run_update_stop_bs_services")
+            && dashboard_server.contains("run_update_post_install_start")
+            && dashboard_server.contains(r#"&["stop", "nexus-bs.service", "nexus-bs-control.service"]"#)
+            && dashboard_server.contains("Waiting 5s before starting Nexus-BS services")
+            && dashboard_server.contains("std::thread::sleep(std::time::Duration::from_secs(5))")
+            && dashboard_server.contains(r#"&["start", "nexus-bs-control.service"]"#)
+            && dashboard_server.contains(r#"&["start", "nexus-bs.service"]"#)
+            && !dashboard_server.contains(r#"&["restart", "nexus-bs.service"]"#)
             && dashboard_server.contains("update_process_runs_as_root")
             && !dashboard_server.contains("systemctl restart nexus-bs-dashboard.service || sudo -n")
             && deb_postinst.contains("install_dashboard_sudoers")

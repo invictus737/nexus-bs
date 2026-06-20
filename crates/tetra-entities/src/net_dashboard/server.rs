@@ -718,11 +718,15 @@ fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
     }
     update_log(&update, format!("Installing nexus-bs {} ({})", version.trim(), arch.trim()));
 
+    if !run_update_stop_bs_services(&update) {
+        update.lock().unwrap().finish(false);
+        return;
+    }
     if !run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str]) {
         update.lock().unwrap().finish(false);
         return;
     }
-    if !run_update_post_install_restart(&update) {
+    if !run_update_post_install_start(&update) {
         update.lock().unwrap().finish(false);
         return;
     }
@@ -734,24 +738,32 @@ fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
         .spawn();
 }
 
-fn run_update_post_install_restart(update: &SharedUpdateState) -> bool {
+fn run_update_stop_bs_services(update: &SharedUpdateState) -> bool {
+    update_log(update, "Stopping Nexus-BS core/control services before package install");
+    run_update_command_privileged(update, "systemctl", &["stop", "nexus-bs.service", "nexus-bs-control.service"])
+}
+
+fn run_update_post_install_start(update: &SharedUpdateState) -> bool {
     update_log(update, "Reloading systemd units after package install");
     let _ = run_update_command_privileged(update, "systemctl", &["daemon-reload"]);
 
-    update_log(update, "Restarting Nexus-BS control service after package install");
-    if !run_update_command_privileged(update, "systemctl", &["restart", "nexus-bs-control.service"]) {
+    update_log(update, "Waiting 5s before starting Nexus-BS services");
+    std::thread::sleep(std::time::Duration::from_secs(5));
+
+    update_log(update, "Starting Nexus-BS control service after package install");
+    if !run_update_command_privileged(update, "systemctl", &["start", "nexus-bs-control.service"]) {
+        return false;
+    }
+
+    update_log(update, "Starting Nexus-BS core service after package install");
+    if !run_update_command_privileged(update, "systemctl", &["start", "nexus-bs.service"]) {
         return false;
     }
 
     update_log(
         update,
-        "Restarting Nexus-BS core service (same action as Settings/Admin Restart BS)",
+        "Restarting dashboard service to load the installed version after BS services are online",
     );
-    if !run_update_command_privileged(update, "systemctl", &["restart", "nexus-bs.service"]) {
-        return false;
-    }
-
-    update_log(update, "Restarting dashboard service to load the installed version");
     true
 }
 

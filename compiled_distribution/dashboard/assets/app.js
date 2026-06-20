@@ -1613,7 +1613,13 @@ async function applySelectedUpdate() {
   const release = selectedUpdateRelease();
   if (!release || state.updateBusy) return;
   const action = release.relation === "older" ? "Downgrade" : release.relation === "current" ? "Reinstall" : "Update";
-  if (!window.confirm(`${action} Nexus-BS to ${release.tag}?\n\nThe package will be downloaded from GitHub and services will restart.`)) return;
+  if (
+    !window.confirm(
+      `${action} Nexus-BS to ${release.tag}?\n\nThe package will be downloaded from GitHub. Core/control services stop before install, wait 5s, then start again.`
+    )
+  ) {
+    return;
+  }
   state.updateBusy = true;
   state.updateStatus = "running";
   state.updateLog = `Starting ${action.toLowerCase()} to ${release.tag}...`;
