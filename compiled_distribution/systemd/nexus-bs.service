@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 [Unit]
-Description=Nexus-BS v0.1.72 TETRA base station service
+Description=Nexus-BS v0.1.73 TETRA base station service
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs-control.service
 Wants=network-online.target nexus-bs-control.service

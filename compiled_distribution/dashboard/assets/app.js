@@ -55,6 +55,13 @@ const state = {
   selectedUpdateUrl: "",
   serviceBusy: false,
   serviceStatus: "idle",
+  easyStart: null,
+  easyStartStep: 0,
+  easyStartBusy: false,
+  easyStartDraft: null,
+  easyStartPreview: null,
+  easyStartDismissed: false,
+  factoryResetBusy: false,
   logAutoScroll: true,
   logBusy: false,
   activePage: "system",
@@ -1051,11 +1058,284 @@ function setServiceStatus(message) {
 }
 
 function renderServiceControls() {
-  for (const id of ["serviceRestartBtn", "serviceShutdownBtn", "serviceStopGoBtn"]) {
+  for (const id of ["serviceRestartBtn", "serviceShutdownBtn", "serviceStopGoBtn", "factoryResetBtn"]) {
     const button = $(id);
-    if (button) button.disabled = !!state.serviceBusy;
+    if (button) button.disabled = !!state.serviceBusy || !!state.factoryResetBusy;
   }
   setText("serviceActionStatus", state.serviceStatus || "idle");
+}
+
+function defaultEasyStartDraft() {
+  const defaults = state.easyStart?.defaults || {};
+  return {
+    mcc: defaults.mcc ?? 901,
+    mnc: defaults.mnc ?? 9999,
+    timezone: defaults.timezone || "Europe/Bucharest",
+    tx_freq: defaults.tx_freq ?? 438025000,
+    duplex_spacing: defaults.duplex_spacing ?? 1,
+    custom_spacing_enabled: !!defaults.custom_spacing_enabled,
+    custom_spacing_hz: defaults.custom_spacing_hz ?? 7600000,
+    brew_enabled: defaults.brew_enabled !== false,
+    brew_host: defaults.brew_host || "core.tetrapack.online",
+    brew_port: defaults.brew_port ?? 443,
+    brew_tls: defaults.brew_tls !== false,
+    brew_username: defaults.brew_username ?? 226008299,
+    brew_password: defaults.brew_password || "changeme123",
+  };
+}
+
+function easyStartDraftFromInputs() {
+  const draft = state.easyStartDraft || defaultEasyStartDraft();
+  return {
+    ...draft,
+    mcc: Number($("easyMcc")?.value || draft.mcc),
+    mnc: Number($("easyMnc")?.value || draft.mnc),
+    timezone: String($("easyTimezone")?.value || draft.timezone).trim(),
+    tx_freq: Number($("easyTxFreq")?.value || draft.tx_freq),
+    duplex_spacing: Number($("easyDuplexSpacing")?.value || draft.duplex_spacing),
+    custom_spacing_enabled: !!$("easyCustomSpacingEnabled")?.checked,
+    custom_spacing_hz: Number($("easyCustomSpacingHz")?.value || draft.custom_spacing_hz),
+    brew_enabled: !!$("easyBrewEnabled")?.checked,
+    brew_host: String($("easyBrewHost")?.value || draft.brew_host).trim(),
+    brew_port: Number($("easyBrewPort")?.value || draft.brew_port),
+    brew_tls: !!$("easyBrewTls")?.checked,
+    brew_username: Number($("easyBrewUsername")?.value || draft.brew_username),
+    brew_password: String($("easyBrewPassword")?.value || draft.brew_password),
+  };
+}
+
+function saveEasyStartInputs() {
+  if ($("easyStartModal")?.classList.contains("hidden")) return;
+  state.easyStartDraft = easyStartDraftFromInputs();
+}
+
+function setEasyStartMessage(message, kind = "") {
+  const node = $("easyStartMessage");
+  if (!node) return;
+  node.textContent = message || "";
+  node.classList.toggle("error", kind === "error");
+  node.classList.toggle("ok", kind === "ok");
+}
+
+function easyStartSteps() {
+  return ["Network", "Carrier", "Brew", "Review"];
+}
+
+function easyField(id, label, value, attrs = "") {
+  return `<label class="field">
+    <span>${esc(label)}</span>
+    <input id="${esc(id)}" value="${esc(value)}" ${attrs}>
+  </label>`;
+}
+
+function renderEasyStartProgress() {
+  const steps = easyStartSteps();
+  setHtml("easyStartProgress", steps.map((step, index) => `<div class="wizard-step-pill${index === state.easyStartStep ? " active" : ""}">${index + 1}. ${esc(step)}</div>`).join(""));
+}
+
+function renderEasyStartWizard() {
+  const draft = state.easyStartDraft || defaultEasyStartDraft();
+  const step = state.easyStartStep;
+  renderEasyStartProgress();
+  let body = "";
+  if (step === 0) {
+    body = `<p class="wizard-copy">Set the network identity and local time. For a private/test TETRA network, 901 / 9999 is the usual starter pair.</p>
+      <div class="wizard-grid">
+        ${easyField("easyMcc", "MCC", draft.mcc, 'type="number" min="1" max="999" inputmode="numeric"')}
+        ${easyField("easyMnc", "MNC", draft.mnc, 'type="number" min="0" max="9999" inputmode="numeric"')}
+        ${easyField("easyTimezone", "Timezone", draft.timezone, 'type="text" autocomplete="off" spellcheck="false" class="full"')}
+      </div>`;
+  } else if (step === 1) {
+    body = `<p class="wizard-copy">Enter the downlink TX frequency in Hz. Nexus-BS calculates RX frequency, carrier number, frequency band, and offset for you.</p>
+      <div class="wizard-grid">
+        ${easyField("easyTxFreq", "TX frequency Hz", draft.tx_freq, 'type="number" min="300000000" max="999999999" inputmode="numeric"')}
+        ${easyField("easyDuplexSpacing", "Duplex spacing code", draft.duplex_spacing, 'type="number" min="1" max="15" inputmode="numeric"')}
+        <label class="check-field full"><input id="easyCustomSpacingEnabled" type="checkbox" ${draft.custom_spacing_enabled ? "checked" : ""}><span>Use custom duplex spacing</span></label>
+        ${easyField("easyCustomSpacingHz", "Custom spacing Hz", draft.custom_spacing_hz, 'type="number" min="1000000" max="20000000" inputmode="numeric"')}
+      </div>`;
+  } else if (step === 2) {
+    body = `<p class="wizard-copy">Brew connects this cell to a TETRAPACK/TETRALink/TETRAFlow style core. Turn it off for a standalone local cell.</p>
+      <div class="wizard-grid">
+        <label class="check-field full"><input id="easyBrewEnabled" type="checkbox" ${draft.brew_enabled ? "checked" : ""}><span>Enable Brew core connection</span></label>
+        ${easyField("easyBrewHost", "Core host", draft.brew_host, 'type="text" autocomplete="off" spellcheck="false"')}
+        ${easyField("easyBrewPort", "Core port", draft.brew_port, 'type="number" min="1" max="65535" inputmode="numeric"')}
+        <label class="check-field"><input id="easyBrewTls" type="checkbox" ${draft.brew_tls ? "checked" : ""}><span>Use SSL/TLS</span></label>
+        ${easyField("easyBrewUsername", "Username / SSI", draft.brew_username, 'type="number" min="1" inputmode="numeric"')}
+        ${easyField("easyBrewPassword", "Password", draft.brew_password, 'type="password" autocomplete="new-password"')}
+      </div>`;
+  } else {
+    const summary = state.easyStartPreview?.summary || {};
+    body = `<p class="wizard-copy">Verify checks the generated config with the same parser Nexus-BS uses at startup. Commit writes config.toml and restarts the BS.</p>
+      <div class="wizard-review">
+        <div class="wizard-review-row"><span>Network</span><strong>${esc(summary.network || `${draft.mcc} / ${draft.mnc}`)}</strong></div>
+        <div class="wizard-review-row"><span>TX</span><strong>${esc(summary.tx_freq || draft.tx_freq)} Hz</strong></div>
+        <div class="wizard-review-row"><span>RX</span><strong>${esc(summary.rx_freq || "--")} Hz</strong></div>
+        <div class="wizard-review-row"><span>Carrier</span><strong>${esc(summary.main_carrier ?? "--")}</strong></div>
+        <div class="wizard-review-row"><span>Offset</span><strong>${esc(summary.freq_offset ?? "--")}</strong></div>
+        <div class="wizard-review-row"><span>Timezone</span><strong>${esc(summary.timezone || draft.timezone)}</strong></div>
+        <div class="wizard-review-row"><span>Brew</span><strong>${esc(summary.brew || (draft.brew_enabled ? `${draft.brew_host}:${draft.brew_port}` : "disabled"))}</strong></div>
+      </div>`;
+  }
+  setHtml("easyStartBody", body);
+  $("easyStartBackBtn").style.display = step > 0 ? "" : "none";
+  $("easyStartNextBtn").style.display = step < 3 ? "" : "none";
+  $("easyStartVerifyBtn").style.display = step === 3 ? "" : "none";
+  $("easyStartCommitBtn").style.display = step === 3 ? "" : "none";
+  for (const id of ["easyStartBackBtn", "easyStartNextBtn", "easyStartVerifyBtn", "easyStartCommitBtn", "easyStartSkipBtn"]) {
+    const button = $(id);
+    if (button) button.disabled = !!state.easyStartBusy;
+  }
+}
+
+async function loadEasyStartStatus() {
+  if (state.easyStartDismissed) return;
+  try {
+    const res = await fetch("/api/easy-start/status", { credentials: "same-origin", cache: "no-store" });
+    if (!res.ok) return;
+    const body = await res.json();
+    state.easyStart = body;
+    const modal = $("easyStartModal");
+    const alreadyOpen = modal ? !modal.classList.contains("hidden") : false;
+    if (body.required && !alreadyOpen) {
+      openEasyStartWizard();
+    }
+  } catch {
+    // Non-critical; dashboard remains usable.
+  }
+}
+
+function openEasyStartWizard() {
+  state.easyStartDraft = state.easyStartDraft || defaultEasyStartDraft();
+  state.easyStartStep = 0;
+  state.easyStartPreview = null;
+  $("easyStartModal")?.classList.remove("hidden");
+  setEasyStartMessage("Fill the basic fields. Advanced TETRA values are calculated automatically.");
+  renderEasyStartWizard();
+}
+
+async function skipEasyStartWizard() {
+  if (state.easyStartBusy) return;
+  state.easyStartBusy = true;
+  renderEasyStartWizard();
+  try {
+    await fetch("/api/easy-start/skip", { method: "POST", credentials: "same-origin", cache: "no-store" });
+  } finally {
+    state.easyStartDismissed = true;
+    $("easyStartModal")?.classList.add("hidden");
+    state.easyStartBusy = false;
+  }
+}
+
+async function verifyEasyStartConfig() {
+  if (state.easyStartBusy) return false;
+  saveEasyStartInputs();
+  state.easyStartBusy = true;
+  setEasyStartMessage("Verifying generated config...");
+  renderEasyStartWizard();
+  try {
+    const res = await fetch("/api/easy-start/preview", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.easyStartDraft),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    state.easyStartPreview = body;
+    setEasyStartMessage(body.message || "Config verified.", "ok");
+    return true;
+  } catch (error) {
+    state.easyStartPreview = null;
+    setEasyStartMessage(String(error.message || error).slice(0, 180), "error");
+    return false;
+  } finally {
+    state.easyStartBusy = false;
+    renderEasyStartWizard();
+  }
+}
+
+async function commitEasyStartConfig() {
+  if (state.easyStartBusy) return;
+  const verified = state.easyStartPreview || (await verifyEasyStartConfig());
+  if (!verified) return;
+  if (!window.confirm("Save this config and restart Nexus-BS now?")) return;
+  state.easyStartBusy = true;
+  setEasyStartMessage("Saving config and starting Nexus-BS...");
+  renderEasyStartWizard();
+  try {
+    const res = await fetch("/api/easy-start/commit", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(state.easyStartDraft),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    setEasyStartMessage(body.message || "Config saved. Restart queued.", "ok");
+    state.easyStartDismissed = true;
+    invalidateSiteConfig("Easy Start committed");
+    scheduleSiteReloads();
+    setTimeout(() => $("easyStartModal")?.classList.add("hidden"), 1200);
+  } catch (error) {
+    setEasyStartMessage(`Commit failed: ${String(error.message || error).slice(0, 160)}`, "error");
+  } finally {
+    state.easyStartBusy = false;
+    renderEasyStartWizard();
+  }
+}
+
+function nextEasyStartStep() {
+  saveEasyStartInputs();
+  state.easyStartStep = Math.min(3, state.easyStartStep + 1);
+  if (state.easyStartStep === 3) state.easyStartPreview = null;
+  setEasyStartMessage(state.easyStartStep === 3 ? "Press Verify Config before committing." : "Fill the fields on this step.");
+  renderEasyStartWizard();
+}
+
+function previousEasyStartStep() {
+  saveEasyStartInputs();
+  state.easyStartStep = Math.max(0, state.easyStartStep - 1);
+  setEasyStartMessage("Review or adjust the fields.");
+  renderEasyStartWizard();
+}
+
+function openFactoryResetDialog() {
+  if (state.factoryResetBusy) return;
+  const input = $("factoryResetConfirmText");
+  if (input) input.value = "";
+  setText("factoryResetStatus", "No reset requested.");
+  $("factoryResetModal")?.classList.remove("hidden");
+}
+
+async function requestFactoryReset() {
+  if (state.factoryResetBusy) return;
+  const confirmation = String($("factoryResetConfirmText")?.value || "").trim();
+  if (confirmation !== "RESET NEXUS-BS") {
+    setText("factoryResetStatus", "Type RESET NEXUS-BS exactly.");
+    return;
+  }
+  state.factoryResetBusy = true;
+  renderServiceControls();
+  setText("factoryResetStatus", "Reset running. Host shutdown will follow.");
+  try {
+    const res = await fetch("/api/factory-reset", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ confirmation }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    setText("factoryResetStatus", body.message || "Factory reset accepted. Host shutdown queued.");
+    setServiceStatus("factory reset queued");
+  } catch (error) {
+    setText("factoryResetStatus", `reset failed: ${String(error.message || error).slice(0, 120)}`);
+    state.factoryResetBusy = false;
+    renderServiceControls();
+  }
 }
 
 function setWifiStatus(message) {
@@ -2615,6 +2895,7 @@ function refreshDashboardData() {
   loadConfigProfiles();
   loadWifiStatus();
   loadUpdateCatalog();
+  loadEasyStartStatus();
 }
 
 function connectWs() {
@@ -2715,6 +2996,14 @@ function initNav() {
   $("serviceRestartBtn")?.addEventListener("click", () => requestServiceAction("restart"));
   $("serviceShutdownBtn")?.addEventListener("click", () => requestServiceAction("shutdown"));
   $("serviceStopGoBtn")?.addEventListener("click", () => requestServiceAction("stopgo"));
+  $("factoryResetBtn")?.addEventListener("click", openFactoryResetDialog);
+  $("factoryResetCancelBtn")?.addEventListener("click", () => $("factoryResetModal")?.classList.add("hidden"));
+  $("factoryResetConfirmBtn")?.addEventListener("click", requestFactoryReset);
+  $("easyStartSkipBtn")?.addEventListener("click", skipEasyStartWizard);
+  $("easyStartBackBtn")?.addEventListener("click", previousEasyStartStep);
+  $("easyStartNextBtn")?.addEventListener("click", nextEasyStartStep);
+  $("easyStartVerifyBtn")?.addEventListener("click", verifyEasyStartConfig);
+  $("easyStartCommitBtn")?.addEventListener("click", commitEasyStartConfig);
   $("updateRefreshBtn")?.addEventListener("click", loadUpdateCatalog);
   $("updateApplyBtn")?.addEventListener("click", applySelectedUpdate);
   $("updateReleaseSelect")?.addEventListener("change", (event) => {

@@ -46,6 +46,10 @@ const DASHBOARD_HTTP_HEADER_LINE_MAX: usize = 2 * 1024;
 const DASHBOARD_HTTP_BODY_MAX: usize = 512 * 1024;
 const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
 const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
+const EASY_START_TEMPLATE_TOML: &str = include_str!("../../../../example_config/config_template.toml");
+const EASY_START_DONE_MARKER: &str = ".easy-start-done";
+const EASY_START_SKIP_MARKER: &str = ".easy-start-skipped";
+const FACTORY_RESET_CONFIRMATION: &str = "RESET NEXUS-BS";
 const DASHBOARD_SECURITY_HEADERS: &str = concat!(
     "X-Content-Type-Options: nosniff\r\n",
     "X-Frame-Options: DENY\r\n",
@@ -1375,6 +1379,510 @@ fn serve_service_command(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>
     }
 }
 
+#[derive(Debug, Clone)]
+struct EasyStartRequest {
+    mcc: u16,
+    mnc: u16,
+    timezone: String,
+    tx_freq: u64,
+    duplex_spacing: u8,
+    custom_spacing_enabled: bool,
+    custom_spacing_hz: Option<u64>,
+    brew_enabled: bool,
+    brew_host: String,
+    brew_port: u16,
+    brew_tls: bool,
+    brew_username: u32,
+    brew_password: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EasyStartCellPlan {
+    freq_band: u8,
+    main_carrier: i64,
+    freq_offset: i64,
+    rx_freq: u64,
+    reverse_operation: bool,
+    spacing_hz: u64,
+}
+
+fn config_dir_for(config_path: &str) -> PathBuf {
+    Path::new(config_path).parent().unwrap_or_else(|| Path::new(".")).to_path_buf()
+}
+
+fn easy_start_marker_path(config_path: &str, marker: &str) -> PathBuf {
+    config_dir_for(config_path).join(marker)
+}
+
+fn easy_start_completed(config_path: &str) -> bool {
+    easy_start_marker_path(config_path, EASY_START_DONE_MARKER).is_file()
+        || easy_start_marker_path(config_path, EASY_START_SKIP_MARKER).is_file()
+}
+
+fn mark_easy_start(config_path: &str, marker: &str) -> Result<(), String> {
+    write_dashboard_config_file(&easy_start_marker_path(config_path, marker), "done\n")
+        .map_err(|e| format!("failed to save Easy Start state: {}", e))
+}
+
+fn parse_easy_start_request(value: &serde_json::Value) -> Result<EasyStartRequest, String> {
+    fn str_field(value: &serde_json::Value, key: &str) -> String {
+        value.get(key).and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string()
+    }
+    fn bool_field(value: &serde_json::Value, key: &str, default: bool) -> bool {
+        value.get(key).and_then(serde_json::Value::as_bool).unwrap_or(default)
+    }
+    fn u64_field(value: &serde_json::Value, key: &str) -> Result<u64, String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())))
+            .ok_or_else(|| format!("{} is required", key))
+    }
+
+    let mcc = u64_field(value, "mcc")?;
+    let mnc = u64_field(value, "mnc")?;
+    let tx_freq = u64_field(value, "tx_freq")?;
+    let duplex_spacing = u64_field(value, "duplex_spacing")?;
+    let custom_spacing_enabled = bool_field(value, "custom_spacing_enabled", false);
+    let custom_spacing_hz = value
+        .get("custom_spacing_hz")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())))
+        .filter(|v| *v > 0);
+    let timezone = str_field(value, "timezone");
+    let brew_enabled = bool_field(value, "brew_enabled", false);
+    let brew_host = str_field(value, "brew_host");
+    let brew_port = value
+        .get("brew_port")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())))
+        .unwrap_or(443);
+    let brew_tls = bool_field(value, "brew_tls", true);
+    let brew_username = value
+        .get("brew_username")
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse::<u64>().ok())))
+        .unwrap_or(0);
+    let brew_password = str_field(value, "brew_password");
+
+    if !(1..=999).contains(&mcc) {
+        return Err("MCC must be a number from 1 to 999".to_string());
+    }
+    if !(0..=9999).contains(&mnc) {
+        return Err("MNC must be a number from 0 to 9999".to_string());
+    }
+    if timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err("Timezone must look like Europe/Bucharest".to_string());
+    }
+    if !(300_000_000..=999_999_999).contains(&tx_freq) {
+        return Err("TX frequency must be in Hz, for example 438025000".to_string());
+    }
+    if !(1..=15).contains(&duplex_spacing) {
+        return Err("Duplex spacing must be a small TETRA spacing code, for example 1".to_string());
+    }
+    if custom_spacing_enabled {
+        let spacing = custom_spacing_hz.ok_or_else(|| "Custom spacing needs a value in Hz".to_string())?;
+        if !(1_000_000..=20_000_000).contains(&spacing) {
+            return Err("Custom spacing must be between 1000000 and 20000000 Hz".to_string());
+        }
+    }
+    if brew_enabled {
+        if brew_host.is_empty() || brew_host.len() > 253 || brew_host.contains('/') || brew_host.contains(' ') {
+            return Err("Brew host must be a hostname like core.tetrapack.online".to_string());
+        }
+        if brew_port == 0 || brew_port > u16::MAX as u64 {
+            return Err("Brew port must be 1-65535".to_string());
+        }
+        if brew_username == 0 || brew_username > u32::MAX as u64 {
+            return Err("Brew username must be your numeric SSI".to_string());
+        }
+        if brew_password.is_empty() {
+            return Err("Brew password is required when Brew is enabled".to_string());
+        }
+    }
+
+    Ok(EasyStartRequest {
+        mcc: mcc as u16,
+        mnc: mnc as u16,
+        timezone,
+        tx_freq,
+        duplex_spacing: duplex_spacing as u8,
+        custom_spacing_enabled,
+        custom_spacing_hz,
+        brew_enabled,
+        brew_host,
+        brew_port: brew_port as u16,
+        brew_tls,
+        brew_username: brew_username as u32,
+        brew_password,
+    })
+}
+
+fn spacing_hz_for(code: u8, custom_enabled: bool, custom: Option<u64>) -> u64 {
+    if custom_enabled {
+        return custom.unwrap_or(7_000_000);
+    }
+    match code {
+        1 => 7_000_000,
+        2 => 10_000_000,
+        3 => 45_000_000,
+        _ => 7_000_000,
+    }
+}
+
+fn easy_start_cell_plan(req: &EasyStartRequest) -> Result<EasyStartCellPlan, String> {
+    let freq_band = (req.tx_freq / 100_000_000) as u8;
+    let band_base = u64::from(freq_band) * 100_000_000;
+    if band_base == 0 || req.tx_freq <= band_base {
+        return Err("TX frequency is outside a supported TETRA band".to_string());
+    }
+    let offset_candidates = [0_i64, 6250, -6250, 12500];
+    let mut best: Option<(u64, usize, i64, i64)> = None;
+    for (rank, offset) in offset_candidates.iter().enumerate() {
+        let relative = req.tx_freq as i64 - band_base as i64 - *offset;
+        let carrier = ((relative as f64) / 25_000.0).round() as i64;
+        if carrier < 0 {
+            continue;
+        }
+        let reconstructed = band_base as i64 + *offset + carrier * 25_000;
+        let error = (reconstructed - req.tx_freq as i64).unsigned_abs();
+        let candidate = (error, rank, carrier, *offset);
+        if best.map(|current| candidate < current).unwrap_or(true) {
+            best = Some(candidate);
+        }
+    }
+    let Some((error, _, main_carrier, freq_offset)) = best else {
+        return Err("Could not calculate TETRA carrier from TX frequency".to_string());
+    };
+    if error > 6250 {
+        return Err("TX frequency is not close to a TETRA 25 kHz raster".to_string());
+    }
+    let spacing_hz = spacing_hz_for(req.duplex_spacing, req.custom_spacing_enabled, req.custom_spacing_hz);
+    if req.tx_freq <= spacing_hz {
+        return Err("Duplex spacing is larger than TX frequency".to_string());
+    }
+    Ok(EasyStartCellPlan {
+        freq_band,
+        main_carrier,
+        freq_offset,
+        rx_freq: req.tx_freq - spacing_hz,
+        reverse_operation: false,
+        spacing_hz,
+    })
+}
+
+fn replace_toml_key_in_section(toml: &mut String, section: Option<&str>, key: &str, value: &str) {
+    let mut output = String::with_capacity(toml.len() + value.len());
+    let mut current_section: Option<String> = None;
+    let mut replaced = false;
+    for line in toml.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = Some(trimmed.trim_matches(['[', ']']).to_string());
+        }
+        let section_matches = match section {
+            Some(expected) => current_section.as_deref() == Some(expected),
+            None => current_section.is_none(),
+        };
+        if !replaced && section_matches && trimmed.starts_with(key) {
+            let after_key = trimmed.get(key.len()..).unwrap_or("");
+            if after_key.trim_start().starts_with('=') {
+                let indent = line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+                output.push_str(&format!("{indent}{key} = {value}\n"));
+                replaced = true;
+                continue;
+            }
+        }
+        output.push_str(line);
+        output.push('\n');
+    }
+    *toml = output;
+}
+
+fn remove_toml_section(toml: &str, section: &str) -> String {
+    let header = format!("[{section}]");
+    let mut output = String::new();
+    let mut skipping = false;
+    for line in toml.lines() {
+        let trimmed = line.trim();
+        if trimmed == header {
+            skipping = true;
+            continue;
+        }
+        if skipping && trimmed.starts_with('[') && trimmed.ends_with(']') {
+            skipping = false;
+        }
+        if !skipping {
+            output.push_str(line);
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn render_easy_start_config(req: &EasyStartRequest) -> Result<(String, EasyStartCellPlan), String> {
+    let plan = easy_start_cell_plan(req)?;
+    let mut toml = EASY_START_TEMPLATE_TOML.to_string();
+    replace_toml_key_in_section(&mut toml, Some("phy_io.soapysdr"), "tx_freq", &req.tx_freq.to_string());
+    replace_toml_key_in_section(&mut toml, Some("phy_io.soapysdr"), "rx_freq", &plan.rx_freq.to_string());
+    replace_toml_key_in_section(&mut toml, Some("net_info"), "mcc", &req.mcc.to_string());
+    replace_toml_key_in_section(&mut toml, Some("net_info"), "mnc", &req.mnc.to_string());
+    replace_toml_key_in_section(&mut toml, Some("cell_info"), "freq_band", &plan.freq_band.to_string());
+    replace_toml_key_in_section(&mut toml, Some("cell_info"), "main_carrier", &plan.main_carrier.to_string());
+    replace_toml_key_in_section(&mut toml, Some("cell_info"), "duplex_spacing", &req.duplex_spacing.to_string());
+    replace_toml_key_in_section(&mut toml, Some("cell_info"), "freq_offset", &plan.freq_offset.to_string());
+    replace_toml_key_in_section(
+        &mut toml,
+        Some("cell_info"),
+        "reverse_operation",
+        if plan.reverse_operation { "true" } else { "false" },
+    );
+    replace_toml_key_in_section(&mut toml, Some("cell_info"), "timezone", &format!("{:?}", req.timezone));
+    if req.custom_spacing_enabled {
+        let custom_line = format!("custom_duplex_spacing = {}", plan.spacing_hz);
+        toml = toml.replace(
+            "# custom_duplex_spacing = 7600000   # Don't uncomment unless you have programmed a custom duplex spacing entry in your radios",
+            &custom_line,
+        );
+    }
+    if req.brew_enabled {
+        replace_toml_key_in_section(&mut toml, Some("brew"), "host", &format!("{:?}", req.brew_host));
+        replace_toml_key_in_section(&mut toml, Some("brew"), "port", &req.brew_port.to_string());
+        replace_toml_key_in_section(&mut toml, Some("brew"), "tls", if req.brew_tls { "true" } else { "false" });
+        replace_toml_key_in_section(&mut toml, Some("brew"), "username", &req.brew_username.to_string());
+        replace_toml_key_in_section(&mut toml, Some("brew"), "password", &format!("{:?}", req.brew_password));
+    } else {
+        toml = remove_toml_section(&toml, "brew");
+    }
+    tetra_config::bluestation::parsing::from_toml_str(&toml).map_err(|e| format!("Generated config did not validate: {}", e))?;
+    Ok((toml, plan))
+}
+
+fn serve_easy_start_status(stream: TcpStream, config_path: &str) {
+    let required = !easy_start_completed(config_path);
+    let body = serde_json::json!({
+        "ok": true,
+        "required": required,
+        "completed": !required,
+        "defaults": {
+            "mcc": 901,
+            "mnc": 9999,
+            "timezone": "Europe/Bucharest",
+            "tx_freq": 438025000_u64,
+            "duplex_spacing": 1,
+            "custom_spacing_enabled": false,
+            "custom_spacing_hz": 7600000_u64,
+            "brew_enabled": true,
+            "brew_host": "core.tetrapack.online",
+            "brew_port": 443,
+            "brew_tls": true,
+            "brew_username": 226008299_u32,
+            "brew_password": "changeme123"
+        }
+    });
+    http_json_response(
+        stream,
+        200,
+        &serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":true}"#.to_string()),
+    );
+}
+
+fn easy_start_preview_json(req: &EasyStartRequest, plan: EasyStartCellPlan, include_toml: Option<&str>) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "ok": true,
+        "summary": {
+            "network": format!("{} / {}", req.mcc, req.mnc),
+            "timezone": req.timezone,
+            "tx_freq": req.tx_freq,
+            "rx_freq": plan.rx_freq,
+            "freq_band": plan.freq_band,
+            "main_carrier": plan.main_carrier,
+            "freq_offset": plan.freq_offset,
+            "duplex_spacing": req.duplex_spacing,
+            "custom_spacing_hz": if req.custom_spacing_enabled { Some(plan.spacing_hz) } else { None },
+            "brew": if req.brew_enabled {
+                format!("{}:{} ({})", req.brew_host, req.brew_port, if req.brew_tls { "TLS" } else { "plain" })
+            } else {
+                "disabled".to_string()
+            },
+        },
+        "message": "Config verified. Review the summary, then Commit & Start Nexus-BS."
+    });
+    if let Some(toml) = include_toml {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("toml".to_string(), serde_json::Value::String(toml.to_string()));
+        }
+    }
+    body
+}
+
+fn serve_easy_start_preview(stream: TcpStream, value: &serde_json::Value) {
+    let response = match parse_easy_start_request(value)
+        .and_then(|req| render_easy_start_config(&req).map(|(toml, plan)| easy_start_preview_json(&req, plan, Some(&toml))))
+    {
+        Ok(body) => (200, body),
+        Err(err) => (400, serde_json::json!({"ok": false, "error": err})),
+    };
+    http_json_response(
+        stream,
+        response.0,
+        &serde_json::to_string(&response.1).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+    );
+}
+
+fn serve_easy_start_commit(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
+    let response = match parse_easy_start_request(value).and_then(|req| {
+        let (toml, plan) = render_easy_start_config(&req)?;
+        let backup_path = format!("{}.bak", config_path);
+        if let Err(e) = std::fs::copy(config_path, &backup_path) {
+            tracing::warn!("Dashboard: Easy Start config backup failed: {}", e);
+        }
+        write_dashboard_config_file(Path::new(config_path), &toml).map_err(|e| format!("failed to write config.toml: {}", e))?;
+        mark_easy_start(config_path, EASY_START_DONE_MARKER)?;
+        let restart_accepted = send_control_cmd(cmd_tx, ControlCommand::RestartService);
+        if !restart_accepted {
+            crate::service_control::schedule_service_action(
+                crate::service_control::ServiceAction::Restart,
+                std::time::Duration::from_secs(2),
+            );
+        }
+        tracing::warn!("Dashboard: Easy Start committed config and queued service restart");
+        let mut body = easy_start_preview_json(&req, plan, None);
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("restart_queued".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "message".to_string(),
+                serde_json::Value::String(if restart_accepted {
+                    "Config saved. Nexus-BS restart queued.".to_string()
+                } else {
+                    "Config saved. Restart scheduled through service manager.".to_string()
+                }),
+            );
+        }
+        Ok(body)
+    }) {
+        Ok(body) => (200, body),
+        Err(err) => (400, serde_json::json!({"ok": false, "error": err})),
+    };
+    http_json_response(
+        stream,
+        response.0,
+        &serde_json::to_string(&response.1).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+    );
+}
+
+fn serve_easy_start_skip(stream: TcpStream, config_path: &str) {
+    let response = match mark_easy_start(config_path, EASY_START_SKIP_MARKER) {
+        Ok(_) => (200, serde_json::json!({"ok": true, "message": "Easy Start skipped"})),
+        Err(err) => (500, serde_json::json!({"ok": false, "error": err})),
+    };
+    http_json_response(
+        stream,
+        response.0,
+        &serde_json::to_string(&response.1).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+    );
+}
+
+fn clean_factory_reset_configs(config_path: &str) -> Vec<String> {
+    let config_dir = config_dir_for(config_path);
+    let mut removed = Vec::new();
+    if let Ok(entries) = fs::read_dir(&config_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                continue;
+            }
+            let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let remove = name.ends_with(".toml")
+                || name.ends_with(".toml.bak")
+                || name.ends_with(".toml.active")
+                || name == EASY_START_DONE_MARKER
+                || name == EASY_START_SKIP_MARKER;
+            if remove && fs::remove_file(&path).is_ok() {
+                removed.push(name);
+            }
+        }
+    }
+    removed
+}
+
+fn clean_factory_reset_wifi() -> Vec<String> {
+    let mut removed = Vec::new();
+    for profile in crate::wifi::list_saved().unwrap_or_default() {
+        if crate::wifi::forget(&profile.uuid).is_ok() {
+            removed.push(profile.name);
+        }
+    }
+    removed
+}
+
+#[cfg(unix)]
+fn clean_factory_reset_ssh_keys() -> Vec<String> {
+    let mut removed = Vec::new();
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() || home == "/" {
+        return removed;
+    }
+    let ssh_dir = Path::new(&home).join(".ssh");
+    if let Ok(entries) = fs::read_dir(&ssh_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                if fs::remove_file(&path).is_ok() {
+                    removed.push(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+                }
+            }
+        }
+    }
+    removed
+}
+
+#[cfg(not(unix))]
+fn clean_factory_reset_ssh_keys() -> Vec<String> {
+    Vec::new()
+}
+
+fn serve_factory_reset(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
+    let confirmation = value.get("confirmation").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+    if confirmation != FACTORY_RESET_CONFIRMATION {
+        let body = serde_json::json!({
+            "ok": false,
+            "error": format!("Type {} to confirm factory reset", FACTORY_RESET_CONFIRMATION),
+        });
+        return http_json_response(
+            stream,
+            400,
+            &serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+        );
+    }
+
+    let wifi_removed = clean_factory_reset_wifi();
+    let config_removed = clean_factory_reset_configs(config_path);
+    let ssh_removed = clean_factory_reset_ssh_keys();
+    let poweroff_accepted = send_control_cmd(cmd_tx, ControlCommand::PowerOffHost);
+    if !poweroff_accepted {
+        crate::service_control::schedule_service_action(
+            crate::service_control::ServiceAction::PowerOffHost,
+            std::time::Duration::from_secs(3),
+        );
+    }
+    tracing::warn!(
+        "Dashboard: factory reset requested; removed {} wifi profiles, {} config files, {} ssh key files",
+        wifi_removed.len(),
+        config_removed.len(),
+        ssh_removed.len()
+    );
+    let body = serde_json::json!({
+        "ok": true,
+        "message": "Factory reset accepted. Wi-Fi, configs, and SSH keys were cleared. Host shutdown queued.",
+        "wifi_removed": wifi_removed,
+        "config_removed": config_removed,
+        "ssh_removed": ssh_removed,
+        "poweroff_queued": true,
+    });
+    http_json_response(
+        stream,
+        200,
+        &serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":true}"#.to_string()),
+    );
+}
+
 fn nmcli_available() -> bool {
     Command::new("nmcli")
         .arg("--version")
@@ -2302,6 +2810,66 @@ fn handle_connection(
     } else if request_matches(&req_line, "POST", "/api/service/stop-go") {
         drain_http_headers(&mut stream);
         serve_service_command(stream, &cmd_tx, "stop-go", ControlCommand::StopGoService { start_delay_secs: 5 });
+    } else if request_matches(&req_line, "GET", "/api/easy-start/status") {
+        drain_http_headers(&mut stream);
+        serve_easy_start_status(stream, &config_path);
+    } else if request_matches(&req_line, "POST", "/api/easy-start/preview") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
+            }
+        };
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => serve_easy_start_preview(buf.into_inner(), &value),
+            Err(e) => http_json_response(
+                buf.into_inner(),
+                400,
+                &serde_json::to_string(&serde_json::json!({"ok": false, "error": format!("invalid JSON: {}", e)}))
+                    .unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            ),
+        }
+    } else if request_matches(&req_line, "POST", "/api/easy-start/commit") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
+            }
+        };
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => serve_easy_start_commit(buf.into_inner(), &config_path, &cmd_tx, &value),
+            Err(e) => http_json_response(
+                buf.into_inner(),
+                400,
+                &serde_json::to_string(&serde_json::json!({"ok": false, "error": format!("invalid JSON: {}", e)}))
+                    .unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            ),
+        }
+    } else if request_matches(&req_line, "POST", "/api/easy-start/skip") {
+        drain_http_headers(&mut stream);
+        serve_easy_start_skip(stream, &config_path);
+    } else if request_matches(&req_line, "POST", "/api/factory-reset") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
+            }
+        };
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => serve_factory_reset(buf.into_inner(), &config_path, &cmd_tx, &value),
+            Err(e) => http_json_response(
+                buf.into_inner(),
+                400,
+                &serde_json::to_string(&serde_json::json!({"ok": false, "error": format!("invalid JSON: {}", e)}))
+                    .unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            ),
+        }
     } else if request_matches(&req_line, "POST", "/api/rf/carrier") {
         let mut buf = BufReader::new(stream);
         let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
@@ -4895,10 +5463,10 @@ mod tests {
         );
 
         assert!(!rendered.contains("{{"));
-        assert!(rendered.contains("Nexus-BS v0.1.72"));
+        assert!(rendered.contains("Nexus-BS v0.1.73"));
         let stale_dotted_tag = ["v", ".", tetra_core::PRODUCT_VERSION].concat();
         assert!(!rendered.contains(&stale_dotted_tag));
-        assert!(rendered.contains("Nexus-BS/v0.1.72"));
+        assert!(rendered.contains("Nexus-BS/v0.1.73"));
         assert!(rendered.contains(tetra_core::STACK_VERSION));
     }
 
@@ -4997,6 +5565,27 @@ mod tests {
         assert!(request_matches("GET /api/calls HTTP/1.1", "GET", "/api/calls"));
         assert!(request_matches("GET /api/site HTTP/1.1", "GET", "/api/site"));
         assert!(request_matches(
+            "GET /api/easy-start/status HTTP/1.1",
+            "GET",
+            "/api/easy-start/status"
+        ));
+        assert!(request_matches(
+            "POST /api/easy-start/preview HTTP/1.1",
+            "POST",
+            "/api/easy-start/preview"
+        ));
+        assert!(request_matches(
+            "POST /api/easy-start/commit HTTP/1.1",
+            "POST",
+            "/api/easy-start/commit"
+        ));
+        assert!(request_matches(
+            "POST /api/easy-start/skip HTTP/1.1",
+            "POST",
+            "/api/easy-start/skip"
+        ));
+        assert!(request_matches("POST /api/factory-reset HTTP/1.1", "POST", "/api/factory-reset"));
+        assert!(request_matches(
             "POST /api/service/restart HTTP/1.1",
             "POST",
             "/api/service/restart"
@@ -5023,6 +5612,34 @@ mod tests {
         ));
         assert!(!request_is_api("GET /assets/app.js HTTP/1.1"));
         assert!(!request_is_api("GET /radios/2260618 HTTP/1.1"));
+    }
+
+    #[test]
+    fn easy_start_calculates_cell_info_for_user_example() {
+        let req = EasyStartRequest {
+            mcc: 901,
+            mnc: 9999,
+            timezone: "Europe/Bucharest".to_string(),
+            tx_freq: 438_025_000,
+            duplex_spacing: 1,
+            custom_spacing_enabled: false,
+            custom_spacing_hz: None,
+            brew_enabled: true,
+            brew_host: "core.tetrapack.online".to_string(),
+            brew_port: 443,
+            brew_tls: true,
+            brew_username: 226_008_299,
+            brew_password: "changeme123".to_string(),
+        };
+        let (toml, plan) = render_easy_start_config(&req).expect("easy start config should validate");
+        assert_eq!(plan.freq_band, 4);
+        assert_eq!(plan.main_carrier, 1521);
+        assert_eq!(plan.freq_offset, 0);
+        assert_eq!(plan.rx_freq, 431_025_000);
+        assert!(toml.contains("tx_freq = 438025000"));
+        assert!(toml.contains("rx_freq = 431025000"));
+        assert!(toml.contains("main_carrier = 1521"));
+        assert!(toml.contains("freq_offset = 0"));
     }
 
     #[test]
@@ -5294,9 +5911,9 @@ mod tests {
         let product = dashboard_product_identity();
 
         assert_eq!(product.name, "Nexus-BS");
-        assert_eq!(product.version, "0.1.72");
-        assert_eq!(product.version_tag, "v0.1.72");
-        assert_eq!(product.user_agent, "Nexus-BS/v0.1.72");
+        assert_eq!(product.version, "0.1.73");
+        assert_eq!(product.version_tag, "v0.1.73");
+        assert_eq!(product.user_agent, "Nexus-BS/v0.1.73");
     }
 
     #[test]

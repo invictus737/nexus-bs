@@ -92,6 +92,7 @@ require_distribution_files() {
         "dashboard/assets/nexus-bs-logo.png"
         "config/config.toml"
         "config/config.toml.fallback"
+        "config/config_template.toml"
         "systemd/nexus-bs.service"
         "systemd/nexus-bs-control.service"
         "systemd/nexus-bs-dashboard.service"
@@ -227,6 +228,7 @@ install_payload() {
     install -d -m 0755 "${root}/${etc_rel}/examples/systemd"
     install -m 0644 "${DIST_DIR}/config/config.toml" "${root}/${etc_rel}/examples/config.toml"
     install -m 0644 "${DIST_DIR}/config/config.toml.fallback" "${root}/${etc_rel}/examples/config.toml.fallback"
+    install -m 0644 "${DIST_DIR}/config/config_template.toml" "${root}/${etc_rel}/examples/config_template.toml"
     install -m 0644 "${DIST_DIR}/systemd/journald-nexus-bs-volatile.conf" "${root}/${etc_rel}/examples/systemd/journald-nexus-bs-volatile.conf"
 
     install -d -m 0755 "${root}/${systemd_rel}"
@@ -249,6 +251,7 @@ generate_debian_metadata() {
     cat > "${root}/DEBIAN/conffiles" <<EOF
 ${ETC_PREFIX}/examples/config.toml
 ${ETC_PREFIX}/examples/config.toml.fallback
+${ETC_PREFIX}/examples/config_template.toml
 ${ETC_PREFIX}/examples/systemd/journald-nexus-bs-volatile.conf
 EOF
 }

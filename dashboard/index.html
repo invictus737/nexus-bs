@@ -353,6 +353,7 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
               <button class="action-btn" id="serviceRestartBtn" type="button">Restart BS</button>
               <button class="action-btn danger" id="serviceShutdownBtn" type="button">Shutdown BS</button>
               <button class="action-btn primary" id="serviceStopGoBtn" type="button">Stop &amp; Go 5s</button>
+              <button class="action-btn danger" id="factoryResetBtn" type="button">Factory Reset</button>
               <span id="serviceActionStatus">idle</span>
             </div>
           </section>
@@ -454,6 +455,51 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
       </section>
     </main>
   </div>
+
+  <div class="modal-backdrop hidden" id="easyStartModal" role="dialog" aria-modal="true" aria-labelledby="easyStartTitle">
+    <section class="modal-panel easy-start-panel">
+      <div class="modal-head">
+        <div>
+          <h2 id="easyStartTitle">Easy Start</h2>
+          <p id="easyStartSubtitle">Basic setup for a new Nexus-BS station.</p>
+        </div>
+        <button class="action-btn secondary compact" id="easyStartSkipBtn" type="button">Skip</button>
+      </div>
+      <div class="wizard-progress" id="easyStartProgress"></div>
+      <div class="wizard-body" id="easyStartBody"></div>
+      <div class="wizard-message" id="easyStartMessage">Fill the basic fields. Advanced TETRA values are calculated automatically.</div>
+      <div class="modal-actions">
+        <button class="action-btn secondary" id="easyStartBackBtn" type="button">Back</button>
+        <button class="action-btn primary" id="easyStartNextBtn" type="button">Next</button>
+        <button class="action-btn primary" id="easyStartVerifyBtn" type="button">Verify Config</button>
+        <button class="action-btn danger" id="easyStartCommitBtn" type="button">Commit &amp; Start Nexus-BS</button>
+      </div>
+    </section>
+  </div>
+
+  <div class="modal-backdrop hidden" id="factoryResetModal" role="dialog" aria-modal="true" aria-labelledby="factoryResetTitle">
+    <section class="modal-panel factory-reset-panel">
+      <div class="modal-head">
+        <div>
+          <h2 id="factoryResetTitle">Factory Reset</h2>
+          <p>This clears local setup and shuts down the host.</p>
+        </div>
+      </div>
+      <div class="danger-note">
+        This will forget Wi-Fi networks, delete Nexus-BS user configs, remove SSH key files for the service user, and power off the BS/OS. You may lose remote access.
+      </div>
+      <label class="field">
+        <span>Type RESET NEXUS-BS to confirm</span>
+        <input id="factoryResetConfirmText" type="text" autocomplete="off" spellcheck="false">
+      </label>
+      <div class="wizard-message" id="factoryResetStatus">No reset requested.</div>
+      <div class="modal-actions">
+        <button class="action-btn secondary" id="factoryResetCancelBtn" type="button">Cancel</button>
+        <button class="action-btn danger" id="factoryResetConfirmBtn" type="button">Factory Reset</button>
+      </div>
+    </section>
+  </div>
+
   <script src="/assets/app.js" defer></script>
 </body>
 </html>

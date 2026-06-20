@@ -161,8 +161,22 @@ fn external_dashboard_asset_manifest_is_coherent() {
         index.contains(r#"id="serviceRestartBtn""#)
             && index.contains(r#"id="serviceShutdownBtn""#)
             && index.contains(r#"id="serviceStopGoBtn""#)
+            && index.contains(r#"id="factoryResetBtn""#)
+            && index.contains(r#"id="factoryResetModal""#)
             && index.contains(r#"id="configDeleteBtn""#),
         "Settings must expose service lifecycle controls and config profile deletion"
+    );
+    assert!(
+        index.contains(r#"id="easyStartModal""#)
+            && index.contains(r#"id="easyStartCommitBtn""#)
+            && app.contains("function renderEasyStartWizard")
+            && app.contains("function verifyEasyStartConfig")
+            && app.contains("function requestFactoryReset")
+            && app.contains(r#"fetch("/api/easy-start/status""#)
+            && app.contains(r#"fetch("/api/easy-start/preview""#)
+            && app.contains(r#"fetch("/api/easy-start/commit""#)
+            && app.contains(r#"fetch("/api/factory-reset""#),
+        "Dashboard must expose beginner Easy Start and confirmed Factory Reset flows"
     );
     assert!(
         index.contains(r#"id="wifiPanel""#)
