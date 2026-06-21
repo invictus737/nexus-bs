@@ -126,7 +126,27 @@ sync_distribution_payload() {
         "$DIST_DIR/systemd/nexus-bs-control.service" \
         "$DIST_DIR/systemd/nexus-bs-dashboard.service"
 
-    update_distribution_readme "$version"
+}
+
+strip_release_binaries() {
+    local strip_cmd
+
+    if [ -n "${STRIP_CMD:-}" ]; then
+        strip_cmd="$STRIP_CMD"
+    elif command -v aarch64-linux-gnu-strip >/dev/null 2>&1; then
+        strip_cmd="aarch64-linux-gnu-strip"
+    elif command -v llvm-strip >/dev/null 2>&1; then
+        strip_cmd="llvm-strip"
+    elif [ "$(uname -m)" = "aarch64" ] && command -v strip >/dev/null 2>&1; then
+        strip_cmd="strip"
+    else
+        die "an ARM64-capable strip tool is required; set STRIP_CMD or install binutils"
+    fi
+
+    log "Stripping release binaries with ${strip_cmd}"
+    for name in "${BIN_NAMES[@]}"; do
+        "$strip_cmd" --strip-unneeded "$DIST_DIR/bin/$name"
+    done
 }
 
 update_distribution_readme() {
@@ -232,6 +252,8 @@ main() {
     validate_tag "$version"
     build_binaries
     sync_distribution_payload "$version"
+    strip_release_binaries
+    update_distribution_readme "$version"
     verify_distribution "$version"
     build_deb "$version"
     bundle_release_artifacts "$version"

@@ -20,6 +20,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let app_path = root.join("dashboard/assets/app.js");
     let css_path = root.join("dashboard/assets/styles.css");
     let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
+    let cargo_toml_path = root.join("Cargo.toml");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
     let release_script_path = root.join("scripts/build-release-artifacts.sh");
     let release_workflow_path = root.join(".github/workflows/release.yml");
@@ -37,6 +38,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let index = std::fs::read_to_string(&index_path).expect("dashboard index.html should exist");
     let app = std::fs::read_to_string(&app_path).expect("dashboard app.js should exist");
     let css = std::fs::read_to_string(&css_path).expect("dashboard styles.css should exist");
+    let cargo_toml = std::fs::read_to_string(&cargo_toml_path).expect("workspace Cargo.toml should exist");
     let deploy_script = std::fs::read_to_string(&deploy_script_path).expect("deploy script should exist");
     let release_script = std::fs::read_to_string(&release_script_path).expect("release script should exist");
     let release_workflow = std::fs::read_to_string(&release_workflow_path).expect("release workflow should exist");
@@ -400,17 +402,24 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         release_workflow.contains("runs-on: ubuntu-24.04-arm")
+            && release_workflow.contains(r#"RUSTFLAGS: "-C target-cpu=cortex-a53""#)
             && release_workflow.contains("scripts/build-release-artifacts.sh")
             && release_workflow.contains("packaging/release/*.deb")
             && release_workflow.contains("packaging/release/SHA256SUMS")
             && !release_workflow.contains("packaging/release/*.tar.gz")
             && release_script.contains("release tag '${tag}' does not match Cargo workspace version")
             && release_script.contains("cargo build --release")
+            && release_script.contains("strip_release_binaries")
+            && release_script.contains("--strip-unneeded")
             && release_script.contains("mktemp -d")
             && release_script.contains("Syncing temporary package payload")
             && release_script.contains("sha256_cmd *.deb > SHA256SUMS")
-            && release_script.contains("Nexus-BS/v${version}"),
-        "GitHub tag release workflow must validate tag/version, build ARM64 binaries into a temporary package payload, and publish .deb plus checksum"
+            && release_script.contains("Nexus-BS/v${version}")
+            && cargo_toml.contains("[profile.release]")
+            && cargo_toml.contains(r#"lto = "thin""#)
+            && cargo_toml.contains("codegen-units = 1")
+            && cargo_toml.contains(r#"strip = "symbols""#),
+        "GitHub tag release workflow must validate tag/version, build optimized stripped ARM64 binaries into a temporary package payload, and publish .deb plus checksum"
     );
     assert!(
         core_unit.contains("Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service")
@@ -444,22 +453,28 @@ fn external_dashboard_asset_manifest_is_coherent() {
         dashboard_server.contains(r#"run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str])"#)
             && dashboard_server.contains("run_update_stop_bs_services")
             && dashboard_server.contains("run_update_post_install_start")
+            && dashboard_server.contains("post_update_control_restart")
+            && dashboard_server.contains("ControlCodecJson")
+            && dashboard_server.contains("Clean Restart BS accepted by control service")
+            && dashboard_server.contains("only http:// control URLs are supported for local update restart")
             && dashboard_server.contains(r#"&["stop", "nexus-bs.service", "nexus-bs-control.service"]"#)
             && dashboard_server.contains("Ensuring Nexus-BS core/control services are fully stopped after package install")
-            && dashboard_server.contains(r#"&["reset-failed", "nexus-bs.service", "nexus-bs-control.service", "nexus-bs-dashboard.service"]"#)
+            && dashboard_server.contains(r#""reset-failed""#)
+            && dashboard_server.contains(r#""nexus-bs-dashboard.service""#)
             && dashboard_server.contains("Waiting 5s before starting Nexus-BS services")
             && dashboard_server.contains("std::thread::sleep(std::time::Duration::from_secs(5))")
             && dashboard_server.contains(r#"&["start", "nexus-bs-control.service"]"#)
             && dashboard_server.contains(r#"&["start", "nexus-bs.service"]"#)
-            && dashboard_server.contains("Scheduling dashboard service restart in 3s")
+            && dashboard_server.contains("Scheduling dashboard service restart in 10s after the BS clean restart cycle")
             && dashboard_server.contains("systemctl --no-block restart nexus-bs-dashboard.service")
-            && !dashboard_server.contains(r#"&["restart", "nexus-bs.service"]"#)
+            && dashboard_server.contains(r#"&["restart", "nexus-bs.service"]"#)
             && dashboard_server.contains("update_process_runs_as_root")
             && !dashboard_server.contains("systemctl restart nexus-bs-dashboard.service || sudo -n")
             && deb_postinst.contains("install_dashboard_sudoers")
             && deb_postinst.contains("/usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb")
             && deb_postinst.contains("/usr/bin/systemctl stop nexus-bs.service nexus-bs-control.service")
-            && deb_postinst.contains("/usr/bin/systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service")
+            && deb_postinst
+                .contains("/usr/bin/systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service")
             && deb_postinst.contains("/usr/bin/systemctl start nexus-bs-control.service")
             && deb_postinst.contains("/usr/bin/systemctl start nexus-bs.service")
             && deb_postinst.contains("/usr/bin/systemctl restart nexus-bs-dashboard.service")

@@ -28,6 +28,12 @@ edition = "2024"
 authors = ["Chris YO3TCO / Nexus-BS Project"]
 license-file = "LICENSE"
 
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
 [workspace.dependencies]
 # Internal crates
 tetra-core = { path = "crates/tetra-core" }

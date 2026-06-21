@@ -14,6 +14,8 @@ permissions:
 jobs:
   package:
     runs-on: ubuntu-24.04-arm
+    env:
+      RUSTFLAGS: "-C target-cpu=cortex-a53"
 
     steps:
       - uses: actions/checkout@v4
