@@ -2019,7 +2019,10 @@ fn serve_factory_reset(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>>>
         crate::service_control::ServiceAction::PowerOffHost,
         std::time::Duration::from_secs(3),
     );
-    tracing::warn!("Dashboard: factory reset requested; privileged cleanup completed: {:?}", cleanup.cleanup_log);
+    tracing::warn!(
+        "Dashboard: factory reset requested; privileged cleanup completed: {:?}",
+        cleanup.cleanup_log
+    );
     let body = serde_json::json!({
         "ok": true,
         "message": "Factory reset accepted. Wi-Fi, configs, and SSH keys were cleared. Host shutdown queued.",

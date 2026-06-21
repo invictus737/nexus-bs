@@ -30,6 +30,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let deb_postrm_path = root.join("packaging/deb/templates/postrm.in");
     let deb_reinstall_path = root.join("scripts/tetrahs-reinstall-nexus-bs.sh");
     let source_install_path = root.join("scripts/install-from-source.sh");
+    let factory_reset_helper_path = root.join("scripts/nexus-bs-factory-reset-clean");
     let dashboard_server_path = root.join("crates/tetra-entities/src/net_dashboard/server.rs");
     let core_unit_path = root.join("contrib/systemd/nexus-bs.service");
     let control_unit_path = root.join("contrib/systemd/nexus-bs-control.service");
@@ -48,6 +49,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let deb_postrm = std::fs::read_to_string(&deb_postrm_path).expect("deb postrm template should exist");
     let deb_reinstall = std::fs::read_to_string(&deb_reinstall_path).expect("clean reinstall script should exist");
     let source_install = std::fs::read_to_string(&source_install_path).expect("source installer should exist");
+    let factory_reset_helper = std::fs::read_to_string(&factory_reset_helper_path).expect("factory reset helper should exist");
     let dashboard_server = std::fs::read_to_string(&dashboard_server_path).expect("dashboard server source should exist");
     let core_unit = std::fs::read_to_string(&core_unit_path).expect("core systemd unit should exist");
     let control_unit = std::fs::read_to_string(&control_unit_path).expect("control systemd unit should exist");
@@ -204,6 +206,16 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && dashboard_server.contains("Factory reset did not complete cleanly. Host shutdown was not queued.")
             && !dashboard_server.contains("cleanup_warnings"),
         "Dashboard must expose beginner Easy Start and confirmed Factory Reset flows, and reset cleanup must run through the privileged packaged helper"
+    );
+    assert!(
+        factory_reset_helper.contains("nmcli connection delete uuid")
+            && factory_reset_helper.contains("config_dir=\"/etc/nexus-bs\"")
+            && factory_reset_helper.contains("find \"$config_dir\" -mindepth 1 -maxdepth 1 -print")
+            && factory_reset_helper.contains("rm -rf -- \"$path\"")
+            && factory_reset_helper.contains("ssh_dir=\"$home/.ssh\"")
+            && factory_reset_helper.contains("rm -rf -- \"$ssh_dir\"")
+            && !factory_reset_helper.contains("! -name examples"),
+        "factory reset helper must delete Wi-Fi profiles, all /etc/nexus-bs entries, and the service user's SSH directory"
     );
     assert!(
         index.contains(r#"id="wifiPanel""#)

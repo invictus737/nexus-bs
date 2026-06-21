@@ -69,7 +69,7 @@ remove_nexus_config() {
         return 0
     }
 
-    paths="$(find "$config_dir" -mindepth 1 -maxdepth 1 ! -name examples -print 2>/dev/null || true)"
+    paths="$(find "$config_dir" -mindepth 1 -maxdepth 1 -print 2>/dev/null || true)"
     while IFS= read -r path; do
         [ -n "$path" ] || continue
         name="$(basename "$path")"
