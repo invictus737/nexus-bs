@@ -40,13 +40,16 @@ mod tests {
 
     #[test]
     fn telemetry_protocol_tracks_nexus_bs_product_version() {
-        assert_eq!(TELEMETRY_PROTOCOL_VERSION, "nexus-bs-telemetry-v0.1.73");
+        assert_eq!(
+            TELEMETRY_PROTOCOL_VERSION,
+            tetra_core::TELEMETRY_PROTOCOL_VERSION
+        );
     }
 
     #[test]
     fn select_telemetry_subprotocol_prefers_current_protocol() {
         assert_eq!(
-            select_telemetry_subprotocol("nexus-bs-telemetry-v0.1.73"),
+            select_telemetry_subprotocol(tetra_core::TELEMETRY_PROTOCOL_VERSION),
             Some(TELEMETRY_PROTOCOL_VERSION)
         );
     }

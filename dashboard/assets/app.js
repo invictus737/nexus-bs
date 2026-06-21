@@ -2250,8 +2250,15 @@ function renderRadios() {
 }
 
 function renderCalls() {
-  const currentCalls = activeCalls();
+  const currentCalls = activeCalls().sort((a, b) => {
+    const ats = Number(a?.ts || 99);
+    const bts = Number(b?.ts || 99);
+    if (ats !== bts) return ats - bts;
+    return Number(a?.call_id || 0) - Number(b?.call_id || 0);
+  });
   const overview = currentCalls.map((call) => callCardHtml(call));
+  const board = $("overviewCalls");
+  if (board) board.dataset.callCount = String(Math.min(Math.max(currentCalls.length, 0), 3));
   setHtml("overviewCalls", overview.length ? overview.join("") : '<div class="empty-call-board">No active calls</div>');
   renderSlots();
 }

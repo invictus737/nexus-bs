@@ -21,7 +21,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let css_path = root.join("dashboard/assets/styles.css");
     let logo_path = root.join("dashboard/assets/nexus-bs-logo.svg");
     let deploy_script_path = root.join("scripts/nexus-bs-test-deploy.sh");
+    let release_script_path = root.join("scripts/build-release-artifacts.sh");
+    let release_workflow_path = root.join(".github/workflows/release.yml");
+    let deb_build_path = root.join("packaging/deb/build-deb.sh");
     let deb_postinst_path = root.join("packaging/deb/templates/postinst.in");
+    let deb_prerm_path = root.join("packaging/deb/templates/prerm.in");
     let deb_postrm_path = root.join("packaging/deb/templates/postrm.in");
     let deb_reinstall_path = root.join("scripts/tetrahs-reinstall-nexus-bs.sh");
     let source_install_path = root.join("scripts/install-from-source.sh");
@@ -34,7 +38,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let app = std::fs::read_to_string(&app_path).expect("dashboard app.js should exist");
     let css = std::fs::read_to_string(&css_path).expect("dashboard styles.css should exist");
     let deploy_script = std::fs::read_to_string(&deploy_script_path).expect("deploy script should exist");
+    let release_script = std::fs::read_to_string(&release_script_path).expect("release script should exist");
+    let release_workflow = std::fs::read_to_string(&release_workflow_path).expect("release workflow should exist");
+    let deb_build = std::fs::read_to_string(&deb_build_path).expect("deb build script should exist");
     let deb_postinst = std::fs::read_to_string(&deb_postinst_path).expect("deb postinst template should exist");
+    let deb_prerm = std::fs::read_to_string(&deb_prerm_path).expect("deb prerm template should exist");
     let deb_postrm = std::fs::read_to_string(&deb_postrm_path).expect("deb postrm template should exist");
     let deb_reinstall = std::fs::read_to_string(&deb_reinstall_path).expect("clean reinstall script should exist");
     let source_install = std::fs::read_to_string(&source_install_path).expect("source installer should exist");
@@ -365,6 +373,46 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "deploy script must use simple service names, not systemd template units"
     );
     assert!(
+        deb_build.contains("reject_nonrelease_binaries")
+            && deb_build.contains("ALLOW_NONRELEASE_BINARIES")
+            && deb_build.contains("require_binary_versions")
+            && deb_build.contains("Nexus-BS/v${VERSION}")
+            && deb_build.contains("v[0-9][0-9.]*(_dev|-[0-9a-f]{8}-modified)"),
+        "Debian packaging must reject dirty/dev binaries and wrong-version binaries by default while keeping an explicit local test override"
+    );
+    assert!(
+        deb_postinst.contains("legacy_unit_needs_replacement")
+            && deb_postinst.contains("Nexus-BS|/opt/nexus-bs")
+            && deb_postinst.contains("retire_legacy_template_units")
+            && deb_postinst.contains("repair_usr_local_helper")
+            && deb_postinst.contains(r#"mv -f "$legacy" "$legacy.legacy-nexus-bs""#),
+        "Debian postinst must retire stale Nexus-BS unit files from /etc/systemd/system so package units in /lib take effect"
+    );
+    assert!(
+        deb_build.contains(r#"render_template "${TEMPLATE_DIR}/prerm.in""#)
+            && deb_prerm.contains("remove|deconfigure")
+            && deb_prerm.contains("nexus-bs@*.service")
+            && deb_postrm.contains("reset-failed")
+            && deb_reinstall.contains("CONFIG_KEEP_PATTERNS")
+            && deb_reinstall.contains("nexus-bs@*.service")
+            && deb_reinstall.contains("/usr/local/bin/nexus-bs-service"),
+        "Debian package and clean reinstall path must stop/remove stale services, legacy templated units, and old helper links without losing operator config state"
+    );
+    assert!(
+        release_workflow.contains("runs-on: ubuntu-24.04-arm")
+            && release_workflow.contains("scripts/build-release-artifacts.sh")
+            && release_workflow.contains("packaging/release/*.deb")
+            && release_workflow.contains("packaging/release/SHA256SUMS")
+            && !release_workflow.contains("packaging/release/*.tar.gz")
+            && release_script.contains("release tag '${tag}' does not match Cargo workspace version")
+            && release_script.contains("cargo build --release")
+            && release_script.contains("mktemp -d")
+            && release_script.contains("Syncing temporary package payload")
+            && release_script.contains("sha256_cmd *.deb > SHA256SUMS")
+            && release_script.contains("Nexus-BS/v${version}"),
+        "GitHub tag release workflow must validate tag/version, build ARM64 binaries into a temporary package payload, and publish .deb plus checksum"
+    );
+    assert!(
         core_unit.contains("Environment=NEXUS_BS_SERVICE_UNIT=nexus-bs.service")
             && !core_unit.contains("NEXUS_BS_CORE_DASHBOARD")
             && !dashboard_unit.contains("NEXUS_BS_DASHBOARD_CORE")
@@ -379,6 +427,12 @@ fn external_dashboard_asset_manifest_is_coherent() {
     assert!(
         core_unit.contains("CPUAffinity=1 2") && control_unit.contains("CPUAffinity=3") && dashboard_unit.contains("CPUAffinity=3"),
         "systemd split deployment must pin RF core to CPU 1+2 and dashboard/control to CPU 3"
+    );
+    assert!(
+        core_unit.contains(&format!("Nexus-BS v{}", env!("CARGO_PKG_VERSION")))
+            && control_unit.contains(&format!("Nexus-BS v{}", env!("CARGO_PKG_VERSION")))
+            && dashboard_unit.contains(&format!("Nexus-BS v{}", env!("CARGO_PKG_VERSION"))),
+        "contrib systemd descriptions must track the workspace version used by fast deploys and release packaging"
     );
     assert!(
         core_unit.contains("CPUSchedulingPolicy=rr")
@@ -458,6 +512,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("function activeCallIdentityHtml")
             && app.contains("function callCardPartyHtml")
             && app.contains("function instantSpeakerHtml")
+            && app.contains("board.dataset.callCount")
             && app.contains("ISSI ${esc(issiLabel || \"--\")}")
             && app.contains("group-call-grid")
             && !app.contains("<span>Caller</span>")
@@ -466,6 +521,8 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("226: \"RO\"")
             && app.contains("750: \"FK\"")
             && css.contains(".active-call-board")
+            && css.contains(r#".active-call-board[data-call-count="3"]"#)
+            && css.contains("grid-template-columns: repeat(3, minmax(0, 1fr))")
             && css.contains(".call-country")
             && css.contains(".call-ts")
             && css.contains(".call-identity-callsign")
