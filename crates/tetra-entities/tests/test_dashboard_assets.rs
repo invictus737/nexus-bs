@@ -451,6 +451,12 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         dashboard_server.contains(r#"run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str])"#)
+            && dashboard_server.contains("Cleaning package download directory")
+            && dashboard_server.contains("fs::remove_dir_all(&work_dir)")
+            && dashboard_server.contains("cache_busted_update_url")
+            && dashboard_server.contains("nexus_bs_cache_bust")
+            && dashboard_server.contains("Cache-Control: no-cache")
+            && dashboard_server.contains(r#"run_update_command_capture(&update, "sha256sum", &[deb_path_str])"#)
             && dashboard_server.contains("run_update_stop_bs_services")
             && dashboard_server.contains("run_update_post_install_start")
             && dashboard_server.contains("finish_deb_update_with_dashboard_restart_api")

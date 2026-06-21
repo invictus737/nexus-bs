@@ -674,6 +674,19 @@ fn run_deb_update(update: SharedUpdateState, service_restart_url: String, deb: D
     update_log(&update, format!("Asset: {}", deb.asset_name));
 
     let work_dir = PathBuf::from("/tmp/nexus-bs-update");
+    update_log(&update, format!("Cleaning package download directory: {}", work_dir.display()));
+    if let Err(e) = fs::remove_dir_all(&work_dir) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            update_log(
+                &update,
+                format!(
+                    "WARNING: could not fully clean {}: {}; continuing with explicit file overwrite",
+                    work_dir.display(),
+                    e
+                ),
+            );
+        }
+    }
     if let Err(e) = fs::create_dir_all(&work_dir) {
         update_log(&update, format!("ERROR: failed to create {}: {}", work_dir.display(), e));
         update.lock().unwrap().finish(false);
@@ -687,14 +700,33 @@ fn run_deb_update(update: SharedUpdateState, service_restart_url: String, deb: D
     };
     let _ = fs::remove_file(&deb_path);
 
+    let download_url = cache_busted_update_url(&deb.url);
+    update_log(&update, "Downloading a fresh GitHub release asset; local /tmp cache is not reused");
     if !run_update_command(
         &update,
         "curl",
-        &["-fL", "--connect-timeout", "10", "--max-time", "180", "-o", deb_path_str, &deb.url],
+        &[
+            "-fL",
+            "--retry",
+            "3",
+            "--retry-all-errors",
+            "-H",
+            "Cache-Control: no-cache",
+            "-H",
+            "Pragma: no-cache",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            "240",
+            "-o",
+            deb_path_str,
+            &download_url,
+        ],
     ) {
         update.lock().unwrap().finish(false);
         return;
     }
+    let _ = run_update_command_capture(&update, "sha256sum", &[deb_path_str]);
 
     let package = run_update_command_capture(&update, "dpkg-deb", &["-f", deb_path_str, "Package"]).unwrap_or_default();
     let version = run_update_command_capture(&update, "dpkg-deb", &["-f", deb_path_str, "Version"]).unwrap_or_default();
@@ -736,6 +768,15 @@ fn run_deb_update(update: SharedUpdateState, service_restart_url: String, deb: D
         return;
     }
     update.lock().unwrap().finish(true);
+}
+
+fn cache_busted_update_url(url: &str) -> String {
+    let stamp = SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or(0);
+    let separator = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{separator}nexus_bs_cache_bust={stamp}")
 }
 
 fn run_update_stop_bs_services(update: &SharedUpdateState) -> bool {
