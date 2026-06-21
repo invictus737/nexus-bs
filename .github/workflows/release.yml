@@ -6,32 +6,40 @@ name: Release
 on:
   push:
     tags:
-      - 'v*'
+      - 'v*.*.*'
 
 permissions:
   contents: write
 
 jobs:
   package:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install package tools
-        run: sudo apt-get update && sudo apt-get install -y dpkg-dev file
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
-      - name: Build Debian package
-        run: packaging/deb/build-deb.sh
+      - name: Install build and package tools
+        run: sudo apt-get update && sudo apt-get install -y binutils build-essential dpkg-dev file libsoapysdr-dev pkg-config python3
 
-      - name: Generate checksums
-        run: |
-          cd packaging/deb/dist
-          sha256sum *.deb > SHA256SUMS
+      - name: Build release artifacts
+        run: scripts/build-release-artifacts.sh
+
+      - name: Upload workflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: nexus-bs-${{ github.ref_name }}-arm64
+          path: |
+            packaging/release/*.deb
+            packaging/release/SHA256SUMS
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            packaging/deb/dist/*.deb
-            packaging/deb/dist/SHA256SUMS
+            packaging/release/*.deb
+            packaging/release/SHA256SUMS

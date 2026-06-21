@@ -2,6 +2,7 @@
 set -e
 
 service_units="nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service"
+legacy_unit_patterns="nexus-bs@*.service nexus-bs-control@*.service nexus-bs-dashboard@*.service"
 
 user_exists() {
     [ -n "$1" ] && getent passwd "$1" >/dev/null 2>&1
@@ -46,8 +47,62 @@ install_service_user_dropins() {
 
 legacy_unit_needs_replacement() {
     unit_path="$1"
-    [ -f "$unit_path" ] || return 1
-    grep -Eq '/home/[^/]+/nexus-bs|/home/%i/nexus-bs|v0\.1\.71_dev|^User=chris$' "$unit_path"
+    [ -e "$unit_path" ] || return 1
+    if [ -L "$unit_path" ]; then
+        return 0
+    fi
+    grep -Eq 'Nexus-BS|/opt/nexus-bs|/home/[^/]+/nexus-bs|/home/%i/nexus-bs|nexus-bs-control-service|nexus-bs-dashboard|^User=chris$' "$unit_path"
+}
+
+systemd_available() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+stop_disable_unit() {
+    unit="$1"
+    [ -n "$unit" ] || return 0
+    systemd_available || return 0
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+}
+
+retire_legacy_unit_file() {
+    unit_path="$1"
+    [ -e "$unit_path" ] || [ -L "$unit_path" ] || return 0
+    stop_disable_unit "$(basename "$unit_path")"
+    if [ -L "$unit_path" ]; then
+        rm -f "$unit_path"
+        return 0
+    fi
+    legacy_unit_needs_replacement "$unit_path" || return 0
+    mv -f "$unit_path" "$unit_path.legacy-nexus-bs"
+}
+
+retire_legacy_template_units() {
+    for dir in \
+        /etc/systemd/system \
+        /etc/systemd/system/multi-user.target.wants \
+        /lib/systemd/system \
+        /usr/lib/systemd/system; do
+        [ -d "$dir" ] || continue
+        for pattern in $legacy_unit_patterns; do
+            for path in "$dir"/$pattern; do
+                [ -e "$path" ] || [ -L "$path" ] || continue
+                retire_legacy_unit_file "$path"
+            done
+        done
+    done
+}
+
+repair_usr_local_helper() {
+    helper="/usr/local/bin/nexus-bs-service"
+    [ -e "$helper" ] || [ -L "$helper" ] || return 0
+    if [ -L "$helper" ]; then
+        rm -f "$helper"
+        ln -s /usr/bin/nexus-bs-service "$helper"
+    else
+        printf 'nexus-bs: leaving non-symlink %s in place; /usr/bin/nexus-bs-service is the packaged helper\n' "$helper" >&2
+    fi
 }
 
 fix_config_permissions() {
@@ -100,6 +155,7 @@ if [ "$1" = "configure" ]; then
     fi
 
     install -d -o "$run_user" -g "$run_group" -m 0750 /etc/nexus-bs
+    retire_legacy_template_units
 
     for unit in $service_units; do
         legacy="/etc/systemd/system/$unit"
@@ -120,8 +176,9 @@ if [ "$1" = "configure" ]; then
     fix_config_permissions "$run_user" "$run_group"
     install_service_user_dropins "$run_user" "$run_group"
     install_dashboard_sudoers "$run_user"
+    repair_usr_local_helper
 
-    if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    if systemd_available; then
         systemctl daemon-reload >/dev/null 2>&1 || true
         if [ -n "$enable_after_legacy_replace" ]; then
             systemctl enable $enable_after_legacy_replace >/dev/null 2>&1 || true

@@ -1,0 +1,44 @@
+#!/bin/sh
+set -e
+
+simple_units="nexus-bs-dashboard.service nexus-bs.service nexus-bs-control.service"
+legacy_templates="nexus-bs@*.service nexus-bs-control@*.service nexus-bs-dashboard@*.service"
+
+systemd_available() {
+    [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1
+}
+
+stop_disable_unit() {
+    unit="$1"
+    [ -n "$unit" ] || return 0
+    systemd_available || return 0
+    systemctl stop "$unit" >/dev/null 2>&1 || true
+    systemctl disable "$unit" >/dev/null 2>&1 || true
+}
+
+stop_disable_legacy_templates() {
+    for dir in \
+        /etc/systemd/system \
+        /etc/systemd/system/multi-user.target.wants \
+        /lib/systemd/system \
+        /usr/lib/systemd/system; do
+        [ -d "$dir" ] || continue
+        for pattern in $legacy_templates; do
+            for path in "$dir"/$pattern; do
+                [ -e "$path" ] || [ -L "$path" ] || continue
+                stop_disable_unit "$(basename "$path")"
+            done
+        done
+    done
+}
+
+case "$1" in
+    remove|deconfigure)
+        for unit in $simple_units; do
+            stop_disable_unit "$unit"
+        done
+        stop_disable_legacy_templates
+        ;;
+esac
+
+exit 0

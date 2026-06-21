@@ -5,19 +5,26 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 # Nexus-BS Debian Package Builder
 
-Build a Debian binary package from the repo's existing `compiled_distribution`
-bundle:
+Build a Debian binary package from a temporary package payload:
 
 ```sh
 packaging/deb/build-deb.sh
 ```
 
 The output is written to `packaging/deb/dist/nexus-bs_VERSION_ARCH.deb`.
+For public tag releases, do not call this builder directly. Use the release
+artifact script so the ARM64 binaries are rebuilt, copied into a temporary
+payload directory, the tag is checked against the Cargo workspace version, and
+the repo is not dirtied by generated binaries:
+
+```sh
+scripts/build-release-artifacts.sh
+```
 
 Defaults:
 
 - `VERSION`: parsed from the root `Cargo.toml` workspace package version.
-- `ARCH`: detected from `compiled_distribution/bin/nexus-bs` when possible.
+- `ARCH`: detected from the temporary payload binary when possible.
 - `MAINTAINER`: `Nexus-BS Project <noreply@nexus-bs.local>`.
 
 Overrides:
@@ -32,6 +39,12 @@ Other optional overrides:
 - `OUT_DIR`: package output directory.
 - `WORK_DIR`: temporary staging directory.
 - `KEEP_BUILD_DIR=1`: keep the staging tree after a build.
+
+The builder rejects `_dev`, `-modified`, and wrong-version binaries by default.
+This prevents publishing a `.deb` whose metadata says one version while the
+generated binary payload contains another. Local field tests can explicitly set
+`ALLOW_NONRELEASE_BINARIES=1`, but the binary base version must still match
+`VERSION`.
 
 The package installs binaries and the dashboard under `/opt/nexus-bs`,
 `nexus-bs-service` on `PATH`, systemd service units under
@@ -70,9 +83,9 @@ then prints service status and logs:
 
 ```sh
 cd /tmp
-curl -fL -o nexus-bs_0.1.75_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.75/nexus-bs_0.1.75_arm64.deb
+curl -fL -o nexus-bs_0.1.76_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.76/nexus-bs_0.1.76_arm64.deb
 curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/main/scripts/tetrahs-reinstall-nexus-bs.sh
-sudo env DEB_PATH=/tmp/nexus-bs_0.1.75_arm64.deb bash /tmp/nexus-bs-reinstall.sh
+sudo env DEB_PATH=/tmp/nexus-bs_0.1.76_arm64.deb bash /tmp/nexus-bs-reinstall.sh
 ```
 
 Expected live config permissions after install:

@@ -15,7 +15,11 @@ DEFAULT_DEPENDS="libc6, libgcc-s1, libsoapysdr0.8 | libsoapysdr0.7, systemd"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
-DIST_DIR="${DIST_DIR:-${REPO_ROOT}/compiled_distribution}"
+DIST_DIR="${DIST_DIR:-${REPO_ROOT}/target/nexus-bs-package-payload}"
+BIN_DIR="${BIN_DIR:-${DIST_DIR}/bin}"
+DASHBOARD_SRC_DIR="${DASHBOARD_SRC_DIR:-${REPO_ROOT}/dashboard}"
+CONFIG_SRC_DIR="${CONFIG_SRC_DIR:-${REPO_ROOT}/example_config}"
+SYSTEMD_SRC_DIR="${SYSTEMD_SRC_DIR:-${REPO_ROOT}/contrib/systemd}"
 TEMPLATE_DIR="${SCRIPT_DIR}/templates"
 
 die() {
@@ -39,7 +43,7 @@ project_version() {
 
 detect_arch() {
     local binary_file file_out machine
-    binary_file="${DIST_DIR}/bin/nexus-bs"
+    binary_file="${BIN_DIR}/nexus-bs"
 
     if command -v file >/dev/null 2>&1 && [ -f "$binary_file" ]; then
         file_out="$(file "$binary_file" 2>/dev/null || true)"
@@ -82,39 +86,44 @@ validate_debian_field() {
 require_distribution_files() {
     local required file
     required=(
-        "bin/nexus-bs"
-        "bin/nexus-bs-control-service"
-        "bin/nexus-bs-dashboard"
-        "dashboard/index.html"
-        "dashboard/assets/app.js"
-        "dashboard/assets/styles.css"
-        "dashboard/assets/nexus-bs-logo.svg"
-        "dashboard/assets/nexus-bs-logo.png"
-        "config/config.toml"
-        "config/config.toml.fallback"
-        "config/config_template.toml"
-        "systemd/nexus-bs.service"
-        "systemd/nexus-bs-control.service"
-        "systemd/nexus-bs-dashboard.service"
-        "systemd/journald-nexus-bs-volatile.conf"
     )
 
-    [ -d "$DIST_DIR" ] || die "missing distribution directory: ${DIST_DIR}"
+    [ -d "$BIN_DIR" ] || die "missing generated binary directory: ${BIN_DIR}"
+    [ -d "$DASHBOARD_SRC_DIR" ] || die "missing dashboard source directory: ${DASHBOARD_SRC_DIR}"
+    [ -d "$CONFIG_SRC_DIR" ] || die "missing config source directory: ${CONFIG_SRC_DIR}"
+    [ -d "$SYSTEMD_SRC_DIR" ] || die "missing systemd source directory: ${SYSTEMD_SRC_DIR}"
+    required=(
+        "${BIN_DIR}/nexus-bs"
+        "${BIN_DIR}/nexus-bs-control-service"
+        "${BIN_DIR}/nexus-bs-dashboard"
+        "${DASHBOARD_SRC_DIR}/index.html"
+        "${DASHBOARD_SRC_DIR}/assets/app.js"
+        "${DASHBOARD_SRC_DIR}/assets/styles.css"
+        "${DASHBOARD_SRC_DIR}/assets/nexus-bs-logo.svg"
+        "${DASHBOARD_SRC_DIR}/assets/nexus-bs-logo.png"
+        "${CONFIG_SRC_DIR}/config.toml"
+        "${CONFIG_SRC_DIR}/config_template.toml"
+        "${SYSTEMD_SRC_DIR}/nexus-bs.service"
+        "${SYSTEMD_SRC_DIR}/nexus-bs-control.service"
+        "${SYSTEMD_SRC_DIR}/nexus-bs-dashboard.service"
+        "${SYSTEMD_SRC_DIR}/journald-nexus-bs-volatile.conf"
+        "${REPO_ROOT}/scripts/nexus-bs-service"
+    )
     for file in "${required[@]}"; do
-        [ -f "${DIST_DIR}/${file}" ] || die "missing compiled_distribution file: ${file}"
+        [ -f "$file" ] || die "missing package source file: ${file}"
     done
 }
 
 reject_private_config_values() {
     local file matches
 
-    for file in "${DIST_DIR}/config/config.toml" "${DIST_DIR}/config/config.toml.fallback"; do
+    for file in "${CONFIG_SRC_DIR}/config.toml"; do
         matches="$(
             LC_ALL=C grep -nE '^[[:space:]]*(username|password|token|secret|api[_-]?key|client[_-]?secret)[[:space:]]*=' "$file" || true
         )"
         if [ -n "$matches" ]; then
             printf 'Refusing to bundle active credential-like settings from %s:\n%s\n' "$file" "$matches" >&2
-            printf 'Keep private values commented out of compiled_distribution/config before packaging.\n' >&2
+            printf 'Keep private values commented out of example_config before packaging.\n' >&2
             exit 1
         fi
     done
@@ -122,12 +131,17 @@ reject_private_config_values() {
 
 reject_nonrelease_binaries() {
     local file found line
+    if [ "${ALLOW_NONRELEASE_BINARIES:-0}" = "1" ]; then
+        printf 'warning: ALLOW_NONRELEASE_BINARIES=1, packaging local test binaries even if version strings contain -modified\n' >&2
+        return 0
+    fi
+
     found=0
 
     for file in \
         "${DIST_DIR}/bin/nexus-bs" \
-        "${DIST_DIR}/bin/nexus-bs-control-service" \
-        "${DIST_DIR}/bin/nexus-bs-dashboard"; do
+        "${BIN_DIR}/nexus-bs-control-service" \
+        "${BIN_DIR}/nexus-bs-dashboard"; do
         while IFS= read -r line; do
             if [ "$found" -eq 0 ]; then
                 printf 'Refusing to package non-release binary version strings:\n' >&2
@@ -138,9 +152,37 @@ reject_nonrelease_binaries() {
     done
 
     if [ "$found" -ne 0 ]; then
-        printf 'Commit the release source, rebuild compiled_distribution/bin from a clean tree, then rebuild the .deb.\n' >&2
+        printf 'Commit the release source, rebuild the generated release distribution from a clean tree, then rebuild the .deb.\n' >&2
         exit 1
     fi
+}
+
+require_binary_versions() {
+    local file expected found
+
+    command -v strings >/dev/null 2>&1 || die "strings is required to verify bundled binary versions"
+
+    for file in \
+        "${BIN_DIR}/nexus-bs" \
+        "${BIN_DIR}/nexus-bs-control-service" \
+        "${BIN_DIR}/nexus-bs-dashboard"; do
+        case "$file" in
+            */nexus-bs-control-service)
+                expected="nexus-bs-control-v${VERSION}"
+                ;;
+            */nexus-bs-dashboard)
+                expected="nexus-bs-telemetry-v${VERSION}"
+                ;;
+            *)
+                expected="Nexus-BS/v${VERSION}"
+                ;;
+        esac
+
+        found="$(strings "$file" | grep -F "$expected" | head -n 1 || true)"
+        if [ -z "$found" ]; then
+            die "bundled binary $(basename "$file") does not contain expected release string '${expected}'; rebuild the generated release distribution for VERSION=${VERSION}"
+        fi
+    done
 }
 
 render_template() {
@@ -203,16 +245,16 @@ install_payload() {
     systemd_rel="${SYSTEMD_UNIT_DIR#/}"
 
     install -d -m 0755 "${root}/${prefix_rel}/bin"
-    install -m 0755 "${DIST_DIR}/bin/nexus-bs" "${root}/${prefix_rel}/bin/nexus-bs"
-    install -m 0755 "${DIST_DIR}/bin/nexus-bs-control-service" "${root}/${prefix_rel}/bin/nexus-bs-control-service"
-    install -m 0755 "${DIST_DIR}/bin/nexus-bs-dashboard" "${root}/${prefix_rel}/bin/nexus-bs-dashboard"
+    install -m 0755 "${BIN_DIR}/nexus-bs" "${root}/${prefix_rel}/bin/nexus-bs"
+    install -m 0755 "${BIN_DIR}/nexus-bs-control-service" "${root}/${prefix_rel}/bin/nexus-bs-control-service"
+    install -m 0755 "${BIN_DIR}/nexus-bs-dashboard" "${root}/${prefix_rel}/bin/nexus-bs-dashboard"
     install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-service" "${root}/${prefix_rel}/bin/nexus-bs-service"
     install -d -m 0755 "${root}/usr/bin"
     install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-service" "${root}/usr/bin/nexus-bs-service"
 
     install -d -m 0755 "${root}/${prefix_rel}/dashboard/assets"
-    install -m 0644 "${DIST_DIR}/dashboard/index.html" "${root}/${prefix_rel}/dashboard/index.html"
-    for asset in "${DIST_DIR}/dashboard/assets/"*; do
+    install -m 0644 "${DASHBOARD_SRC_DIR}/index.html" "${root}/${prefix_rel}/dashboard/index.html"
+    for asset in "${DASHBOARD_SRC_DIR}/assets/"*; do
         [ -f "$asset" ] || continue
         asset_name="$(basename "$asset")"
         case "$asset_name" in
@@ -220,21 +262,21 @@ install_payload() {
                 install -m 0644 "$asset" "${root}/${prefix_rel}/dashboard/assets/${asset_name}"
                 ;;
             *)
-                die "unexpected dashboard asset in compiled_distribution: ${asset_name}"
+                die "unexpected dashboard asset in source tree: ${asset_name}"
                 ;;
         esac
     done
 
     install -d -m 0755 "${root}/${etc_rel}/examples/systemd"
-    install -m 0644 "${DIST_DIR}/config/config.toml" "${root}/${etc_rel}/examples/config.toml"
-    install -m 0644 "${DIST_DIR}/config/config.toml.fallback" "${root}/${etc_rel}/examples/config.toml.fallback"
-    install -m 0644 "${DIST_DIR}/config/config_template.toml" "${root}/${etc_rel}/examples/config_template.toml"
-    install -m 0644 "${DIST_DIR}/systemd/journald-nexus-bs-volatile.conf" "${root}/${etc_rel}/examples/systemd/journald-nexus-bs-volatile.conf"
+    install -m 0644 "${CONFIG_SRC_DIR}/config.toml" "${root}/${etc_rel}/examples/config.toml"
+    install -m 0644 "${CONFIG_SRC_DIR}/config.toml" "${root}/${etc_rel}/examples/config.toml.fallback"
+    install -m 0644 "${CONFIG_SRC_DIR}/config_template.toml" "${root}/${etc_rel}/examples/config_template.toml"
+    install -m 0644 "${SYSTEMD_SRC_DIR}/journald-nexus-bs-volatile.conf" "${root}/${etc_rel}/examples/systemd/journald-nexus-bs-volatile.conf"
 
     install -d -m 0755 "${root}/${systemd_rel}"
-    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs.service" "${root}/${systemd_rel}/nexus-bs.service"
-    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs-control.service" "${root}/${systemd_rel}/nexus-bs-control.service"
-    install_transformed_unit "${DIST_DIR}/systemd/nexus-bs-dashboard.service" "${root}/${systemd_rel}/nexus-bs-dashboard.service"
+    install_transformed_unit "${SYSTEMD_SRC_DIR}/nexus-bs.service" "${root}/${systemd_rel}/nexus-bs.service"
+    install_transformed_unit "${SYSTEMD_SRC_DIR}/nexus-bs-control.service" "${root}/${systemd_rel}/nexus-bs-control.service"
+    install_transformed_unit "${SYSTEMD_SRC_DIR}/nexus-bs-dashboard.service" "${root}/${systemd_rel}/nexus-bs-dashboard.service"
 }
 
 generate_debian_metadata() {
@@ -245,9 +287,10 @@ generate_debian_metadata() {
     INSTALLED_SIZE="$(du -sk "$root" | awk '{print $1}')"
     render_template "${TEMPLATE_DIR}/control.in" "${root}/DEBIAN/control"
     render_template "${TEMPLATE_DIR}/postinst.in" "${root}/DEBIAN/postinst"
+    render_template "${TEMPLATE_DIR}/prerm.in" "${root}/DEBIAN/prerm"
     render_template "${TEMPLATE_DIR}/postrm.in" "${root}/DEBIAN/postrm"
     chmod 0644 "${root}/DEBIAN/control"
-    chmod 0755 "${root}/DEBIAN/postinst" "${root}/DEBIAN/postrm"
+    chmod 0755 "${root}/DEBIAN/postinst" "${root}/DEBIAN/prerm" "${root}/DEBIAN/postrm"
     cat > "${root}/DEBIAN/conffiles" <<EOF
 ${ETC_PREFIX}/examples/config.toml
 ${ETC_PREFIX}/examples/config.toml.fallback
@@ -289,6 +332,7 @@ validate_debian_field "DEPENDS" "$DEPENDS" '^[0-9A-Za-z.,+~:|()<>= _-]+$'
 require_distribution_files
 reject_private_config_values
 reject_nonrelease_binaries
+require_binary_versions
 
 mkdir -p "$OUT_DIR" "$WORK_DIR"
 rm -rf "$DEB_ROOT"

@@ -4,9 +4,16 @@ set -e
 case "$1" in
     remove|purge)
         rm -f /etc/sudoers.d/nexus-bs-dashboard
+        for unit in nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service; do
+            rm -f "/etc/systemd/system/multi-user.target.wants/$unit"
+        done
+        for pattern in nexus-bs@*.service nexus-bs-control@*.service nexus-bs-dashboard@*.service; do
+            rm -f /etc/systemd/system/multi-user.target.wants/$pattern
+        done
         if [ "$1" != "purge" ]; then
             if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
                 systemctl daemon-reload >/dev/null 2>&1 || true
+                systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service >/dev/null 2>&1 || true
             fi
             exit 0
         fi
@@ -14,8 +21,14 @@ case "$1" in
             rm -f "/etc/systemd/system/$unit.d/10-nexus-bs-user.conf"
             rmdir "/etc/systemd/system/$unit.d" 2>/dev/null || true
         done
+        for pattern in nexus-bs@*.service nexus-bs-control@*.service nexus-bs-dashboard@*.service; do
+            rm -f /etc/systemd/system/$pattern
+            rm -f /lib/systemd/system/$pattern
+            rm -f /usr/lib/systemd/system/$pattern
+        done
         if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
             systemctl daemon-reload >/dev/null 2>&1 || true
+            systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service >/dev/null 2>&1 || true
         fi
         ;;
     remove|purge|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)

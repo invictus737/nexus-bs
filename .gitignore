@@ -1,4 +1,6 @@
 /target/
+/compiled_distribution/
 .DS_Store
 .private_backups/
+.local/
 timeline_wap.md

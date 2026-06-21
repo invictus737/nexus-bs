@@ -4,12 +4,13 @@
 
 set -Eeuo pipefail
 
-DEB_PATH="${DEB_PATH:-/tmp/nexus-bs_0.1.75_arm64.deb}"
+DEB_PATH="${DEB_PATH:-/tmp/nexus-bs_0.1.76_arm64.deb}"
 EXPECTED_SHA256="${EXPECTED_SHA256:-}"
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 BACKUP_DIR="/tmp/nexus-bs-reinstall-backup-${STAMP}"
 LOG_FILE="/tmp/nexus-bs-reinstall-${STAMP}.log"
 RUN_USER="${NEXUS_BS_RUN_USER:-${SUDO_USER:-}}"
+CONFIG_KEEP_PATTERNS="config.toml config.toml.fallback *.toml.active calibration.toml calibration.run.toml calibration.rejected.toml"
 
 log() {
     printf '[%s] %s\n' "$(date -u +%H:%M:%S)" "$*"
@@ -43,14 +44,26 @@ main() {
     fi
 
     install -d -o root -g root -m 0700 "$BACKUP_DIR"
-    if [ -e /etc/nexus-bs/config.toml ]; then
-        install -o root -g root -m 0600 /etc/nexus-bs/config.toml "$BACKUP_DIR/config.toml"
-        log "Backed up /etc/nexus-bs/config.toml"
+    if [ -d /etc/nexus-bs ]; then
+        for pattern in $CONFIG_KEEP_PATTERNS; do
+            for path in /etc/nexus-bs/$pattern; do
+                [ -f "$path" ] || continue
+                install -o root -g root -m 0600 "$path" "$BACKUP_DIR/$(basename "$path")"
+                log "Backed up $path"
+            done
+        done
     fi
 
     log "Stopping services"
     systemctl stop nexus-bs-dashboard.service nexus-bs.service nexus-bs-control.service 2>/dev/null || true
     systemctl disable nexus-bs-dashboard.service nexus-bs.service nexus-bs-control.service 2>/dev/null || true
+    for legacy in \
+        nexus-bs@*.service \
+        nexus-bs-control@*.service \
+        nexus-bs-dashboard@*.service; do
+        systemctl stop "$legacy" 2>/dev/null || true
+        systemctl disable "$legacy" 2>/dev/null || true
+    done
 
     log "Purging package"
     apt-get purge -y nexus-bs || true
@@ -58,18 +71,33 @@ main() {
     log "Removing old runtime files"
     rm -rf /etc/nexus-bs /opt/nexus-bs /run/nexus-bs
     rm -f /usr/bin/nexus-bs-service
+    if [ -L /usr/local/bin/nexus-bs-service ]; then
+        rm -f /usr/local/bin/nexus-bs-service
+    fi
     rm -f /lib/systemd/system/nexus-bs.service
     rm -f /lib/systemd/system/nexus-bs-control.service
     rm -f /lib/systemd/system/nexus-bs-dashboard.service
+    rm -f /lib/systemd/system/nexus-bs@*.service
+    rm -f /lib/systemd/system/nexus-bs-control@*.service
+    rm -f /lib/systemd/system/nexus-bs-dashboard@*.service
     rm -f /usr/lib/systemd/system/nexus-bs.service
     rm -f /usr/lib/systemd/system/nexus-bs-control.service
     rm -f /usr/lib/systemd/system/nexus-bs-dashboard.service
+    rm -f /usr/lib/systemd/system/nexus-bs@*.service
+    rm -f /usr/lib/systemd/system/nexus-bs-control@*.service
+    rm -f /usr/lib/systemd/system/nexus-bs-dashboard@*.service
     rm -f /etc/systemd/system/nexus-bs.service
     rm -f /etc/systemd/system/nexus-bs-control.service
     rm -f /etc/systemd/system/nexus-bs-dashboard.service
+    rm -f /etc/systemd/system/nexus-bs@*.service
+    rm -f /etc/systemd/system/nexus-bs-control@*.service
+    rm -f /etc/systemd/system/nexus-bs-dashboard@*.service
     rm -f /etc/systemd/system/multi-user.target.wants/nexus-bs.service
     rm -f /etc/systemd/system/multi-user.target.wants/nexus-bs-control.service
     rm -f /etc/systemd/system/multi-user.target.wants/nexus-bs-dashboard.service
+    rm -f /etc/systemd/system/multi-user.target.wants/nexus-bs@*.service
+    rm -f /etc/systemd/system/multi-user.target.wants/nexus-bs-control@*.service
+    rm -f /etc/systemd/system/multi-user.target.wants/nexus-bs-dashboard@*.service
     systemctl daemon-reload
     systemctl reset-failed nexus-bs-dashboard.service nexus-bs.service nexus-bs-control.service 2>/dev/null || true
 
@@ -78,9 +106,10 @@ main() {
 
     log "Restoring live config if backup exists"
     install -d -o "$RUN_USER" -g "$RUN_GROUP" -m 0750 /etc/nexus-bs
-    if [ -f "$BACKUP_DIR/config.toml" ]; then
-        install -o "$RUN_USER" -g "$RUN_GROUP" -m 0600 "$BACKUP_DIR/config.toml" /etc/nexus-bs/config.toml
-    fi
+    for path in "$BACKUP_DIR"/*; do
+        [ -f "$path" ] || continue
+        install -o "$RUN_USER" -g "$RUN_GROUP" -m 0600 "$path" "/etc/nexus-bs/$(basename "$path")"
+    done
     chown -R "$RUN_USER:$RUN_GROUP" /etc/nexus-bs
     find /etc/nexus-bs -type d -exec chmod 0750 {} +
     find /etc/nexus-bs -type f -name '*.toml' -exec chmod 0600 {} +

@@ -7,7 +7,7 @@ Maintainer: @MAINTAINER@
 Depends: @DEPENDS@
 Installed-Size: @INSTALLED_SIZE@
 Description: Nexus-BS TETRA base station runtime
- Nexus-BS packaged from the compiled_distribution binary bundle.
+ Nexus-BS packaged from release-built binaries and source-tree assets.
  .
  The package installs runtime binaries and dashboard assets under
  /opt/nexus-bs, systemd service units under /lib/systemd/system, and
