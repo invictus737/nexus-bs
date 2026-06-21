@@ -75,6 +75,12 @@ fn external_dashboard_asset_manifest_is_coherent() {
         "deploy script must copy the dashboard vector logo asset to the remote static directory"
     );
     assert!(
+        deploy_script.contains("scripts/nexus-bs-factory-reset-clean")
+            && deploy_script.contains("nexus-bs-factory-reset-clean")
+            && deploy_script.contains("$INSTALL_PREFIX/bin/nexus-bs-factory-reset-clean"),
+        "fast deploy must install the packaged factory reset helper next to the service binaries"
+    );
+    assert!(
         index.contains(r#"id="overviewHeard""#),
         "overview page must include the integrated Last Heard table"
     );
@@ -189,8 +195,15 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains(r#"fetch("/api/easy-start/status""#)
             && app.contains(r#"fetch("/api/easy-start/preview""#)
             && app.contains(r#"fetch("/api/easy-start/commit""#)
-            && app.contains(r#"fetch("/api/factory-reset""#),
-        "Dashboard must expose beginner Easy Start and confirmed Factory Reset flows"
+            && app.contains(r#"fetch("/api/factory-reset""#)
+            && dashboard_server.contains("\"sudo\"")
+            && dashboard_server.contains("NEXUS_BS_FACTORY_RESET_CLEANER")
+            && dashboard_server.contains("\"-n\", cleaner.as_str()")
+            && dashboard_server.contains("/opt/nexus-bs/bin/nexus-bs-factory-reset-clean")
+            && dashboard_server.contains("\"cleanup_log\"")
+            && dashboard_server.contains("Factory reset did not complete cleanly. Host shutdown was not queued.")
+            && !dashboard_server.contains("cleanup_warnings"),
+        "Dashboard must expose beginner Easy Start and confirmed Factory Reset flows, and reset cleanup must run through the privileged packaged helper"
     );
     assert!(
         index.contains(r#"id="wifiPanel""#)
@@ -402,12 +415,16 @@ fn external_dashboard_asset_manifest_is_coherent() {
     );
     assert!(
         release_workflow.contains("runs-on: ubuntu-24.04-arm")
+            && release_workflow.contains("RELEASE_TAG: ${{ github.ref_name }}")
             && release_workflow.contains(r#"RUSTFLAGS: "-C target-cpu=cortex-a53""#)
             && release_workflow.contains("scripts/build-release-artifacts.sh")
             && release_workflow.contains("packaging/release/*.deb")
             && release_workflow.contains("packaging/release/SHA256SUMS")
             && !release_workflow.contains("packaging/release/*.tar.gz")
             && release_script.contains("release tag '${tag}' does not match Cargo workspace version")
+            && release_script.contains("checkout HEAD ${head_commit} does not match ${tag} commit ${tag_commit}")
+            && release_script.contains("NEXUS_BS_BUILD_HASH=\"$RELEASE_BUILD_HASH\"")
+            && release_script.contains("Release build hash ${RELEASE_BUILD_HASH}")
             && release_script.contains("cargo build --release")
             && release_script.contains("strip_release_binaries")
             && release_script.contains("--strip-unneeded")
@@ -415,6 +432,8 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && release_script.contains("Syncing temporary package payload")
             && release_script.contains("sha256_cmd *.deb > SHA256SUMS")
             && release_script.contains("Nexus-BS/v${version}")
+            && release_script.contains("scripts/nexus-bs-factory-reset-clean")
+            && release_script.contains("release binary ${name} does not contain tag build string")
             && cargo_toml.contains("[profile.release]")
             && cargo_toml.contains(r#"lto = "thin""#)
             && cargo_toml.contains("codegen-units = 1")
@@ -457,8 +476,6 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && dashboard_server.contains("nexus_bs_cache_bust")
             && dashboard_server.contains("Cache-Control: no-cache")
             && dashboard_server.contains(r#"run_update_command_capture(&update, "sha256sum", &[deb_path_str])"#)
-            && dashboard_server.contains("run_update_stop_bs_services")
-            && dashboard_server.contains("run_update_post_install_start")
             && dashboard_server.contains("finish_deb_update_with_dashboard_restart_api")
             && dashboard_server.contains("post_dashboard_service_restart_api")
             && dashboard_server.contains("Finishing update by calling dashboard Restart BS API")
@@ -467,14 +484,12 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && dashboard_server.contains("X-Nexus-BS-Internal-Update-Restart: 1")
             && dashboard_server.contains(r#"request_matches(&req_line, "POST", "/api/service/restart")"#)
             && dashboard_server.contains("eq_ignore_ascii_case(DASHBOARD_INTERNAL_RESTART_HEADER)")
-            && dashboard_server.contains(r#"&["stop", "nexus-bs.service", "nexus-bs-control.service"]"#)
-            && dashboard_server.contains("Ensuring Nexus-BS core/control services are fully stopped after package install")
-            && dashboard_server.contains(r#""reset-failed""#)
-            && dashboard_server.contains(r#""nexus-bs-dashboard.service""#)
-            && dashboard_server.contains("Waiting 5s before starting Nexus-BS services")
-            && dashboard_server.contains("std::thread::sleep(std::time::Duration::from_secs(5))")
-            && dashboard_server.contains(r#"&["start", "nexus-bs-control.service"]"#)
-            && dashboard_server.contains(r#"&["start", "nexus-bs.service"]"#)
+            && !dashboard_server.contains("run_update_stop_bs_services")
+            && !dashboard_server.contains("run_update_post_install_start")
+            && !dashboard_server.contains("Ensuring Nexus-BS core/control services are fully stopped after package install")
+            && !dashboard_server.contains("Waiting 5s before starting Nexus-BS services")
+            && !dashboard_server.contains(r#"&["start", "nexus-bs-control.service"]"#)
+            && !dashboard_server.contains(r#"&["start", "nexus-bs.service"]"#)
             && !dashboard_server.contains("Scheduling dashboard service restart in")
             && !dashboard_server.contains("systemctl --no-block restart nexus-bs-dashboard.service")
             && !dashboard_server.contains(r#"&["restart", "nexus-bs.service"]"#)
@@ -490,6 +505,8 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && deb_postinst.contains("/usr/bin/systemctl restart nexus-bs-dashboard.service")
             && deb_postinst.contains("/usr/bin/systemctl --no-block restart nexus-bs-dashboard.service")
             && deb_postinst.contains("/usr/bin/systemctl --no-block poweroff")
+            && deb_postinst.contains("/opt/nexus-bs/bin/nexus-bs-factory-reset-clean")
+            && deb_build.contains("scripts/nexus-bs-factory-reset-clean")
             && deb_postinst.contains("legacy_unit_needs_replacement")
             && deb_postinst.contains("/home/[^/]+/nexus-bs")
             && deb_postinst.contains("enable_after_legacy_replace")

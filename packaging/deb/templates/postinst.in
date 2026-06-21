@@ -138,6 +138,7 @@ install_dashboard_sudoers() {
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl restart nexus-bs-dashboard.service, /bin/systemctl restart nexus-bs-dashboard.service\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block restart nexus-bs-dashboard.service, /bin/systemctl --no-block restart nexus-bs-dashboard.service\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl --no-block poweroff, /bin/systemctl --no-block poweroff\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /opt/nexus-bs/bin/nexus-bs-factory-reset-clean\n' "$run_user"
     } > "$sudoers.tmp"
     chmod 0440 "$sudoers.tmp"
     if visudo -cf "$sudoers.tmp" >/dev/null 2>&1; then

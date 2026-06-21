@@ -1,0 +1,115 @@
+#!/bin/sh
+# SPDX-FileCopyrightText: 2026 Chris YO3TCO / Nexus-BS Project
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
+set -u
+
+failures=0
+
+log() {
+    printf '%s\n' "$*"
+}
+
+fail() {
+    log "ERROR: $*"
+    failures=1
+}
+
+service_user_from_unit() {
+    unit="$1"
+    user="$(systemctl show "$unit" --property=User --value 2>/dev/null || true)"
+    [ -n "$user" ] && [ "$user" != "root" ] && printf '%s\n' "$user"
+}
+
+detect_service_user() {
+    if [ -n "${SUDO_USER:-}" ] && [ "${SUDO_USER:-}" != "root" ]; then
+        printf '%s\n' "$SUDO_USER"
+        return 0
+    fi
+
+    user="$(service_user_from_unit nexus-bs-dashboard.service)"
+    if [ -n "$user" ]; then
+        printf '%s\n' "$user"
+        return 0
+    fi
+
+    user="$(service_user_from_unit nexus-bs.service)"
+    if [ -n "$user" ]; then
+        printf '%s\n' "$user"
+        return 0
+    fi
+
+    awk -F: '($3 >= 1000 && $3 < 60000 && $1 != "nobody") { print $1; exit }' /etc/passwd
+}
+
+remove_wifi_profiles() {
+    if ! command -v nmcli >/dev/null 2>&1; then
+        log "wifi_skipped=nmcli_not_available"
+        return 0
+    fi
+
+    profiles="$(nmcli -t -f UUID,TYPE,NAME connection show 2>/dev/null || true)"
+    while IFS=: read -r uuid conn_type name_rest; do
+        [ -n "$uuid" ] || continue
+        [ "$conn_type" = "802-11-wireless" ] || continue
+        if nmcli connection delete uuid "$uuid" >/dev/null 2>&1; then
+            log "wifi_removed=${name_rest:-$uuid}"
+        else
+            fail "failed to remove Wi-Fi profile ${name_rest:-$uuid}"
+        fi
+    done <<EOF
+$profiles
+EOF
+}
+
+remove_nexus_config() {
+    config_dir="/etc/nexus-bs"
+    [ -d "$config_dir" ] || {
+        log "config_skipped=not_present"
+        return 0
+    }
+
+    paths="$(find "$config_dir" -mindepth 1 -maxdepth 1 ! -name examples -print 2>/dev/null || true)"
+    while IFS= read -r path; do
+        [ -n "$path" ] || continue
+        name="$(basename "$path")"
+        if rm -rf -- "$path"; then
+            log "config_removed=$name"
+        else
+            fail "failed to remove config path $path"
+        fi
+    done <<EOF
+$paths
+EOF
+}
+
+remove_service_user_ssh() {
+    service_user="$(detect_service_user)"
+    if [ -z "$service_user" ] || [ "$service_user" = "root" ]; then
+        fail "could not determine non-root Nexus-BS service user"
+        return 0
+    fi
+
+    home="$(getent passwd "$service_user" 2>/dev/null | awk -F: '{ print $6; exit }')"
+    if [ -z "$home" ] || [ "$home" = "/" ] || [ "$home" = "/root" ]; then
+        fail "could not determine safe home directory for $service_user"
+        return 0
+    fi
+
+    ssh_dir="$home/.ssh"
+    if rm -rf -- "$ssh_dir"; then
+        log "ssh_removed=$ssh_dir"
+    else
+        fail "failed to remove SSH directory $ssh_dir"
+    fi
+}
+
+remove_wifi_profiles
+remove_nexus_config
+remove_service_user_ssh
+
+if [ "$failures" -ne 0 ]; then
+    exit 1
+fi
+
+exit 0

@@ -25,10 +25,13 @@ pub const CONTROL_PROTOCOL_VERSION: &str = const_format::formatcp!("nexus-bs-con
 pub const TELEMETRY_PROTOCOL_VERSION: &str = const_format::formatcp!("nexus-bs-telemetry-{}", PRODUCT_VERSION_TAG);
 
 /// Short git commit hash, set at compile time (e.g. "g2aad62c")
-pub const GIT_HASH: &str = git_version::git_version!(
-    args = ["--always", "--dirty=-modified", "--match=", "--abbrev=8"],
-    fallback = "unknown"
-);
+pub const GIT_HASH: &str = match option_env!("NEXUS_BS_BUILD_HASH") {
+    Some(hash) => hash,
+    None => git_version::git_version!(
+        args = ["--always", "--dirty=-modified", "--match=", "--abbrev=8"],
+        fallback = "unknown"
+    ),
+};
 /// Full stack version string, e.g. "vX.Y.Z-g2aad62c"
 pub const STACK_VERSION: &str = const_format::formatcp!("{}-{}", PRODUCT_VERSION_TAG, GIT_HASH);
 

@@ -23,6 +23,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use crossbeam_channel::{Receiver, Sender, bounded};
+use tetra_core::STACK_VERSION;
 use tetra_entities::net_control::codec::ControlCodecJson;
 use tetra_entities::net_control::commands::{
     ControlCommand, WAP_MVP_COLOR_PAGE_TEXT, WAP_MVP_PAGE_TEXT, WAP_SDS_TYPE4_MAX_BYTE_ALIGNED_PAYLOAD_BYTES,
@@ -38,7 +39,7 @@ const CONTROL_HTTP_BODY_MAX: usize = 512 * 1024;
 const CONTROL_HTTP_HEADER_MAX: usize = 16 * 1024;
 
 #[derive(Parser)]
-#[command(name = "nexus-bs-control", version, about = "Nexus-BS TETRA control service")]
+#[command(name = "nexus-bs-control", version = STACK_VERSION, about = "Nexus-BS TETRA control service")]
 struct Args {
     /// Listen address (host:port)
     #[arg(short, long, default_value = "127.0.0.1:9002")]

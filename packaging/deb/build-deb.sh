@@ -108,6 +108,7 @@ require_distribution_files() {
         "${SYSTEMD_SRC_DIR}/nexus-bs-dashboard.service"
         "${SYSTEMD_SRC_DIR}/journald-nexus-bs-volatile.conf"
         "${REPO_ROOT}/scripts/nexus-bs-service"
+        "${REPO_ROOT}/scripts/nexus-bs-factory-reset-clean"
     )
     for file in "${required[@]}"; do
         [ -f "$file" ] || die "missing package source file: ${file}"
@@ -249,6 +250,7 @@ install_payload() {
     install -m 0755 "${BIN_DIR}/nexus-bs-control-service" "${root}/${prefix_rel}/bin/nexus-bs-control-service"
     install -m 0755 "${BIN_DIR}/nexus-bs-dashboard" "${root}/${prefix_rel}/bin/nexus-bs-dashboard"
     install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-service" "${root}/${prefix_rel}/bin/nexus-bs-service"
+    install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-factory-reset-clean" "${root}/${prefix_rel}/bin/nexus-bs-factory-reset-clean"
     install -d -m 0755 "${root}/usr/bin"
     install -m 0755 "${REPO_ROOT}/scripts/nexus-bs-service" "${root}/usr/bin/nexus-bs-service"
 

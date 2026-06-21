@@ -246,6 +246,7 @@ atomic_install_user_file "$BIN_DIR/nexus-bs-control-service" "${RUN_DIR}/nexus-b
 atomic_install_user_file "$BIN_DIR/nexus-bs-dashboard" "${RUN_DIR}/nexus-bs-dashboard"
 atomic_install_user_file "$ROOT/scripts/nexus-bs-control" "${RUN_DIR}/nexus-bs-control"
 atomic_install_user_file "$ROOT/scripts/nexus-bs-service" "${RUN_DIR}/nexus-bs-service"
+atomic_install_user_file "$ROOT/scripts/nexus-bs-factory-reset-clean" "${RUN_DIR}/nexus-bs-factory-reset-clean"
 copy_dashboard
 install_config_if_missing
 link_runtime_config

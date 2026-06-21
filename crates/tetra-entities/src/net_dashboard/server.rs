@@ -751,15 +751,11 @@ fn run_deb_update(update: SharedUpdateState, service_restart_url: String, deb: D
     }
     update_log(&update, format!("Installing nexus-bs {} ({})", version.trim(), arch.trim()));
 
-    if !run_update_stop_bs_services(&update) {
-        update.lock().unwrap().finish(false);
-        return;
-    }
+    update_log(
+        &update,
+        "Installing package with apt-get; final BS restart is delegated to the dashboard Restart BS API",
+    );
     if !run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str]) {
-        update.lock().unwrap().finish(false);
-        return;
-    }
-    if !run_update_post_install_start(&update) {
         update.lock().unwrap().finish(false);
         return;
     }
@@ -777,52 +773,6 @@ fn cache_busted_update_url(url: &str) -> String {
         .unwrap_or(0);
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}nexus_bs_cache_bust={stamp}")
-}
-
-fn run_update_stop_bs_services(update: &SharedUpdateState) -> bool {
-    update_log(update, "Stopping Nexus-BS core/control services before package install");
-    run_update_command_privileged(update, "systemctl", &["stop", "nexus-bs.service", "nexus-bs-control.service"])
-}
-
-fn run_update_post_install_start(update: &SharedUpdateState) -> bool {
-    update_log(update, "Reloading systemd units after package install");
-    let _ = run_update_command_privileged(update, "systemctl", &["daemon-reload"]);
-
-    update_log(
-        update,
-        "Ensuring Nexus-BS core/control services are fully stopped after package install",
-    );
-    if !run_update_command_privileged(update, "systemctl", &["stop", "nexus-bs.service", "nexus-bs-control.service"]) {
-        return false;
-    }
-
-    update_log(update, "Clearing stale Nexus-BS systemd failure state");
-    let _ = run_update_command_privileged(
-        update,
-        "systemctl",
-        &[
-            "reset-failed",
-            "nexus-bs.service",
-            "nexus-bs-control.service",
-            "nexus-bs-dashboard.service",
-        ],
-    );
-
-    update_log(update, "Waiting 5s before starting Nexus-BS services");
-    std::thread::sleep(std::time::Duration::from_secs(5));
-
-    update_log(update, "Starting Nexus-BS control service after package install");
-    if !run_update_command_privileged(update, "systemctl", &["start", "nexus-bs-control.service"]) {
-        return false;
-    }
-
-    update_log(update, "Starting Nexus-BS core service after package install");
-    if !run_update_command_privileged(update, "systemctl", &["start", "nexus-bs.service"]) {
-        return false;
-    }
-
-    update_log(update, "Nexus-BS core/control services are online after package install");
-    true
 }
 
 fn finish_deb_update_with_dashboard_restart_api(update: &SharedUpdateState, service_restart_url: &str) -> bool {
@@ -2002,165 +1952,39 @@ fn serve_easy_start_skip(stream: TcpStream, config_path: &str) {
 
 #[derive(Debug, Default)]
 struct FactoryResetCleanup {
-    wifi_removed: Vec<String>,
-    config_removed: Vec<String>,
-    ssh_removed: Vec<String>,
+    cleanup_log: Vec<String>,
 }
 
-fn clean_factory_reset_configs(config_path: &str) -> Result<Vec<String>, Vec<String>> {
-    let config_dir = config_dir_for(config_path);
-    let mut removed = Vec::new();
-    let mut errors = Vec::new();
-    let entries = match fs::read_dir(&config_dir) {
-        Ok(entries) => entries,
-        Err(e) => return Err(vec![format!("config dir {} not readable: {}", config_dir.display(), e)]),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => {
-                errors.push(format!("config dir entry read failed: {}", e));
-                continue;
-            }
-        };
-        let path = entry.path();
-        if path.is_dir() {
-            continue;
-        }
-        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-        let remove = name.ends_with(".toml")
-            || name.ends_with(".toml.bak")
-            || name.ends_with(".toml.active")
-            || name == EASY_START_DONE_MARKER
-            || name == EASY_START_SKIP_MARKER;
-        if !remove {
-            continue;
-        }
-        match fs::remove_file(&path) {
-            Ok(_) => removed.push(name),
-            Err(e) => errors.push(format!("failed to remove config {}: {}", path.display(), e)),
-        }
-    }
-    if errors.is_empty() { Ok(removed) } else { Err(errors) }
-}
+fn clean_factory_reset() -> Result<FactoryResetCleanup, Vec<String>> {
+    const CLEANER: &str = "/opt/nexus-bs/bin/nexus-bs-factory-reset-clean";
+    let cleaner = std::env::var("NEXUS_BS_FACTORY_RESET_CLEANER").unwrap_or_else(|_| CLEANER.to_string());
 
-fn clean_factory_reset_wifi() -> Result<Vec<String>, Vec<String>> {
-    let mut removed = Vec::new();
-    let mut errors = Vec::new();
-    let profiles = match crate::wifi::list_saved() {
-        Ok(profiles) => profiles,
-        Err(e) => return Err(vec![format!("could not list saved Wi-Fi profiles: {}", e)]),
-    };
-    for profile in profiles {
-        match crate::wifi::forget(&profile.uuid) {
-            Ok(_) => removed.push(profile.name),
-            Err(e) => errors.push(format!("failed to forget Wi-Fi profile {}: {}", profile.name, e)),
-        }
-    }
-    if errors.is_empty() { Ok(removed) } else { Err(errors) }
-}
-
-#[cfg(unix)]
-fn current_user_home_dir() -> Result<PathBuf, String> {
-    let home = std::env::var("HOME").unwrap_or_default();
-    if !home.trim().is_empty() && home != "/" {
-        return Ok(PathBuf::from(home));
-    }
-    let id_output = Command::new("id")
-        .arg("-un")
+    let output = Command::new("sudo")
+        .args(["-n", cleaner.as_str()])
         .output()
-        .map_err(|e| format!("could not determine service user: {}", e))?;
-    if !id_output.status.success() {
-        return Err("could not determine service user with id -un".to_string());
-    }
-    let user = String::from_utf8_lossy(&id_output.stdout).trim().to_string();
-    if user.is_empty() || user == "root" {
-        return Err("refusing to erase SSH keys without a non-root service user home".to_string());
-    }
-    let passwd_output = Command::new("getent")
-        .args(["passwd", &user])
-        .output()
-        .map_err(|e| format!("could not query passwd database for {}: {}", user, e))?;
-    if !passwd_output.status.success() {
-        return Err(format!("could not query passwd database for {}", user));
-    }
-    let passwd = String::from_utf8_lossy(&passwd_output.stdout);
-    let home = passwd
-        .split(':')
-        .nth(5)
+        .map_err(|e| vec![format!("failed to run sudo factory reset cleaner: {}", e)])?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let cleanup_log = stdout
+        .lines()
+        .chain(stderr.lines())
         .map(str::trim)
-        .filter(|value| !value.is_empty() && *value != "/")
-        .ok_or_else(|| format!("could not determine home directory for {}", user))?;
-    Ok(PathBuf::from(home))
-}
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
 
-#[cfg(unix)]
-fn clean_factory_reset_ssh_keys() -> Result<Vec<String>, Vec<String>> {
-    let mut removed = Vec::new();
-    let home = match current_user_home_dir() {
-        Ok(home) => home,
-        Err(e) => return Err(vec![e]),
-    };
-    let ssh_dir = home.join(".ssh");
-    if !ssh_dir.exists() {
-        return Ok(removed);
-    }
-    let entries = match fs::read_dir(&ssh_dir) {
-        Ok(entries) => entries,
-        Err(e) => return Err(vec![format!("SSH dir {} not readable: {}", ssh_dir.display(), e)]),
-    };
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(e) => return Err(vec![format!("SSH dir entry read failed: {}", e)]),
-        };
-        let path = entry.path();
-        removed.push(path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
-    }
-    fs::remove_dir_all(&ssh_dir).map_err(|e| vec![format!("failed to remove SSH dir {}: {}", ssh_dir.display(), e)])?;
-    Ok(removed)
-}
-
-#[cfg(not(unix))]
-fn clean_factory_reset_ssh_keys() -> Result<Vec<String>, Vec<String>> {
-    Ok(Vec::new())
-}
-
-fn clean_factory_reset(config_path: &str) -> Result<FactoryResetCleanup, Vec<String>> {
-    let mut errors = Vec::new();
-    let wifi_removed = match clean_factory_reset_wifi() {
-        Ok(removed) => removed,
-        Err(mut step_errors) => {
-            errors.append(&mut step_errors);
-            Vec::new()
-        }
-    };
-    let config_removed = match clean_factory_reset_configs(config_path) {
-        Ok(removed) => removed,
-        Err(mut step_errors) => {
-            errors.append(&mut step_errors);
-            Vec::new()
-        }
-    };
-    let ssh_removed = match clean_factory_reset_ssh_keys() {
-        Ok(removed) => removed,
-        Err(mut step_errors) => {
-            errors.append(&mut step_errors);
-            Vec::new()
-        }
-    };
-    if errors.is_empty() {
-        Ok(FactoryResetCleanup {
-            wifi_removed,
-            config_removed,
-            ssh_removed,
-        })
+    if output.status.success() {
+        Ok(FactoryResetCleanup { cleanup_log })
     } else {
-        Err(errors)
+        Err(if cleanup_log.is_empty() {
+            vec![format!("factory reset cleaner exited with {}", output.status)]
+        } else {
+            cleanup_log
+        })
     }
 }
 
-fn serve_factory_reset(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
+fn serve_factory_reset(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
     let confirmation = value.get("confirmation").and_then(serde_json::Value::as_str).unwrap_or("").trim();
     if confirmation != FACTORY_RESET_CONFIRMATION {
         let body = serde_json::json!({
@@ -2174,10 +1998,10 @@ fn serve_factory_reset(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<
         );
     }
 
-    let cleanup = match clean_factory_reset(config_path) {
+    let cleanup = match clean_factory_reset() {
         Ok(cleanup) => cleanup,
         Err(errors) => {
-            tracing::error!("Dashboard: factory reset refused after cleanup errors: {:?}", errors);
+            tracing::error!("Dashboard: factory reset refused after privileged cleanup errors: {:?}", errors);
             let body = serde_json::json!({
                 "ok": false,
                 "error": "Factory reset did not complete cleanly. Host shutdown was not queued.",
@@ -2195,18 +2019,11 @@ fn serve_factory_reset(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<
         crate::service_control::ServiceAction::PowerOffHost,
         std::time::Duration::from_secs(3),
     );
-    tracing::warn!(
-        "Dashboard: factory reset requested; removed {} wifi profiles, {} config files, {} ssh key files",
-        cleanup.wifi_removed.len(),
-        cleanup.config_removed.len(),
-        cleanup.ssh_removed.len()
-    );
+    tracing::warn!("Dashboard: factory reset requested; privileged cleanup completed: {:?}", cleanup.cleanup_log);
     let body = serde_json::json!({
         "ok": true,
         "message": "Factory reset accepted. Wi-Fi, configs, and SSH keys were cleared. Host shutdown queued.",
-        "wifi_removed": cleanup.wifi_removed,
-        "config_removed": cleanup.config_removed,
-        "ssh_removed": cleanup.ssh_removed,
+        "cleanup_log": cleanup.cleanup_log,
         "poweroff_queued": true,
         "control_poweroff_queued": poweroff_accepted,
         "local_poweroff_fallback_queued": true,
@@ -3204,7 +3021,7 @@ fn handle_connection(
             }
         };
         match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(value) => serve_factory_reset(buf.into_inner(), &config_path, &cmd_tx, &value),
+            Ok(value) => serve_factory_reset(buf.into_inner(), &cmd_tx, &value),
             Err(e) => http_json_response(
                 buf.into_inner(),
                 400,

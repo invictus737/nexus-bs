@@ -15,7 +15,7 @@ use tetra_entities::net_control::{
 };
 
 use tetra_config::bluestation::{PhyBackend, SharedConfig, StackConfig, StackState, parsing};
-use tetra_core::{PRODUCT_NAME, PRODUCT_USER_AGENT, PRODUCT_VERSION_TAG, TdmaTime, debug};
+use tetra_core::{PRODUCT_NAME, PRODUCT_USER_AGENT, PRODUCT_VERSION_TAG, STACK_VERSION, TdmaTime, debug};
 use tetra_entities::MessageRouter;
 use tetra_entities::net_brew::entity::BrewEntity;
 use tetra_entities::net_brew::new_websocket_transport;
@@ -251,7 +251,7 @@ fn build_bs_stack(cfg: &mut SharedConfig) -> (MessageRouter, Option<TelemetrySou
 #[command(
     name = "nexus-bs",
     author,
-    version,
+    version = STACK_VERSION,
     about = "Nexus-BS TETRA base station stack",
     long_about = "Runs the Nexus-BS TETRA base station stack using the provided TOML configuration files"
 )]

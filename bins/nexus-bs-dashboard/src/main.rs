@@ -12,6 +12,7 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use tetra_config::bluestation::{SharedConfig, StackConfig, parsing};
+use tetra_core::STACK_VERSION;
 use tetra_entities::net_control::codec::ControlCodecJson;
 use tetra_entities::net_control::commands::ControlCommand;
 use tetra_entities::net_dashboard::DashboardServer;
@@ -26,7 +27,7 @@ const DASHBOARD_CONTROL_QUEUE_CAPACITY: usize = 2048;
 #[command(
     name = "nexus-bs-dashboard",
     author,
-    version,
+    version = STACK_VERSION,
     about = "Nexus-BS external dashboard/API service",
     long_about = "Serves the Nexus-BS dashboard API, WebSocket and static assets from a separate process. Runtime telemetry is received from the core over the telemetry link; commands are submitted to nexus-bs-control-service."
 )]
