@@ -132,7 +132,6 @@ fn main() {
     dashboard.set_cmd_sender(cmd_tx.clone());
     dashboard.set_rf_cmd_sender(cmd_tx.clone());
     dashboard.set_phy_cmd_sender(cmd_tx);
-    dashboard.set_control_url(Some(runtime.control_url.clone()));
     dashboard.start(&runtime.bind, runtime.port);
 
     let dashboard = Arc::new(dashboard);
