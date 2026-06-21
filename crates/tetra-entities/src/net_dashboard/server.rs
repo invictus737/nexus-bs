@@ -730,12 +730,11 @@ fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
         update.lock().unwrap().finish(false);
         return;
     }
+    if !schedule_dashboard_restart_after_deb_update(&update) {
+        update.lock().unwrap().finish(false);
+        return;
+    }
     update.lock().unwrap().finish(true);
-
-    let _ = Command::new("sh")
-        .arg("-c")
-        .arg("sleep 2; if [ \"$(id -u)\" = 0 ]; then systemctl restart nexus-bs-dashboard.service; else sudo -n systemctl restart nexus-bs-dashboard.service; fi")
-        .spawn();
 }
 
 fn run_update_stop_bs_services(update: &SharedUpdateState) -> bool {
@@ -746,6 +745,18 @@ fn run_update_stop_bs_services(update: &SharedUpdateState) -> bool {
 fn run_update_post_install_start(update: &SharedUpdateState) -> bool {
     update_log(update, "Reloading systemd units after package install");
     let _ = run_update_command_privileged(update, "systemctl", &["daemon-reload"]);
+
+    update_log(update, "Ensuring Nexus-BS core/control services are fully stopped after package install");
+    if !run_update_command_privileged(update, "systemctl", &["stop", "nexus-bs.service", "nexus-bs-control.service"]) {
+        return false;
+    }
+
+    update_log(update, "Clearing stale Nexus-BS systemd failure state");
+    let _ = run_update_command_privileged(
+        update,
+        "systemctl",
+        &["reset-failed", "nexus-bs.service", "nexus-bs-control.service", "nexus-bs-dashboard.service"],
+    );
 
     update_log(update, "Waiting 5s before starting Nexus-BS services");
     std::thread::sleep(std::time::Duration::from_secs(5));
@@ -762,9 +773,29 @@ fn run_update_post_install_start(update: &SharedUpdateState) -> bool {
 
     update_log(
         update,
-        "Restarting dashboard service to load the installed version after BS services are online",
+        "Nexus-BS core/control services are online after package install",
     );
     true
+}
+
+fn schedule_dashboard_restart_after_deb_update(update: &SharedUpdateState) -> bool {
+    let command = "sleep 3; if [ \"$(id -u)\" = 0 ]; then systemctl --no-block restart nexus-bs-dashboard.service; else sudo -n systemctl --no-block restart nexus-bs-dashboard.service; fi";
+
+    update_log(
+        update,
+        "Scheduling dashboard service restart in 3s to load the installed version",
+    );
+    update_log(update, format!("$ sh -c '{}'", command));
+    match Command::new("sh").arg("-c").arg(command).spawn() {
+        Ok(_) => {
+            update_log(update, "Dashboard restart queued; browser may reconnect shortly.");
+            true
+        }
+        Err(e) => {
+            update_log(update, format!("ERROR: failed to queue dashboard restart: {}", e));
+            false
+        }
+    }
 }
 
 pub struct DashboardServer {
