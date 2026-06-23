@@ -1085,11 +1085,13 @@ td .pill {
 }
 
 .update-log {
-  min-height: 104px;
-  max-height: none;
+  height: clamp(156px, 24vh, 260px);
+  min-height: 156px;
+  max-height: 260px;
   margin: 0;
   padding: 10px 12px;
-  overflow: visible;
+  overflow: auto;
+  overscroll-behavior: contain;
   border-top: 1px solid var(--line-soft);
   background: #f5f9fa;
   color: #071923;
@@ -1140,11 +1142,13 @@ td .pill {
 
 .calibration-log {
   grid-column: 1 / -1;
-  min-height: 104px;
-  max-height: none;
+  height: clamp(128px, 22vh, 220px);
+  min-height: 128px;
+  max-height: 220px;
   margin: 0;
   padding: 10px;
-  overflow: visible;
+  overflow: auto;
+  overscroll-behavior: contain;
   border: 1px solid var(--line-soft);
   border-radius: 6px;
   background: #f5f9fa;

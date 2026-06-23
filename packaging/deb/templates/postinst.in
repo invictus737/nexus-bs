@@ -126,8 +126,9 @@ install_dashboard_sudoers() {
 
     sudoers="/etc/sudoers.d/nexus-bs-dashboard"
     {
-        printf '# Installed by nexus-bs. Allows the dashboard to apply Nexus-BS updates and host service actions.\n'
+        printf '# Installed by nexus-bs. Allows the dashboard to apply Nexus-BS updates, Wi-Fi setup, and host service actions.\n'
         printf '%s ALL=(root) NOPASSWD: /usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb\n' "$run_user"
+        printf '%s ALL=(root) NOPASSWD: /usr/bin/nmcli *, /bin/nmcli *\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl daemon-reload, /bin/systemctl daemon-reload\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl stop nexus-bs.service nexus-bs-control.service, /bin/systemctl stop nexus-bs.service nexus-bs-control.service\n' "$run_user"
         printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service, /bin/systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service\n' "$run_user"
@@ -145,6 +146,36 @@ install_dashboard_sudoers() {
         mv -f "$sudoers.tmp" "$sudoers"
     else
         rm -f "$sudoers.tmp"
+    fi
+}
+
+schedule_postinst_service_realign() {
+    systemd_available || return 0
+    systemctl is-active --quiet nexus-bs-dashboard.service >/dev/null 2>&1 || return 0
+    if ! systemctl is-active --quiet nexus-bs.service >/dev/null 2>&1 \
+        && ! systemctl is-active --quiet nexus-bs-control.service >/dev/null 2>&1; then
+        return 0
+    fi
+
+    realign_cmd='systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl stop nexus-bs.service nexus-bs-control.service >/dev/null 2>&1 || true
+systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service >/dev/null 2>&1 || true
+sleep 5
+systemctl start nexus-bs-control.service >/dev/null 2>&1 || true
+systemctl start nexus-bs.service >/dev/null 2>&1 || true
+systemctl restart nexus-bs-dashboard.service >/dev/null 2>&1 || true'
+
+    if command -v systemd-run >/dev/null 2>&1; then
+        systemd-run \
+            --unit="nexus-bs-postinst-realign-$$" \
+            --description="Nexus-BS post-install service realignment" \
+            --on-active=2s \
+            /bin/sh -c "$realign_cmd" >/dev/null 2>&1 || true
+    else
+        (
+            sleep 2
+            /bin/sh -c "$realign_cmd"
+        ) >/dev/null 2>&1 &
     fi
 }
 
@@ -186,6 +217,7 @@ if [ "$1" = "configure" ]; then
         if [ -n "$enable_after_legacy_replace" ]; then
             systemctl enable $enable_after_legacy_replace >/dev/null 2>&1 || true
         fi
+        schedule_postinst_service_realign
     fi
 fi
 

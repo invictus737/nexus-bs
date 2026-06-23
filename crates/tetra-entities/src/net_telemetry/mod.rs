@@ -40,10 +40,7 @@ mod tests {
 
     #[test]
     fn telemetry_protocol_tracks_nexus_bs_product_version() {
-        assert_eq!(
-            TELEMETRY_PROTOCOL_VERSION,
-            tetra_core::TELEMETRY_PROTOCOL_VERSION
-        );
+        assert_eq!(TELEMETRY_PROTOCOL_VERSION, tetra_core::TELEMETRY_PROTOCOL_VERSION);
     }
 
     #[test]

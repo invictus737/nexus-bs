@@ -56,7 +56,6 @@ const DASHBOARD_HTTP_HEADER_LINE_MAX: usize = 2 * 1024;
 const DASHBOARD_HTTP_BODY_MAX: usize = 512 * 1024;
 const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
 const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
-const DASHBOARD_INTERNAL_RESTART_HEADER: &str = "x-nexus-bs-internal-update-restart: 1";
 const EASY_START_TEMPLATE_TOML: &str = include_str!("../../../../example_config/config_template.toml");
 const EASY_START_DONE_MARKER: &str = ".easy-start-done";
 const EASY_START_SKIP_MARKER: &str = ".easy-start-skipped";
@@ -668,7 +667,7 @@ fn run_update_command_capture(update: &SharedUpdateState, program: &str, args: &
     }
 }
 
-fn run_deb_update(update: SharedUpdateState, service_restart_url: String, deb: DebUpdateRequest) {
+fn run_deb_update(update: SharedUpdateState, deb: DebUpdateRequest) {
     update_log(&update, "=== Nexus-BS Debian package update ===");
     update_log(&update, format!("Selected version: {}", deb.version));
     update_log(&update, format!("Asset: {}", deb.asset_name));
@@ -751,15 +750,24 @@ fn run_deb_update(update: SharedUpdateState, service_restart_url: String, deb: D
     }
     update_log(&update, format!("Installing nexus-bs {} ({})", version.trim(), arch.trim()));
 
-    update_log(
-        &update,
-        "Installing package with apt-get; final BS restart is delegated to the dashboard Restart BS API",
-    );
-    if !run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str]) {
+    update_log(&update, "Stopping Nexus-BS core/control services before package install");
+    if !run_update_command_privileged(&update, "systemctl", &["stop", "nexus-bs.service", "nexus-bs-control.service"]) {
         update.lock().unwrap().finish(false);
         return;
     }
-    if !finish_deb_update_with_dashboard_restart_api(&update, &service_restart_url) {
+
+    update_log(
+        &update,
+        "Installing package with apt-get; services will be restarted from the installed unit files",
+    );
+    if !run_update_command_privileged(&update, "apt-get", &["install", "-y", deb_path_str]) {
+        update_log(&update, "Package install failed; attempting to restore Nexus-BS services");
+        let _ = run_update_command_privileged(&update, "systemctl", &["start", "nexus-bs-control.service"]);
+        let _ = run_update_command_privileged(&update, "systemctl", &["start", "nexus-bs.service"]);
+        update.lock().unwrap().finish(false);
+        return;
+    }
+    if !finish_deb_update_with_aligned_services(&update) {
         update.lock().unwrap().finish(false);
         return;
     }
@@ -775,78 +783,45 @@ fn cache_busted_update_url(url: &str) -> String {
     format!("{url}{separator}nexus_bs_cache_bust={stamp}")
 }
 
-fn finish_deb_update_with_dashboard_restart_api(update: &SharedUpdateState, service_restart_url: &str) -> bool {
+fn finish_deb_update_with_aligned_services(update: &SharedUpdateState) -> bool {
+    update_log(update, "Reloading systemd units from installed package");
+    if !run_update_command_privileged(update, "systemctl", &["daemon-reload"]) {
+        return false;
+    }
+
+    update_log(update, "Resetting stale Nexus-BS service failure state");
+    if !run_update_command_privileged(
+        update,
+        "systemctl",
+        &[
+            "reset-failed",
+            "nexus-bs.service",
+            "nexus-bs-control.service",
+            "nexus-bs-dashboard.service",
+        ],
+    ) {
+        return false;
+    }
+
     update_log(
         update,
-        format!("Finishing update by calling dashboard Restart BS API: {}", service_restart_url),
+        "Waiting 5s before starting Nexus-BS services so radios see a clean carrier drop",
     );
+    std::thread::sleep(Duration::from_secs(5));
 
-    let mut attempt = 0u32;
-    loop {
-        attempt += 1;
-        match post_dashboard_service_restart_api(service_restart_url) {
-            Ok(()) => {
-                update_log(
-                    update,
-                    format!(
-                        "Dashboard Restart BS API accepted on attempt {}; this is the same action as Settings/Admin Restart BS.",
-                        attempt
-                    ),
-                );
-                return true;
-            }
-            Err(error) => {
-                if attempt == 1 || attempt % 5 == 0 {
-                    update_log(
-                        update,
-                        format!(
-                            "Dashboard Restart BS API not accepted yet on attempt {}: {}; retrying",
-                            attempt, error
-                        ),
-                    );
-                }
-                std::thread::sleep(Duration::from_secs(1));
-            }
-        }
+    update_log(update, "Starting Nexus-BS control service from installed package");
+    if !run_update_command_privileged(update, "systemctl", &["start", "nexus-bs-control.service"]) {
+        return false;
     }
-}
-
-fn post_dashboard_service_restart_api(url: &str) -> Result<(), String> {
-    let (host_port, path) = parse_dashboard_api_url(url)?;
-    let mut stream = TcpStream::connect(&host_port).map_err(|error| format!("connect {host_port}: {error}"))?;
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
-    let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {host_port}\r\nX-Nexus-BS-Internal-Update-Restart: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+    update_log(update, "Starting Nexus-BS core service from installed package");
+    if !run_update_command_privileged(update, "systemctl", &["start", "nexus-bs.service"]) {
+        return false;
+    }
+    update_log(
+        update,
+        "Restarting dashboard service so browser/API/telemetry use the installed version",
     );
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| format!("write control request: {error}"))?;
-
-    let mut response = Vec::new();
-    stream
-        .take(4096)
-        .read_to_end(&mut response)
-        .map_err(|error| format!("read control response: {error}"))?;
-    let text = String::from_utf8_lossy(&response);
-    let status = text.lines().next().unwrap_or("").to_string();
-    if status.contains(" 200 ") {
-        Ok(())
-    } else {
-        let detail = text.lines().last().unwrap_or("").trim();
-        Err(format!("dashboard API response '{}': {}", status, detail))
-    }
-}
-
-fn parse_dashboard_api_url(url: &str) -> Result<(String, String), String> {
-    let rest = url
-        .strip_prefix("http://")
-        .ok_or_else(|| "only http:// dashboard API URLs are supported for local update restart".to_string())?;
-    let (host_port, path) = rest.split_once('/').unwrap_or((rest, "api/service/restart"));
-    if host_port.trim().is_empty() {
-        return Err("dashboard API URL host is empty".to_string());
-    }
-    Ok((host_port.to_string(), format!("/{}", path.trim_start_matches('/'))))
+    run_update_command_privileged(update, "systemctl", &["--no-block", "restart", "nexus-bs-dashboard.service"])
 }
 
 pub struct DashboardServer {
@@ -950,7 +925,6 @@ impl DashboardServer {
         let update_state = Arc::clone(&self.update_state);
         let source_dir_override = self.source_dir_override.clone();
         let static_dir = self.static_dir.clone();
-        let service_restart_url = format!("http://127.0.0.1:{port}/api/service/restart");
         let auth = self.auth.clone();
         let shared_config = self.shared_config.clone();
         let sessions = Arc::clone(&self.sessions);
@@ -992,7 +966,6 @@ impl DashboardServer {
                     let update_state = Arc::clone(&update_state);
                     let source_dir_override = source_dir_override.clone();
                     let static_dir = static_dir.clone();
-                    let service_restart_url = service_restart_url.clone();
                     let auth = auth.clone();
                     let shared_config = shared_config.clone();
                     let sessions = Arc::clone(&sessions);
@@ -1012,7 +985,6 @@ impl DashboardServer {
                             update_state,
                             source_dir_override,
                             static_dir,
-                            service_restart_url,
                             auth,
                             shared_config,
                             sessions,
@@ -2113,6 +2085,33 @@ fn nmcli_output(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn nmcli_output_privileged(args: &[&str]) -> Result<String, String> {
+    if update_process_runs_as_root() {
+        return nmcli_output(args);
+    }
+
+    let mut sudo_args = Vec::with_capacity(args.len() + 2);
+    sudo_args.push("-n");
+    sudo_args.push("nmcli");
+    sudo_args.extend_from_slice(args);
+    let output = Command::new("sudo")
+        .args(&sudo_args)
+        .output()
+        .map_err(|e| format!("sudo nmcli unavailable: {}", e))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("sudo nmcli exited with status {}", output.status)
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 fn split_nmcli_terse_line(line: &str) -> Vec<String> {
     let mut fields = Vec::new();
     let mut current = String::new();
@@ -2358,7 +2357,7 @@ fn scanned_wifi_security_for_ssid(status: &serde_json::Value, ssid: &str) -> Opt
 }
 
 fn update_saved_wifi_password(uuid: &str, ssid: &str, password: &str) -> Result<(), String> {
-    nmcli_output(&[
+    nmcli_output_privileged(&[
         "connection",
         "modify",
         "uuid",
@@ -2791,14 +2790,12 @@ fn handle_connection(
     update_state: SharedUpdateState,
     source_dir_override: Option<String>,
     static_dir: Option<String>,
-    service_restart_url: String,
     auth: Option<(String, String)>,
     shared_config: Option<tetra_config::bluestation::SharedConfig>,
     sessions: SharedSessionStore,
     bs_started_at: Instant,
 ) {
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(500)));
-    let peer_is_loopback = stream.peer_addr().map(|addr| addr.ip().is_loopback()).unwrap_or(false);
 
     // ── Read the first 4KB of headers into a buffer, peek first for routing ──
     // We need to both route on the request line AND read the Authorization header,
@@ -2826,11 +2823,6 @@ fn handle_connection(
     }
     let header_str = String::from_utf8_lossy(&header_buf);
     let req_line = header_str.lines().next().unwrap_or("").to_string();
-    let internal_update_restart = peer_is_loopback
-        && request_matches(&req_line, "POST", "/api/service/restart")
-        && header_str
-            .lines()
-            .any(|line| line.trim().eq_ignore_ascii_case(DASHBOARD_INTERNAL_RESTART_HEADER));
 
     if request_matches(&req_line, "GET", "/api/auth/status") {
         let mut buf = BufReader::new(stream);
@@ -2938,7 +2930,7 @@ fn handle_connection(
         }
 
         // All other routes require a valid session.
-        if !internal_update_restart && !session_ok {
+        if !session_ok {
             let mut buf = BufReader::new(stream);
             loop {
                 let mut line = String::new();
@@ -3284,10 +3276,9 @@ fn handle_connection(
         }
         tracing::info!("Dashboard: Debian package update triggered for {}", deb.version);
         let update_clone = Arc::clone(&update_state);
-        let service_restart_url_clone = service_restart_url.clone();
         std::thread::Builder::new()
             .name("deb-update".into())
-            .spawn(move || run_deb_update(update_clone, service_restart_url_clone, deb))
+            .spawn(move || run_deb_update(update_clone, deb))
             .ok();
         http_json_response(buf.into_inner(), 200, r#"{"ok":true,"message":"package update started"}"#);
     } else if request_matches(&req_line, "GET", "/api/config/backup") {

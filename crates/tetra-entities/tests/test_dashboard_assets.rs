@@ -32,6 +32,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let source_install_path = root.join("scripts/install-from-source.sh");
     let factory_reset_helper_path = root.join("scripts/nexus-bs-factory-reset-clean");
     let dashboard_server_path = root.join("crates/tetra-entities/src/net_dashboard/server.rs");
+    let wifi_rs_path = root.join("crates/tetra-entities/src/wifi.rs");
     let core_unit_path = root.join("contrib/systemd/nexus-bs.service");
     let control_unit_path = root.join("contrib/systemd/nexus-bs-control.service");
     let dashboard_unit_path = root.join("contrib/systemd/nexus-bs-dashboard.service");
@@ -51,6 +52,7 @@ fn external_dashboard_asset_manifest_is_coherent() {
     let source_install = std::fs::read_to_string(&source_install_path).expect("source installer should exist");
     let factory_reset_helper = std::fs::read_to_string(&factory_reset_helper_path).expect("factory reset helper should exist");
     let dashboard_server = std::fs::read_to_string(&dashboard_server_path).expect("dashboard server source should exist");
+    let wifi_rs = std::fs::read_to_string(&wifi_rs_path).expect("Wi-Fi helper source should exist");
     let core_unit = std::fs::read_to_string(&core_unit_path).expect("core systemd unit should exist");
     let control_unit = std::fs::read_to_string(&control_unit_path).expect("control systemd unit should exist");
     let dashboard_unit = std::fs::read_to_string(&dashboard_unit_path).expect("dashboard systemd unit should exist");
@@ -232,8 +234,22 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && app.contains("wifiNetworkDetail")
             && app.contains(r#"fetch("/api/wifi""#)
             && app.contains(r#"fetchWithTimeout("/api/wifi/scan""#)
-            && app.contains(r#"fetchWithTimeout("/api/wifi/connect""#),
-        "Settings must expose Wi-Fi scan/select/connect controls backed by dashboard API endpoints"
+            && app.contains(r#"fetchWithTimeout("/api/wifi/connect""#)
+            && wifi_rs.contains("run_nmcli_privileged")
+            && wifi_rs.contains(r#"sudo_args.push("nmcli")"#)
+            && dashboard_server.contains("nmcli_output_privileged")
+            && deb_postinst.contains("/usr/bin/nmcli *, /bin/nmcli *"),
+        "Settings must expose Wi-Fi scan/select/connect controls and privileged nmcli write paths"
+    );
+    assert!(
+        css.contains(".update-log")
+            && css.contains("height: clamp(156px, 24vh, 260px)")
+            && css.contains("max-height: 260px")
+            && css.contains(".calibration-log")
+            && css.contains("height: clamp(128px, 22vh, 220px)")
+            && css.contains("max-height: 220px")
+            && css.contains("overscroll-behavior: contain"),
+        "Update and calibration logs must stay fixed-size and manually scrollable"
     );
     assert!(
         index.contains(r#"id="logAutoScrollBtn""#)
@@ -491,27 +507,32 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && dashboard_server.contains("nexus_bs_cache_bust")
             && dashboard_server.contains("Cache-Control: no-cache")
             && dashboard_server.contains(r#"run_update_command_capture(&update, "sha256sum", &[deb_path_str])"#)
-            && dashboard_server.contains("finish_deb_update_with_dashboard_restart_api")
-            && dashboard_server.contains("post_dashboard_service_restart_api")
-            && dashboard_server.contains("Finishing update by calling dashboard Restart BS API")
-            && dashboard_server.contains("Dashboard Restart BS API accepted")
-            && dashboard_server.contains("POST {path} HTTP/1.1")
-            && dashboard_server.contains("X-Nexus-BS-Internal-Update-Restart: 1")
+            && dashboard_server.contains("Stopping Nexus-BS core/control services before package install")
+            && dashboard_server.contains(
+                r#"run_update_command_privileged(&update, "systemctl", &["stop", "nexus-bs.service", "nexus-bs-control.service"])"#
+            )
             && dashboard_server.contains(r#"request_matches(&req_line, "POST", "/api/service/restart")"#)
-            && dashboard_server.contains("eq_ignore_ascii_case(DASHBOARD_INTERNAL_RESTART_HEADER)")
-            && !dashboard_server.contains("run_update_stop_bs_services")
-            && !dashboard_server.contains("run_update_post_install_start")
-            && !dashboard_server.contains("Ensuring Nexus-BS core/control services are fully stopped after package install")
-            && !dashboard_server.contains("Waiting 5s before starting Nexus-BS services")
-            && !dashboard_server.contains(r#"&["start", "nexus-bs-control.service"]"#)
-            && !dashboard_server.contains(r#"&["start", "nexus-bs.service"]"#)
-            && !dashboard_server.contains("Scheduling dashboard service restart in")
-            && !dashboard_server.contains("systemctl --no-block restart nexus-bs-dashboard.service")
+            && dashboard_server.contains("finish_deb_update_with_aligned_services")
+            && !dashboard_server.contains("finish_deb_update_with_dashboard_restart_api")
+            && !dashboard_server.contains("post_dashboard_service_restart_api")
+            && !dashboard_server.contains("Finishing update by calling dashboard Restart BS API")
+            && !dashboard_server.contains("Dashboard Restart BS API accepted")
+            && dashboard_server.contains("Waiting 5s before starting Nexus-BS services")
+            && dashboard_server.contains(r#"&["start", "nexus-bs-control.service"]"#)
+            && dashboard_server.contains(r#"&["start", "nexus-bs.service"]"#)
+            && dashboard_server.contains(r#"&["--no-block", "restart", "nexus-bs-dashboard.service"]"#)
             && !dashboard_server.contains(r#"&["restart", "nexus-bs.service"]"#)
             && dashboard_server.contains("update_process_runs_as_root")
             && !dashboard_server.contains("systemctl restart nexus-bs-dashboard.service || sudo -n")
             && deb_postinst.contains("install_dashboard_sudoers")
+            && deb_postinst.contains("schedule_postinst_service_realign")
+            && deb_postinst.contains("systemctl is-active --quiet nexus-bs-dashboard.service")
+            && deb_postinst.contains("systemctl is-active --quiet nexus-bs.service")
+            && deb_postinst.contains("systemctl is-active --quiet nexus-bs-control.service")
+            && deb_postinst.contains("systemd-run")
+            && deb_postinst.contains(r#"--unit="nexus-bs-postinst-realign-$$""#)
             && deb_postinst.contains("/usr/bin/apt-get install -y /tmp/nexus-bs-update/nexus-bs_*.deb")
+            && deb_postinst.contains("/usr/bin/nmcli *, /bin/nmcli *")
             && deb_postinst.contains("/usr/bin/systemctl stop nexus-bs.service nexus-bs-control.service")
             && deb_postinst
                 .contains("/usr/bin/systemctl reset-failed nexus-bs.service nexus-bs-control.service nexus-bs-dashboard.service")

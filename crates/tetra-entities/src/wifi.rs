@@ -223,7 +223,7 @@ pub fn connect_saved(uuid: &str) -> Result<(), WifiError> {
     // --wait gives nmcli up to 12 s to actually associate before returning;
     // without it nmcli returns immediately after starting the connection and
     // the dashboard never knows whether it worked.
-    run_nmcli(&["--wait", "12", "connection", "up", "uuid", uuid])?;
+    run_nmcli_privileged(&["--wait", "12", "connection", "up", "uuid", uuid])?;
     Ok(())
 }
 
@@ -243,20 +243,20 @@ pub fn connect_new(ssid: &str, psk: &str, hidden: bool) -> Result<(), WifiError>
         args.push("hidden");
         args.push("yes");
     }
-    run_nmcli(&args)?;
+    run_nmcli_privileged(&args)?;
     Ok(())
 }
 
 /// Disconnect the active Wi-Fi connection. This *deactivates* the profile but
 /// keeps it saved — calling `connect_saved` later re-uses the stored PSK.
 pub fn disconnect(iface: &str) -> Result<(), WifiError> {
-    run_nmcli(&["device", "disconnect", iface])?;
+    run_nmcli_privileged(&["device", "disconnect", iface])?;
     Ok(())
 }
 
 /// Delete a saved profile entirely. Use this for "forget this network".
 pub fn forget(uuid: &str) -> Result<(), WifiError> {
-    run_nmcli(&["connection", "delete", "uuid", uuid])?;
+    run_nmcli_privileged(&["connection", "delete", "uuid", uuid])?;
     Ok(())
 }
 
@@ -264,7 +264,7 @@ pub fn forget(uuid: &str) -> Result<(), WifiError> {
 /// host is on Ethernet and the operator wants to silence Wi-Fi for power
 /// reasons.
 pub fn set_radio(enabled: bool) -> Result<(), WifiError> {
-    run_nmcli(&["radio", "wifi", if enabled { "on" } else { "off" }])?;
+    run_nmcli_privileged(&["radio", "wifi", if enabled { "on" } else { "off" }])?;
     Ok(())
 }
 
@@ -349,7 +349,33 @@ pub fn status() -> Result<WifiStatus, WifiError> {
 /// poll interval is short enough that human-perceived latency on success
 /// (nmcli returns in 2-3 s typically) is unaffected.
 fn run_nmcli(args: &[&str]) -> Result<String, WifiError> {
-    let mut child = match Command::new("nmcli")
+    run_nmcli_command("nmcli", args)
+}
+
+fn run_nmcli_privileged(args: &[&str]) -> Result<String, WifiError> {
+    if process_runs_as_root() {
+        return run_nmcli(args);
+    }
+
+    let mut sudo_args = Vec::with_capacity(args.len() + 2);
+    sudo_args.push("-n");
+    sudo_args.push("nmcli");
+    sudo_args.extend_from_slice(args);
+    run_nmcli_command("sudo", &sudo_args)
+}
+
+fn process_runs_as_root() -> bool {
+    Command::new("id")
+        .arg("-u")
+        .output()
+        .ok()
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|uid| uid.trim() == "0")
+        .unwrap_or(false)
+}
+
+fn run_nmcli_command(program: &str, args: &[&str]) -> Result<String, WifiError> {
+    let mut child = match Command::new(program)
         .args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -360,7 +386,7 @@ fn run_nmcli(args: &[&str]) -> Result<String, WifiError> {
             // Distinguish "not installed" (ENOENT) from other IO errors so
             // the UI can show a helpful install hint instead of a generic
             // exec error.
-            if e.kind() == std::io::ErrorKind::NotFound {
+            if e.kind() == std::io::ErrorKind::NotFound && program == "nmcli" {
                 return Err(WifiError::NotAvailable);
             }
             return Err(WifiError::Io(e.to_string()));

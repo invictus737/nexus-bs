@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 
 [Unit]
-Description=Nexus-BS v0.1.77 external dashboard front-end
+Description=Nexus-BS v0.1.78 external dashboard front-end
 Documentation=man:systemd.service(5)
 After=network-online.target nexus-bs.service
 Wants=network-online.target nexus-bs.service

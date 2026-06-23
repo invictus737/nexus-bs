@@ -74,6 +74,37 @@ sudo apt install /tmp/nexus-bs_NEW_VERSION_arm64.deb
 nexus-bs-service restart
 ```
 
+Dashboard-driven package update/downgrade must follow the same clean-service
+contract as a manual install:
+
+1. Stop `nexus-bs.service` and `nexus-bs-control.service` before package
+   installation.
+2. Install the selected `.deb` with `apt-get install -y`.
+3. Run `systemctl daemon-reload`.
+4. Run `systemctl reset-failed` for the Nexus-BS services.
+5. Wait 5 seconds so RF drops cleanly and terminals re-affiliate.
+6. Start `nexus-bs-control.service`.
+7. Start `nexus-bs.service`.
+8. Restart `nexus-bs-dashboard.service` from the installed package.
+
+Do not finish package updates by calling the dashboard Restart BS HTTP API from
+inside the updating dashboard process. That created mixed-version windows where
+the dashboard and core used different internal telemetry protocol versions, so
+telemetry WebSocket handshakes could fail until a full OS reboot.
+
+Because a dashboard self-update starts from the old dashboard binary, the
+package `postinst` also schedules a root-side service realignment when the
+dashboard and at least one core/control service were still active during
+install. Keep that safety net in the package scripts: it is what lets a newly
+installed `.deb` repair an update initiated by an older dashboard without
+forcing a full OS reboot.
+
+The dashboard sudoers file is intentionally narrow. It grants package update,
+Nexus-BS service lifecycle, host poweroff, factory reset helper, and `nmcli`
+for Wi-Fi profile changes. If Wi-Fi connect fails from the dashboard but works
+with `sudo nmcli` on the host, inspect `/etc/sudoers.d/nexus-bs-dashboard` and
+reinstall the package so `postinst` refreshes it.
+
 ## Clean Reinstall / Recovery
 
 Use this when a target has stale manual systemd units or a broken package
@@ -83,9 +114,9 @@ then prints service status and logs:
 
 ```sh
 cd /tmp
-curl -fL -o nexus-bs_0.1.77_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.77/nexus-bs_0.1.77_arm64.deb
-curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/v0.1.77/scripts/tetrahs-reinstall-nexus-bs.sh
-sudo env DEB_PATH=/tmp/nexus-bs_0.1.77_arm64.deb bash /tmp/nexus-bs-reinstall.sh
+curl -fL -o nexus-bs_0.1.78_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.78/nexus-bs_0.1.78_arm64.deb
+curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/v0.1.78/scripts/tetrahs-reinstall-nexus-bs.sh
+sudo env DEB_PATH=/tmp/nexus-bs_0.1.78_arm64.deb bash /tmp/nexus-bs-reinstall.sh
 ```
 
 Expected live config permissions after install:
