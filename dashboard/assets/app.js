@@ -1299,7 +1299,7 @@ async function requestFactoryReset() {
     });
     const body = await res.json().catch(() => ({}));
     if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
-    setText("factoryResetStatus", body.message || "Factory reset accepted. Host shutdown queued.");
+    setText("factoryResetStatus", body.message || "Factory reset accepted. Host shutdown accepted.");
     setServiceStatus("factory reset queued");
   } catch (error) {
     setText("factoryResetStatus", `reset failed: ${String(error.message || error).slice(0, 120)}`);

@@ -203,13 +203,8 @@ pub fn schedule_service_action(action: ServiceAction, delay: Duration) {
         .spawn(move || {
             std::thread::sleep(delay);
             if matches!(action, ServiceAction::PowerOffHost) {
-                match run_host_poweroff() {
-                    Ok(()) => {
-                        tracing::warn!("Service control: host poweroff requested");
-                        if let Some(lifecycle) = LIFECYCLE_CONTROL.get() {
-                            lifecycle.running.store(false, Ordering::SeqCst);
-                        }
-                    }
+                match request_host_poweroff() {
+                    Ok(()) => {}
                     Err(e) => tracing::error!("Service control: host poweroff failed: {}", e),
                 }
                 return;
@@ -236,6 +231,19 @@ pub fn schedule_service_action(action: ServiceAction, delay: Duration) {
             }
         })
         .ok();
+}
+
+pub fn request_host_poweroff() -> Result<(), String> {
+    match run_host_poweroff() {
+        Ok(()) => {
+            tracing::warn!("Service control: host poweroff requested");
+            if let Some(lifecycle) = LIFECYCLE_CONTROL.get() {
+                lifecycle.running.store(false, Ordering::SeqCst);
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
 }
 
 pub fn force_process_restart_after(delay: Duration, reason: &'static str) {

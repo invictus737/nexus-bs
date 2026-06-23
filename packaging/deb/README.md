@@ -83,9 +83,9 @@ then prints service status and logs:
 
 ```sh
 cd /tmp
-curl -fL -o nexus-bs_0.1.76_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.76/nexus-bs_0.1.76_arm64.deb
-curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/main/scripts/tetrahs-reinstall-nexus-bs.sh
-sudo env DEB_PATH=/tmp/nexus-bs_0.1.76_arm64.deb bash /tmp/nexus-bs-reinstall.sh
+curl -fL -o nexus-bs_0.1.77_arm64.deb https://github.com/invictus737/nexus-bs/releases/download/v0.1.77/nexus-bs_0.1.77_arm64.deb
+curl -fL -o nexus-bs-reinstall.sh https://github.com/invictus737/nexus-bs/raw/v0.1.77/scripts/tetrahs-reinstall-nexus-bs.sh
+sudo env DEB_PATH=/tmp/nexus-bs_0.1.77_arm64.deb bash /tmp/nexus-bs-reinstall.sh
 ```
 
 Expected live config permissions after install:

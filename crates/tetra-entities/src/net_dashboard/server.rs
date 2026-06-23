@@ -1549,6 +1549,39 @@ fn serve_service_command(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>
     }
 }
 
+fn serve_service_shutdown(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
+    let control_accepted = send_control_cmd(cmd_tx, ControlCommand::PowerOffHost);
+    match crate::service_control::request_host_poweroff() {
+        Ok(()) => {
+            tracing::warn!(
+                "Dashboard: host shutdown requested; local dashboard poweroff accepted, core command accepted={}",
+                control_accepted
+            );
+            let body = serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "action": "host shutdown",
+                "message": "host shutdown accepted",
+                "control_poweroff_queued": control_accepted,
+                "local_poweroff_accepted": true,
+            }))
+            .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+            http_json_response(stream, 200, &body);
+        }
+        Err(err) => {
+            tracing::error!("Dashboard: host shutdown failed through local dashboard path: {}", err);
+            let body = serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "action": "host shutdown",
+                "error": format!("host shutdown failed: {}", err),
+                "control_poweroff_queued": control_accepted,
+                "local_poweroff_accepted": false,
+            }))
+            .unwrap_or_else(|_| r#"{"ok":false,"error":"host shutdown failed"}"#.to_string());
+            http_json_response(stream, 500, &body);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EasyStartRequest {
     mcc: u16,
@@ -1897,37 +1930,42 @@ fn serve_easy_start_preview(stream: TcpStream, value: &serde_json::Value) {
     );
 }
 
+fn commit_easy_start_config(
+    config_path: &str,
+    cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    req: &EasyStartRequest,
+) -> Result<serde_json::Value, String> {
+    let (toml, plan) = render_easy_start_config(req)?;
+    let backup_path = format!("{}.bak", config_path);
+    if let Err(e) = std::fs::copy(config_path, &backup_path) {
+        tracing::warn!("Dashboard: Easy Start config backup failed: {}", e);
+    }
+    write_dashboard_config_file(Path::new(config_path), &toml).map_err(|e| format!("failed to write config.toml: {}", e))?;
+    write_active_config_marker(config_path, &active_config_filename(config_path))?;
+    clear_dashboard_config_cache(config_path);
+    mark_easy_start(config_path, EASY_START_DONE_MARKER)?;
+    let restart_accepted = send_control_cmd(cmd_tx, ControlCommand::RestartService);
+    if !restart_accepted {
+        crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(2));
+    }
+    tracing::warn!("Dashboard: Easy Start committed config and queued service restart");
+    let mut body = easy_start_preview_json(req, plan, None);
+    if let Some(obj) = body.as_object_mut() {
+        obj.insert("restart_queued".to_string(), serde_json::Value::Bool(true));
+        obj.insert(
+            "message".to_string(),
+            serde_json::Value::String(if restart_accepted {
+                "Config saved. Nexus-BS restart queued.".to_string()
+            } else {
+                "Config saved. Restart scheduled through service manager.".to_string()
+            }),
+        );
+    }
+    Ok(body)
+}
+
 fn serve_easy_start_commit(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, value: &serde_json::Value) {
-    let response = match parse_easy_start_request(value).and_then(|req| {
-        let (toml, plan) = render_easy_start_config(&req)?;
-        let backup_path = format!("{}.bak", config_path);
-        if let Err(e) = std::fs::copy(config_path, &backup_path) {
-            tracing::warn!("Dashboard: Easy Start config backup failed: {}", e);
-        }
-        write_dashboard_config_file(Path::new(config_path), &toml).map_err(|e| format!("failed to write config.toml: {}", e))?;
-        mark_easy_start(config_path, EASY_START_DONE_MARKER)?;
-        let restart_accepted = send_control_cmd(cmd_tx, ControlCommand::RestartService);
-        if !restart_accepted {
-            crate::service_control::schedule_service_action(
-                crate::service_control::ServiceAction::Restart,
-                std::time::Duration::from_secs(2),
-            );
-        }
-        tracing::warn!("Dashboard: Easy Start committed config and queued service restart");
-        let mut body = easy_start_preview_json(&req, plan, None);
-        if let Some(obj) = body.as_object_mut() {
-            obj.insert("restart_queued".to_string(), serde_json::Value::Bool(true));
-            obj.insert(
-                "message".to_string(),
-                serde_json::Value::String(if restart_accepted {
-                    "Config saved. Nexus-BS restart queued.".to_string()
-                } else {
-                    "Config saved. Restart scheduled through service manager.".to_string()
-                }),
-            );
-        }
-        Ok(body)
-    }) {
+    let response = match parse_easy_start_request(value).and_then(|req| commit_easy_start_config(config_path, cmd_tx, &req)) {
         Ok(body) => (200, body),
         Err(err) => (400, serde_json::json!({"ok": false, "error": err})),
     };
@@ -2014,22 +2052,32 @@ fn serve_factory_reset(stream: TcpStream, cmd_tx: &Arc<Mutex<Option<CmdSender>>>
             );
         }
     };
-    let poweroff_accepted = send_control_cmd(cmd_tx, ControlCommand::PowerOffHost);
-    crate::service_control::schedule_service_action(
-        crate::service_control::ServiceAction::PowerOffHost,
-        std::time::Duration::from_secs(3),
-    );
+    let control_poweroff_accepted = send_control_cmd(cmd_tx, ControlCommand::PowerOffHost);
+    if let Err(err) = crate::service_control::request_host_poweroff() {
+        tracing::error!("Dashboard: factory reset cleanup completed but host shutdown failed: {}", err);
+        let body = serde_json::json!({
+            "ok": false,
+            "error": format!("Factory reset cleanup completed, but host shutdown failed: {}", err),
+            "cleanup_log": cleanup.cleanup_log,
+            "control_poweroff_queued": control_poweroff_accepted,
+        });
+        return http_json_response(
+            stream,
+            500,
+            &serde_json::to_string(&body).unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+        );
+    }
     tracing::warn!(
         "Dashboard: factory reset requested; privileged cleanup completed: {:?}",
         cleanup.cleanup_log
     );
     let body = serde_json::json!({
         "ok": true,
-        "message": "Factory reset accepted. Wi-Fi, configs, and SSH keys were cleared. Host shutdown queued.",
+        "message": "Factory reset accepted. Wi-Fi, configs, and SSH keys were cleared. Host shutdown accepted.",
         "cleanup_log": cleanup.cleanup_log,
-        "poweroff_queued": true,
-        "control_poweroff_queued": poweroff_accepted,
-        "local_poweroff_fallback_queued": true,
+        "poweroff_accepted": true,
+        "control_poweroff_queued": control_poweroff_accepted,
+        "local_poweroff_accepted": true,
     });
     http_json_response(
         stream,
@@ -2968,7 +3016,7 @@ fn handle_connection(
         serve_service_command(stream, &cmd_tx, "restart", ControlCommand::RestartService);
     } else if request_matches(&req_line, "POST", "/api/service/shutdown") {
         drain_http_headers(&mut stream);
-        serve_service_command(stream, &cmd_tx, "host shutdown", ControlCommand::PowerOffHost);
+        serve_service_shutdown(stream, &cmd_tx);
     } else if request_matches(&req_line, "POST", "/api/service/stop-go") {
         drain_http_headers(&mut stream);
         serve_service_command(stream, &cmd_tx, "stop-go", ControlCommand::StopGoService { start_delay_secs: 5 });
@@ -3757,6 +3805,14 @@ fn cached_active_dashboard_config(config_path: &str) -> Result<tetra_config::blu
         },
     );
     Ok(config)
+}
+
+fn clear_dashboard_config_cache(config_path: &str) {
+    if let Some(cache) = DASHBOARD_CONFIG_CACHE.get() {
+        if let Ok(mut guard) = cache.lock() {
+            guard.remove(config_path);
+        }
+    }
 }
 
 fn dashboard_site_json(
@@ -5870,6 +5926,55 @@ mod tests {
         assert!(second_site.contains("\"main_carrier\":1545"));
         assert!(second_site.contains("\"tx_hz\":438625000.0"));
         assert!(!second_site.contains("\"main_carrier\":1534"));
+    }
+
+    #[test]
+    fn easy_start_commit_reselects_runtime_config_after_stale_active_marker() {
+        let dir = temp_config_dir("easy-start-active-marker");
+        let config_path = dir.join("config.toml");
+        let stale_profile = dir.join("config_template.toml");
+        let mut req = EasyStartRequest {
+            mcc: 901,
+            mnc: 9999,
+            timezone: "Europe/Bucharest".to_string(),
+            tx_freq: 438_362_500,
+            duplex_spacing: 1,
+            custom_spacing_enabled: false,
+            custom_spacing_hz: None,
+            brew_enabled: false,
+            brew_host: "core.tetrapack.online".to_string(),
+            brew_port: 443,
+            brew_tls: true,
+            brew_username: 123_456_789,
+            brew_password: "".to_string(),
+        };
+        let (stale, _) = render_easy_start_config(&req).expect("stale profile config");
+        fs::write(&config_path, &stale).expect("write runtime config");
+        fs::write(&stale_profile, stale).expect("write stale profile");
+        write_active_config_marker(config_path.to_string_lossy().as_ref(), "config_template.toml").expect("write stale marker");
+        let dashboard = DashboardServer::new(config_path.to_string_lossy().to_string());
+
+        let stale_site = dashboard_site_json(&dashboard.state, &None, config_path.to_string_lossy().as_ref());
+        assert!(stale_site.contains("\"main_carrier\":1534"));
+
+        req.tx_freq = 438_625_000;
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let cmd_tx = Arc::new(Mutex::new(Some(tx)));
+        commit_easy_start_config(config_path.to_string_lossy().as_ref(), &cmd_tx, &req).expect("commit Easy Start config");
+
+        assert_eq!(
+            read_active_config_marker(config_path.to_string_lossy().as_ref()).as_deref(),
+            Some("config.toml")
+        );
+        assert!(matches!(
+            rx.try_recv().expect("restart command queued"),
+            ControlCommand::RestartService
+        ));
+
+        let updated_site = dashboard_site_json(&dashboard.state, &None, config_path.to_string_lossy().as_ref());
+        assert!(updated_site.contains("\"main_carrier\":1545"));
+        assert!(updated_site.contains("\"tx_hz\":438625000.0"));
+        assert!(!updated_site.contains("\"main_carrier\":1534"));
     }
 
     #[test]
