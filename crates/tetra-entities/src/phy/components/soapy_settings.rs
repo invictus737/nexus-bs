@@ -117,6 +117,7 @@ impl SdrSettings {
     /// Get settings based on SDR type and SoapySDR configuration
     pub fn get_settings(cfg: &CfgSoapySdr, device: SupportedDevice, mode: StackMode) -> Result<Self, Error> {
         let mut settings = Self::get_defaults(cfg, device, mode);
+        Self::apply_tx_gain_profile_defaults(cfg, &mut settings);
 
         // Override settings if specified in configuration
         if let Some(fs) = cfg.fs {
@@ -164,6 +165,25 @@ impl SdrSettings {
         let _ = DETECTED_SDR_NAME.set(settings.name.clone());
 
         Ok(settings)
+    }
+
+    fn apply_tx_gain_profile_defaults(cfg: &CfgSoapySdr, settings: &mut Self) {
+        match cfg.tx_gain_profile.as_str() {
+            "low_drive_calibration" => {
+                offset_gains(&mut settings.rx_gain, -6.0);
+                offset_gains(&mut settings.tx_gain, -6.0);
+            }
+            "nominal_clean" => {}
+            "pa_drive_linear" => {
+                offset_gains(&mut settings.rx_gain, -3.0);
+                offset_gains(&mut settings.tx_gain, 3.0);
+            }
+            "max_test_only" => {
+                offset_gains(&mut settings.rx_gain, -6.0);
+                offset_gains(&mut settings.tx_gain, 6.0);
+            }
+            _ => {}
+        }
     }
 
     /// Get default settings based on SDR type
@@ -353,6 +373,12 @@ impl SdrSettings {
     }
 }
 
+fn offset_gains(gains: &mut [(String, f64)], delta_db: f64) {
+    for (_, gain) in gains.iter_mut() {
+        *gain = (*gain + delta_db).max(0.0);
+    }
+}
+
 /// Get processing block size in samples for a given sample rate.
 /// This can be used to optimize performance for some SDRs.
 pub fn block_size(fs: f64) -> usize {
@@ -399,5 +425,46 @@ mod tests {
 
         assert_eq!(settings.rx_gain, vec![("LNA".to_string(), 42.0), ("PGA".to_string(), 16.0)]);
         assert_eq!(settings.tx_gain, vec![("DAC".to_string(), 9.0), ("MIXER".to_string(), 30.0)]);
+    }
+
+    #[test]
+    fn sxceiver_low_drive_profile_offsets_default_rx_tx_gains() {
+        let mut cfg = minimal_soapy_cfg();
+        cfg.tx_gain_profile = "low_drive_calibration".to_string();
+        let settings = match SdrSettings::get_settings(&cfg, SupportedDevice::SXceiver, StackMode::Bs) {
+            Ok(settings) => settings,
+            Err(_) => panic!("SXceiver low-drive profile must be valid"),
+        };
+
+        assert_eq!(settings.rx_gain, vec![("LNA".to_string(), 36.0), ("PGA".to_string(), 10.0)]);
+        assert_eq!(settings.tx_gain, vec![("DAC".to_string(), 3.0), ("MIXER".to_string(), 24.0)]);
+    }
+
+    #[test]
+    fn pluto_low_drive_profile_offsets_generic_soapy_gains() {
+        let mut cfg = minimal_soapy_cfg();
+        cfg.tx_gain_profile = "low_drive_calibration".to_string();
+        let settings = match SdrSettings::get_settings(&cfg, SupportedDevice::PlutoSdr, StackMode::Bs) {
+            Ok(settings) => settings,
+            Err(_) => panic!("Pluto low-drive profile must be valid"),
+        };
+
+        assert_eq!(settings.rx_gain, vec![("PGA".to_string(), 14.0)]);
+        assert_eq!(settings.tx_gain, vec![("PGA".to_string(), 83.0)]);
+    }
+
+    #[test]
+    fn explicit_gains_override_tx_gain_profile_defaults() {
+        let mut cfg = minimal_soapy_cfg();
+        cfg.tx_gain_profile = "low_drive_calibration".to_string();
+        cfg.tx_gains.insert("dac".to_string(), 8.0);
+        cfg.rx_gains.insert("lna".to_string(), 40.0);
+        let settings = match SdrSettings::get_settings(&cfg, SupportedDevice::SXceiver, StackMode::Bs) {
+            Ok(settings) => settings,
+            Err(_) => panic!("explicit gains must override profile defaults"),
+        };
+
+        assert_eq!(settings.rx_gain, vec![("LNA".to_string(), 40.0), ("PGA".to_string(), 10.0)]);
+        assert_eq!(settings.tx_gain, vec![("DAC".to_string(), 8.0), ("MIXER".to_string(), 24.0)]);
     }
 }

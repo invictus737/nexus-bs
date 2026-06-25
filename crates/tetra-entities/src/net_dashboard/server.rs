@@ -59,6 +59,7 @@ const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
 const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
 const EASY_START_TEMPLATE_TOML: &str = include_str!("../../../../example_config/config_template.toml");
 const EASY_START_DONE_MARKER: &str = ".easy-start-done";
+const SMART_RF_TUNE_RESTART_WARMUP_SECS: u64 = 20;
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct SmartRfTuneState {
@@ -80,20 +81,16 @@ struct SmartRfTuneState {
 struct SmartRfTuneCandidate {
     name: String,
     tx_gain_profile: String,
-    tx_gain_dac: f64,
-    tx_gain_mixer: f64,
-    rx_gain_lna: f64,
-    rx_gain_pga: f64,
+    tx_gains: Vec<(String, f64)>,
+    rx_gains: Vec<(String, f64)>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct SmartRfTuneResult {
     name: String,
     tx_gain_profile: String,
-    tx_gain_dac: f64,
-    tx_gain_mixer: f64,
-    rx_gain_lna: f64,
-    rx_gain_pga: f64,
+    tx_gains: Vec<(String, f64)>,
+    rx_gains: Vec<(String, f64)>,
     measured: bool,
     score: f64,
     rms_evm_pct: Option<f64>,
@@ -2613,6 +2610,571 @@ fn serve_rf_calibration_status(stream: TcpStream, config_path: &str) {
     http_json_response(stream, 200, &body);
 }
 
+fn serve_smart_rf_tune_status(stream: TcpStream) {
+    let body = serde_json::to_string(&smart_rf_tune_snapshot()).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+    http_json_response(stream, 200, &body);
+}
+
+fn serve_smart_rf_tune_start(
+    stream: TcpStream,
+    state: &DashboardState,
+    config_path: &str,
+    rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+) {
+    let (active_calls, sdr_health) = match state.read() {
+        Ok(snapshot) => (snapshot.snapshot_calls(), snapshot.last_sdr_health.clone()),
+        Err(_) => {
+            http_json_response(stream, 503, r#"{"ok":false,"error":"dashboard state unavailable"}"#);
+            return;
+        }
+    };
+    if !active_calls.is_empty() {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": "Smart RF Tune refused while calls are active",
+            "calls": active_calls,
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 423, &body);
+        return;
+    }
+    let Some(sdr_health) = sdr_health else {
+        http_json_response(stream, 409, r#"{"ok":false,"error":"waiting for live Soapy SDR gain readback"}"#);
+        return;
+    };
+    if sdr_health.tx_gains.is_empty() && sdr_health.rx_gains.is_empty() {
+        http_json_response(
+            stream,
+            409,
+            r#"{"ok":false,"error":"Soapy SDR did not report tunable gain elements"}"#,
+        );
+        return;
+    }
+    if let Err(err) = smart_rf_tune_begin(config_path, &sdr_health) {
+        let body = serde_json::to_string(&serde_json::json!({"ok": false, "error": err})).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 409, &body);
+        return;
+    }
+
+    let config_path = config_path.to_string();
+    let sdr_health_for_worker = sdr_health.clone();
+    let rf_cmd_tx = Arc::clone(rf_cmd_tx);
+    let phy_cmd_tx = Arc::clone(phy_cmd_tx);
+    let core_cmd_tx = Arc::clone(core_cmd_tx);
+    if let Err(err) = std::thread::Builder::new().name("smart-rf-tune".into()).spawn(move || {
+        run_smart_rf_tune_orchestrator(config_path, sdr_health_for_worker, rf_cmd_tx, phy_cmd_tx, core_cmd_tx);
+    }) {
+        smart_rf_tune_fail(format!("failed to start Smart RF Tune worker: {}", err));
+        let body = serde_json::to_string(&serde_json::json!({"ok": false, "error": "failed to start Smart RF Tune worker"}))
+            .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 503, &body);
+        return;
+    }
+
+    let body = serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "status": "running",
+        "message": "Smart RF Tune started; RF service will restart and run measured gain candidates",
+    }))
+    .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+    http_json_response(stream, 202, &body);
+}
+
+fn run_smart_rf_tune_orchestrator(
+    config_path: String,
+    sdr_health: crate::net_dashboard::state::SdrHealthSnapshot,
+    rf_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
+    phy_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
+    core_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
+) {
+    let base_config = match std::fs::read_to_string(&config_path) {
+        Ok(text) => text,
+        Err(err) => {
+            smart_rf_tune_fail(format!("read active config failed: {}", err));
+            return;
+        }
+    };
+    let current_profile = cached_active_dashboard_config(&config_path)
+        .ok()
+        .and_then(|cfg| cfg.phy_io.soapysdr.map(|soapy| soapy.tx_gain_profile))
+        .unwrap_or_else(|| tetra_config::bluestation::TX_GAIN_PROFILE_DEFAULT.to_string());
+    let candidates = smart_rf_tune_candidates(&sdr_health, &current_profile);
+    if candidates.is_empty() {
+        smart_rf_tune_fail("no generic Soapy gain candidates could be built from SDR readback");
+        return;
+    }
+    smart_rf_tune_set_total(candidates.len());
+    let mut results = Vec::new();
+    let calibration_path = crate::rf_calibration::calibration_path_for_config(&config_path);
+
+    for (idx, candidate) in candidates.iter().enumerate() {
+        smart_rf_tune_set_candidate(idx + 1, candidate);
+        match apply_smart_rf_tune_candidate_config(&config_path, &base_config, candidate) {
+            Ok(()) => {
+                clear_dashboard_config_cache(&config_path);
+                smart_rf_tune_log("candidate config written; restarting SDR for measured RF run");
+            }
+            Err(err) => {
+                let result = smart_rf_tune_error_result(candidate, format!("config write failed: {}", err));
+                smart_rf_tune_push_result(result.clone());
+                results.push(result);
+                continue;
+            }
+        }
+        restart_core_for_smart_rf_tune(&core_cmd_tx);
+        smart_rf_tune_log(format!(
+            "warm-up {}s after SDR restart; startup RX/TX lost events are ignored",
+            SMART_RF_TUNE_RESTART_WARMUP_SECS
+        ));
+        std::thread::sleep(std::time::Duration::from_secs(SMART_RF_TUNE_RESTART_WARMUP_SECS));
+
+        let result = match run_smart_rf_tune_measurement(&calibration_path, &rf_cmd_tx, &phy_cmd_tx) {
+            Ok(report) => smart_rf_tune_result_from_report(candidate, &report),
+            Err(err) => smart_rf_tune_error_result(candidate, err),
+        };
+        smart_rf_tune_push_result(result.clone());
+        results.push(result);
+        std::thread::sleep(std::time::Duration::from_secs(8));
+    }
+
+    let Some(best) = results
+        .iter()
+        .filter(|result| result.measured && result.rms_evm_pct.is_some())
+        .min_by(|a, b| a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal))
+        .cloned()
+    else {
+        let _ = write_dashboard_config_file(Path::new(&config_path), &base_config);
+        clear_dashboard_config_cache(&config_path);
+        restart_core_for_smart_rf_tune(&core_cmd_tx);
+        smart_rf_tune_fail("Smart RF Tune measured no usable known-symbol RF EVM result; restored starting config");
+        return;
+    };
+
+    let best_candidate = SmartRfTuneCandidate {
+        name: best.name.clone(),
+        tx_gain_profile: best.tx_gain_profile.clone(),
+        tx_gains: best.tx_gains.clone(),
+        rx_gains: best.rx_gains.clone(),
+    };
+    match apply_smart_rf_tune_candidate_config(&config_path, &base_config, &best_candidate) {
+        Ok(()) => {
+            clear_dashboard_config_cache(&config_path);
+            restart_core_for_smart_rf_tune(&core_cmd_tx);
+            smart_rf_tune_finish(best);
+        }
+        Err(err) => {
+            let _ = write_dashboard_config_file(Path::new(&config_path), &base_config);
+            clear_dashboard_config_cache(&config_path);
+            restart_core_for_smart_rf_tune(&core_cmd_tx);
+            smart_rf_tune_fail(format!("best measured config write failed: {}; restored starting config", err));
+        }
+    }
+}
+
+fn smart_rf_tune_state() -> &'static Mutex<SmartRfTuneState> {
+    SMART_RF_TUNE_STATE.get_or_init(|| Mutex::new(SmartRfTuneState::default()))
+}
+
+fn unix_secs_for_dashboard() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+fn smart_rf_tune_snapshot() -> serde_json::Value {
+    let snapshot = smart_rf_tune_state().lock().map(|state| state.clone()).unwrap_or_default();
+    serde_json::json!({
+        "ok": true,
+        "active": snapshot.active,
+        "phase": snapshot.phase,
+        "error": if snapshot.error.is_empty() { serde_json::Value::Null } else { serde_json::json!(snapshot.error) },
+        "started_unix_secs": snapshot.started_unix_secs,
+        "updated_unix_secs": snapshot.updated_unix_secs,
+        "current_index": snapshot.current_index,
+        "total_candidates": snapshot.total_candidates,
+        "best": snapshot.best,
+        "results": snapshot.results,
+        "default_snapshot_path": snapshot.default_snapshot_path,
+        "report_path": snapshot.report_path,
+        "log": snapshot.log,
+    })
+}
+
+fn smart_rf_tune_begin(config_path: &str, sdr_health: &crate::net_dashboard::state::SdrHealthSnapshot) -> Result<(), String> {
+    let mut state = smart_rf_tune_state()
+        .lock()
+        .map_err(|_| "Smart RF Tune state lock poisoned".to_string())?;
+    if state.active {
+        return Err("Smart RF Tune already running".to_string());
+    }
+    if crate::rf_calibration::current_phase().is_active() {
+        return Err(format!(
+            "RF calibration already running: {}",
+            crate::rf_calibration::current_phase().as_str()
+        ));
+    }
+    let config_text = std::fs::read_to_string(config_path).map_err(|err| format!("read active config: {}", err))?;
+    let snapshot_path = smart_rf_tune_default_snapshot_path(config_path);
+    std::fs::write(&snapshot_path, config_text)
+        .map_err(|err| format!("write default tune snapshot {}: {}", snapshot_path.display(), err))?;
+    let now = unix_secs_for_dashboard();
+    *state = SmartRfTuneState {
+        active: true,
+        phase: "starting".to_string(),
+        log: String::new(),
+        error: String::new(),
+        started_unix_secs: now,
+        updated_unix_secs: now,
+        current_index: 0,
+        total_candidates: 0,
+        best: None,
+        results: Vec::new(),
+        default_snapshot_path: snapshot_path.display().to_string(),
+        report_path: smart_rf_tune_report_path(config_path).display().to_string(),
+    };
+    state.append(format!(
+        "Smart RF Tune accepted; starting from TX gains {:?}, RX gains {:?}",
+        sdr_health.tx_gains, sdr_health.rx_gains
+    ));
+    Ok(())
+}
+
+fn smart_rf_tune_set_total(total: usize) {
+    if let Ok(mut state) = smart_rf_tune_state().lock() {
+        state.total_candidates = total;
+        state.phase = "running".to_string();
+        state.updated_unix_secs = unix_secs_for_dashboard();
+        state.append(format!("built {} generic Soapy gain candidates", total));
+    }
+}
+
+fn smart_rf_tune_set_candidate(index: usize, candidate: &SmartRfTuneCandidate) {
+    if let Ok(mut state) = smart_rf_tune_state().lock() {
+        state.current_index = index;
+        state.phase = "measuring".to_string();
+        state.updated_unix_secs = unix_secs_for_dashboard();
+        let total = state.total_candidates;
+        state.append(format!(
+            "candidate {}/{} {} profile={} tx={:?} rx={:?}",
+            index, total, candidate.name, candidate.tx_gain_profile, candidate.tx_gains, candidate.rx_gains
+        ));
+    }
+}
+
+fn smart_rf_tune_push_result(result: SmartRfTuneResult) {
+    if let Ok(mut state) = smart_rf_tune_state().lock() {
+        state.updated_unix_secs = unix_secs_for_dashboard();
+        state.append(format!(
+            "result {} measured={} score={:.3} rms={:?} peak={:?} snr={:?}",
+            result.name, result.measured, result.score, result.rms_evm_pct, result.peak_evm_pct, result.snr_db
+        ));
+        state.results.push(result);
+        write_smart_rf_tune_report_locked(&state);
+    }
+}
+
+fn smart_rf_tune_log(message: impl AsRef<str>) {
+    if let Ok(mut state) = smart_rf_tune_state().lock() {
+        state.updated_unix_secs = unix_secs_for_dashboard();
+        state.append(message.as_ref());
+    }
+}
+
+fn smart_rf_tune_finish(best: SmartRfTuneResult) {
+    if let Ok(mut state) = smart_rf_tune_state().lock() {
+        state.active = false;
+        state.phase = "applied_best".to_string();
+        state.error.clear();
+        state.updated_unix_secs = unix_secs_for_dashboard();
+        state.best = Some(best.clone());
+        state.append(format!(
+            "Smart RF Tune applied best measured candidate {} score={:.3} tx={:?} rx={:?}",
+            best.name, best.score, best.tx_gains, best.rx_gains
+        ));
+        write_smart_rf_tune_report_locked(&state);
+    }
+}
+
+fn smart_rf_tune_fail(error: impl AsRef<str>) {
+    if let Ok(mut state) = smart_rf_tune_state().lock() {
+        state.active = false;
+        state.phase = "failed".to_string();
+        state.error = error.as_ref().to_string();
+        state.updated_unix_secs = unix_secs_for_dashboard();
+        let line = format!("ERROR: {}", state.error);
+        state.append(line);
+        write_smart_rf_tune_report_locked(&state);
+    }
+}
+
+impl SmartRfTuneState {
+    fn append(&mut self, message: impl AsRef<str>) {
+        self.log
+            .push_str(&format!("[{}] {}\n", unix_secs_for_dashboard(), message.as_ref()));
+    }
+}
+
+fn smart_rf_tune_default_snapshot_path(config_path: &str) -> PathBuf {
+    Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("smart-rf-tune.default.toml")
+}
+
+fn smart_rf_tune_report_path(config_path: &str) -> PathBuf {
+    Path::new(config_path)
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("smart-rf-tune.report.json")
+}
+
+fn write_smart_rf_tune_report_locked(state: &SmartRfTuneState) {
+    if state.report_path.is_empty() {
+        return;
+    }
+    if let Ok(text) = serde_json::to_string_pretty(state) {
+        let _ = std::fs::write(&state.report_path, text);
+    }
+}
+
+fn smart_rf_tune_candidates(
+    sdr_health: &crate::net_dashboard::state::SdrHealthSnapshot,
+    current_profile: &str,
+) -> Vec<SmartRfTuneCandidate> {
+    let tx_base = f32_gain_vec_to_f64(&sdr_health.tx_gains);
+    let rx_base = f32_gain_vec_to_f64(&sdr_health.rx_gains);
+    let mut candidates = Vec::new();
+    candidates.push(SmartRfTuneCandidate {
+        name: "baseline_readback".to_string(),
+        tx_gain_profile: current_profile.to_string(),
+        tx_gains: tx_base.clone(),
+        rx_gains: rx_base.clone(),
+    });
+    candidates.push(SmartRfTuneCandidate {
+        name: "clean_tx_minus_3db".to_string(),
+        tx_gain_profile: "nominal_clean".to_string(),
+        tx_gains: offset_gain_vec(&tx_base, -3.0),
+        rx_gains: rx_base.clone(),
+    });
+    candidates.push(SmartRfTuneCandidate {
+        name: "clean_tx_minus_6db".to_string(),
+        tx_gain_profile: "low_drive_calibration".to_string(),
+        tx_gains: offset_gain_vec(&tx_base, -6.0),
+        rx_gains: rx_base.clone(),
+    });
+    candidates.push(SmartRfTuneCandidate {
+        name: "desense_guard_rx_minus_3db".to_string(),
+        tx_gain_profile: "nominal_clean".to_string(),
+        tx_gains: offset_gain_vec(&tx_base, -3.0),
+        rx_gains: offset_gain_vec(&rx_base, -3.0),
+    });
+    candidates.push(SmartRfTuneCandidate {
+        name: "hotspot_isolation_guard".to_string(),
+        tx_gain_profile: "low_drive_calibration".to_string(),
+        tx_gains: offset_gain_vec(&tx_base, -6.0),
+        rx_gains: offset_gain_vec(&rx_base, -6.0),
+    });
+    dedup_smart_rf_candidates(candidates)
+}
+
+fn f32_gain_vec_to_f64(gains: &[(String, f32)]) -> Vec<(String, f64)> {
+    let mut out: Vec<_> = gains.iter().map(|(name, value)| (name.clone(), *value as f64)).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+fn offset_gain_vec(gains: &[(String, f64)], delta_db: f64) -> Vec<(String, f64)> {
+    gains
+        .iter()
+        .map(|(name, value)| (name.clone(), (*value + delta_db).max(0.0)))
+        .collect()
+}
+
+fn dedup_smart_rf_candidates(candidates: Vec<SmartRfTuneCandidate>) -> Vec<SmartRfTuneCandidate> {
+    let mut unique = Vec::new();
+    for candidate in candidates {
+        let key = format!("{}|{:?}|{:?}", candidate.tx_gain_profile, candidate.tx_gains, candidate.rx_gains);
+        if unique.iter().any(|existing: &SmartRfTuneCandidate| {
+            format!("{}|{:?}|{:?}", existing.tx_gain_profile, existing.tx_gains, existing.rx_gains) == key
+        }) {
+            continue;
+        }
+        unique.push(candidate);
+    }
+    unique
+}
+
+fn apply_smart_rf_tune_candidate_config(config_path: &str, base_config: &str, candidate: &SmartRfTuneCandidate) -> Result<(), String> {
+    let mut text = upsert_soapy_key(base_config, "tx_gain_profile", &format!("{:?}", candidate.tx_gain_profile))?;
+    for (name, value) in &candidate.tx_gains {
+        text = upsert_soapy_key(&text, &format!("tx_gain_{}", soapy_gain_config_key(name)), &format!("{value:.3}"))?;
+    }
+    for (name, value) in &candidate.rx_gains {
+        text = upsert_soapy_key(&text, &format!("rx_gain_{}", soapy_gain_config_key(name)), &format!("{value:.3}"))?;
+    }
+    write_dashboard_config_file(Path::new(config_path), &text).map_err(|err| err.to_string())
+}
+
+fn soapy_gain_config_key(name: &str) -> String {
+    name.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '_' })
+        .collect()
+}
+
+fn restart_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
+    let queued = send_control_cmd(core_cmd_tx, ControlCommand::RestartService);
+    smart_rf_tune_log(format!("core restart requested for SDR reinit queued={}", queued));
+    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
+}
+
+fn run_smart_rf_tune_measurement(
+    calibration_path: &Path,
+    rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+) -> Result<tetra_config::bluestation::TxCalibrationFile, String> {
+    let calibration_path_string = calibration_path.display().to_string();
+    crate::rf_calibration::try_start(&calibration_path_string)?;
+    let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(calibration_path);
+    if !send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: true }) {
+        crate::rf_calibration::mark_failed("Smart RF Tune could not inhibit RF carrier");
+        return Err("RF carrier control channel unavailable".to_string());
+    }
+    smart_rf_tune_log("RF carrier inhibited; waiting guard before known-symbol EVM measurement");
+    std::thread::sleep(std::time::Duration::from_secs(3));
+    let phy_sender = phy_cmd_tx.lock().ok().and_then(|guard| guard.clone());
+    let Some(phy_sender) = phy_sender else {
+        crate::rf_calibration::mark_failed("Smart RF Tune PHY command channel unavailable");
+        let _ = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: false });
+        return Err("PHY command channel unavailable".to_string());
+    };
+    phy_sender
+        .try_send(ControlCommand::RunTxCalibration {
+            calibration_path: calibration_path_string,
+        })
+        .map_err(|_| "failed to queue PHY known-symbol EVM measurement".to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
+    while std::time::Instant::now() < deadline {
+        if run_report_path.exists() {
+            crate::rf_calibration::mark_calibrated("Smart RF Tune known-symbol EVM report available");
+            return tetra_config::bluestation::read_tx_calibration_file(&run_report_path);
+        }
+        if matches!(
+            crate::rf_calibration::current_phase(),
+            crate::rf_calibration::CalibrationPhase::Failed
+        ) {
+            return Err("PHY measurement failed before report was written".to_string());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    crate::rf_calibration::mark_failed("Smart RF Tune timeout waiting for known-symbol EVM report");
+    Err("timeout waiting for known-symbol EVM report".to_string())
+}
+
+fn smart_rf_tune_result_from_report(
+    candidate: &SmartRfTuneCandidate,
+    report: &tetra_config::bluestation::TxCalibrationFile,
+) -> SmartRfTuneResult {
+    let point = &report.calibrated;
+    let score = smart_rf_tune_score(report);
+    SmartRfTuneResult {
+        name: candidate.name.clone(),
+        tx_gain_profile: candidate.tx_gain_profile.clone(),
+        tx_gains: candidate.tx_gains.clone(),
+        rx_gains: candidate.rx_gains.clone(),
+        measured: point.tetra_known_rms_evm_pct.is_some(),
+        score,
+        rms_evm_pct: point.tetra_known_rms_evm_pct,
+        peak_evm_pct: point.tetra_known_peak_evm_pct,
+        carrier_leakage_dbc: Some(point.carrier_leakage_dbc),
+        image_rejection_db: Some(point.image_rejection_db),
+        snr_db: Some(point.snr_db),
+        signal_dbfs: Some(point.signal_dbfs),
+        floor_drift_abs_db: Some(point.floor_drift_abs_db),
+        clipped_fraction: Some(point.clipped_fraction),
+        timing_warning: report.report.timing_warning,
+        accepted_dc_iq: report.report.accepted,
+        summary: report.report.summary.clone(),
+    }
+}
+
+fn smart_rf_tune_error_result(candidate: &SmartRfTuneCandidate, error: impl Into<String>) -> SmartRfTuneResult {
+    SmartRfTuneResult {
+        name: candidate.name.clone(),
+        tx_gain_profile: candidate.tx_gain_profile.clone(),
+        tx_gains: candidate.tx_gains.clone(),
+        rx_gains: candidate.rx_gains.clone(),
+        measured: false,
+        score: f64::INFINITY,
+        rms_evm_pct: None,
+        peak_evm_pct: None,
+        carrier_leakage_dbc: None,
+        image_rejection_db: None,
+        snr_db: None,
+        signal_dbfs: None,
+        floor_drift_abs_db: None,
+        clipped_fraction: None,
+        timing_warning: true,
+        accepted_dc_iq: false,
+        summary: error.into(),
+    }
+}
+
+fn smart_rf_tune_score(report: &tetra_config::bluestation::TxCalibrationFile) -> f64 {
+    let point = &report.calibrated;
+    let Some(rms) = point.tetra_known_rms_evm_pct else {
+        return f64::INFINITY;
+    };
+    let peak = point.tetra_known_peak_evm_pct.unwrap_or(rms * 2.0);
+    let mut score = rms * 10.0 + peak * 1.5;
+    score += (point.carrier_leakage_dbc + 45.0).max(0.0) * 2.0;
+    score += (45.0 - point.image_rejection_db).max(0.0);
+    score += (35.0 - point.snr_db).max(0.0);
+    score += point.floor_drift_abs_db.max(0.0) * 0.5;
+    score += point.clipped_fraction * 10_000.0;
+    if report.report.timing_warning {
+        score += 100.0;
+    }
+    score
+}
+
+fn restore_smart_rf_tune_default_config(config_path: &str) -> Result<PathBuf, String> {
+    let snapshot_path = smart_rf_tune_default_snapshot_path(config_path);
+    let text = std::fs::read_to_string(&snapshot_path)
+        .map_err(|err| format!("read default tune snapshot {}: {}", snapshot_path.display(), err))?;
+    write_dashboard_config_file(Path::new(config_path), &text).map_err(|err| err.to_string())?;
+    Ok(snapshot_path)
+}
+
+fn serve_smart_rf_tune_default(stream: TcpStream, config_path: &str, cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
+    match restore_smart_rf_tune_default_config(config_path) {
+        Ok(snapshot_path) => {
+            clear_dashboard_config_cache(config_path);
+            let restart_queued = send_control_cmd(cmd_tx, ControlCommand::RestartService);
+            crate::service_control::schedule_service_action(
+                crate::service_control::ServiceAction::Restart,
+                std::time::Duration::from_secs(4),
+            );
+            smart_rf_tune_log(format!("Default Tune restored {}", snapshot_path.display()));
+            let body = serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "snapshot": snapshot_path.display().to_string(),
+                "restart_queued": restart_queued,
+                "message": "Default Tune restored saved user config; SDR restart queued",
+            }))
+            .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+            http_json_response(stream, 200, &body);
+        }
+        Err(err) => {
+            let body =
+                serde_json::to_string(&serde_json::json!({"ok": false, "error": err})).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+            http_json_response(stream, 409, &body);
+        }
+    }
+}
+
 fn serve_rf_calibration_run(
     stream: TcpStream,
     state: &DashboardState,
@@ -3254,6 +3816,15 @@ fn handle_connection(
     } else if request_matches(&req_line, "GET", "/api/rf/calibration/status") {
         drain_http_headers(&mut stream);
         serve_rf_calibration_status(stream, &config_path);
+    } else if request_matches(&req_line, "GET", "/api/rf/smart-tune/status") {
+        drain_http_headers(&mut stream);
+        serve_smart_rf_tune_status(stream);
+    } else if request_matches(&req_line, "POST", "/api/rf/smart-tune/start") {
+        drain_http_headers(&mut stream);
+        serve_smart_rf_tune_start(stream, &state, &config_path, &rf_cmd_tx, &phy_cmd_tx, &cmd_tx);
+    } else if request_matches(&req_line, "POST", "/api/rf/smart-tune/default") {
+        drain_http_headers(&mut stream);
+        serve_smart_rf_tune_default(stream, &config_path, &cmd_tx);
     } else if request_matches(&req_line, "POST", "/api/rf/profile-autotest/apply-safe") {
         let mut buf = BufReader::new(stream);
         let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
@@ -6394,6 +6965,21 @@ mod tests {
         ));
         assert!(request_matches("POST /api/rf/carrier HTTP/1.1", "POST", "/api/rf/carrier"));
         assert!(request_matches(
+            "GET /api/rf/smart-tune/status HTTP/1.1",
+            "GET",
+            "/api/rf/smart-tune/status"
+        ));
+        assert!(request_matches(
+            "POST /api/rf/smart-tune/start HTTP/1.1",
+            "POST",
+            "/api/rf/smart-tune/start"
+        ));
+        assert!(request_matches(
+            "POST /api/rf/smart-tune/default HTTP/1.1",
+            "POST",
+            "/api/rf/smart-tune/default"
+        ));
+        assert!(request_matches(
             "POST /api/rf/profile-autotest/apply-safe HTTP/1.1",
             "POST",
             "/api/rf/profile-autotest/apply-safe"
@@ -7289,6 +7875,36 @@ main_carrier = 1
         assert!(updated.contains("tx_gain_profile = \"low_drive_calibration\""));
         assert!(!updated.contains("tx_gain_profile = \"nominal_clean\""));
         assert!(updated.contains("[cell]"));
+    }
+
+    #[test]
+    fn smart_rf_tune_candidate_config_writes_generic_soapy_gain_keys() {
+        let dir = temp_config_dir("smart-rf-tune-generic-gains");
+        let config_path = dir.join("config.toml");
+        let input = r#"[phy_io]
+backend = "SoapySdr"
+
+[phy_io.soapysdr]
+tx_freq = 438362500
+rx_freq = 431362500
+tx_gain_profile = "nominal_clean"
+tx_gain_pga = 45.0
+rx_gain_pga = 20.0
+"#;
+        fs::write(&config_path, input).expect("write config");
+        let candidate = SmartRfTuneCandidate {
+            name: "generic".to_string(),
+            tx_gain_profile: "low_drive_calibration".to_string(),
+            tx_gains: vec![("PGA".to_string(), 39.0)],
+            rx_gains: vec![("PGA".to_string(), 14.0)],
+        };
+
+        apply_smart_rf_tune_candidate_config(config_path.to_string_lossy().as_ref(), input, &candidate).expect("write candidate");
+        let updated = fs::read_to_string(&config_path).expect("read updated config");
+
+        assert!(updated.contains("tx_gain_profile = \"low_drive_calibration\""));
+        assert!(updated.contains("tx_gain_pga = 39.000"));
+        assert!(updated.contains("rx_gain_pga = 14.000"));
     }
 
     #[test]

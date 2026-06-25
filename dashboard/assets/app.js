@@ -1748,16 +1748,77 @@ async function requestTxCalibration() {
 
 async function loadCalibrationStatus() {
   try {
-    const res = await fetch("/api/rf/calibration/status", {
-      credentials: "same-origin",
-      cache: "no-store",
-    });
-    if (!res.ok) return;
-    state.calibration = await res.json();
+    const [calRes, tuneRes] = await Promise.all([
+      fetch("/api/rf/calibration/status", {
+        credentials: "same-origin",
+        cache: "no-store",
+      }),
+      fetch("/api/rf/smart-tune/status", {
+        credentials: "same-origin",
+        cache: "no-store",
+      }),
+    ]);
+    if (calRes.ok) state.calibration = await calRes.json();
+    if (tuneRes.ok) state.smartRfTune = await tuneRes.json();
     state.calibrationBusy = !!state.calibration?.active;
     renderCalibration();
   } catch {
     // Keep the last report visible.
+  }
+}
+
+async function requestSmartRfTune() {
+  if (state.smartRfTuneBusy) return;
+  if (!window.confirm("Run Smart RF Tune?\nNexus-BS will test measured RX/TX Soapy gain candidates with RF known-symbol EVM, restart SDR between candidates, apply the best measured config, and keep a Default Tune snapshot for rollback.")) {
+    return;
+  }
+  state.smartRfTuneBusy = true;
+  setCalibrationStatus("starting Smart RF Tune");
+  try {
+    const res = await fetchWithTimeout("/api/rf/smart-tune/start", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+    }, COMMAND_FETCH_TIMEOUT_MS);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    setCalibrationStatus(body.message || "Smart RF Tune running");
+    await loadCalibrationStatus();
+  } catch (error) {
+    setCalibrationStatus(`Smart RF Tune refused: ${String(error.message || error).slice(0, 110)}`);
+  } finally {
+    window.setTimeout(() => {
+      state.smartRfTuneBusy = false;
+      renderCalibration();
+    }, 2500);
+  }
+}
+
+async function requestDefaultRfTune() {
+  if (state.smartRfTuneBusy) return;
+  if (!window.confirm("Restore Default Tune?\nThis restores the config snapshot saved before the last Smart RF Tune and restarts SDR.")) {
+    return;
+  }
+  state.smartRfTuneBusy = true;
+  setCalibrationStatus("restoring Default Tune");
+  try {
+    const res = await fetchWithTimeout("/api/rf/smart-tune/default", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+    }, COMMAND_FETCH_TIMEOUT_MS);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    setCalibrationStatus(body.message || "Default Tune restored");
+    await loadSite({ force: true });
+    await loadCalibrationStatus();
+  } catch (error) {
+    setCalibrationStatus(`Default Tune failed: ${String(error.message || error).slice(0, 110)}`);
+  } finally {
+    window.setTimeout(() => {
+      state.smartRfTuneBusy = false;
+      renderCalibration();
+    }, 2500);
   }
 }
 
@@ -1812,6 +1873,8 @@ function renderCalibration() {
   const phase = status.status || "idle";
   const failed = phase === "failed";
   const rfAdvice = state.site?.rf_profile_advice || {};
+  const smartTune = state.smartRfTune || {};
+  const smartTuneActive = !!smartTune.active || state.smartRfTuneBusy;
 
   setText("calibrationStatus", active ? phase.toUpperCase() : accepted && !failed ? "APPLIED" : phase.toUpperCase());
   setText("calibrationPath", status.report_path || status.path || "calibration.toml");
@@ -1849,19 +1912,27 @@ function renderCalibration() {
   );
   setText(
     "calibrationActionStatus",
-    active
-      ? "running; accepted DC restarts service; IQ remains opt-in"
-      : failed
-        ? status.error || summary.summary || "calibration failed"
-        : summary.summary || (activeAccepted ? "active calibration preserved" : status.error || "traffic outage required")
+    smartTuneActive
+      ? `Smart RF Tune ${smartTune.phase || "running"} ${smartTune.current_index || 0}/${smartTune.total_candidates || 0}`
+      : active
+        ? "running; accepted DC restarts service; IQ remains opt-in"
+        : failed
+          ? status.error || summary.summary || "calibration failed"
+          : smartTune.best
+            ? `Smart RF Tune best ${smartTune.best.name}: RMS EVM ${Number(smartTune.best.rms_evm_pct).toFixed(2)}%`
+            : summary.summary || (activeAccepted ? "active calibration preserved" : status.error || "traffic outage required")
   );
-  setText("calibrationLog", status.log || (summary.summary ? `${summary.summary}\n` : ""));
+  setText("calibrationLog", smartTune.log || status.log || (summary.summary ? `${summary.summary}\n` : ""));
+  const smartButton = $("smartRfTuneBtn");
+  if (smartButton) smartButton.disabled = active || smartTuneActive || !state.site?.config?.available;
+  const defaultButton = $("defaultRfTuneBtn");
+  if (defaultButton) defaultButton.disabled = active || smartTuneActive || !state.site?.config?.available;
   const button = $("calibrationRunBtn");
-  if (button) button.disabled = active || state.calibrationBusy || !state.site?.config?.available;
+  if (button) button.disabled = active || smartTuneActive || state.calibrationBusy || !state.site?.config?.available;
   const profileButton = $("rfProfileApplyBtn");
   if (profileButton) {
     profileButton.textContent = rfAdvice.profile_validation_status === "pending_retest" ? "Apply & Retest Profile" : "Apply Safe Profile";
-    profileButton.disabled = active || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || !rfAdvice.safe_auto_apply;
+    profileButton.disabled = active || smartTuneActive || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || !rfAdvice.safe_auto_apply;
   }
   for (const [id, target] of [
     ["rfProfileHotspotBtn", "hotspot"],
@@ -1871,7 +1942,7 @@ function renderCalibration() {
     const targetButton = $(id);
     if (!targetButton) continue;
     const currentTarget = rfAdvice.target_profile === target;
-    targetButton.disabled = active || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || currentTarget && rfAdvice.profile_validation_status === "validated";
+    targetButton.disabled = active || smartTuneActive || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || currentTarget && rfAdvice.profile_validation_status === "validated";
   }
 }
 
@@ -3089,6 +3160,8 @@ function initNav() {
     renderUpdatePanel();
   });
   $("calibrationRunBtn")?.addEventListener("click", requestTxCalibration);
+  $("smartRfTuneBtn")?.addEventListener("click", requestSmartRfTune);
+  $("defaultRfTuneBtn")?.addEventListener("click", requestDefaultRfTune);
   $("rfProfileApplyBtn")?.addEventListener("click", () => applySafeRfProfile());
   $("rfProfileHotspotBtn")?.addEventListener("click", () => applySafeRfProfile("hotspot"));
   $("rfProfileLowPowerBtn")?.addEventListener("click", () => applySafeRfProfile("low_power_basestation"));
