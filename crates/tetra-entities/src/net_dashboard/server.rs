@@ -3117,10 +3117,10 @@ fn dedup_smart_rf_candidates(candidates: Vec<SmartRfTuneCandidate>) -> Vec<Smart
 fn apply_smart_rf_tune_candidate_config(config_path: &str, base_config: &str, candidate: &SmartRfTuneCandidate) -> Result<(), String> {
     let mut text = upsert_soapy_key(base_config, "tx_gain_profile", &format!("{:?}", candidate.tx_gain_profile))?;
     for (name, value) in &candidate.tx_gains {
-        text = upsert_soapy_key(&text, &format!("tx_gain_{}", soapy_gain_config_key(name)), &format!("{value:.3}"))?;
+        text = upsert_soapy_key(&text, &format!("tx_gain_{}", soapy_gain_config_key(name)), &format!("{value:.1}"))?;
     }
     for (name, value) in &candidate.rx_gains {
-        text = upsert_soapy_key(&text, &format!("rx_gain_{}", soapy_gain_config_key(name)), &format!("{value:.3}"))?;
+        text = upsert_soapy_key(&text, &format!("rx_gain_{}", soapy_gain_config_key(name)), &format!("{value:.1}"))?;
     }
     write_dashboard_config_file(Path::new(config_path), &text).map_err(|err| err.to_string())
 }
@@ -8200,8 +8200,8 @@ rx_gain_pga = 20.0
         let updated = fs::read_to_string(&config_path).expect("read updated config");
 
         assert!(updated.contains("tx_gain_profile = \"low_drive_calibration\""));
-        assert!(updated.contains("tx_gain_pga = 39.000"));
-        assert!(updated.contains("rx_gain_pga = 14.000"));
+        assert!(updated.contains("tx_gain_pga = 39.0"));
+        assert!(updated.contains("rx_gain_pga = 14.0"));
     }
 
     #[test]
