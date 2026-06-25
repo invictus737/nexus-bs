@@ -3468,13 +3468,7 @@ fn serve_smart_rf_tune_default(stream: TcpStream, config_path: &str, cmd_tx: &Ar
     }
 }
 
-fn serve_rf_calibration_run(
-    stream: TcpStream,
-    state: &DashboardState,
-    config_path: &str,
-    rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
-    phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
-) {
+fn serve_rf_calibration_run(stream: TcpStream, state: &DashboardState, config_path: &str, core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
     let active_calls = match state.read() {
         Ok(snapshot) => snapshot.snapshot_calls(),
         Err(_) => {
@@ -3506,144 +3500,94 @@ fn serve_rf_calibration_run(
         return;
     }
 
-    let rf_accepted = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: true });
-    if !rf_accepted {
-        crate::rf_calibration::mark_failed("RF carrier control channel unavailable");
-        http_json_response(stream, 503, r#"{"ok":false,"error":"RF carrier control channel unavailable"}"#);
-        return;
-    }
-
-    let phy_sender = phy_cmd_tx.lock().ok().and_then(|guard| guard.clone());
-    let Some(phy_sender) = phy_sender else {
-        crate::rf_calibration::mark_failed("PHY control channel unavailable");
-        let _ = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: false });
-        http_json_response(stream, 503, r#"{"ok":false,"error":"PHY control channel unavailable"}"#);
-        return;
-    };
-    let rf_sender = rf_cmd_tx.lock().ok().and_then(|guard| guard.clone());
-
     let config_path_string = config_path.to_string();
+    let core_cmd_tx = Arc::clone(core_cmd_tx);
     if let Err(err) = std::thread::Builder::new().name("rf-calibration".into()).spawn(move || {
-        run_rf_calibration_orchestrator(config_path_string, calibration_path_string, rf_sender, phy_sender);
+        run_rf_calibration_orchestrator(config_path_string, calibration_path, core_cmd_tx);
     }) {
         crate::rf_calibration::mark_failed(format!("failed to start RF calibration orchestrator: {}", err));
-        let _ = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: false });
         http_json_response(stream, 503, r#"{"ok":false,"error":"failed to start RF calibration orchestrator"}"#);
         return;
     }
 
     let body = serde_json::to_string(&serde_json::json!({
         "ok": true,
-        "status": "inhibiting",
-        "path": calibration_path.display().to_string(),
-        "message": "RF calibration started",
+        "status": "stopping_core",
+        "path": calibration_path_string,
+        "message": "RF calibration started; core runtime will stop before SDR access",
     }))
     .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
     http_json_response(stream, 202, &body);
 }
 
-fn run_rf_calibration_orchestrator(config_path: String, calibration_path: String, rf_sender: Option<CmdSender>, phy_sender: CmdSender) {
-    crate::rf_calibration::append_log("RF carrier inhibit queued; waiting notification guard before PHY calibration");
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    if phy_sender
-        .try_send(ControlCommand::RunTxCalibration {
-            calibration_path: calibration_path.clone(),
-        })
-        .is_err()
-    {
-        crate::rf_calibration::mark_failed("failed to queue PHY calibration command");
-        restore_rf_carrier_after_calibration(&rf_sender, "failed PHY queue");
-        return;
-    }
-
-    crate::rf_calibration::append_log("PHY calibration command queued; waiting for run report from core");
-    let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(180);
-    loop {
-        if run_report_path.exists() {
-            crate::rf_calibration::mark_calibrated("PHY calibration report available");
-            break;
-        }
-        if matches!(
-            crate::rf_calibration::current_phase(),
-            crate::rf_calibration::CalibrationPhase::Failed
-        ) {
-            request_core_restart_after_rf_calibration(&rf_sender, "failed calibration");
+fn run_rf_calibration_orchestrator(config_path: String, calibration_path: PathBuf, core_cmd_tx: Arc<Mutex<Option<CmdSender>>>) {
+    let core_unit = stop_core_for_exclusive_rf_calibration(&core_cmd_tx);
+    match wait_for_core_stopped(&core_unit, std::time::Duration::from_secs(SMART_RF_TUNE_CORE_STOP_TIMEOUT_SECS)) {
+        Ok(()) => crate::rf_calibration::append_log(format!(
+            "verified {} is stopped; only calibration-only process will touch Soapy SDR",
+            core_unit
+        )),
+        Err(err) => {
+            crate::rf_calibration::mark_failed(format!(
+                "RF calibration refused because core runtime stop could not be verified: {}",
+                err
+            ));
+            restart_core_after_exclusive_rf_calibration(&core_cmd_tx, "core stop verification failed");
             return;
         }
-        if std::time::Instant::now() >= deadline {
-            crate::rf_calibration::mark_failed("timeout waiting for PHY calibration report");
-            request_core_restart_after_rf_calibration(&rf_sender, "calibration timeout");
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     }
 
-    let report_path = if run_report_path.exists() {
-        &run_report_path
-    } else {
-        Path::new(&calibration_path)
-    };
-    let report = match tetra_config::bluestation::read_tx_calibration_file(report_path) {
+    crate::rf_calibration::mark_calibrating(&calibration_path.display().to_string());
+    let report = match run_smart_rf_tune_measurement(&config_path, &calibration_path) {
         Ok(report) => report,
         Err(err) => {
-            crate::rf_calibration::mark_failed(format!("calibration run report was not readable after PHY finished: {}", err));
-            request_core_restart_after_rf_calibration(&rf_sender, "unreadable calibration file");
+            crate::rf_calibration::mark_failed(format!("exclusive RF calibration failed: {}", err));
+            restart_core_after_exclusive_rf_calibration(&core_cmd_tx, "calibration failed");
             return;
         }
     };
     if !report.report.accepted {
         crate::rf_calibration::mark_failed(format!("calibration rejected; config not changed: {}", report.report.summary));
-        request_core_restart_after_rf_calibration(&rf_sender, "rejected calibration");
+        restart_core_after_exclusive_rf_calibration(&core_cmd_tx, "rejected calibration");
         return;
     }
 
     match enable_tx_calibration_in_config(&config_path) {
         Ok(()) => {
             crate::rf_calibration::mark_restarting("calibration accepted; config.toml updated; restarting service");
-            request_core_restart_after_rf_calibration(&rf_sender, "accepted calibration");
+            restart_core_after_exclusive_rf_calibration(&core_cmd_tx, "accepted calibration");
         }
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("calibration accepted but config update failed: {}", err));
-            request_core_restart_after_rf_calibration(&rf_sender, "config update failure");
+            restart_core_after_exclusive_rf_calibration(&core_cmd_tx, "config update failure");
         }
     }
 }
 
-fn request_core_restart_after_rf_calibration(sender: &Option<CmdSender>, reason: &str) {
-    let restart_message = format!(
-        "core service restart requested after {}; full SDR reinit required after destructive calibration",
-        reason
-    );
-    if matches!(
-        crate::rf_calibration::current_phase(),
-        crate::rf_calibration::CalibrationPhase::Failed
-    ) {
-        crate::rf_calibration::append_log(restart_message);
-    } else {
-        crate::rf_calibration::mark_restarting(restart_message);
+fn stop_core_for_exclusive_rf_calibration(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) -> String {
+    let unit = crate::service_control::resolve_service_unit();
+    let queued = send_control_cmd(core_cmd_tx, ControlCommand::ShutdownService);
+    crate::rf_calibration::append_log(format!(
+        "core stop requested before exclusive RF calibration unit={} queued={}",
+        unit, queued
+    ));
+    match request_systemctl_action("stop", &unit) {
+        Ok(()) => crate::rf_calibration::append_log(format!("systemctl stop {} completed", unit)),
+        Err(err) => crate::rf_calibration::append_log(format!(
+            "systemctl stop {} failed; waiting on control-service stop path: {}",
+            unit, err
+        )),
     }
-    let Some(sender) = sender else {
-        crate::rf_calibration::append_log("ERROR: core restart unavailable after calibration; restart nexus-bs.service manually");
-        return;
-    };
-    match sender.try_send(ControlCommand::RestartService) {
-        Ok(()) => crate::rf_calibration::append_log("core restart command queued"),
-        Err(_) => crate::rf_calibration::append_log("ERROR: core restart command queue failed after calibration"),
-    }
-    crate::rf_calibration::append_log("core restart fallback scheduled through systemd");
-    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
+    unit
 }
 
-fn restore_rf_carrier_after_calibration(rf_sender: &Option<CmdSender>, reason: &str) {
-    let Some(sender) = rf_sender else {
-        crate::rf_calibration::append_log(format!("ERROR: RF carrier enable unavailable after {}", reason));
-        return;
-    };
-    match sender.try_send(ControlCommand::SetRfCarrierInhibit { inhibited: false }) {
-        Ok(()) => crate::rf_calibration::append_log(format!("RF carrier enable queued after {}", reason)),
-        Err(_) => crate::rf_calibration::append_log(format!("ERROR: RF carrier enable queue failed after {}", reason)),
-    }
+fn restart_core_after_exclusive_rf_calibration(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>, reason: &str) {
+    let queued = send_control_cmd(core_cmd_tx, ControlCommand::RestartService);
+    crate::rf_calibration::append_log(format!(
+        "core restart requested after exclusive RF calibration queued={} reason={}",
+        queued, reason
+    ));
+    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
 }
 
 fn enable_tx_calibration_in_config(config_path: &str) -> Result<(), String> {
@@ -4105,7 +4049,7 @@ fn handle_connection(
         }
     } else if request_matches(&req_line, "POST", "/api/rf/calibration/run") {
         drain_http_headers(&mut stream);
-        serve_rf_calibration_run(stream, &state, &config_path, &rf_cmd_tx, &phy_cmd_tx);
+        serve_rf_calibration_run(stream, &state, &config_path, &cmd_tx);
     } else if request_matches(&req_line, "POST", "/api/rf/evm/measure") {
         drain_http_headers(&mut stream);
         serve_rf_evm_measure(stream, &state, &config_path, &cmd_tx);
