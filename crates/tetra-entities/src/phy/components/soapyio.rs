@@ -62,6 +62,8 @@ const TX_CAL_CONFIRM_MAX_SIGNAL_SPREAD_DB: f64 = 1.0;
 const TX_CAL_CONFIRM_MAX_IMAGE_WORSEN_DB: f64 = 1.0;
 const TX_CAL_CONFIRM_MAX_EVM_WORSEN_PCT: f64 = 1.0;
 const TX_CAL_CONFIRM_MAX_KNOWN_EVM_WORSEN_PCT: f64 = 1.0;
+const TX_CAL_ACCEPT_MIN_KNOWN_EVM_RMS_IMPROVEMENT_PCT: f64 = 0.05;
+const TX_CAL_ACCEPT_MIN_KNOWN_EVM_PEAK_IMPROVEMENT_PCT: f64 = 0.25;
 const TX_CAL_MAX_COMPONENT_ABS: f64 = 0.85;
 const TX_CAL_CLIP_LEVEL: f32 = 0.98;
 const TX_CAL_MAX_CLIPPED_FRACTION: f64 = 0.001;
@@ -541,7 +543,7 @@ impl SoapyIo {
                 &mut timing,
             )?;
 
-            let (mut best, mut best_meas) = self.search_tx_dc_calibration_grid(
+            let dc_search = self.search_tx_dc_calibration_grid(
                 &mut rx_stream,
                 &mut tx_stream,
                 rx_baseline,
@@ -553,6 +555,8 @@ impl SoapyIo {
                 dc_actuator.estimated,
                 &mut timing,
             )?;
+            let mut best = dc_search.best;
+            let mut best_meas = dc_search.best_meas;
             tracing::warn!(
                 "SoapySDR: TX DC search best dc=({:+.5},{:+.5}) carrier {:.1}->{:.1} dBc signal {:.1} dBFS snr {:.1} dB floor_drift {:.1} dB",
                 best.dc_i,
@@ -566,6 +570,8 @@ impl SoapyIo {
 
             let dc_best = best;
             let dc_best_meas = best_meas;
+            let dc_diagnostic_best = dc_search.diagnostic;
+            let dc_diagnostic_best_meas = dc_search.diagnostic_meas;
 
             for step in [0.12, 0.06, 0.03, 0.015] {
                 for axis in [CalibrationAxis::IqI, CalibrationAxis::IqQ] {
@@ -602,6 +608,7 @@ impl SoapyIo {
             let iq_preaccepted = dc_preaccepted && iq_calibration_accepted(&dc_best_meas, &iq_best_meas, dc_best, iq_best);
             let mut applied = TxCalibrationCoefficients::default();
             let mut candidate_has_iq = false;
+            let mut evm_preaccepted = false;
             if dc_preaccepted {
                 applied.dc_i = dc_best.dc_i;
                 applied.dc_q = dc_best.dc_q;
@@ -643,9 +650,70 @@ impl SoapyIo {
                     }
                 }
             }
+            if applied == TxCalibrationCoefficients::default() {
+                let evm_candidates = [dc_best, dc_diagnostic_best];
+                let mut evm_best: Option<(TxCalibrationCoefficients, TetraKnownEvmMeasurement)> = None;
+                for candidate in evm_candidates {
+                    if candidate == TxCalibrationCoefficients::default() {
+                        continue;
+                    }
+                    match self.capture_tetra_known_evm_measurement(
+                        &mut rx_stream,
+                        &mut tx_stream,
+                        candidate,
+                        block_len,
+                        session.calibration_center_hz,
+                        &mut timing,
+                        false,
+                    ) {
+                        Ok(known) => {
+                            let improved = tetra_known_evm_candidate_improved(reference_meas.tetra_known, Some(known));
+                            tracing::warn!(
+                                "SoapySDR: TETRA known-symbol EVM DC probe dc=({:+.5},{:+.5}) rms={:.2}% peak={:.2}% improved={} symbols={} timing={:.2}",
+                                candidate.dc_i,
+                                candidate.dc_q,
+                                known.rms_evm_pct,
+                                known.peak_evm_pct,
+                                improved,
+                                known.symbols_used,
+                                known.timing_sample
+                            );
+                            if improved
+                                && evm_best
+                                    .map(|(_, current)| tetra_known_evm_score(known) < tetra_known_evm_score(current))
+                                    .unwrap_or(true)
+                            {
+                                evm_best = Some((candidate, known));
+                            }
+                        }
+                        Err(err) => tracing::warn!(
+                            "SoapySDR: TETRA known-symbol EVM DC probe dc=({:+.5},{:+.5}) failed: {}",
+                            candidate.dc_i,
+                            candidate.dc_q,
+                            err
+                        ),
+                    }
+                }
+                if let Some((candidate, known)) = evm_best {
+                    tracing::warn!(
+                        "SoapySDR: TX calibration selecting EVM-improving DC candidate dc=({:+.5},{:+.5}) rms {:.2}->{:.2}% peak {:.2}->{:.2}%",
+                        candidate.dc_i,
+                        candidate.dc_q,
+                        reference_meas.tetra_known.map(|evm| evm.rms_evm_pct).unwrap_or(f64::NAN),
+                        known.rms_evm_pct,
+                        reference_meas.tetra_known.map(|evm| evm.peak_evm_pct).unwrap_or(f64::NAN),
+                        known.peak_evm_pct
+                    );
+                    applied = candidate;
+                    candidate_has_iq = iq_coeff_delta(TxCalibrationCoefficients::default(), candidate) > 0.0;
+                    evm_preaccepted = true;
+                }
+            }
 
-            let (confirmation, mut final_meas) = if applied != TxCalibrationCoefficients::default() {
-                self.confirm_calibration_candidate(
+            let (confirmation, mut final_meas, reported_candidate, reported_label, rejected_diagnostic) = if applied
+                != TxCalibrationCoefficients::default()
+            {
+                let (confirmation, final_meas) = self.confirm_calibration_candidate(
                     &mut rx_stream,
                     &mut tx_stream,
                     rx_baseline,
@@ -655,17 +723,40 @@ impl SoapyIo {
                     applied,
                     &reference_meas,
                     &mut timing,
-                )?
-            } else if dc_best != TxCalibrationCoefficients::default() {
-                tracing::warn!(
-                    "SoapySDR: TX calibration rejected candidate dc=({:+.5},{:+.5}) will be reported for diagnostics but not applied",
-                    dc_best.dc_i,
-                    dc_best.dc_q
-                );
-                (CalibrationConfirmation::default(), dc_best_meas)
+                )?;
+                (confirmation, final_meas, applied, "applied_candidate", None)
             } else {
-                tracing::warn!("SoapySDR: TX calibration found no safe candidate; preserving neutral reference as final report");
-                (CalibrationConfirmation::default(), reference_meas)
+                let rejected = rejected_calibration_report_candidate(
+                    dc_best,
+                    dc_best_meas,
+                    dc_diagnostic_best,
+                    dc_diagnostic_best_meas,
+                    reference_meas,
+                );
+                match rejected.label {
+                    "rejected_dc_candidate" => tracing::warn!(
+                        "SoapySDR: TX calibration rejected candidate dc=({:+.5},{:+.5}) will be reported for diagnostics but not applied",
+                        rejected.coeffs.dc_i,
+                        rejected.coeffs.dc_q
+                    ),
+                    "rejected_raw_dc_probe" => tracing::warn!(
+                        "SoapySDR: TX calibration found no gate-safe candidate; reporting raw measured diagnostic dc=({:+.5},{:+.5}) carrier {:.1}->{:.1} dBc but not applying it",
+                        rejected.coeffs.dc_i,
+                        rejected.coeffs.dc_q,
+                        reference_meas.carrier_leakage_dbc,
+                        rejected.meas.carrier_leakage_dbc
+                    ),
+                    _ => tracing::warn!(
+                        "SoapySDR: TX calibration found no measured DC candidate better than neutral; preserving neutral reference as final report"
+                    ),
+                }
+                (
+                    CalibrationConfirmation::default(),
+                    rejected.meas,
+                    rejected.coeffs,
+                    rejected.label,
+                    Some(rejected),
+                )
             };
 
             if applied != TxCalibrationCoefficients::default() {
@@ -706,20 +797,29 @@ impl SoapyIo {
             let image_quality_ok = calibration_image_quality_ok(&final_meas);
             let final_quality_ok = calibration_final_quality_ok(&final_meas, &confirmation);
             let rf_limiting = rf_limiting_factor_with_dc_actuator(&final_meas, tetra_known_quality_ok, Some(dc_actuator));
-            let accepted = applied != TxCalibrationCoefficients::default()
-                && dc_preaccepted
-                && confirmation.confirmed
+            let known_evm_improved = tetra_known_evm_candidate_improved(reference_meas.tetra_known, final_meas.tetra_known);
+            let candidate_accepted = applied != TxCalibrationCoefficients::default()
+                && ((dc_preaccepted && confirmation.confirmed) || (evm_preaccepted && known_evm_improved))
                 && timing.confirmation_ok()
                 && final_quality_ok
                 && known_evm_acceptance_ok
                 && (!candidate_has_iq || image_quality_ok);
-            let accepted_dc = accepted;
+            let accepted = candidate_accepted;
+            let accepted_dc = candidate_accepted;
             let accepted_iq = accepted && candidate_has_iq;
             let accepted_mode = if accepted {
-                if accepted_iq { "dc_iq" } else { "dc_only" }
+                if evm_preaccepted && !confirmation.confirmed {
+                    "evm_dc"
+                } else if accepted_iq {
+                    "dc_iq"
+                } else {
+                    "dc_only"
+                }
             } else {
                 "rejected"
             };
+            let rejected_diagnostic_suffix = rejected_diagnostic_summary_suffix(rejected_diagnostic, &reference_meas);
+            let persisted_applied = if accepted { applied } else { TxCalibrationCoefficients::default() };
 
             let now = unix_secs_now();
             let file = TxCalibrationFile {
@@ -756,16 +856,10 @@ impl SoapyIo {
                 limits,
                 reference: reference_meas.into_point("neutral_no_calibration", neutral),
                 calibrated: final_meas.into_point(
-                    if accepted {
-                        "applied_candidate"
-                    } else if applied == TxCalibrationCoefficients::default() && dc_best != TxCalibrationCoefficients::default() {
-                        "rejected_dc_candidate"
-                    } else {
-                        "neutral_no_safe_candidate"
-                    },
-                    if accepted { applied } else { dc_best },
+                    if candidate_accepted { "applied_candidate" } else { reported_label },
+                    if candidate_accepted { applied } else { reported_candidate },
                 ),
-                applied,
+                applied: persisted_applied,
                 report: TxCalibrationReport {
                     carrier_leakage_improvement_db: carrier_improvement,
                     image_rejection_improvement_db: image_improvement,
@@ -843,7 +937,7 @@ impl SoapyIo {
                         let known_suffix = tetra_known_summary_suffix(&reference_meas, &final_meas);
                         let dc_actuator_suffix = tx_dc_actuator_summary_suffix(Some(dc_actuator));
                         format!(
-                            "rejected: gates failed; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} known_evm_safe={} confirm spread carrier {:.1} dB signal {:.1} dB{}{}{}",
+                            "rejected: no positive RF calibration candidate; carrier {:+.1} dB ({:.1}->{:.1} dBc), image {:+.1} dB ({:.1}->{:.1} dB), EVM proxy {:+.2} pp, SNR {:.1}->{:.1} dB, floor drift {:.1} dB, dc_confirmed={} final_quality={} image_quality={} known_evm_safe={} known_evm_improved={} confirm spread carrier {:.1} dB signal {:.1} dB{}{}{}{}",
                             carrier_improvement,
                             reference_meas.carrier_leakage_dbc,
                             final_meas.carrier_leakage_dbc,
@@ -858,9 +952,11 @@ impl SoapyIo {
                             final_quality_ok,
                             image_quality_ok,
                             known_evm_acceptance_ok,
+                            known_evm_improved,
                             confirmation.carrier_spread_db,
                             confirmation.signal_spread_db,
                             known_suffix,
+                            rejected_diagnostic_suffix,
                             dc_actuator_suffix,
                             timing_suffix
                         )
@@ -1198,7 +1294,7 @@ impl SoapyIo {
         limits: &TxCalibrationLimits,
         initial_candidate: Option<TxCalibrationCoefficients>,
         timing: &mut CalibrationTiming,
-    ) -> Result<(TxCalibrationCoefficients, CalibrationMeasurement), String> {
+    ) -> Result<DcCalibrationSearchResult, String> {
         let mut best = neutral;
         let mut best_meas = reference;
         let mut best_score = dc_calibration_search_score(&best_meas);
@@ -1288,7 +1384,12 @@ impl SoapyIo {
             }
         }
 
-        Ok((best, best_meas))
+        Ok(DcCalibrationSearchResult {
+            best,
+            best_meas,
+            diagnostic: raw_best,
+            diagnostic_meas: raw_best_meas,
+        })
     }
 
     fn capture_calibration_measurement(
@@ -1771,6 +1872,21 @@ struct TxDcActuatorDiagnostic {
     estimated: Option<TxCalibrationCoefficients>,
     readback_ok: bool,
     effective: bool,
+}
+
+#[derive(Clone, Copy)]
+struct DcCalibrationSearchResult {
+    best: TxCalibrationCoefficients,
+    best_meas: CalibrationMeasurement,
+    diagnostic: TxCalibrationCoefficients,
+    diagnostic_meas: CalibrationMeasurement,
+}
+
+#[derive(Clone, Copy)]
+struct RejectedCalibrationReportCandidate {
+    label: &'static str,
+    coeffs: TxCalibrationCoefficients,
+    meas: CalibrationMeasurement,
 }
 
 impl From<evm::ModulationAccuracy> for TetraKnownEvmMeasurement {
@@ -2607,7 +2723,7 @@ fn calibration_capture_core_quality_ok(meas: &CalibrationMeasurement) -> bool {
 }
 
 fn calibration_floor_stable(meas: &CalibrationMeasurement) -> bool {
-    meas.floor_drift_abs_db <= TX_CAL_ACCEPT_MAX_FLOOR_DRIFT_DB
+    meas.floor_drift_db <= TX_CAL_ACCEPT_MAX_FLOOR_DRIFT_DB
 }
 
 fn calibration_low_floor_warning_ok(meas: &CalibrationMeasurement) -> bool {
@@ -2645,6 +2761,34 @@ fn tetra_known_peak_evm_improvement(
     Some(reference?.peak_evm_pct - candidate?.peak_evm_pct)
 }
 
+fn rejected_calibration_report_candidate(
+    dc_best: TxCalibrationCoefficients,
+    dc_best_meas: CalibrationMeasurement,
+    diagnostic_best: TxCalibrationCoefficients,
+    diagnostic_best_meas: CalibrationMeasurement,
+    reference_meas: CalibrationMeasurement,
+) -> RejectedCalibrationReportCandidate {
+    if dc_best != TxCalibrationCoefficients::default() {
+        RejectedCalibrationReportCandidate {
+            label: "rejected_dc_candidate",
+            coeffs: dc_best,
+            meas: dc_best_meas,
+        }
+    } else if diagnostic_best != TxCalibrationCoefficients::default() {
+        RejectedCalibrationReportCandidate {
+            label: "rejected_raw_dc_probe",
+            coeffs: diagnostic_best,
+            meas: diagnostic_best_meas,
+        }
+    } else {
+        RejectedCalibrationReportCandidate {
+            label: "neutral_no_measured_improvement",
+            coeffs: TxCalibrationCoefficients::default(),
+            meas: reference_meas,
+        }
+    }
+}
+
 fn tetra_known_evm_quality_ok(candidate: Option<TetraKnownEvmMeasurement>) -> bool {
     candidate.is_some_and(|evm| {
         evm.rms_evm_pct <= evm::TETRA_RMS_EVM_LIMIT as f64 * 100.0 && evm.peak_evm_pct <= evm::TETRA_PEAK_EVM_LIMIT as f64 * 100.0
@@ -2675,6 +2819,15 @@ fn tetra_known_evm_candidate_safe(
     } else {
         not_worse
     }
+}
+
+fn tetra_known_evm_candidate_improved(reference: Option<TetraKnownEvmMeasurement>, candidate: Option<TetraKnownEvmMeasurement>) -> bool {
+    let (Some(reference), Some(candidate)) = (reference, candidate) else {
+        return false;
+    };
+    tetra_known_evm_candidate_safe(Some(reference), Some(candidate), true)
+        && (reference.rms_evm_pct - candidate.rms_evm_pct >= TX_CAL_ACCEPT_MIN_KNOWN_EVM_RMS_IMPROVEMENT_PCT
+            || reference.peak_evm_pct - candidate.peak_evm_pct >= TX_CAL_ACCEPT_MIN_KNOWN_EVM_PEAK_IMPROVEMENT_PCT)
 }
 
 fn tetra_known_summary_suffix(reference: &CalibrationMeasurement, candidate: &CalibrationMeasurement) -> String {
@@ -2714,6 +2867,27 @@ fn tx_dc_actuator_summary_suffix(diagnostic: Option<TxDcActuatorDiagnostic>) -> 
         }
         None => String::new(),
     }
+}
+
+fn rejected_diagnostic_summary_suffix(rejected: Option<RejectedCalibrationReportCandidate>, reference: &CalibrationMeasurement) -> String {
+    let Some(rejected) = rejected else {
+        return String::new();
+    };
+    if rejected.label == "neutral_no_measured_improvement" {
+        return ", no measured DC/IQ probe improved neutral".to_string();
+    }
+    format!(
+        ", best rejected probe {} dc=({:+.5},{:+.5}) carrier {:.1}->{:.1} dBc image {:.1}->{:.1} dB EVM proxy {:.2}->{:.2}%",
+        rejected.label,
+        rejected.coeffs.dc_i,
+        rejected.coeffs.dc_q,
+        reference.carrier_leakage_dbc,
+        rejected.meas.carrier_leakage_dbc,
+        reference.image_rejection_db,
+        rejected.meas.image_rejection_db,
+        reference.evm_proxy_pct,
+        rejected.meas.evm_proxy_pct
+    )
 }
 
 fn rf_limiting_factor_with_dc_actuator(
@@ -3124,6 +3298,53 @@ mod tests {
     }
 
     #[test]
+    fn rejected_tx_calibration_reports_raw_measured_probe_when_gate_best_is_neutral() {
+        let reference = calibration_measurement(-20.0, 43.0, 9.5, -34.0);
+        let diagnostic = calibration_measurement(-31.0, 42.0, 4.5, -34.0);
+        let diagnostic_coeffs = TxCalibrationCoefficients {
+            dc_i: 0.002,
+            dc_q: -0.001,
+            ..Default::default()
+        };
+
+        let rejected = rejected_calibration_report_candidate(
+            TxCalibrationCoefficients::default(),
+            reference,
+            diagnostic_coeffs,
+            diagnostic,
+            reference,
+        );
+
+        assert_eq!(rejected.label, "rejected_raw_dc_probe");
+        assert_eq!(rejected.coeffs, diagnostic_coeffs);
+        assert_eq!(rejected.meas.carrier_leakage_dbc, diagnostic.carrier_leakage_dbc);
+        assert_ne!(rejected.meas.carrier_leakage_dbc, reference.carrier_leakage_dbc);
+    }
+
+    #[test]
+    fn rejected_tx_calibration_prefers_gate_best_candidate_over_raw_probe() {
+        let reference = calibration_measurement(-20.0, 43.0, 9.5, -34.0);
+        let dc_best = calibration_measurement(-35.0, 43.0, 2.0, -34.0);
+        let raw_best = calibration_measurement(-36.0, 39.0, 2.5, -34.0);
+        let dc_best_coeffs = TxCalibrationCoefficients {
+            dc_i: 0.004,
+            dc_q: -0.002,
+            ..Default::default()
+        };
+        let raw_best_coeffs = TxCalibrationCoefficients {
+            dc_i: 0.008,
+            dc_q: -0.004,
+            ..Default::default()
+        };
+
+        let rejected = rejected_calibration_report_candidate(dc_best_coeffs, dc_best, raw_best_coeffs, raw_best, reference);
+
+        assert_eq!(rejected.label, "rejected_dc_candidate");
+        assert_eq!(rejected.coeffs, dc_best_coeffs);
+        assert_eq!(rejected.meas.carrier_leakage_dbc, dc_best.carrier_leakage_dbc);
+    }
+
+    #[test]
     fn tx_dc_actuator_no_effect_is_reported_as_limiting_factor() {
         let meas = calibration_measurement(-20.0, 43.0, 9.5, -34.0);
         let diagnostic = TxDcActuatorDiagnostic {
@@ -3315,10 +3536,10 @@ mod tests {
         let candidate_a = calibration_measurement(-42.1, 43.3, 1.1, -33.9);
         let neutral_b = calibration_measurement(-20.4, 43.1, 9.7, -34.0);
         let mut candidate_b = calibration_measurement(-42.4, 43.4, 1.0, -33.95);
-        candidate_b.floor_before_dbfs = -116.8;
-        candidate_b.floor_after_dbfs = -120.9;
+        candidate_b.floor_before_dbfs = -120.9;
+        candidate_b.floor_after_dbfs = -116.8;
         candidate_b.loopback_floor_dbfs = -120.9;
-        candidate_b.floor_drift_db = -4.1;
+        candidate_b.floor_drift_db = 4.1;
         candidate_b.floor_drift_abs_db = 4.1;
 
         let confirmation = calibration_confirmation(&reference, &neutral_a, &candidate_a, &neutral_b, &candidate_b);
