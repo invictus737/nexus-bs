@@ -30,7 +30,7 @@ use tetra_entities::{
     lmac::lmac_bs::LmacBs,
     mle::mle_bs::MleBs,
     mm::mm_bs::MmBs,
-    phy::{components::soapy_dev::RxTxDevSoapySdr, phy_bs::PhyBs},
+    phy::{components::soapy_dev::RxTxDevSoapySdr, components::soapyio::SoapyIo, phy_bs::PhyBs},
     sndcp::sndcp_bs::Sndcp,
     umac::umac_bs::UmacBs,
 };
@@ -260,6 +260,10 @@ struct Args {
     /// Config file (required)
     #[arg(help = "TOML config with network/cell parameters")]
     config: String,
+
+    /// Run only the destructive Soapy RF known-symbol/DC-IQ calibration, then exit.
+    #[arg(long, value_name = "CALIBRATION_TOML")]
+    rf_calibration_only: Option<String>,
 }
 
 fn main() {
@@ -309,6 +313,30 @@ fn main() {
             fb_reason,
             fb_path
         );
+    }
+
+    if let Some(calibration_path) = args.rf_calibration_only.as_deref() {
+        tracing::warn!(
+            "RF calibration-only mode: opening Soapy exclusively config={} calibration={}",
+            args.config,
+            calibration_path
+        );
+        match SoapyIo::new(&cfg).map_err(|err| err.to_string()).and_then(|mut sdr| {
+            sdr.run_tx_calibration(calibration_path).map(|report| {
+                tracing::warn!(
+                    "RF calibration-only report status={} accepted={}",
+                    report.status,
+                    report.report.accepted
+                )
+            })
+        }) {
+            Ok(()) => return,
+            Err(err) => {
+                tracing::error!("RF calibration-only failed: {}", err);
+                eprintln!("ERROR: RF calibration-only failed: {}", err);
+                std::process::exit(2);
+            }
+        }
     }
 
     let (mut router, tsource, cdispatchers) = build_bs_stack(&mut cfg);

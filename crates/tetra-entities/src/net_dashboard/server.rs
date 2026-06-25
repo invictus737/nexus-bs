@@ -10,7 +10,7 @@ use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -59,7 +59,8 @@ const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
 const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
 const EASY_START_TEMPLATE_TOML: &str = include_str!("../../../../example_config/config_template.toml");
 const EASY_START_DONE_MARKER: &str = ".easy-start-done";
-const SMART_RF_TUNE_RESTART_WARMUP_SECS: u64 = 20;
+const SMART_RF_TUNE_CORE_STOP_TIMEOUT_SECS: u64 = 20;
+const SMART_RF_TUNE_MEASUREMENT_TIMEOUT_SECS: u64 = 180;
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct SmartRfTuneState {
@@ -2619,8 +2620,8 @@ fn serve_smart_rf_tune_start(
     stream: TcpStream,
     state: &DashboardState,
     config_path: &str,
-    rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
-    phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    _rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    _phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
     core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
 ) {
     let (active_calls, sdr_health) = match state.read() {
@@ -2660,11 +2661,9 @@ fn serve_smart_rf_tune_start(
 
     let config_path = config_path.to_string();
     let sdr_health_for_worker = sdr_health.clone();
-    let rf_cmd_tx = Arc::clone(rf_cmd_tx);
-    let phy_cmd_tx = Arc::clone(phy_cmd_tx);
     let core_cmd_tx = Arc::clone(core_cmd_tx);
     if let Err(err) = std::thread::Builder::new().name("smart-rf-tune".into()).spawn(move || {
-        run_smart_rf_tune_orchestrator(config_path, sdr_health_for_worker, rf_cmd_tx, phy_cmd_tx, core_cmd_tx);
+        run_smart_rf_tune_orchestrator(config_path, sdr_health_for_worker, core_cmd_tx);
     }) {
         smart_rf_tune_fail(format!("failed to start Smart RF Tune worker: {}", err));
         let body = serde_json::to_string(&serde_json::json!({"ok": false, "error": "failed to start Smart RF Tune worker"}))
@@ -2685,14 +2684,13 @@ fn serve_smart_rf_tune_start(
 fn run_smart_rf_tune_orchestrator(
     config_path: String,
     sdr_health: crate::net_dashboard::state::SdrHealthSnapshot,
-    rf_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
-    phy_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
     core_cmd_tx: Arc<Mutex<Option<CmdSender>>>,
 ) {
     let base_config = match std::fs::read_to_string(&config_path) {
         Ok(text) => text,
         Err(err) => {
             smart_rf_tune_fail(format!("read active config failed: {}", err));
+            crate::rf_calibration::mark_failed(format!("Smart RF Tune read active config failed: {}", err));
             return;
         }
     };
@@ -2703,18 +2701,38 @@ fn run_smart_rf_tune_orchestrator(
     let candidates = smart_rf_tune_candidates(&sdr_health, &current_profile);
     if candidates.is_empty() {
         smart_rf_tune_fail("no generic Soapy gain candidates could be built from SDR readback");
+        crate::rf_calibration::mark_failed("Smart RF Tune could not build generic Soapy gain candidates");
         return;
     }
     smart_rf_tune_set_total(candidates.len());
     let mut results = Vec::new();
     let calibration_path = crate::rf_calibration::calibration_path_for_config(&config_path);
+    let core_unit = stop_core_for_smart_rf_tune(&core_cmd_tx);
+    match wait_for_core_stopped(&core_unit, std::time::Duration::from_secs(SMART_RF_TUNE_CORE_STOP_TIMEOUT_SECS)) {
+        Ok(()) => smart_rf_tune_log(format!(
+            "verified {} is stopped; only calibration-only process will touch Soapy SDR",
+            core_unit
+        )),
+        Err(err) => {
+            let _ = write_dashboard_config_file(Path::new(&config_path), &base_config);
+            clear_dashboard_config_cache(&config_path);
+            restart_core_for_smart_rf_tune(&core_cmd_tx);
+            crate::rf_calibration::mark_failed(format!("Smart RF Tune refused measurement: {}", err));
+            smart_rf_tune_fail(format!(
+                "Smart RF Tune refused to measure because core runtime stop could not be verified: {}",
+                err
+            ));
+            return;
+        }
+    }
+    crate::rf_calibration::mark_calibrating(&calibration_path.display().to_string());
 
     for (idx, candidate) in candidates.iter().enumerate() {
         smart_rf_tune_set_candidate(idx + 1, candidate);
         match apply_smart_rf_tune_candidate_config(&config_path, &base_config, candidate) {
             Ok(()) => {
                 clear_dashboard_config_cache(&config_path);
-                smart_rf_tune_log("candidate config written; restarting SDR for measured RF run");
+                smart_rf_tune_log("candidate config written; launching exclusive measured RF run");
             }
             Err(err) => {
                 let result = smart_rf_tune_error_result(candidate, format!("config write failed: {}", err));
@@ -2723,17 +2741,13 @@ fn run_smart_rf_tune_orchestrator(
                 continue;
             }
         }
-        restart_core_for_smart_rf_tune(&core_cmd_tx);
-        smart_rf_tune_log(format!(
-            "warm-up {}s after SDR restart; startup RX/TX lost events are ignored",
-            SMART_RF_TUNE_RESTART_WARMUP_SECS
-        ));
-        std::thread::sleep(std::time::Duration::from_secs(SMART_RF_TUNE_RESTART_WARMUP_SECS));
 
-        let result = match run_smart_rf_tune_measurement(&calibration_path, &rf_cmd_tx, &phy_cmd_tx) {
+        let candidate_calibration_path = smart_rf_tune_candidate_calibration_path(idx + 1);
+        let result = match run_smart_rf_tune_measurement(&config_path, &candidate_calibration_path) {
             Ok(report) => smart_rf_tune_result_from_report(candidate, &report),
             Err(err) => smart_rf_tune_error_result(candidate, err),
         };
+        cleanup_smart_rf_tune_candidate_calibration_files(&candidate_calibration_path);
         smart_rf_tune_push_result(result.clone());
         results.push(result);
         std::thread::sleep(std::time::Duration::from_secs(8));
@@ -2748,6 +2762,7 @@ fn run_smart_rf_tune_orchestrator(
         let _ = write_dashboard_config_file(Path::new(&config_path), &base_config);
         clear_dashboard_config_cache(&config_path);
         restart_core_for_smart_rf_tune(&core_cmd_tx);
+        crate::rf_calibration::mark_failed("Smart RF Tune measured no usable known-symbol RF EVM result");
         smart_rf_tune_fail("Smart RF Tune measured no usable known-symbol RF EVM result; restored starting config");
         return;
     };
@@ -2761,13 +2776,30 @@ fn run_smart_rf_tune_orchestrator(
     match apply_smart_rf_tune_candidate_config(&config_path, &base_config, &best_candidate) {
         Ok(()) => {
             clear_dashboard_config_cache(&config_path);
+            smart_rf_tune_log("best measured config written; running final persistent RF calibration at selected gains");
+            match run_smart_rf_tune_measurement(&config_path, &calibration_path) {
+                Ok(report) => smart_rf_tune_log(format!(
+                    "final persistent calibration report accepted={} rms={:?} peak={:?} snr={:.1} summary={}",
+                    report.report.accepted,
+                    report.calibrated.tetra_known_rms_evm_pct,
+                    report.calibrated.tetra_known_peak_evm_pct,
+                    report.calibrated.snr_db,
+                    report.report.summary
+                )),
+                Err(err) => smart_rf_tune_log(format!(
+                    "final persistent calibration failed after best gain selection; restarting with measured best gains but without new accepted DC/IQ: {}",
+                    err
+                )),
+            }
             restart_core_for_smart_rf_tune(&core_cmd_tx);
+            crate::rf_calibration::mark_calibrated("Smart RF Tune applied best measured gains; core SDR restart queued");
             smart_rf_tune_finish(best);
         }
         Err(err) => {
             let _ = write_dashboard_config_file(Path::new(&config_path), &base_config);
             clear_dashboard_config_cache(&config_path);
             restart_core_for_smart_rf_tune(&core_cmd_tx);
+            crate::rf_calibration::mark_failed(format!("Smart RF Tune best measured config write failed: {}", err));
             smart_rf_tune_fail(format!("best measured config write failed: {}; restored starting config", err));
         }
     }
@@ -2820,6 +2852,9 @@ fn smart_rf_tune_begin(config_path: &str, sdr_health: &crate::net_dashboard::sta
     let snapshot_path = smart_rf_tune_default_snapshot_path(config_path);
     std::fs::write(&snapshot_path, config_text)
         .map_err(|err| format!("write default tune snapshot {}: {}", snapshot_path.display(), err))?;
+    let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path);
+    let calibration_path_string = calibration_path.display().to_string();
+    crate::rf_calibration::try_start(&calibration_path_string)?;
     let now = unix_secs_for_dashboard();
     *state = SmartRfTuneState {
         active: true,
@@ -2839,6 +2874,7 @@ fn smart_rf_tune_begin(config_path: &str, sdr_health: &crate::net_dashboard::sta
         "Smart RF Tune accepted; starting from TX gains {:?}, RX gains {:?}",
         sdr_health.tx_gains, sdr_health.rx_gains
     ));
+    crate::rf_calibration::append_log("Smart RF Tune owns RF calibration state; manual calibration is blocked until tune finishes");
     Ok(())
 }
 
@@ -2929,6 +2965,28 @@ fn smart_rf_tune_report_path(config_path: &str) -> PathBuf {
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join("smart-rf-tune.report.json")
+}
+
+fn smart_rf_tune_candidate_calibration_path(index: usize) -> PathBuf {
+    std::env::temp_dir().join(format!("nexus-bs-smart-rf-tune-{}-candidate-{}.toml", std::process::id(), index))
+}
+
+fn cleanup_smart_rf_tune_candidate_calibration_files(path: &Path) {
+    for candidate_path in [
+        path.to_path_buf(),
+        tetra_config::bluestation::tx_calibration_run_report_path(path),
+        tetra_config::bluestation::tx_calibration_rejected_report_path(path),
+    ] {
+        match std::fs::remove_file(&candidate_path) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => smart_rf_tune_log(format!(
+                "could not remove temporary calibration file {}: {}",
+                candidate_path.display(),
+                err
+            )),
+        }
+    }
 }
 
 fn write_smart_rf_tune_report_locked(state: &SmartRfTuneState) {
@@ -3030,47 +3088,158 @@ fn restart_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
     crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
 }
 
+fn stop_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) -> String {
+    let unit = crate::service_control::resolve_service_unit();
+    let queued = send_control_cmd(core_cmd_tx, ControlCommand::ShutdownService);
+    smart_rf_tune_log(format!(
+        "core stop requested before exclusive SDR calibration unit={} queued={}",
+        unit, queued
+    ));
+    match request_systemctl_action("stop", &unit) {
+        Ok(()) => smart_rf_tune_log(format!("systemctl stop {} completed", unit)),
+        Err(err) => smart_rf_tune_log(format!(
+            "systemctl stop {} failed; waiting on control-service stop path: {}",
+            unit, err
+        )),
+    }
+    unit
+}
+
 fn run_smart_rf_tune_measurement(
+    config_path: &str,
     calibration_path: &Path,
-    rf_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
-    phy_cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
 ) -> Result<tetra_config::bluestation::TxCalibrationFile, String> {
-    let calibration_path_string = calibration_path.display().to_string();
-    crate::rf_calibration::try_start(&calibration_path_string)?;
     let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(calibration_path);
-    if !send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: true }) {
-        crate::rf_calibration::mark_failed("Smart RF Tune could not inhibit RF carrier");
-        return Err("RF carrier control channel unavailable".to_string());
+    match std::fs::remove_file(&run_report_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("remove stale run report {}: {}", run_report_path.display(), err)),
     }
-    smart_rf_tune_log("RF carrier inhibited; waiting guard before known-symbol EVM measurement");
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    let phy_sender = phy_cmd_tx.lock().ok().and_then(|guard| guard.clone());
-    let Some(phy_sender) = phy_sender else {
-        crate::rf_calibration::mark_failed("Smart RF Tune PHY command channel unavailable");
-        let _ = send_control_cmd(rf_cmd_tx, ControlCommand::SetRfCarrierInhibit { inhibited: false });
-        return Err("PHY command channel unavailable".to_string());
-    };
-    phy_sender
-        .try_send(ControlCommand::RunTxCalibration {
-            calibration_path: calibration_path_string,
-        })
-        .map_err(|_| "failed to queue PHY known-symbol EVM measurement".to_string())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(150);
-    while std::time::Instant::now() < deadline {
-        if run_report_path.exists() {
-            crate::rf_calibration::mark_calibrated("Smart RF Tune known-symbol EVM report available");
-            return tetra_config::bluestation::read_tx_calibration_file(&run_report_path);
+    smart_rf_tune_log(format!(
+        "starting exclusive calibration-only process; BS runtime is stopped; startup underruns are not part of measurement"
+    ));
+    let mut child = Command::new(nexus_bs_core_binary_path())
+        .arg(config_path)
+        .arg("--rf-calibration-only")
+        .arg(calibration_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|err| format!("spawn calibration-only process: {}", err))?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(SMART_RF_TUNE_MEASUREMENT_TIMEOUT_SECS);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(250)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "calibration-only timed out after {}s",
+                    SMART_RF_TUNE_MEASUREMENT_TIMEOUT_SECS
+                ));
+            }
+            Err(err) => return Err(format!("wait calibration-only process: {}", err)),
         }
-        if matches!(
-            crate::rf_calibration::current_phase(),
-            crate::rf_calibration::CalibrationPhase::Failed
-        ) {
-            return Err("PHY measurement failed before report was written".to_string());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
     }
-    crate::rf_calibration::mark_failed("Smart RF Tune timeout waiting for known-symbol EVM report");
-    Err("timeout waiting for known-symbol EVM report".to_string())
+    let output = child
+        .wait_with_output()
+        .map_err(|err| format!("collect calibration-only output: {}", err))?;
+    if !output.status.success() {
+        return Err(format!(
+            "calibration-only exited status={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("")
+        ));
+    }
+    tetra_config::bluestation::read_tx_calibration_file(&run_report_path)
+}
+
+fn wait_for_core_stopped(unit: &str, timeout: std::time::Duration) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match systemctl_is_active_state(unit)? {
+            SystemctlActiveState::Inactive | SystemctlActiveState::Failed => return Ok(()),
+            SystemctlActiveState::Unknown => return Err(format!("{} is unknown to systemd", unit)),
+            SystemctlActiveState::Active | SystemctlActiveState::Activating | SystemctlActiveState::Deactivating => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("{} still {:?} after {:?}", unit, systemctl_is_active_state(unit)?, timeout));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SystemctlActiveState {
+    Active,
+    Activating,
+    Deactivating,
+    Inactive,
+    Failed,
+    Unknown,
+}
+
+fn systemctl_is_active_state(unit: &str) -> Result<SystemctlActiveState, String> {
+    let output = Command::new("systemctl")
+        .args(["is-active", unit])
+        .output()
+        .map_err(|err| format!("systemctl is-active {}: {}", unit, err))?;
+    let state = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(match state.as_str() {
+        "active" => SystemctlActiveState::Active,
+        "activating" => SystemctlActiveState::Activating,
+        "deactivating" => SystemctlActiveState::Deactivating,
+        "inactive" => SystemctlActiveState::Inactive,
+        "failed" => SystemctlActiveState::Failed,
+        "unknown" => SystemctlActiveState::Unknown,
+        _ if output.status.success() => SystemctlActiveState::Active,
+        _ => SystemctlActiveState::Unknown,
+    })
+}
+
+fn request_systemctl_action(action: &str, unit: &str) -> Result<(), String> {
+    match Command::new("systemctl").args([action, unit]).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let systemctl_err = command_output_error(output);
+            match Command::new("sudo").args(["-n", "systemctl", action, unit]).output() {
+                Ok(output) if output.status.success() => Ok(()),
+                Ok(output) => Err(format!("systemctl: {}; sudo -n: {}", systemctl_err, command_output_error(output))),
+                Err(err) => Err(format!("systemctl: {}; sudo -n: {}", systemctl_err, err)),
+            }
+        }
+        Err(err) => Err(err.to_string()),
+    }
+}
+
+fn command_output_error(output: std::process::Output) -> String {
+    let status = output.status.to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if !stderr.is_empty() {
+        format!("{}: {}", status, stderr)
+    } else if !stdout.is_empty() {
+        format!("{}: {}", status, stdout)
+    } else {
+        status
+    }
+}
+
+fn nexus_bs_core_binary_path() -> PathBuf {
+    if let Ok(path) = std::env::var("NEXUS_BS_CORE_BINARY") {
+        return PathBuf::from(path);
+    }
+    if let Ok(current) = std::env::current_exe() {
+        if let Some(parent) = current.parent() {
+            let sibling = parent.join("nexus-bs");
+            if sibling.exists() {
+                return sibling;
+            }
+        }
+    }
+    PathBuf::from("nexus-bs")
 }
 
 fn smart_rf_tune_result_from_report(
