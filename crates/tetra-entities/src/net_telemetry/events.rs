@@ -108,6 +108,29 @@ pub enum TelemetryEvent {
         carrier_leakage_db: f32,
         /// Occupied bandwidth in Hz — width containing 99% of total power.
         occupied_bandwidth_hz: f32,
+        /// EVM gate derived from the pre-SDR DSP estimate: ok/degraded/critical.
+        /// This is an operational health gate, not formal RF conformance proof.
+        evm_gate: String,
+        /// Current gate limit for critical DSP EVM estimate, in percent.
+        evm_limit_pct: f32,
+        /// Operator-selected TX gain intent for PA-safe operation.
+        tx_gain_profile: String,
+        /// Configured TX frequency correction applied from PPM, in Hz.
+        frequency_error_hz: f32,
+        /// RF reference clock source label.
+        reference_clock: String,
+        /// RF timing health severity from the health registry.
+        rf_timing_severity: String,
+        /// Total late TX timing events since process start.
+        rf_tx_late_events: u64,
+        /// Total skipped TX blocks since process start.
+        rf_tx_late_blocks: u64,
+        /// Total RX lost-sample events since process start.
+        rf_rx_lost_events: u64,
+        /// Total lost RX samples since process start.
+        rf_rx_lost_samples: u64,
+        /// Age of the last RF timing anomaly in milliseconds.
+        rf_last_anomaly_age_ms: u64,
     },
     /// SDR hardware health snapshot. Emitted every ~5 seconds. Some fields may be
     /// absent (None) depending on what the radio exposes via Soapy.

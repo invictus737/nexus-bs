@@ -199,8 +199,13 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
               <dt>Device</dt><dd id="rfDevice">--</dd>
               <dt>Sample Rate</dt><dd id="rfSampleRate">--</dd>
               <dt>PPM</dt><dd id="rfPpm">--</dd>
+              <dt>Reference</dt><dd id="rfReferenceClock">--</dd>
+              <dt>TX Corrected</dt><dd id="rfTxCorrected">--</dd>
+              <dt>RX Corrected</dt><dd id="rfRxCorrected">--</dd>
+              <dt>PPM Error</dt><dd id="rfPpmErrorHz">--</dd>
               <dt>Channels</dt><dd id="rfChannels">--</dd>
               <dt>Antennas</dt><dd id="rfAntennas">--</dd>
+              <dt>TX Profile</dt><dd id="rfTxGainProfile">--</dd>
               <dt>TX Gains</dt><dd id="rfTxGains">--</dd>
               <dt>RX Gains</dt><dd id="rfRxGains">--</dd>
               <dt>Temperature</dt><dd id="rfTemp">--</dd>
@@ -213,9 +218,12 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
               <dt>RMS</dt><dd id="rfRms">--</dd>
               <dt>Peak</dt><dd id="rfPeak">--</dd>
               <dt>DSP EVM Est.</dt><dd id="rfEvm">--</dd>
+              <dt>EVM Gate</dt><dd id="rfEvmGate">--</dd>
               <dt>PAPR</dt><dd id="rfPapr">--</dd>
               <dt>Occupied BW</dt><dd id="rfObw">--</dd>
               <dt>Carrier Leak</dt><dd id="rfCarrierLeak">--</dd>
+              <dt>RF Timing</dt><dd id="rfTiming">--</dd>
+              <dt>RF Advice</dt><dd id="rfAdvice">--</dd>
               <dt>System Power</dt><dd id="rfPower">--</dd>
               <dt>Soapy Summary</dt><dd id="soapyInfo">--</dd>
             </dl>
@@ -368,11 +376,18 @@ SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
                 <dt>Applied</dt><dd id="calibrationApplied">--</dd>
                 <dt>Carrier Leak</dt><dd id="calibrationCarrier">--</dd>
                 <dt>Image Rejection</dt><dd id="calibrationImage">--</dd>
+                <dt>Known RMS EVM</dt><dd id="calibrationKnownRmsEvm">--</dd>
+                <dt>Known Peak EVM</dt><dd id="calibrationKnownPeakEvm">--</dd>
                 <dt>DC/Image Proxy</dt><dd id="calibrationEvm">--</dd>
+                <dt>Profile Autotest</dt><dd id="calibrationProfileAdvice">--</dd>
               </dl>
             </div>
             <div class="calibration-actions">
               <button class="action-btn danger" id="calibrationRunBtn" type="button">Calibrate TX DC/IQ</button>
+              <button class="action-btn" id="rfProfileApplyBtn" type="button">Apply Safe Profile</button>
+              <button class="action-btn" id="rfProfileHotspotBtn" type="button">Test Hotspot</button>
+              <button class="action-btn" id="rfProfileLowPowerBtn" type="button">Test Low Power</button>
+              <button class="action-btn" id="rfProfilePaBtn" type="button">Test PA</button>
               <span id="calibrationActionStatus">traffic outage required</span>
               <pre id="calibrationLog" class="calibration-log"></pre>
             </div>

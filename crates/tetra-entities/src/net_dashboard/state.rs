@@ -103,6 +103,17 @@ pub struct TxQualitySnapshot {
     pub iq_phase_imbalance_deg: f32,
     pub carrier_leakage_db: f32,
     pub occupied_bandwidth_hz: f32,
+    pub evm_gate: String,
+    pub evm_limit_pct: f32,
+    pub tx_gain_profile: String,
+    pub frequency_error_hz: f32,
+    pub reference_clock: String,
+    pub rf_timing_severity: String,
+    pub rf_tx_late_events: u64,
+    pub rf_tx_late_blocks: u64,
+    pub rf_rx_lost_events: u64,
+    pub rf_rx_lost_samples: u64,
+    pub rf_last_anomaly_age_ms: u64,
 }
 
 /// Snapshot of host system health (temperatures, voltages, currents, power).

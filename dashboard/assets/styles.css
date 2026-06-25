@@ -1122,14 +1122,16 @@ td .pill {
 .calibration-actions {
   min-width: 0;
   display: grid;
-  grid-template-columns: minmax(150px, auto) minmax(0, 1fr);
+  grid-template-columns: repeat(2, minmax(136px, max-content));
   gap: 8px;
+  justify-content: start;
   align-content: start;
   padding: 12px;
   border-left: 1px solid var(--line-soft);
 }
 
 .calibration-actions > span {
+  grid-column: 1 / -1;
   min-width: 0;
   align-self: end;
   overflow: hidden;
@@ -1588,6 +1590,7 @@ td .pill {
 
 .action-btn {
   min-width: 0;
+  max-width: 100%;
   min-height: 34px;
   align-self: end;
   border: 1px solid var(--line);
@@ -1599,6 +1602,8 @@ td .pill {
   font-size: 12px;
   font-weight: 700;
   padding: 0 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

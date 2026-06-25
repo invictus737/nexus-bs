@@ -53,6 +53,10 @@ ppm_err = 0                       # Adjust if your SDR has a non-negligible tuni
 
 # Optional gain values to override device-specific defaults.
 # Check valid gain names with SoapySDRUtil --probe
+# TX gain profile is an operator intent label used by dashboard/calibration
+# health gates. Keep nominal_clean unless you have validated a PA drive profile.
+tx_gain_profile = "nominal_clean"    # low_drive_calibration | nominal_clean | pa_drive_linear | max_test_only
+reference_clock = "internal"         # internal unless the SDR is locked to an external reference
 tx_gain_dac = 0.0
 tx_gain_mixer = 30.0
 

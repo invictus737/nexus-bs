@@ -101,6 +101,7 @@ pub struct SoapyIo {
     tx: Option<soapysdr::TxStream<StreamType>>,
     temperature_sensor_reads_supported: bool,
     sdr_name: String,
+    tx_gain_profile: String,
     rx_ant: Option<String>,
     tx_ant: Option<String>,
     rx_gain: Vec<(String, f64)>,
@@ -148,6 +149,7 @@ struct TxCalibrationSession {
 #[derive(Clone, Debug)]
 struct TxCalibrationRuntimeConfig {
     name: String,
+    tx_gain_profile: String,
     live_rx_carrier_hz: f64,
     live_tx_carrier_hz: f64,
     live_rx_center_hz: f64,
@@ -273,6 +275,7 @@ impl SoapyIo {
 
             let runtime_calibration_config = TxCalibrationRuntimeConfig {
                 name: sdr_name.clone(),
+                tx_gain_profile: soapy_cfg.tx_gain_profile.clone(),
                 live_rx_carrier_hz: live_rx_carrier_hz.unwrap_or(rx_freq.unwrap_or_default()),
                 live_tx_carrier_hz: live_tx_carrier_hz.unwrap_or(tx_freq.unwrap_or_default()),
                 live_rx_center_hz: dev
@@ -334,6 +337,7 @@ impl SoapyIo {
             tx,
             temperature_sensor_reads_supported,
             sdr_name,
+            tx_gain_profile: soapy_cfg.tx_gain_profile.clone(),
             rx_ant: rx_ant_configured,
             tx_ant: tx_ant_configured,
             rx_gain: rx_gain_configured,
@@ -729,6 +733,7 @@ impl SoapyIo {
                 updated_unix_secs: now,
                 device: TxCalibrationDevice {
                     name: self.sdr_name.clone(),
+                    tx_gain_profile: self.tx_gain_profile.clone(),
                     tx_frequency_hz: session.live_tx_carrier_hz,
                     rx_frequency_hz: session.live_rx_carrier_hz,
                     tx_center_frequency_hz: session.live_tx_center_hz,
@@ -1932,6 +1937,12 @@ fn validate_tx_calibration_matches_runtime_config(
     if device.name != runtime.name {
         mismatches.push(format!("device.name stored={} current={}", device.name, runtime.name));
     }
+    if !device.tx_gain_profile.is_empty() && device.tx_gain_profile != runtime.tx_gain_profile {
+        mismatches.push(format!(
+            "tx_gain_profile stored={} current={}",
+            device.tx_gain_profile, runtime.tx_gain_profile
+        ));
+    }
     compare_hz(
         &mut mismatches,
         "tx_frequency_hz",
@@ -3024,6 +3035,7 @@ mod tests {
     fn runtime_calibration_config() -> TxCalibrationRuntimeConfig {
         TxCalibrationRuntimeConfig {
             name: "SXceiver".to_string(),
+            tx_gain_profile: "nominal_clean".to_string(),
             live_rx_carrier_hz: 431_362_500.0,
             live_tx_carrier_hz: 438_362_500.0,
             live_rx_center_hz: 431_342_500.0,
@@ -3045,6 +3057,7 @@ mod tests {
             status: "calibrated".to_string(),
             device: TxCalibrationDevice {
                 name: runtime.name.clone(),
+                tx_gain_profile: runtime.tx_gain_profile.clone(),
                 tx_frequency_hz: runtime.live_tx_carrier_hz,
                 rx_frequency_hz: runtime.live_rx_carrier_hz,
                 tx_center_frequency_hz: runtime.live_tx_center_hz,

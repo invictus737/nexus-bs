@@ -15,6 +15,7 @@ pub mod mle;
 pub mod mm;
 pub mod phy;
 pub mod rf_calibration;
+pub mod rf_profile_optimizer;
 pub mod sndcp;
 pub mod umac;
 

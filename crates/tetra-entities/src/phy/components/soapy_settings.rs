@@ -378,6 +378,8 @@ mod tests {
             tx_ant: None,
             rx_gains: HashMap::new(),
             tx_gains: HashMap::new(),
+            tx_gain_profile: tetra_config::bluestation::TX_GAIN_PROFILE_DEFAULT.to_string(),
+            reference_clock: tetra_config::bluestation::TX_REFERENCE_CLOCK_DEFAULT.to_string(),
             fs: None,
             rx_ch: None,
             tx_ch: None,

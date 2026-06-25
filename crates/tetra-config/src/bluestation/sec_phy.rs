@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use serde::Deserialize;
 use toml::Value;
 
-use crate::bluestation::{CfgSoapySdr, SoapySdrDto};
+use crate::bluestation::{CfgSoapySdr, SoapySdrDto, TX_GAIN_PROFILE_DEFAULT, TX_REFERENCE_CLOCK_DEFAULT, validate_tx_gain_profile};
 
 /// The PHY layer backend type
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
@@ -81,6 +81,9 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> Result<CfgPhyIo, String> {
                 })
                 .collect::<Result<HashMap<_, _>, String>>()?;
 
+            let tx_gain_profile = soapy_dto.tx_gain_profile.unwrap_or_else(|| TX_GAIN_PROFILE_DEFAULT.to_string());
+            validate_tx_gain_profile(&tx_gain_profile)?;
+
             Ok::<CfgSoapySdr, String>(CfgSoapySdr {
                 ul_freq: soapy_dto.rx_freq,
                 dl_freq: soapy_dto.tx_freq,
@@ -93,6 +96,8 @@ pub fn phy_dto_to_cfg(src: PhyIoDto) -> Result<CfgPhyIo, String> {
                 tx_ant: soapy_dto.tx_antenna,
                 rx_gains,
                 tx_gains,
+                tx_gain_profile,
+                reference_clock: soapy_dto.reference_clock.unwrap_or_else(|| TX_REFERENCE_CLOCK_DEFAULT.to_string()),
                 tx_calibration_enabled: soapy_dto.tx_calibration_enabled.unwrap_or(false),
                 tx_calibration_file: soapy_dto
                     .tx_calibration_file

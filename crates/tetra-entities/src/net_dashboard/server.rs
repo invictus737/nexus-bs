@@ -45,6 +45,7 @@ struct CachedDashboardConfig {
 }
 
 static DASHBOARD_CONFIG_CACHE: OnceLock<Mutex<HashMap<String, CachedDashboardConfig>>> = OnceLock::new();
+static SMART_RF_TUNE_STATE: OnceLock<Mutex<SmartRfTuneState>> = OnceLock::new();
 
 const MAX_AIR_INTERFACE_SSI: u64 = 0x00FF_FFFF;
 const DASHBOARD_WAP_SOURCE_SSI: u32 = 0x00FF_FFFF;
@@ -58,6 +59,74 @@ const DASHBOARD_SMALL_BODY_MAX: usize = 4096;
 const DASHBOARD_STATIC_FILE_MAX: u64 = 2 * 1024 * 1024;
 const EASY_START_TEMPLATE_TOML: &str = include_str!("../../../../example_config/config_template.toml");
 const EASY_START_DONE_MARKER: &str = ".easy-start-done";
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct SmartRfTuneState {
+    active: bool,
+    phase: String,
+    log: String,
+    error: String,
+    started_unix_secs: u64,
+    updated_unix_secs: u64,
+    current_index: usize,
+    total_candidates: usize,
+    best: Option<SmartRfTuneResult>,
+    results: Vec<SmartRfTuneResult>,
+    default_snapshot_path: String,
+    report_path: String,
+}
+
+#[derive(Clone, Debug)]
+struct SmartRfTuneCandidate {
+    name: String,
+    tx_gain_profile: String,
+    tx_gain_dac: f64,
+    tx_gain_mixer: f64,
+    rx_gain_lna: f64,
+    rx_gain_pga: f64,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+struct SmartRfTuneResult {
+    name: String,
+    tx_gain_profile: String,
+    tx_gain_dac: f64,
+    tx_gain_mixer: f64,
+    rx_gain_lna: f64,
+    rx_gain_pga: f64,
+    measured: bool,
+    score: f64,
+    rms_evm_pct: Option<f64>,
+    peak_evm_pct: Option<f64>,
+    carrier_leakage_dbc: Option<f64>,
+    image_rejection_db: Option<f64>,
+    snr_db: Option<f64>,
+    signal_dbfs: Option<f64>,
+    floor_drift_abs_db: Option<f64>,
+    clipped_fraction: Option<f64>,
+    timing_warning: bool,
+    accepted_dc_iq: bool,
+    summary: String,
+}
+
+impl Default for SmartRfTuneState {
+    fn default() -> Self {
+        Self {
+            active: false,
+            phase: "idle".to_string(),
+            log: String::new(),
+            error: String::new(),
+            started_unix_secs: 0,
+            updated_unix_secs: 0,
+            current_index: 0,
+            total_candidates: 0,
+            best: None,
+            results: Vec::new(),
+            default_snapshot_path: String::new(),
+            report_path: String::new(),
+        }
+    }
+}
 const EASY_START_SKIP_MARKER: &str = ".easy-start-skipped";
 const FACTORY_RESET_CONFIRMATION: &str = "RESET NEXUS-BS";
 const DASHBOARD_SECURITY_HEADERS: &str = concat!(
@@ -1179,6 +1248,17 @@ impl DashboardServer {
                     iq_phase_imbalance_deg,
                     carrier_leakage_db,
                     occupied_bandwidth_hz,
+                    evm_gate,
+                    evm_limit_pct,
+                    tx_gain_profile,
+                    frequency_error_hz,
+                    reference_clock,
+                    rf_timing_severity,
+                    rf_tx_late_events,
+                    rf_tx_late_blocks,
+                    rf_rx_lost_events,
+                    rf_rx_lost_samples,
+                    rf_last_anomaly_age_ms,
                 } => {
                     // Cache the quality numbers so late-joining clients get them
                     // straight away rather than waiting up to a second.
@@ -1191,6 +1271,17 @@ impl DashboardServer {
                         iq_phase_imbalance_deg: *iq_phase_imbalance_deg,
                         carrier_leakage_db: *carrier_leakage_db,
                         occupied_bandwidth_hz: *occupied_bandwidth_hz,
+                        evm_gate: evm_gate.clone(),
+                        evm_limit_pct: *evm_limit_pct,
+                        tx_gain_profile: tx_gain_profile.clone(),
+                        frequency_error_hz: *frequency_error_hz,
+                        reference_clock: reference_clock.clone(),
+                        rf_timing_severity: rf_timing_severity.clone(),
+                        rf_tx_late_events: *rf_tx_late_events,
+                        rf_tx_late_blocks: *rf_tx_late_blocks,
+                        rf_rx_lost_events: *rf_rx_lost_events,
+                        rf_rx_lost_samples: *rf_rx_lost_samples,
+                        rf_last_anomaly_age_ms: *rf_last_anomaly_age_ms,
                     });
                 }
                 TelemetryEvent::SdrHealth {
@@ -1390,6 +1481,17 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             iq_phase_imbalance_deg,
             carrier_leakage_db,
             occupied_bandwidth_hz,
+            evm_gate,
+            evm_limit_pct,
+            tx_gain_profile,
+            frequency_error_hz,
+            reference_clock,
+            rf_timing_severity,
+            rf_tx_late_events,
+            rf_tx_late_blocks,
+            rf_rx_lost_events,
+            rf_rx_lost_samples,
+            rf_last_anomaly_age_ms,
         } => serde_json::json!({
             "type": "tx_quality",
             "papr_db": papr_db,
@@ -1400,6 +1502,17 @@ fn event_to_ws_msg(event: &TelemetryEvent) -> Option<String> {
             "iq_phase_imbalance_deg": iq_phase_imbalance_deg,
             "carrier_leakage_db": carrier_leakage_db,
             "occupied_bandwidth_hz": occupied_bandwidth_hz,
+            "evm_gate": evm_gate,
+            "evm_limit_pct": evm_limit_pct,
+            "tx_gain_profile": tx_gain_profile,
+            "frequency_error_hz": frequency_error_hz,
+            "reference_clock": reference_clock,
+            "rf_timing_severity": rf_timing_severity,
+            "rf_tx_late_events": rf_tx_late_events,
+            "rf_tx_late_blocks": rf_tx_late_blocks,
+            "rf_rx_lost_events": rf_rx_lost_events,
+            "rf_rx_lost_samples": rf_rx_lost_samples,
+            "rf_last_anomaly_age_ms": rf_last_anomaly_age_ms,
         }),
         TelemetryEvent::SdrHealth {
             temperature_c,
@@ -2690,6 +2803,56 @@ fn enable_tx_calibration_in_config(config_path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn set_tx_gain_profile_in_config(config_path: &str, profile: &str) -> Result<(), String> {
+    tetra_config::bluestation::validate_tx_gain_profile(profile)?;
+    let path = Path::new(config_path);
+    let text = std::fs::read_to_string(path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let updated = upsert_soapy_key(&text, "tx_gain_profile", &format!("{profile:?}"))?;
+    let backup_path = format!("{}.bak", config_path);
+    let _ = std::fs::copy(path, &backup_path);
+    let tmp_path = path.with_extension("toml.tmp");
+    std::fs::write(&tmp_path, updated).map_err(|e| format!("write {}: {}", tmp_path.display(), e))?;
+    std::fs::rename(&tmp_path, path).map_err(|e| format!("rename {} -> {}: {}", tmp_path.display(), path.display(), e))?;
+    Ok(())
+}
+
+fn upsert_soapy_key(input: &str, key: &str, value: &str) -> Result<String, String> {
+    let mut lines: Vec<String> = input.lines().map(|line| line.to_string()).collect();
+    let had_trailing_newline = input.ends_with('\n');
+    let section_start = lines
+        .iter()
+        .position(|line| line.trim() == "[phy_io.soapysdr]")
+        .ok_or_else(|| "missing [phy_io.soapysdr] section".to_string())?;
+    let section_end = lines
+        .iter()
+        .enumerate()
+        .skip(section_start + 1)
+        .find(|(_, line)| {
+            let trimmed = line.trim();
+            trimmed.starts_with('[') && trimmed.ends_with(']')
+        })
+        .map(|(idx, _)| idx)
+        .unwrap_or(lines.len());
+
+    for line in lines.iter_mut().take(section_end).skip(section_start + 1) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with(key) && trimmed[key.len()..].trim_start().starts_with('=') {
+            *line = format!("{key} = {value}");
+            let mut out = lines.join("\n");
+            if had_trailing_newline {
+                out.push('\n');
+            }
+            return Ok(out);
+        }
+    }
+    lines.insert(section_end, format!("{key} = {value}"));
+    let mut out = lines.join("\n");
+    if had_trailing_newline {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
 fn upsert_soapy_calibration_keys(input: &str) -> Result<String, String> {
     let mut lines: Vec<String> = input.lines().map(|line| line.to_string()).collect();
     let had_trailing_newline = input.ends_with('\n');
@@ -3091,6 +3254,24 @@ fn handle_connection(
     } else if request_matches(&req_line, "GET", "/api/rf/calibration/status") {
         drain_http_headers(&mut stream);
         serve_rf_calibration_status(stream, &config_path);
+    } else if request_matches(&req_line, "POST", "/api/rf/profile-autotest/apply-safe") {
+        let mut buf = BufReader::new(stream);
+        let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+            Ok(body) => body,
+            Err(e) => {
+                respond_http_body_error(buf.into_inner(), e);
+                return;
+            }
+        };
+        match serde_json::from_slice::<serde_json::Value>(&body) {
+            Ok(value) => serve_rf_profile_apply_safe(buf.into_inner(), &state, &config_path, &cmd_tx, &value),
+            Err(e) => http_json_response(
+                buf.into_inner(),
+                400,
+                &serde_json::to_string(&serde_json::json!({"ok": false, "error": format!("invalid JSON: {}", e)}))
+                    .unwrap_or_else(|_| r#"{"ok":false}"#.to_string()),
+            ),
+        }
     } else if request_matches(&req_line, "GET", "/api/wifi") {
         drain_http_headers(&mut stream);
         serve_wifi_status(stream, false);
@@ -3938,6 +4119,8 @@ fn dashboard_site_json(
                 "sample_rate": s.fs,
                 "rx_gains": gain_map_json(&s.rx_gains),
                 "tx_gains": gain_map_json(&s.tx_gains),
+                "tx_gain_profile": s.tx_gain_profile,
+                "reference_clock": s.reference_clock,
                 "frequency_match": frequency_match,
             })),
             "brew": cfg.brew.as_ref().map(|brew| serde_json::json!({
@@ -3976,6 +4159,8 @@ fn dashboard_site_json(
         }),
     };
 
+    let rf_profile_advice = rf_profile_advice_json(last_tx_quality.as_ref(), config_path);
+
     let mut timeslots = Vec::new();
     for ts in 1..=4u8 {
         let call = calls.iter().find(|call| call.ts == ts || call.secondary_ts == Some(ts));
@@ -4008,8 +4193,381 @@ fn dashboard_site_json(
             "sys_health": last_sys_health,
             "health": last_health,
         },
+        "rf_profile_advice": rf_profile_advice,
     }))
     .unwrap_or_else(|_| r#"{"type":"site","config":{"available":false}}"#.to_string())
+}
+
+fn rf_profile_advice_json(
+    last_tx_quality: Option<&crate::net_dashboard::state::TxQualitySnapshot>,
+    config_path: &str,
+) -> serde_json::Value {
+    let Ok((advice, calibration_path)) = build_rf_profile_advice(last_tx_quality, config_path, None) else {
+        let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path);
+        return serde_json::json!({
+            "severity": "insufficient_measurement",
+            "measurement_valid": false,
+            "summary": "waiting for live TX quality and RF loopback EVM measurement",
+            "measurement_sources": [],
+            "calibration_path": calibration_path.display().to_string(),
+        });
+    };
+
+    rf_profile_advice_value(advice, &calibration_path)
+}
+
+fn build_rf_profile_advice(
+    last_tx_quality: Option<&crate::net_dashboard::state::TxQualitySnapshot>,
+    config_path: &str,
+    target_override: Option<crate::rf_profile_optimizer::RfDeploymentProfile>,
+) -> Result<(crate::rf_profile_optimizer::RfProfileRecommendation, PathBuf), String> {
+    let Some(tx_quality) = last_tx_quality else {
+        return Err("live TX quality is unavailable".to_string());
+    };
+    let target = crate::rf_profile_optimizer::RfDeploymentProfile::from_tx_gain_profile(&tx_quality.tx_gain_profile);
+    let target = target_override.unwrap_or(target);
+    let mut measurement = crate::rf_profile_optimizer::RfQualityMeasurement::from_live_tx_quality(
+        tx_quality.tx_gain_profile.clone(),
+        tx_quality.evm_pct,
+        tx_quality.papr_db,
+        tx_quality.carrier_leakage_db,
+        tx_quality.frequency_error_hz,
+        tx_quality.rf_timing_severity.clone(),
+        tx_quality.rf_tx_late_events,
+        tx_quality.rf_rx_lost_events,
+        Some(tx_quality.rf_last_anomaly_age_ms),
+    );
+    let (calibration_path, calibration_report, calibration_error) = latest_tx_calibration_report_for_profile_advice(config_path);
+    match calibration_report {
+        Some(calibration) => match validate_tx_calibration_report_for_profile_advice(config_path, &calibration) {
+            Ok(()) => {
+                measurement = measurement.with_tx_calibration_report(&calibration);
+            }
+            Err(err) => {
+                measurement
+                    .measured_sources
+                    .push(format!("stale_tx_calibration_rf_loopback: {}", err));
+            }
+        },
+        None => {
+            let err = calibration_error.unwrap_or_else(|| "no TX calibration report found".to_string());
+            measurement
+                .measured_sources
+                .push(format!("missing_tx_calibration_rf_loopback: {}", err));
+        }
+    }
+
+    let advice = crate::rf_profile_optimizer::recommend_rf_profile_adjustment(target, &measurement);
+    Ok((advice, calibration_path))
+}
+
+const PROFILE_ADVICE_FREQ_MATCH_TOLERANCE_HZ: f64 = 50.0;
+const PROFILE_ADVICE_SAMPLE_RATE_MATCH_TOLERANCE_HZ: f64 = 1.0;
+const PROFILE_ADVICE_RX_CENTER_OFFSET_HZ: f64 = 20_000.0;
+
+fn validate_tx_calibration_report_for_profile_advice(
+    config_path: &str,
+    calibration: &tetra_config::bluestation::TxCalibrationFile,
+) -> Result<(), String> {
+    let config = cached_active_dashboard_config(config_path)?;
+    let soapy = config
+        .phy_io
+        .soapysdr
+        .as_ref()
+        .ok_or_else(|| "active config is not SoapySDR".to_string())?;
+    let device = supported_device_from_calibration_name(&calibration.device.name)
+        .ok_or_else(|| format!("unsupported calibration device '{}'", calibration.device.name))?;
+    let settings = crate::phy::components::soapy_settings::SdrSettings::get_settings(soapy, device, config.stack_mode)
+        .map_err(|_| "active SoapySDR config is not valid for calibrated device".to_string())?;
+    let (dl_corrected, _) = soapy.dl_freq_corrected();
+    let (ul_corrected, _) = soapy.ul_freq_corrected();
+    let (expected_rx_carrier, expected_tx_carrier, expected_rx_center, expected_tx_center) = match config.stack_mode {
+        tetra_config::bluestation::StackMode::Bs => (
+            ul_corrected,
+            dl_corrected,
+            ul_corrected - PROFILE_ADVICE_RX_CENTER_OFFSET_HZ,
+            dl_corrected,
+        ),
+        tetra_config::bluestation::StackMode::Ms => (
+            dl_corrected,
+            ul_corrected,
+            dl_corrected - PROFILE_ADVICE_RX_CENTER_OFFSET_HZ,
+            ul_corrected,
+        ),
+        tetra_config::bluestation::StackMode::Mon => {
+            return Err("monitor mode has no TX profile calibration runtime".to_string());
+        }
+    };
+    let mut mismatches = Vec::new();
+    if calibration.device.name != settings.name {
+        mismatches.push(format!("device.name stored={} current={}", calibration.device.name, settings.name));
+    }
+    if !calibration.device.tx_gain_profile.is_empty() && calibration.device.tx_gain_profile != soapy.tx_gain_profile {
+        mismatches.push(format!(
+            "tx_gain_profile stored={} current={}",
+            calibration.device.tx_gain_profile, soapy.tx_gain_profile
+        ));
+    }
+    compare_profile_advice_hz(
+        &mut mismatches,
+        "tx_frequency_hz",
+        calibration.device.tx_frequency_hz,
+        expected_tx_carrier,
+        PROFILE_ADVICE_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_profile_advice_hz(
+        &mut mismatches,
+        "rx_frequency_hz",
+        calibration.device.rx_frequency_hz,
+        expected_rx_carrier,
+        PROFILE_ADVICE_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_profile_advice_hz(
+        &mut mismatches,
+        "tx_center_frequency_hz",
+        calibration.device.tx_center_frequency_hz,
+        expected_tx_center,
+        PROFILE_ADVICE_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_profile_advice_hz(
+        &mut mismatches,
+        "rx_center_frequency_hz",
+        calibration.device.rx_center_frequency_hz,
+        expected_rx_center,
+        PROFILE_ADVICE_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_profile_advice_hz(
+        &mut mismatches,
+        "duplex_shift_hz",
+        calibration.device.duplex_shift_hz,
+        expected_tx_carrier - expected_rx_carrier,
+        PROFILE_ADVICE_FREQ_MATCH_TOLERANCE_HZ,
+    );
+    compare_profile_advice_hz(
+        &mut mismatches,
+        "sample_rate_hz",
+        calibration.device.sample_rate_hz,
+        settings.fs,
+        PROFILE_ADVICE_SAMPLE_RATE_MATCH_TOLERANCE_HZ,
+    );
+    if calibration.device.tx_channel != settings.tx_ch {
+        mismatches.push(format!(
+            "tx_channel stored={} current={}",
+            calibration.device.tx_channel, settings.tx_ch
+        ));
+    }
+    if calibration.device.rx_channel != settings.rx_ch {
+        mismatches.push(format!(
+            "rx_channel stored={} current={}",
+            calibration.device.rx_channel, settings.rx_ch
+        ));
+    }
+    let expected_tx_ant = settings.tx_ant.as_deref().unwrap_or("auto");
+    let expected_rx_ant = settings.rx_ant.as_deref().unwrap_or("auto");
+    if !profile_advice_antenna_matches(&calibration.device.tx_antenna, expected_tx_ant) {
+        mismatches.push(format!(
+            "tx_antenna stored={} current={}",
+            calibration.device.tx_antenna, expected_tx_ant
+        ));
+    }
+    if !profile_advice_antenna_matches(&calibration.device.rx_antenna, expected_rx_ant) {
+        mismatches.push(format!(
+            "rx_antenna stored={} current={}",
+            calibration.device.rx_antenna, expected_rx_ant
+        ));
+    }
+    let expected_tx_gains = profile_advice_gain_fingerprint(&settings.tx_gain);
+    let expected_rx_gains = profile_advice_gain_fingerprint(&settings.rx_gain);
+    if calibration.device.tx_gains_fingerprint != expected_tx_gains {
+        mismatches.push(format!(
+            "tx_gains stored={} current={}",
+            calibration.device.tx_gains_fingerprint, expected_tx_gains
+        ));
+    }
+    if calibration.device.rx_gains_fingerprint != expected_rx_gains {
+        mismatches.push(format!(
+            "rx_gains stored={} current={}",
+            calibration.device.rx_gains_fingerprint, expected_rx_gains
+        ));
+    }
+
+    if mismatches.is_empty() {
+        Ok(())
+    } else {
+        Err(mismatches.join("; "))
+    }
+}
+
+fn supported_device_from_calibration_name(name: &str) -> Option<crate::phy::components::soapy_settings::SupportedDevice> {
+    use crate::phy::components::soapy_settings::{LimeSdrModel, SupportedDevice, UsrpModel};
+    match name {
+        "SXceiver" => Some(SupportedDevice::SXceiver),
+        "µCell" | "uCell" => Some(SupportedDevice::MuCell),
+        "Pluto" => Some(SupportedDevice::PlutoSdr),
+        "USRP B200" => Some(SupportedDevice::Usrp(UsrpModel::B200)),
+        "USRP B210" => Some(SupportedDevice::Usrp(UsrpModel::B210)),
+        "Unknown USRP model" => Some(SupportedDevice::Usrp(UsrpModel::Other)),
+        "LimeSDR USB" => Some(SupportedDevice::LimeSdr(LimeSdrModel::LimeSdrUsb)),
+        "LimeSDR Mini 2.0" => Some(SupportedDevice::LimeSdr(LimeSdrModel::LimeSdrMiniV2)),
+        "LimeNET Micro" => Some(SupportedDevice::LimeSdr(LimeSdrModel::LimeNetMicro)),
+        "Unknown LimeSDR model with FX3" => Some(SupportedDevice::LimeSdr(LimeSdrModel::OtherFx3)),
+        "Unknown LimeSDR model with FT601" => Some(SupportedDevice::LimeSdr(LimeSdrModel::OtherFt601)),
+        _ => None,
+    }
+}
+
+fn compare_profile_advice_hz(mismatches: &mut Vec<String>, name: &str, stored: f64, current: f64, tolerance_hz: f64) {
+    if !stored.is_finite() || !current.is_finite() || (stored - current).abs() > tolerance_hz {
+        mismatches.push(format!("{name} stored={stored:.3} current={current:.3}"));
+    }
+}
+
+fn profile_advice_antenna_matches(stored: &str, current: &str) -> bool {
+    stored == current || (stored == "auto" && current.is_empty()) || (stored.is_empty() && current == "auto")
+}
+
+fn profile_advice_gain_fingerprint(gains: &[(String, f64)]) -> String {
+    let mut pairs: Vec<_> = gains.iter().collect();
+    pairs.sort_by(|a, b| a.0.cmp(&b.0));
+    pairs
+        .into_iter()
+        .map(|(name, gain)| format!("{}={:.2}", name, gain))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn latest_tx_calibration_report_for_profile_advice(
+    config_path: &str,
+) -> (PathBuf, Option<tetra_config::bluestation::TxCalibrationFile>, Option<String>) {
+    let active_path = crate::rf_calibration::calibration_path_for_config(config_path);
+    let run_path = tetra_config::bluestation::tx_calibration_run_report_path(&active_path);
+    let active_file = tetra_config::bluestation::read_tx_calibration_file(&active_path);
+    let run_file = tetra_config::bluestation::read_tx_calibration_file(&run_path);
+
+    let prefer_run_report = run_file.is_ok()
+        && match (
+            tx_calibration_report_mtime_unix_secs(&run_path),
+            tx_calibration_report_mtime_unix_secs(&active_path),
+        ) {
+            (Some(run), Some(active)) => run >= active,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+    if prefer_run_report {
+        return (run_path, run_file.ok(), None);
+    }
+    match active_file {
+        Ok(file) => (active_path, Some(file), None),
+        Err(active_err) => match run_file {
+            Ok(file) => (run_path, Some(file), None),
+            Err(run_err) => (
+                active_path,
+                None,
+                Some(format!("active report: {}; run report: {}", active_err, run_err)),
+            ),
+        },
+    }
+}
+
+fn tx_calibration_report_mtime_unix_secs(path: &Path) -> Option<u64> {
+    std::fs::metadata(path)
+        .ok()?
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn rf_profile_advice_value(advice: crate::rf_profile_optimizer::RfProfileRecommendation, calibration_path: &Path) -> serde_json::Value {
+    let summary = advice.summary().to_string();
+    let mut value = serde_json::to_value(advice).unwrap_or_else(|_| serde_json::json!({"measurement_valid": false}));
+    if let Some(object) = value.as_object_mut() {
+        object.insert("summary".to_string(), serde_json::json!(summary));
+        object.insert(
+            "calibration_path".to_string(),
+            serde_json::json!(calibration_path.display().to_string()),
+        );
+    }
+    value
+}
+
+fn serve_rf_profile_apply_safe(
+    stream: TcpStream,
+    state: &DashboardState,
+    config_path: &str,
+    cmd_tx: &Arc<Mutex<Option<CmdSender>>>,
+    value: &serde_json::Value,
+) {
+    let target = value
+        .get("target")
+        .and_then(|v| v.as_str())
+        .and_then(crate::rf_profile_optimizer::RfDeploymentProfile::parse);
+    let last_tx_quality = match state.read() {
+        Ok(snapshot) => snapshot.last_tx_quality.clone(),
+        Err(_) => {
+            http_json_response(stream, 503, r#"{"ok":false,"error":"dashboard state unavailable"}"#);
+            return;
+        }
+    };
+    let (advice, calibration_path) = match build_rf_profile_advice(last_tx_quality.as_ref(), config_path, target) {
+        Ok(result) => result,
+        Err(err) => {
+            let body = serde_json::to_string(&serde_json::json!({
+                "ok": false,
+                "error": err,
+                "measurement_valid": false,
+            }))
+            .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+            http_json_response(stream, 409, &body);
+            return;
+        }
+    };
+    if !advice.measurement_valid || !advice.safe_auto_apply {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": "RF profile advice is not safe to apply automatically",
+            "advice": rf_profile_advice_value(advice, &calibration_path),
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 409, &body);
+        return;
+    }
+
+    if let Err(err) = tetra_config::bluestation::validate_tx_gain_profile(&advice.recommended_tx_gain_profile) {
+        let body = serde_json::to_string(&serde_json::json!({"ok": false, "error": err})).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 500, &body);
+        return;
+    }
+    match set_tx_gain_profile_in_config(config_path, &advice.recommended_tx_gain_profile) {
+        Ok(()) => {
+            clear_dashboard_config_cache(config_path);
+            let restart_queued = send_control_cmd(cmd_tx, ControlCommand::RestartService);
+            crate::service_control::schedule_service_action(
+                crate::service_control::ServiceAction::Restart,
+                std::time::Duration::from_secs(4),
+            );
+            let message = if advice.profile_validation_status == crate::rf_profile_optimizer::RfProfileValidationStatus::PendingRetest {
+                "RF profile applied as a retest candidate; run RF calibration again after SDR restart"
+            } else {
+                "measured RF profile applied; service restart required for SDR reinit"
+            };
+            let body = serde_json::to_string(&serde_json::json!({
+                "ok": true,
+                "tx_gain_profile": advice.recommended_tx_gain_profile,
+                "restart_queued": restart_queued,
+                "message": message,
+            }))
+            .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+            http_json_response(stream, 200, &body);
+        }
+        Err(err) => {
+            let body =
+                serde_json::to_string(&serde_json::json!({"ok": false, "error": err})).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+            http_json_response(stream, 500, &body);
+        }
+    }
 }
 
 fn serve_dashboard_site(
@@ -5835,6 +6393,11 @@ mod tests {
             "/api/service/stop-go"
         ));
         assert!(request_matches("POST /api/rf/carrier HTTP/1.1", "POST", "/api/rf/carrier"));
+        assert!(request_matches(
+            "POST /api/rf/profile-autotest/apply-safe HTTP/1.1",
+            "POST",
+            "/api/rf/profile-autotest/apply-safe"
+        ));
         assert!(request_matches("GET /api/wifi HTTP/1.1", "GET", "/api/wifi"));
         assert!(request_matches("POST /api/wifi/scan HTTP/1.1", "POST", "/api/wifi/scan"));
         assert!(request_matches("POST /api/wifi/connect HTTP/1.1", "POST", "/api/wifi/connect"));
@@ -5917,6 +6480,135 @@ mod tests {
         assert!(second_site.contains("\"main_carrier\":1545"));
         assert!(second_site.contains("\"tx_hz\":438625000.0"));
         assert!(!second_site.contains("\"main_carrier\":1534"));
+    }
+
+    fn profile_advice_tx_quality(profile: &str) -> crate::net_dashboard::state::TxQualitySnapshot {
+        crate::net_dashboard::state::TxQualitySnapshot {
+            papr_db: 3.8,
+            evm_pct: 12.0,
+            dc_offset_i: 0.0,
+            dc_offset_q: 0.0,
+            iq_amplitude_imbalance_db: 0.0,
+            iq_phase_imbalance_deg: 0.0,
+            carrier_leakage_db: -43.6,
+            occupied_bandwidth_hz: 18_000.0,
+            evm_gate: "critical".to_string(),
+            evm_limit_pct: 7.0,
+            tx_gain_profile: profile.to_string(),
+            frequency_error_hz: 20.0,
+            reference_clock: "internal".to_string(),
+            rf_timing_severity: "ok".to_string(),
+            rf_tx_late_events: 0,
+            rf_tx_late_blocks: 0,
+            rf_rx_lost_events: 0,
+            rf_rx_lost_samples: 0,
+            rf_last_anomaly_age_ms: u64::MAX,
+        }
+    }
+
+    fn write_profile_advice_config(dir: &std::path::Path, profile: &str) -> PathBuf {
+        let config_path = dir.join("config.toml");
+        let text = EASY_START_TEMPLATE_TOML
+            .replace("tx_gain_profile = \"nominal_clean\"", &format!("tx_gain_profile = \"{profile}\""))
+            .replace("tx_gain_dac = 0.0", "tx_gain_dac = 9.0")
+            .replace("sample_rate = 512000", "sample_rate = 600000");
+        fs::write(&config_path, text).expect("write profile advice config");
+        config_path
+    }
+
+    fn profile_advice_calibration(profile: &str, tx_gain_fingerprint: &str) -> tetra_config::bluestation::TxCalibrationFile {
+        tetra_config::bluestation::TxCalibrationFile {
+            schema_version: 1,
+            status: "rejected".to_string(),
+            device: tetra_config::bluestation::TxCalibrationDevice {
+                name: "SXceiver".to_string(),
+                tx_gain_profile: profile.to_string(),
+                tx_frequency_hz: 438_362_500.0,
+                rx_frequency_hz: 431_362_500.0,
+                tx_center_frequency_hz: 438_362_500.0,
+                rx_center_frequency_hz: 431_342_500.0,
+                calibration_frequency_hz: 438_362_500.0,
+                duplex_shift_hz: 7_000_000.0,
+                sample_rate_hz: 600_000.0,
+                tx_channel: 0,
+                rx_channel: 0,
+                tx_antenna: "TX".to_string(),
+                rx_antenna: "RX".to_string(),
+                loopback_source: "rx_internal_lb".to_string(),
+                pa_setting: "AUTO".to_string(),
+                tx_gains_fingerprint: tx_gain_fingerprint.to_string(),
+                rx_gains_fingerprint: "LNA=42.00,PGA=16.00".to_string(),
+            },
+            reference: tetra_config::bluestation::TxCalibrationPoint {
+                tetra_known_rms_evm_pct: Some(3.9),
+                tetra_known_peak_evm_pct: Some(8.2),
+                tetra_known_symbols_used: Some(192),
+                ..Default::default()
+            },
+            calibrated: tetra_config::bluestation::TxCalibrationPoint {
+                carrier_leakage_dbc: -43.6,
+                image_rejection_db: 43.0,
+                evm_proxy_pct: 1.0,
+                tetra_known_rms_evm_pct: Some(3.9),
+                tetra_known_peak_evm_pct: Some(8.2),
+                tetra_known_symbols_used: Some(192),
+                snr_db: 65.2,
+                ..Default::default()
+            },
+            report: tetra_config::bluestation::TxCalibrationReport {
+                accepted: false,
+                summary: "rejected: gates failed but known-symbol EVM captured".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn profile_advice_refuses_stale_run_report_as_rf_evm_evidence() {
+        let dir = temp_config_dir("profile-advice-stale-run");
+        let config_path = write_profile_advice_config(&dir, "nominal_clean");
+        clear_dashboard_config_cache(config_path.to_string_lossy().as_ref());
+        let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path.to_string_lossy().as_ref());
+        let run_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
+        let stale = profile_advice_calibration("low_drive_calibration", "DAC=3.00,MIXER=30.00");
+        tetra_config::bluestation::write_tx_calibration_file_atomic(&run_path, &stale).expect("write stale run report");
+
+        let tx_quality = profile_advice_tx_quality("nominal_clean");
+        let (advice, selected_path) =
+            build_rf_profile_advice(Some(&tx_quality), config_path.to_string_lossy().as_ref(), None).expect("build advice");
+
+        assert_eq!(selected_path, run_path);
+        assert!(!advice.measurement_valid);
+        assert!(
+            advice
+                .measurement_sources
+                .iter()
+                .any(|source| source.contains("stale_tx_calibration_rf_loopback"))
+        );
+    }
+
+    #[test]
+    fn rejected_but_matching_run_report_counts_as_measured_current_profile() {
+        let dir = temp_config_dir("profile-advice-matching-run");
+        let config_path = write_profile_advice_config(&dir, "nominal_clean");
+        clear_dashboard_config_cache(config_path.to_string_lossy().as_ref());
+        let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path.to_string_lossy().as_ref());
+        let run_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
+        let report = profile_advice_calibration("nominal_clean", "DAC=9.00,MIXER=30.00");
+        tetra_config::bluestation::write_tx_calibration_file_atomic(&run_path, &report).expect("write matching run report");
+
+        let tx_quality = profile_advice_tx_quality("nominal_clean");
+        let (advice, selected_path) =
+            build_rf_profile_advice(Some(&tx_quality), config_path.to_string_lossy().as_ref(), None).expect("build advice");
+
+        assert_eq!(selected_path, run_path);
+        assert!(advice.measurement_valid);
+        assert_eq!(
+            advice.profile_validation_status,
+            crate::rf_profile_optimizer::RfProfileValidationStatus::Validated
+        );
+        assert_eq!(advice.calibration_report_accepted, Some(false));
     }
 
     #[test]
@@ -6579,6 +7271,24 @@ main_carrier = 1
         assert!(updated.contains("tx_calibration_apply_dc = true"));
         assert!(updated.contains("tx_calibration_apply_iq = false"));
         assert!(!updated.contains("tx_calibration_apply_iq = true"));
+    }
+
+    #[test]
+    fn tx_gain_profile_upsert_replaces_existing_soapy_value() {
+        let input = r#"[phy_io.soapysdr]
+rx_freq = 431362500.0
+tx_gain_profile = "nominal_clean"
+tx_freq = 438362500.0
+
+[cell]
+main_carrier = 1
+"#;
+
+        let updated = upsert_soapy_key(input, "tx_gain_profile", "\"low_drive_calibration\"").expect("upsert gain profile");
+
+        assert!(updated.contains("tx_gain_profile = \"low_drive_calibration\""));
+        assert!(!updated.contains("tx_gain_profile = \"nominal_clean\""));
+        assert!(updated.contains("[cell]"));
     }
 
     #[test]

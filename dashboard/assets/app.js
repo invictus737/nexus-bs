@@ -41,6 +41,7 @@ const state = {
   rfCarrierBusy: false,
   rfCarrierPendingInhibited: null,
   rfCarrierPendingUntilMs: 0,
+  rfProfileApplyBusy: false,
   calibration: null,
   calibrationBusy: false,
   wifi: null,
@@ -1760,6 +1761,42 @@ async function loadCalibrationStatus() {
   }
 }
 
+async function applySafeRfProfile(target = null) {
+  if (state.rfProfileApplyBusy) return;
+  const advice = state.site?.rf_profile_advice || {};
+  const pendingRetest = advice.profile_validation_status === "pending_retest";
+  const targetSuffix = target ? ` (${target.replaceAll("_", " ")})` : "";
+  const title = pendingRetest || target ? `Apply profile for RF/EVM retest${targetSuffix}?` : "Apply measured RF profile?";
+  const fallback = pendingRetest
+    ? "The backend will switch profile only as a retest candidate; run RF calibration again after restart."
+    : "The backend will refuse if RF EVM evidence is missing or unsafe.";
+  if (!window.confirm(`${title}\n${advice.summary || fallback}`)) {
+    return;
+  }
+  state.rfProfileApplyBusy = true;
+  setCalibrationStatus(pendingRetest ? "applying profile for RF/EVM retest" : "applying measured RF profile");
+  try {
+    const res = await fetchWithTimeout("/api/rf/profile-autotest/apply-safe", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(target ? { target } : {}),
+    }, COMMAND_FETCH_TIMEOUT_MS);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    setCalibrationStatus(body.message || "RF profile applied; restart queued");
+    await loadSite({ force: true });
+  } catch (error) {
+    setCalibrationStatus(`profile apply refused: ${String(error.message || error).slice(0, 110)}`);
+  } finally {
+    window.setTimeout(() => {
+      state.rfProfileApplyBusy = false;
+      renderCalibration();
+    }, 2500);
+  }
+}
+
 function renderCalibration() {
   const status = state.calibration || {};
   const report = status.report || {};
@@ -1774,6 +1811,7 @@ function renderCalibration() {
   const active = !!status.active || !!state.calibrationBusy;
   const phase = status.status || "idle";
   const failed = phase === "failed";
+  const rfAdvice = state.site?.rf_profile_advice || {};
 
   setText("calibrationStatus", active ? phase.toUpperCase() : accepted && !failed ? "APPLIED" : phase.toUpperCase());
   setText("calibrationPath", status.report_path || status.path || "calibration.toml");
@@ -1792,8 +1830,22 @@ function renderCalibration() {
     metricBeforeAfter(reference.image_rejection_db, calibrated.image_rejection_db, "dB", summary.image_rejection_improvement_db)
   );
   setText(
+    "calibrationKnownRmsEvm",
+    metricBeforeAfter(reference.tetra_known_rms_evm_pct, calibrated.tetra_known_rms_evm_pct, "%", summary.tetra_known_rms_evm_improvement_pct)
+  );
+  setText(
+    "calibrationKnownPeakEvm",
+    metricBeforeAfter(reference.tetra_known_peak_evm_pct, calibrated.tetra_known_peak_evm_pct, "%", summary.tetra_known_peak_evm_improvement_pct)
+  );
+  setText(
     "calibrationEvm",
     metricBeforeAfter(reference.evm_proxy_pct, calibrated.evm_proxy_pct, "%", summary.evm_proxy_improvement_pct)
+  );
+  setText(
+    "calibrationProfileAdvice",
+    rfAdvice.measurement_valid
+      ? `${String(rfAdvice.profile_validation_status || "unmeasured").toUpperCase()} / ${String(rfAdvice.severity || "ok").toUpperCase()} / ${rfAdvice.summary || "--"}`
+      : rfAdvice.summary || "--"
   );
   setText(
     "calibrationActionStatus",
@@ -1806,6 +1858,21 @@ function renderCalibration() {
   setText("calibrationLog", status.log || (summary.summary ? `${summary.summary}\n` : ""));
   const button = $("calibrationRunBtn");
   if (button) button.disabled = active || state.calibrationBusy || !state.site?.config?.available;
+  const profileButton = $("rfProfileApplyBtn");
+  if (profileButton) {
+    profileButton.textContent = rfAdvice.profile_validation_status === "pending_retest" ? "Apply & Retest Profile" : "Apply Safe Profile";
+    profileButton.disabled = active || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || !rfAdvice.safe_auto_apply;
+  }
+  for (const [id, target] of [
+    ["rfProfileHotspotBtn", "hotspot"],
+    ["rfProfileLowPowerBtn", "low_power_basestation"],
+    ["rfProfilePaBtn", "power_amplified_basestation"],
+  ]) {
+    const targetButton = $(id);
+    if (!targetButton) continue;
+    const currentTarget = rfAdvice.target_profile === target;
+    targetButton.disabled = active || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || currentTarget && rfAdvice.profile_validation_status === "validated";
+  }
 }
 
 function metricBeforeAfter(before, after, unit, improvement) {
@@ -2414,6 +2481,7 @@ function renderSite() {
   const txQuality = state.txQuality || cached.tx_quality || {};
   const sdrHealth = state.sdrHealth || cached.sdr_health || {};
   const sysHealth = state.sysHealth || cached.sys_health || {};
+  const rfAdvice = state.site?.rf_profile_advice || {};
   const carrierInhibited = !!cfg.rf_control?.carrier_inhibited;
   const services = cfg.services || {};
 
@@ -2461,8 +2529,20 @@ function renderSite() {
   );
   setText("rfSampleRate", soapy.sample_rate ? fmtHz(soapy.sample_rate, "kHz") : txVisual.sample_rate ? fmtHz(txVisual.sample_rate, "kHz") : "--");
   setText("rfPpm", soapy.ppm_err !== undefined ? `${Number(soapy.ppm_err).toFixed(2)} ppm` : "--");
+  setText("rfReferenceClock", txQuality.reference_clock || soapy.reference_clock || "internal");
+  setText("rfTxCorrected", fmtHz(soapy.tx_corrected_hz ?? txHz));
+  setText("rfRxCorrected", fmtHz(soapy.rx_corrected_hz ?? rxHz));
+  setText(
+    "rfPpmErrorHz",
+    soapy.tx_ppm_error_hz !== undefined || soapy.rx_ppm_error_hz !== undefined
+      ? `TX ${fmtHz(soapy.tx_ppm_error_hz || 0)} / RX ${fmtHz(soapy.rx_ppm_error_hz || 0)}`
+      : txQuality.frequency_error_hz !== undefined
+        ? fmtHz(txQuality.frequency_error_hz)
+        : "--"
+  );
   setText("rfChannels", `RX ${soapy.rx_ch ?? "auto"} / TX ${soapy.tx_ch ?? "auto"}`);
   setText("rfAntennas", `RX ${soapy.rx_ant || "auto"} / TX ${soapy.tx_ant || "auto"}`);
+  setText("rfTxGainProfile", txQuality.tx_gain_profile || soapy.tx_gain_profile || "nominal_clean");
   setText("rfTxGains", gainsLabel(sdrHealth.tx_gains || soapy.tx_gains));
   setText("rfRxGains", gainsLabel(sdrHealth.rx_gains || soapy.rx_gains));
   setText("rfTemp", sdrHealth.temperature_c !== null && sdrHealth.temperature_c !== undefined ? `${Number(sdrHealth.temperature_c).toFixed(1)} C` : state.system?.cpu_temp_c ? `${Number(state.system.cpu_temp_c).toFixed(1)} C host` : "--");
@@ -2470,9 +2550,22 @@ function renderSite() {
   setText("rfRms", fmtDb(txVisual.rms_dbfs, "dBFS"));
   setText("rfPeak", fmtDb(txVisual.peak_dbfs, "dBFS"));
   setText("rfEvm", txQuality.evm_pct !== undefined ? `${fmtPct(txQuality.evm_pct)} DSP` : "--");
+  setText(
+    "rfEvmGate",
+    txQuality.evm_gate
+      ? `${String(txQuality.evm_gate).toUpperCase()} / ${fmtPct(txQuality.evm_limit_pct)} DSP limit`
+      : "--"
+  );
   setText("rfPapr", fmtDb(txQuality.papr_db));
   setText("rfObw", fmtHz(txQuality.occupied_bandwidth_hz, "kHz"));
   setText("rfCarrierLeak", fmtDb(txQuality.carrier_leakage_db));
+  setText(
+    "rfTiming",
+    txQuality.rf_timing_severity
+      ? `${String(txQuality.rf_timing_severity).toUpperCase()} / late ${txQuality.rf_tx_late_events ?? 0}, rx lost ${txQuality.rf_rx_lost_events ?? 0}`
+      : "--"
+  );
+  setText("rfAdvice", rfAdvice.summary || "--");
   setText("rfPower", sysHealth.total_power_w !== null && sysHealth.total_power_w !== undefined ? `${Number(sysHealth.total_power_w).toFixed(1)} W` : "--");
   setText("rfSnapshotAge", cfg.available ? "live config" : Object.keys(cached).length ? "cached" : "--");
 
@@ -2996,6 +3089,10 @@ function initNav() {
     renderUpdatePanel();
   });
   $("calibrationRunBtn")?.addEventListener("click", requestTxCalibration);
+  $("rfProfileApplyBtn")?.addEventListener("click", () => applySafeRfProfile());
+  $("rfProfileHotspotBtn")?.addEventListener("click", () => applySafeRfProfile("hotspot"));
+  $("rfProfileLowPowerBtn")?.addEventListener("click", () => applySafeRfProfile("low_power_basestation"));
+  $("rfProfilePaBtn")?.addEventListener("click", () => applySafeRfProfile("power_amplified_basestation"));
   $("wifiScanBtn")?.addEventListener("click", scanWifiNetworks);
   $("wifiClearBtn")?.addEventListener("click", clearWifiScanList);
   $("wifiConnectBtn")?.addEventListener("click", connectWifiNetwork);

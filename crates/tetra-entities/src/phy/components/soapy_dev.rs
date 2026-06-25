@@ -14,6 +14,7 @@ use tetra_pdus::phy::traits::rxtx_dev::RxTxDev;
 use tetra_pdus::phy::traits::rxtx_dev::RxTxDevError;
 use tetra_pdus::phy::traits::rxtx_dev::TxSlotBits;
 
+use crate::health::{HealthDomain, HealthSeverity};
 use crate::net_telemetry::channel::TelemetrySink;
 use crate::net_telemetry::events::TelemetryEvent;
 use crate::phy::components::soapy_dev;
@@ -42,6 +43,12 @@ pub struct PhyConfig<'a> {
     pub bs_dl_frequencies: &'a [f64],
     /// Uplink carrier frequencies for a BS.
     pub bs_ul_frequencies: &'a [f64],
+    /// Operator-selected TX gain intent for PA-safe operation.
+    pub tx_gain_profile: &'a str,
+    /// RF reference clock source label.
+    pub reference_clock: &'a str,
+    /// Configured TX frequency correction from PPM, in Hz.
+    pub frequency_error_hz: f32,
 }
 
 pub struct RxTxDevSoapySdr {
@@ -90,6 +97,9 @@ impl RxTxDevSoapySdr {
         let phy_config = soapy_dev::PhyConfig {
             bs_dl_frequencies: &[dl_corrected],
             bs_ul_frequencies: &[ul_corrected],
+            tx_gain_profile: soapy_cfg.tx_gain_profile.as_str(),
+            reference_clock: soapy_cfg.reference_clock.as_str(),
+            frequency_error_hz: dl_err as f32,
             ..Default::default()
         };
 
@@ -445,8 +455,17 @@ impl TxDsp {
             modulators.push(ModulatorChannel::new(fft_planner, fcfb_params, *dl_freq, modulator::Mode::Dl));
         }
 
-        let monitor = telemetry
-            .map(|sink| TxSignalMonitor::new(fft_planner, sink, sdr_sample_rate as RealSample, sdr.tx_center_frequency().unwrap()));
+        let monitor = telemetry.map(|sink| {
+            TxSignalMonitor::new(
+                fft_planner,
+                sink,
+                sdr_sample_rate as RealSample,
+                sdr.tx_center_frequency().unwrap(),
+                phy_config.tx_gain_profile,
+                phy_config.reference_clock,
+                phy_config.frequency_error_hz,
+            )
+        });
 
         Self {
             fcfb,
@@ -788,6 +807,9 @@ struct TxSignalMonitor {
     /// natural human-readable rate; combined with the front-end smoothing window
     /// it ends up looking rock-stable.
     quality_interval: std::time::Duration,
+    tx_gain_profile: String,
+    reference_clock: String,
+    frequency_error_hz: f32,
 }
 
 impl TxSignalMonitor {
@@ -796,7 +818,15 @@ impl TxSignalMonitor {
     const CONSTELLATION_ENCODE_SCALE: RealSample = 32767.0 / 1.5;
     const MIN_OBSERVABLE_TX_RMS: RealSample = 1.0e-6;
 
-    fn new(fft_planner: &mut FftPlanner, sink: TelemetrySink, sample_rate: RealSample, center_frequency: f64) -> Self {
+    fn new(
+        fft_planner: &mut FftPlanner,
+        sink: TelemetrySink,
+        sample_rate: RealSample,
+        center_frequency: f64,
+        tx_gain_profile: &str,
+        reference_clock: &str,
+        frequency_error_hz: f32,
+    ) -> Self {
         let fft = fft_planner.plan_fft_forward(Self::FFT_LEN);
         let window = (0..Self::FFT_LEN)
             .map(|i| {
@@ -816,6 +846,9 @@ impl TxSignalMonitor {
             next_quality_emit: std::time::Instant::now(),
             visual_interval: std::time::Duration::from_millis(200),
             quality_interval: std::time::Duration::from_millis(1000),
+            tx_gain_profile: tx_gain_profile.to_string(),
+            reference_clock: reference_clock.to_string(),
+            frequency_error_hz,
         }
     }
 
@@ -954,6 +987,9 @@ impl TxSignalMonitor {
 
             // Occupied bandwidth (ETSI 99%).
             let occupied_bandwidth_hz = occupied_bandwidth(&mag2, self.sample_rate, 0.99);
+            crate::health::registry().mark_phy_tx_quality(evm_pct, papr_db, carrier_leakage_db, occupied_bandwidth_hz);
+            let evm_gate = tx_dsp_evm_gate(evm_pct);
+            let rf_timing = rf_timing_kpis_from_health();
 
             self.sink.send(TelemetryEvent::TxQuality {
                 papr_db,
@@ -964,6 +1000,17 @@ impl TxSignalMonitor {
                 iq_phase_imbalance_deg,
                 carrier_leakage_db,
                 occupied_bandwidth_hz,
+                evm_gate: evm_gate.to_string(),
+                evm_limit_pct: TX_DSP_EVM_CRITICAL_PCT,
+                tx_gain_profile: self.tx_gain_profile.clone(),
+                frequency_error_hz: self.frequency_error_hz,
+                reference_clock: self.reference_clock.clone(),
+                rf_timing_severity: rf_timing.severity,
+                rf_tx_late_events: rf_timing.tx_late_events,
+                rf_tx_late_blocks: rf_timing.tx_late_blocks,
+                rf_rx_lost_events: rf_timing.rx_lost_events,
+                rf_rx_lost_samples: rf_timing.rx_lost_samples,
+                rf_last_anomaly_age_ms: rf_timing.last_anomaly_age_ms,
             });
         }
     }
@@ -1048,6 +1095,66 @@ impl TxSignalMonitor {
 
 fn tx_monitor_signal_present(rms: RealSample) -> bool {
     rms.is_finite() && rms >= TxSignalMonitor::MIN_OBSERVABLE_TX_RMS
+}
+
+const TX_DSP_EVM_OK_PCT: f32 = 7.0;
+const TX_DSP_EVM_CRITICAL_PCT: f32 = 10.0;
+
+fn tx_dsp_evm_gate(evm_pct: f32) -> &'static str {
+    if !evm_pct.is_finite() || evm_pct <= 0.0 {
+        "unknown"
+    } else if evm_pct <= TX_DSP_EVM_OK_PCT {
+        "ok"
+    } else if evm_pct <= TX_DSP_EVM_CRITICAL_PCT {
+        "degraded"
+    } else {
+        "critical"
+    }
+}
+
+#[derive(Debug, Default)]
+struct RfTimingKpis {
+    severity: String,
+    tx_late_events: u64,
+    tx_late_blocks: u64,
+    rx_lost_events: u64,
+    rx_lost_samples: u64,
+    last_anomaly_age_ms: u64,
+}
+
+fn rf_timing_kpis_from_health() -> RfTimingKpis {
+    let snapshot = crate::health::registry().snapshot();
+    let Some(rf) = snapshot.domains.iter().find(|domain| domain.domain == HealthDomain::Rf) else {
+        return RfTimingKpis {
+            severity: "unknown".to_string(),
+            ..Default::default()
+        };
+    };
+    RfTimingKpis {
+        severity: health_severity_label(rf.severity).to_string(),
+        tx_late_events: health_metric_u64(rf, "tx_late_events"),
+        tx_late_blocks: health_metric_u64(rf, "tx_late_blocks"),
+        rx_lost_events: health_metric_u64(rf, "rx_lost_events"),
+        rx_lost_samples: health_metric_u64(rf, "rx_lost_samples"),
+        last_anomaly_age_ms: health_metric_u64(rf, "last_anomaly_age_ms"),
+    }
+}
+
+fn health_severity_label(severity: HealthSeverity) -> &'static str {
+    match severity {
+        HealthSeverity::Ok => "ok",
+        HealthSeverity::Degraded => "degraded",
+        HealthSeverity::Critical => "critical",
+    }
+}
+
+fn health_metric_u64(domain: &crate::health::HealthDomainSnapshot, name: &str) -> u64 {
+    domain
+        .metrics
+        .iter()
+        .find(|metric| metric.name == name)
+        .map(|metric| metric.value.max(0) as u64)
+        .unwrap_or_default()
 }
 
 /// Find the smallest contiguous band around the centre bin that contains the
@@ -1304,5 +1411,13 @@ mod tests {
         assert!(!tx_monitor_signal_present(TxSignalMonitor::MIN_OBSERVABLE_TX_RMS * 0.5));
         assert!(tx_monitor_signal_present(TxSignalMonitor::MIN_OBSERVABLE_TX_RMS));
         assert!(tx_monitor_signal_present(0.05));
+    }
+
+    #[test]
+    fn tx_dsp_evm_gate_uses_operational_thresholds() {
+        assert_eq!(tx_dsp_evm_gate(0.0), "unknown");
+        assert_eq!(tx_dsp_evm_gate(6.9), "ok");
+        assert_eq!(tx_dsp_evm_gate(8.0), "degraded");
+        assert_eq!(tx_dsp_evm_gate(12.0), "critical");
     }
 }

@@ -39,6 +39,8 @@ const UMAC_QUEUE_CRITICAL: u64 = 2_048;
 const RF_RXTEX_DEGRADED_US: u64 = 100_000;
 const RF_RXTEX_CRITICAL_US: u64 = 500_000;
 const RF_ANOMALY_RECENT_MS: u64 = 10_000;
+const RF_TX_DSP_EVM_DEGRADED_MILLI_PCT: u64 = 7_000;
+const RF_TX_DSP_EVM_CRITICAL_MILLI_PCT: u64 = 10_000;
 const MAX_RECENT_ACTIONS: usize = 16;
 
 static HEALTH_REGISTRY: OnceLock<HealthRegistry> = OnceLock::new();
@@ -101,6 +103,11 @@ pub struct HealthRegistry {
     phy_rx_lost_samples: AtomicU64,
     phy_rx_processing_blocks: AtomicU64,
     phy_last_anomaly_unix_ms: AtomicU64,
+    phy_tx_dsp_evm_milli_pct: AtomicU64,
+    phy_tx_dsp_papr_deci_db: AtomicU64,
+    phy_tx_carrier_leakage_deci_db_offset: AtomicU64,
+    phy_tx_occupied_bandwidth_hz: AtomicU64,
+    phy_tx_quality_gate: AtomicU8,
 
     health_action_queue_len: AtomicU64,
     health_action_drops: AtomicU64,
@@ -156,6 +163,11 @@ impl HealthRegistry {
             phy_rx_lost_samples: AtomicU64::new(0),
             phy_rx_processing_blocks: AtomicU64::new(0),
             phy_last_anomaly_unix_ms: AtomicU64::new(0),
+            phy_tx_dsp_evm_milli_pct: AtomicU64::new(0),
+            phy_tx_dsp_papr_deci_db: AtomicU64::new(0),
+            phy_tx_carrier_leakage_deci_db_offset: AtomicU64::new(0),
+            phy_tx_occupied_bandwidth_hz: AtomicU64::new(0),
+            phy_tx_quality_gate: AtomicU8::new(0),
             health_action_queue_len: AtomicU64::new(0),
             health_action_drops: AtomicU64::new(0),
             recent_actions: Mutex::new(VecDeque::new()),
@@ -281,6 +293,34 @@ impl HealthRegistry {
         self.phy_rx_lost_samples.fetch_add(samples_lost, Ordering::Relaxed);
         self.phy_rx_processing_blocks.fetch_add(processing_blocks, Ordering::Relaxed);
         self.phy_last_anomaly_unix_ms.store(unix_ms(), Ordering::Relaxed);
+    }
+
+    pub fn mark_phy_tx_quality(&self, evm_pct: f32, papr_db: f32, carrier_leakage_db: f32, occupied_bandwidth_hz: f32) {
+        if evm_pct.is_finite() && evm_pct > 0.0 {
+            let evm_milli_pct = (evm_pct * 1000.0).round().max(0.0) as u64;
+            self.phy_tx_dsp_evm_milli_pct.store(evm_milli_pct, Ordering::Relaxed);
+            let gate = if evm_milli_pct >= RF_TX_DSP_EVM_CRITICAL_MILLI_PCT {
+                3
+            } else if evm_milli_pct >= RF_TX_DSP_EVM_DEGRADED_MILLI_PCT {
+                2
+            } else {
+                1
+            };
+            self.phy_tx_quality_gate.store(gate, Ordering::Relaxed);
+        }
+        if papr_db.is_finite() {
+            self.phy_tx_dsp_papr_deci_db
+                .store((papr_db * 10.0).round().max(0.0) as u64, Ordering::Relaxed);
+        }
+        if carrier_leakage_db.is_finite() {
+            // Keep a signed dB-like value in an unsigned atomic with +200 dB offset.
+            self.phy_tx_carrier_leakage_deci_db_offset
+                .store(((carrier_leakage_db + 200.0) * 10.0).round().max(0.0) as u64, Ordering::Relaxed);
+        }
+        if occupied_bandwidth_hz.is_finite() {
+            self.phy_tx_occupied_bandwidth_hz
+                .store(occupied_bandwidth_hz.round().max(0.0) as u64, Ordering::Relaxed);
+        }
     }
 
     pub fn set_health_action_backlog(&self, queue_len: usize) {
@@ -649,6 +689,14 @@ impl HealthRegistry {
         let rx_lost_events = self.phy_rx_lost_events.load(Ordering::Relaxed);
         let rx_lost_samples = self.phy_rx_lost_samples.load(Ordering::Relaxed);
         let rx_processing_blocks = self.phy_rx_processing_blocks.load(Ordering::Relaxed);
+        let tx_dsp_evm_milli_pct = self.phy_tx_dsp_evm_milli_pct.load(Ordering::Relaxed);
+        let tx_dsp_papr_deci_db = self.phy_tx_dsp_papr_deci_db.load(Ordering::Relaxed);
+        let tx_carrier_leakage_deci_db = self
+            .phy_tx_carrier_leakage_deci_db_offset
+            .load(Ordering::Relaxed)
+            .saturating_sub(2_000) as i64;
+        let tx_occupied_bandwidth_hz = self.phy_tx_occupied_bandwidth_hz.load(Ordering::Relaxed);
+        let tx_quality_gate = self.phy_tx_quality_gate.load(Ordering::Relaxed);
         let last_anomaly = self.phy_last_anomaly_unix_ms.load(Ordering::Relaxed);
         let anomaly_age_ms = if last_anomaly == 0 {
             u64::MAX
@@ -656,9 +704,9 @@ impl HealthRegistry {
             now.saturating_sub(last_anomaly)
         };
 
-        let severity = if last_rxtx_us >= RF_RXTEX_CRITICAL_US {
+        let severity = if last_rxtx_us >= RF_RXTEX_CRITICAL_US || tx_quality_gate >= 3 {
             HealthSeverity::Critical
-        } else if last_rxtx_us >= RF_RXTEX_DEGRADED_US || anomaly_age_ms <= RF_ANOMALY_RECENT_MS {
+        } else if last_rxtx_us >= RF_RXTEX_DEGRADED_US || anomaly_age_ms <= RF_ANOMALY_RECENT_MS || tx_quality_gate >= 2 {
             HealthSeverity::Degraded
         } else {
             HealthSeverity::Ok
@@ -666,7 +714,9 @@ impl HealthRegistry {
 
         let message = match severity {
             HealthSeverity::Ok => "RF timing healthy".to_string(),
+            HealthSeverity::Degraded if tx_quality_gate >= 2 => "RF DSP EVM gate degraded".to_string(),
             HealthSeverity::Degraded => "RF timing anomaly detected".to_string(),
+            HealthSeverity::Critical if tx_quality_gate >= 3 => "RF DSP EVM gate critical".to_string(),
             HealthSeverity::Critical => "RF timing stalled".to_string(),
         };
 
@@ -682,6 +732,18 @@ impl HealthRegistry {
                 HealthMetric::new("rx_lost_events", rx_lost_events.min(i64::MAX as u64) as i64, "events"),
                 HealthMetric::new("rx_lost_samples", rx_lost_samples.min(i64::MAX as u64) as i64, "samples"),
                 HealthMetric::new("rx_processing_blocks", rx_processing_blocks.min(i64::MAX as u64) as i64, "blocks"),
+                HealthMetric::new(
+                    "tx_dsp_evm_milli_pct",
+                    tx_dsp_evm_milli_pct.min(i64::MAX as u64) as i64,
+                    "milli_pct",
+                ),
+                HealthMetric::new("tx_dsp_papr_deci_db", tx_dsp_papr_deci_db.min(i64::MAX as u64) as i64, "deci_db"),
+                HealthMetric::new("tx_carrier_leakage_deci_db", tx_carrier_leakage_deci_db, "deci_db"),
+                HealthMetric::new(
+                    "tx_occupied_bandwidth_hz",
+                    tx_occupied_bandwidth_hz.min(i64::MAX as u64) as i64,
+                    "hz",
+                ),
                 HealthMetric::new("last_anomaly_age_ms", anomaly_age_ms.min(i64::MAX as u64) as i64, "ms"),
             ],
         }
@@ -771,6 +833,27 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn rf_snapshot_escalates_on_tx_dsp_evm_gate() {
+        let registry = HealthRegistry::new();
+        registry.mark_phy_tx_quality(6.0, 3.5, -45.0, 18_000.0);
+        let ok = registry.rf_snapshot(unix_ms());
+        assert_eq!(ok.severity, HealthSeverity::Ok);
+        assert!(
+            ok.metrics
+                .iter()
+                .any(|metric| metric.name == "tx_dsp_evm_milli_pct" && metric.value == 6_000)
+        );
+
+        registry.mark_phy_tx_quality(8.0, 3.5, -45.0, 18_000.0);
+        let degraded = registry.rf_snapshot(unix_ms());
+        assert_eq!(degraded.severity, HealthSeverity::Degraded);
+
+        registry.mark_phy_tx_quality(12.0, 3.5, -45.0, 18_000.0);
+        let critical = registry.rf_snapshot(unix_ms());
+        assert_eq!(critical.severity, HealthSeverity::Critical);
     }
 
     #[test]

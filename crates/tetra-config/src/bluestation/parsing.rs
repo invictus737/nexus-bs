@@ -400,6 +400,8 @@ tx_gain_vga = 12.5
         assert_eq!(soapy.tx_calibration_file, "calibration.toml");
         assert!(soapy.tx_calibration_apply_dc);
         assert!(!soapy.tx_calibration_apply_iq);
+        assert_eq!(soapy.tx_gain_profile, "nominal_clean");
+        assert_eq!(soapy.reference_clock, "internal");
     }
 
     #[test]
@@ -410,6 +412,8 @@ tx_calibration_enabled = true
 tx_calibration_file = "calibration.toml"
 tx_calibration_apply_dc = true
 tx_calibration_apply_iq = false
+tx_gain_profile = "pa_drive_linear"
+reference_clock = "external_10mhz"
 "#,
         ))
         .expect("calibration fields should parse");
@@ -418,6 +422,8 @@ tx_calibration_apply_iq = false
         assert_eq!(soapy.tx_calibration_file, "calibration.toml");
         assert!(soapy.tx_calibration_apply_dc);
         assert!(!soapy.tx_calibration_apply_iq);
+        assert_eq!(soapy.tx_gain_profile, "pa_drive_linear");
+        assert_eq!(soapy.reference_clock, "external_10mhz");
     }
 
     #[test]
@@ -427,6 +433,9 @@ tx_calibration_apply_iq = false
             "tx_calibration_file = true",
             "tx_calibration_apply_dc = 1",
             "tx_calibration_apply_iq = \"false\"",
+            "tx_gain_profile = \"overdrive\"",
+            "tx_gain_profile = 123",
+            "reference_clock = true",
         ] {
             let toml = minimal_soapy_toml(input);
             assert!(from_toml_str(&toml).is_err(), "should reject {input}");
@@ -830,17 +839,17 @@ allowed_gssi_ranges = [
 
     #[test]
     fn test_compiled_distribution_configs_parse_without_active_credentials() {
-        for (name, toml) in [
-            (
-                "compiled_distribution/config/config.toml",
-                include_str!("../../../../compiled_distribution/config/config.toml"),
-            ),
-            (
-                "compiled_distribution/config/config.toml.fallback",
-                include_str!("../../../../compiled_distribution/config/config.toml.fallback"),
-            ),
+        let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        for name in [
+            "compiled_distribution/config/config.toml",
+            "compiled_distribution/config/config.toml.fallback",
         ] {
-            let cfg = from_toml_str(toml).unwrap_or_else(|err| panic!("{name} should parse: {err}"));
+            let path = manifest_dir.join("../..").join(name);
+            let Ok(toml) = std::fs::read_to_string(&path) else {
+                eprintln!("skipping {name}; compiled distribution config is not present");
+                continue;
+            };
+            let cfg = from_toml_str(&toml).unwrap_or_else(|err| panic!("{name} should parse: {err}"));
             assert!(cfg.cell.sndcp_service, "{name} should advertise SNDCP for WAP/IP");
             assert!(cfg.cell.wap_ip.is_some(), "{name} should enable WAP/IP status");
             assert!(cfg.brew.is_none(), "{name} must not include active Brew credentials");

@@ -9,6 +9,9 @@ use std::path::{Path, PathBuf};
 use toml::Value;
 
 pub const TX_CALIBRATION_DEFAULT_FILE: &str = "calibration.toml";
+pub const TX_GAIN_PROFILE_DEFAULT: &str = "nominal_clean";
+pub const TX_REFERENCE_CLOCK_DEFAULT: &str = "internal";
+pub const TX_GAIN_PROFILES: &[&str] = &["low_drive_calibration", "nominal_clean", "pa_drive_linear", "max_test_only"];
 
 /// SoapySDR configuration
 #[derive(Debug, Clone)]
@@ -32,6 +35,11 @@ pub struct CfgSoapySdr {
     /// TX gain values.
     /// Device specific defaults will be used for gains that are not set.
     pub tx_gains: HashMap<String, f64>,
+    /// Operator-selected TX gain intent. This does not replace explicit
+    /// Soapy gain values; it labels and gates PA-safe operating profiles.
+    pub tx_gain_profile: String,
+    /// RF reference clock source label reported to the dashboard.
+    pub reference_clock: String,
     /// RX and TX sample rate. Device specific default will be used if None.
     pub fs: Option<f64>,
     /// RX channel number
@@ -86,9 +94,23 @@ pub struct SoapySdrDto {
     pub tx_calibration_file: Option<String>,
     pub tx_calibration_apply_dc: Option<bool>,
     pub tx_calibration_apply_iq: Option<bool>,
+    pub tx_gain_profile: Option<String>,
+    pub reference_clock: Option<String>,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
+}
+
+pub fn validate_tx_gain_profile(profile: &str) -> Result<(), String> {
+    if TX_GAIN_PROFILES.contains(&profile) {
+        Ok(())
+    } else {
+        Err(format!(
+            "phy_io.soapysdr.tx_gain_profile must be one of {}; got '{}'",
+            TX_GAIN_PROFILES.join(", "),
+            profile
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,6 +132,7 @@ pub struct TxCalibrationFile {
 #[serde(default)]
 pub struct TxCalibrationDevice {
     pub name: String,
+    pub tx_gain_profile: String,
     pub tx_frequency_hz: f64,
     pub rx_frequency_hz: f64,
     pub tx_center_frequency_hz: f64,
