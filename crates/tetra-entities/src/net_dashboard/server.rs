@@ -2611,6 +2611,55 @@ fn serve_rf_calibration_status(stream: TcpStream, config_path: &str) {
     http_json_response(stream, 200, &body);
 }
 
+fn serve_rf_evm_measure(stream: TcpStream, state: &DashboardState, config_path: &str, core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
+    let active_calls = match state.read() {
+        Ok(snapshot) => snapshot.snapshot_calls(),
+        Err(_) => Vec::new(),
+    };
+    if !active_calls.is_empty() {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": "RF EVM measurement refused while calls are active",
+            "calls": active_calls,
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false,"error":"RF EVM measurement refused while calls are active"}"#.to_string());
+        http_json_response(stream, 423, &body);
+        return;
+    }
+
+    let calibration_path = crate::rf_calibration::calibration_path_for_config(config_path);
+    let calibration_path_string = calibration_path.display().to_string();
+    if let Err(err) = crate::rf_calibration::try_start(&calibration_path_string) {
+        let body = serde_json::to_string(&serde_json::json!({
+            "ok": false,
+            "error": err,
+            "status": crate::rf_calibration::current_phase().as_str(),
+        }))
+        .unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
+        http_json_response(stream, 409, &body);
+        return;
+    }
+
+    let config_path = config_path.to_string();
+    let core_cmd_tx = Arc::clone(core_cmd_tx);
+    if let Err(err) = std::thread::Builder::new().name("rf-evm-measure".into()).spawn(move || {
+        run_rf_evm_measure_orchestrator(config_path, calibration_path, core_cmd_tx);
+    }) {
+        crate::rf_calibration::mark_failed(format!("failed to start RF EVM measurement worker: {}", err));
+        http_json_response(stream, 503, r#"{"ok":false,"error":"failed to start RF EVM measurement worker"}"#);
+        return;
+    }
+
+    let body = serde_json::to_string(&serde_json::json!({
+        "ok": true,
+        "status": "inhibiting",
+        "path": calibration_path_string,
+        "message": "RF EVM measurement started; core runtime will stop briefly",
+    }))
+    .unwrap_or_else(|_| r#"{"ok":true}"#.to_string());
+    http_json_response(stream, 202, &body);
+}
+
 fn serve_smart_rf_tune_status(stream: TcpStream) {
     let body = serde_json::to_string(&smart_rf_tune_snapshot()).unwrap_or_else(|_| r#"{"ok":false}"#.to_string());
     http_json_response(stream, 200, &body);
@@ -3086,6 +3135,81 @@ fn restart_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) {
     let queued = send_control_cmd(core_cmd_tx, ControlCommand::RestartService);
     smart_rf_tune_log(format!("core restart requested for SDR reinit queued={}", queued));
     crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
+}
+
+fn stop_core_for_rf_evm_measure(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) -> String {
+    let unit = crate::service_control::resolve_service_unit();
+    let queued = send_control_cmd(core_cmd_tx, ControlCommand::ShutdownService);
+    crate::rf_calibration::append_log(format!(
+        "core stop requested before exclusive RF EVM measurement unit={} queued={}",
+        unit, queued
+    ));
+    match request_systemctl_action("stop", &unit) {
+        Ok(()) => crate::rf_calibration::append_log(format!("systemctl stop {} completed", unit)),
+        Err(err) => crate::rf_calibration::append_log(format!(
+            "systemctl stop {} failed; waiting on control-service stop path: {}",
+            unit, err
+        )),
+    }
+    unit
+}
+
+fn restart_core_after_rf_evm_measure(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>, reason: &str) {
+    let queued = send_control_cmd(core_cmd_tx, ControlCommand::RestartService);
+    crate::rf_calibration::append_log(format!(
+        "core restart requested after RF EVM measurement queued={} reason={}",
+        queued, reason
+    ));
+    crate::service_control::schedule_service_action(crate::service_control::ServiceAction::Restart, std::time::Duration::from_secs(4));
+}
+
+fn run_rf_evm_measure_orchestrator(config_path: String, calibration_path: PathBuf, core_cmd_tx: Arc<Mutex<Option<CmdSender>>>) {
+    let core_unit = stop_core_for_rf_evm_measure(&core_cmd_tx);
+    match wait_for_core_stopped(&core_unit, std::time::Duration::from_secs(SMART_RF_TUNE_CORE_STOP_TIMEOUT_SECS)) {
+        Ok(()) => crate::rf_calibration::append_log(format!(
+            "verified {} is stopped; measuring RF known-symbol EVM with calibration-only SDR owner",
+            core_unit
+        )),
+        Err(err) => {
+            crate::rf_calibration::mark_failed(format!(
+                "RF EVM measurement refused because core runtime stop could not be verified: {}",
+                err
+            ));
+            restart_core_after_rf_evm_measure(&core_cmd_tx, "core stop verification failed");
+            return;
+        }
+    }
+
+    crate::rf_calibration::mark_calibrating(&calibration_path.display().to_string());
+    let temp_path = rf_evm_measure_temp_calibration_path();
+    let result = run_smart_rf_tune_measurement(&config_path, &temp_path);
+    let cleanup_path = temp_path.clone();
+    match result {
+        Ok(report) => {
+            let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(&calibration_path);
+            match tetra_config::bluestation::write_tx_calibration_file_atomic(&run_report_path, &report) {
+                Ok(()) => {
+                    let rms = report.calibrated.tetra_known_rms_evm_pct;
+                    let peak = report.calibrated.tetra_known_peak_evm_pct;
+                    crate::rf_calibration::mark_calibrated(format!(
+                        "RF EVM measured rms={:?} peak={:?} snr={:.1} dB; report saved to {}",
+                        rms,
+                        peak,
+                        report.calibrated.snr_db,
+                        run_report_path.display()
+                    ));
+                }
+                Err(err) => crate::rf_calibration::mark_failed(format!("RF EVM measured but report save failed: {}", err)),
+            }
+        }
+        Err(err) => crate::rf_calibration::mark_failed(format!("RF EVM measurement failed: {}", err)),
+    }
+    cleanup_smart_rf_tune_candidate_calibration_files(&cleanup_path);
+    restart_core_after_rf_evm_measure(&core_cmd_tx, "measurement complete");
+}
+
+fn rf_evm_measure_temp_calibration_path() -> PathBuf {
+    std::env::temp_dir().join(format!("nexus-bs-rf-evm-measure-{}.toml", std::process::id()))
 }
 
 fn stop_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) -> String {
@@ -3982,6 +4106,9 @@ fn handle_connection(
     } else if request_matches(&req_line, "POST", "/api/rf/calibration/run") {
         drain_http_headers(&mut stream);
         serve_rf_calibration_run(stream, &state, &config_path, &rf_cmd_tx, &phy_cmd_tx);
+    } else if request_matches(&req_line, "POST", "/api/rf/evm/measure") {
+        drain_http_headers(&mut stream);
+        serve_rf_evm_measure(stream, &state, &config_path, &cmd_tx);
     } else if request_matches(&req_line, "GET", "/api/rf/calibration/status") {
         drain_http_headers(&mut stream);
         serve_rf_calibration_status(stream, &config_path);
@@ -7148,6 +7275,7 @@ mod tests {
             "POST",
             "/api/rf/smart-tune/default"
         ));
+        assert!(request_matches("POST /api/rf/evm/measure HTTP/1.1", "POST", "/api/rf/evm/measure"));
         assert!(request_matches(
             "POST /api/rf/profile-autotest/apply-safe HTTP/1.1",
             "POST",

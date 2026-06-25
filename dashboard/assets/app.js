@@ -44,6 +44,7 @@ const state = {
   rfProfileApplyBusy: false,
   calibration: null,
   calibrationBusy: false,
+  rfEvmMeasureBusy: false,
   wifi: null,
   wifiBusy: false,
   wifiSelectedSsid: "",
@@ -1746,6 +1747,38 @@ async function requestTxCalibration() {
   }
 }
 
+async function requestRfEvmMeasure() {
+  if (state.rfEvmMeasureBusy || state.calibrationBusy) return;
+  if (!window.confirm("Measure RF EVM now?\nNexus-BS will stop RF service briefly, run an exclusive known-symbol RF EVM measurement, save only the run report, then restart the core. Use this after changing antennas, filters or PA.")) {
+    return;
+  }
+  state.rfEvmMeasureBusy = true;
+  state.calibrationBusy = true;
+  renderCalibration();
+  setCalibrationStatus("starting RF EVM measurement");
+  try {
+    const res = await fetchWithTimeout("/api/rf/evm/measure", {
+      method: "POST",
+      credentials: "same-origin",
+      cache: "no-store",
+    }, COMMAND_FETCH_TIMEOUT_MS);
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false) throw new Error(body.error || body.message || `HTTP ${res.status}`);
+    state.calibration = body;
+    setCalibrationStatus(body.message || "RF EVM measurement running");
+    await loadCalibrationStatus();
+  } catch (error) {
+    setCalibrationStatus(`RF EVM measurement failed: ${String(error.message || error).slice(0, 110)}`);
+  } finally {
+    window.setTimeout(() => {
+      state.rfEvmMeasureBusy = false;
+      state.calibrationBusy = false;
+      renderCalibration();
+      loadCalibrationStatus();
+    }, 2500);
+  }
+}
+
 async function loadCalibrationStatus() {
   try {
     const [calRes, tuneRes] = await Promise.all([
@@ -1762,6 +1795,7 @@ async function loadCalibrationStatus() {
     if (tuneRes.ok) state.smartRfTune = await tuneRes.json();
     state.calibrationBusy = !!state.calibration?.active;
     renderCalibration();
+    renderSite();
   } catch {
     // Keep the last report visible.
   }
@@ -1875,6 +1909,7 @@ function renderCalibration() {
   const rfAdvice = state.site?.rf_profile_advice || {};
   const smartTune = state.smartRfTune || {};
   const smartTuneActive = !!smartTune.active || state.smartRfTuneBusy;
+  const rfEvmBusy = !!state.rfEvmMeasureBusy;
 
   setText("calibrationStatus", active ? phase.toUpperCase() : accepted && !failed ? "APPLIED" : phase.toUpperCase());
   setText("calibrationPath", status.report_path || status.path || "calibration.toml");
@@ -1914,6 +1949,8 @@ function renderCalibration() {
     "calibrationActionStatus",
     smartTuneActive
       ? `Smart RF Tune ${smartTune.phase || "running"} ${smartTune.current_index || 0}/${smartTune.total_candidates || 0}`
+      : rfEvmBusy
+        ? "RF EVM measurement running"
       : active
         ? "running; accepted DC restarts service; IQ remains opt-in"
         : failed
@@ -1924,15 +1961,17 @@ function renderCalibration() {
   );
   setText("calibrationLog", smartTune.log || status.log || (summary.summary ? `${summary.summary}\n` : ""));
   const smartButton = $("smartRfTuneBtn");
-  if (smartButton) smartButton.disabled = active || smartTuneActive || !state.site?.config?.available;
+  if (smartButton) smartButton.disabled = active || smartTuneActive || rfEvmBusy || !state.site?.config?.available;
   const defaultButton = $("defaultRfTuneBtn");
-  if (defaultButton) defaultButton.disabled = active || smartTuneActive || !state.site?.config?.available;
+  if (defaultButton) defaultButton.disabled = active || smartTuneActive || rfEvmBusy || !state.site?.config?.available;
+  const rfEvmButton = $("rfEvmMeasureBtn");
+  if (rfEvmButton) rfEvmButton.disabled = active || smartTuneActive || rfEvmBusy || !state.site?.config?.available;
   const button = $("calibrationRunBtn");
-  if (button) button.disabled = active || smartTuneActive || state.calibrationBusy || !state.site?.config?.available;
+  if (button) button.disabled = active || smartTuneActive || rfEvmBusy || state.calibrationBusy || !state.site?.config?.available;
   const profileButton = $("rfProfileApplyBtn");
   if (profileButton) {
     profileButton.textContent = rfAdvice.profile_validation_status === "pending_retest" ? "Apply & Retest Profile" : "Apply Safe Profile";
-    profileButton.disabled = active || smartTuneActive || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || !rfAdvice.safe_auto_apply;
+    profileButton.disabled = active || smartTuneActive || rfEvmBusy || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || !rfAdvice.safe_auto_apply;
   }
   for (const [id, target] of [
     ["rfProfileHotspotBtn", "hotspot"],
@@ -1942,8 +1981,41 @@ function renderCalibration() {
     const targetButton = $(id);
     if (!targetButton) continue;
     const currentTarget = rfAdvice.target_profile === target;
-    targetButton.disabled = active || smartTuneActive || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || currentTarget && rfAdvice.profile_validation_status === "validated";
+    targetButton.disabled = active || smartTuneActive || rfEvmBusy || state.rfProfileApplyBusy || !rfAdvice.measurement_valid || currentTarget && rfAdvice.profile_validation_status === "validated";
   }
+}
+
+function measuredRfEvm() {
+  const status = state.calibration || {};
+  const report = status.report || status.run_report || {};
+  const calibrated = report.calibrated || {};
+  const summary = report.report || {};
+  const rms = Number(calibrated.tetra_known_rms_evm_pct);
+  const peak = Number(calibrated.tetra_known_peak_evm_pct);
+  if (!Number.isFinite(rms)) return null;
+  const updated = Number(report.updated_unix_secs || status.updated_unix_secs || 0);
+  const ageSecs = updated > 0 ? Math.max(0, Math.floor(Date.now() / 1000 - updated)) : null;
+  return {
+    rms,
+    peak: Number.isFinite(peak) ? peak : null,
+    snr: Number(calibrated.snr_db),
+    accepted: !!summary.accepted,
+    timingWarning: !!summary.timing_warning,
+    status: report.status || status.status || "",
+    ageSecs,
+  };
+}
+
+function rfEvmGateLabel(rfEvm) {
+  if (!rfEvm) return null;
+  const peakBad = Number.isFinite(rfEvm.peak) && rfEvm.peak > 30;
+  const peakWarn = Number.isFinite(rfEvm.peak) && rfEvm.peak > 20;
+  let gate = "OK";
+  if (rfEvm.rms > 10 || peakBad || rfEvm.timingWarning) gate = "CRITICAL";
+  else if (rfEvm.rms > 7 || peakWarn) gate = "DEGRADED";
+  const age = rfEvm.ageSecs !== null ? ` / age ${fmtAge(rfEvm.ageSecs)}` : "";
+  const peak = rfEvm.peak !== null ? ` / peak ${rfEvm.peak.toFixed(1)}%` : "";
+  return `${gate}${peak}${age}`;
 }
 
 function metricBeforeAfter(before, after, unit, improvement) {
@@ -2553,6 +2625,7 @@ function renderSite() {
   const sdrHealth = state.sdrHealth || cached.sdr_health || {};
   const sysHealth = state.sysHealth || cached.sys_health || {};
   const rfAdvice = state.site?.rf_profile_advice || {};
+  const rfEvm = measuredRfEvm();
   const carrierInhibited = !!cfg.rf_control?.carrier_inhibited;
   const services = cfg.services || {};
 
@@ -2583,9 +2656,11 @@ function renderSite() {
     "diagramPhyState",
     carrierInhibited
       ? "TX inhibited, RX monitor"
-      : txQuality.evm_pct !== undefined
-        ? `pi/4-DQPSK, DSP EVM est. ${fmtPct(txQuality.evm_pct)}`
-        : "pi/4-DQPSK, waiting TX"
+      : rfEvm
+        ? `pi/4-DQPSK, RF EVM ${rfEvm.rms.toFixed(2)}%`
+        : txQuality.evm_pct !== undefined
+          ? `pi/4-DQPSK, DSP estimate ${fmtPct(txQuality.evm_pct)}`
+          : "pi/4-DQPSK, waiting TX"
   );
   setText(
     "diagramServicesState",
@@ -2620,12 +2695,21 @@ function renderSite() {
 
   setText("rfRms", fmtDb(txVisual.rms_dbfs, "dBFS"));
   setText("rfPeak", fmtDb(txVisual.peak_dbfs, "dBFS"));
-  setText("rfEvm", txQuality.evm_pct !== undefined ? `${fmtPct(txQuality.evm_pct)} DSP` : "--");
+  setText(
+    "rfEvm",
+    rfEvm
+      ? `${rfEvm.rms.toFixed(2)}% RF${Number.isFinite(rfEvm.snr) ? ` / SNR ${rfEvm.snr.toFixed(1)} dB` : ""}`
+      : txQuality.evm_pct !== undefined
+        ? `${fmtPct(txQuality.evm_pct)} DSP est.`
+        : "--"
+  );
   setText(
     "rfEvmGate",
-    txQuality.evm_gate
-      ? `${String(txQuality.evm_gate).toUpperCase()} / ${fmtPct(txQuality.evm_limit_pct)} DSP limit`
-      : "--"
+    rfEvm
+      ? rfEvmGateLabel(rfEvm)
+      : txQuality.evm_gate
+        ? `${String(txQuality.evm_gate).toUpperCase()} / DSP estimate`
+        : "--"
   );
   setText("rfPapr", fmtDb(txQuality.papr_db));
   setText("rfObw", fmtHz(txQuality.occupied_bandwidth_hz, "kHz"));
@@ -3160,6 +3244,7 @@ function initNav() {
     renderUpdatePanel();
   });
   $("calibrationRunBtn")?.addEventListener("click", requestTxCalibration);
+  $("rfEvmMeasureBtn")?.addEventListener("click", requestRfEvmMeasure);
   $("smartRfTuneBtn")?.addEventListener("click", requestSmartRfTune);
   $("defaultRfTuneBtn")?.addEventListener("click", requestDefaultRfTune);
   $("rfProfileApplyBtn")?.addEventListener("click", () => applySafeRfProfile());
