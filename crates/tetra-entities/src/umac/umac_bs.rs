@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use tetra_config::bluestation::{EnergySavingAssignment, SharedConfig};
 use tetra_core::freqs::FreqInfo;
+use tetra_core::pdu_parse_error::PduParseErr;
 use tetra_core::tetra_entities::TetraEntity;
 use tetra_core::{
     BitBuffer, Direction, EndpointId, PhyBlockNum, Sap, SsiType, TdmaTime, TetraAddress, TimeslotOwner, Todo, TxReporter, TxState,
@@ -2226,7 +2227,20 @@ impl UmacBs {
                 pdu
             }
             Err(e) => {
-                tracing::warn!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
+                let raw_bits = prim.pdu.get_len();
+                if mac_access_parse_error_is_truncated_random_access(&e, raw_bits) {
+                    // Scope: EN 300 392-2 21.4.2.1 MAC-ACCESS on SCH/HU random access
+                    // (23.5.1.4). A block that ends before the selected address/optional
+                    // field is incomplete, not an alternate valid PDU.
+                    tracing::debug!(
+                        "Ignoring truncated MacAccess: {:?} raw_bits={} {}",
+                        e,
+                        raw_bits,
+                        prim.pdu.dump_bin()
+                    );
+                } else {
+                    tracing::warn!("Failed parsing MacAccess: {:?} {}", e, prim.pdu.dump_bin());
+                }
                 return;
             }
         };
@@ -4051,4 +4065,48 @@ fn pack_ul_acelp_bits(bits: &[u8]) -> Option<Vec<u8>> {
         out.push(byte);
     }
     Some(out)
+}
+
+fn mac_access_parse_error_is_truncated_random_access(err: &PduParseErr, raw_bits: usize) -> bool {
+    match err {
+        PduParseErr::BufferEnded { field: Some(field) }
+            if matches!(
+                *field,
+                "ssi"
+                    | "ussi"
+                    | "smi"
+                    | "event_label"
+                    | "optional_field_flag"
+                    | "length_ind_or_cap_req"
+                    | "length_ind"
+                    | "frag_flag"
+                    | "reservation_req"
+            ) =>
+        {
+            raw_bits > 0
+        }
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncated_mac_access_buffer_errors_are_not_protocol_warnings() {
+        let err = PduParseErr::BufferEnded { field: Some("ssi") };
+
+        assert!(mac_access_parse_error_is_truncated_random_access(&err, 21));
+    }
+
+    #[test]
+    fn invalid_complete_mac_access_errors_remain_protocol_warnings() {
+        let err = PduParseErr::InvalidValue {
+            field: "event_label",
+            value: 0,
+        };
+
+        assert!(!mac_access_parse_error_is_truncated_random_access(&err, 16));
+    }
 }

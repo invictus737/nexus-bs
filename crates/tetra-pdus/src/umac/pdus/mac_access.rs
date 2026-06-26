@@ -356,6 +356,22 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_truncated_ssi_address_without_panic() {
+        let mut buf = BitBuffer::new_autoexpand(24);
+        buf.write_bits(0, 1); // MAC-ACCESS
+        buf.write_bits(0, 1); // no fill bits
+        buf.write_bits(0, 1); // not encrypted
+        buf.write_bits(0, 2); // SSI address type
+        buf.write_bits(0, 16); // truncated before the 24-bit SSI field completes
+        buf.seek(0);
+
+        assert_eq!(
+            MacAccess::from_bitbuf(&mut buf).unwrap_err(),
+            PduParseErr::BufferEnded { field: Some("ssi") }
+        );
+    }
+
+    #[test]
     fn parser_rejects_reserved_zero_event_label_without_panic() {
         let mut buf = mac_access_event_label_bits(0);
 
