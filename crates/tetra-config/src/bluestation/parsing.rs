@@ -271,6 +271,26 @@ location_area = 1
         )
     }
 
+    fn toml_without_section(toml: &str, section: &str) -> String {
+        let header = format!("[{section}]");
+        let mut output = Vec::new();
+        let mut skipping = false;
+        for line in toml.lines() {
+            let trimmed = line.trim();
+            if trimmed == header {
+                skipping = true;
+                continue;
+            }
+            if skipping && trimmed.starts_with('[') && trimmed.ends_with(']') {
+                skipping = false;
+            }
+            if !skipping {
+                output.push(line);
+            }
+        }
+        output.join("\n")
+    }
+
     fn minimal_soapy_toml(extra_soapy: &str) -> String {
         format!(
             r#"
@@ -789,8 +809,13 @@ allowed_gssi_ranges = [
         assert!(toml.contains("protocol_id = 220"));
         assert!(toml.contains("# [brew]"));
         assert!(!toml.contains("\n[brew]\n"));
-        assert!(!toml.contains("\nusername = "));
-        assert!(!toml.contains("\npassword = "));
+        assert!(toml.contains("\n[dashboard]\n"));
+        assert!(toml.contains("auth_enabled = false"));
+        assert!(toml.contains("username = \"admin\""));
+        assert!(toml.contains("password = \"nexus\""));
+        let toml_without_dashboard = toml_without_section(toml, "dashboard");
+        assert!(!toml_without_dashboard.contains("\nusername = "));
+        assert!(!toml_without_dashboard.contains("\npassword = "));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));
@@ -853,8 +878,15 @@ allowed_gssi_ranges = [
             assert!(cfg.cell.sndcp_service, "{name} should advertise SNDCP for WAP/IP");
             assert!(cfg.cell.wap_ip.is_some(), "{name} should enable WAP/IP status");
             assert!(cfg.brew.is_none(), "{name} must not include active Brew credentials");
-            assert!(!toml.contains("\nusername = "), "{name} must not contain active username");
-            assert!(!toml.contains("\npassword = "), "{name} must not contain active password");
+            let toml_without_dashboard = toml_without_section(&toml, "dashboard");
+            assert!(
+                !toml_without_dashboard.contains("\nusername = "),
+                "{name} must not contain active username outside dashboard"
+            );
+            assert!(
+                !toml_without_dashboard.contains("\npassword = "),
+                "{name} must not contain active password outside dashboard"
+            );
         }
     }
 

@@ -54,6 +54,8 @@ const state = {
   updateStatus: "checking",
   updateLog: "",
   selectedUpdateUrl: "",
+  updateReloadPending: false,
+  updateReloadScheduled: false,
   serviceBusy: false,
   serviceStatus: "idle",
   easyStart: null,
@@ -79,6 +81,7 @@ const radioId = {
 };
 
 const RADIOID_CACHE_KEY = "nexus-bs.radioid.cache.v2";
+const UPDATE_RELOAD_PENDING_KEY = "nexus-bs.update.reloadPending.v1";
 const RADIOID_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RADIOID_NEGATIVE_TTL_MS = 24 * 60 * 60 * 1000;
 const RADIOID_RETRY_MS = 30 * 1000;
@@ -1569,6 +1572,72 @@ function selectedUpdateRelease() {
   return (state.updateCatalog?.releases || []).find((release) => release.deb_url === url) || null;
 }
 
+function readUpdateReloadPending() {
+  try {
+    return window.sessionStorage?.getItem(UPDATE_RELOAD_PENDING_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function setUpdateReloadPending(pending) {
+  state.updateReloadPending = !!pending;
+  try {
+    if (pending) window.sessionStorage?.setItem(UPDATE_RELOAD_PENDING_KEY, "1");
+    else window.sessionStorage?.removeItem(UPDATE_RELOAD_PENDING_KEY);
+  } catch {
+    // Session storage is best-effort; in-memory state still drives this tab.
+  }
+}
+
+async function clearDashboardBrowserCaches() {
+  radioId.cache.clear();
+  radioId.queue = [];
+  radioId.queued.clear();
+  radioId.failureUntil.clear();
+  if (radioId.saveTimer) {
+    window.clearTimeout(radioId.saveTimer);
+    radioId.saveTimer = null;
+  }
+  try {
+    window.localStorage?.removeItem(RADIOID_CACHE_KEY);
+  } catch {
+    // Ignore storage policy/private-mode failures.
+  }
+  try {
+    const cacheApi = window.caches;
+    if (cacheApi?.keys) {
+      const names = await cacheApi.keys();
+      await Promise.all(names.map((name) => cacheApi.delete(name)));
+    }
+  } catch {
+    // HTTP Cache-Control and the cache-busting URL below still force fresh assets.
+  }
+}
+
+function dashboardHardReloadUrl() {
+  const url = new URL(window.location.href);
+  url.searchParams.set("nexus_bs_reload", `${Date.now()}`);
+  return url.toString();
+}
+
+function scheduleDashboardHardReloadAfterUpdate(reason = "update complete") {
+  if (state.updateReloadScheduled) return;
+  state.updateReloadScheduled = true;
+  state.updateBusy = false;
+  state.updateStatus = "done_ok";
+  state.updateLog = `${state.updateLog || ""}\nDashboard ${reason}; clearing browser caches and reloading...`.trim();
+  renderUpdatePanel();
+  clearDashboardBrowserCaches()
+    .catch(() => {})
+    .finally(() => {
+      setUpdateReloadPending(false);
+      window.setTimeout(() => {
+        window.location.replace(dashboardHardReloadUrl());
+      }, 600);
+    });
+}
+
 async function loadUpdateCatalog() {
   state.updateStatus = "checking";
   renderUpdatePanel();
@@ -1599,11 +1668,21 @@ async function loadUpdateStatus() {
       { credentials: "same-origin", cache: "no-store" },
       5000
     );
+    const pendingReload = state.updateReloadPending || readUpdateReloadPending();
     state.updateLog = status.log || state.updateLog || "";
     if (status.status === "running") state.updateStatus = "running";
     if (status.status === "done_ok") state.updateStatus = "done_ok";
     if (status.status === "done_err") state.updateStatus = "done_err";
     state.updateBusy = status.status === "running";
+    if (status.status === "done_ok" || status.reload_required === true) {
+      scheduleDashboardHardReloadAfterUpdate("update completed");
+      return;
+    }
+    if (pendingReload && status.status === "idle") {
+      scheduleDashboardHardReloadAfterUpdate("service restarted after update");
+      return;
+    }
+    if (status.status === "done_err") setUpdateReloadPending(false);
     renderUpdatePanel();
   } catch {
     // Status polling is best-effort; release catalog remains useful.
@@ -1624,6 +1703,7 @@ async function applySelectedUpdate() {
   state.updateBusy = true;
   state.updateStatus = "running";
   state.updateLog = `Starting ${action.toLowerCase()} to ${release.tag}...`;
+  setUpdateReloadPending(true);
   renderUpdatePanel();
   try {
     const res = await fetchWithTimeout(
@@ -1646,6 +1726,7 @@ async function applySelectedUpdate() {
     state.updateLog = body.message || "Package update started.";
     pollUpdateStatus();
   } catch (error) {
+    setUpdateReloadPending(false);
     state.updateBusy = false;
     state.updateStatus = "done_err";
     state.updateLog = `Update request failed: ${String(error.message || error)}`;
@@ -1655,7 +1736,9 @@ async function applySelectedUpdate() {
 
 function pollUpdateStatus() {
   loadUpdateStatus();
-  if (state.updateBusy) window.setTimeout(pollUpdateStatus, 1500);
+  if ((state.updateBusy || state.updateReloadPending || readUpdateReloadPending()) && !state.updateReloadScheduled) {
+    window.setTimeout(pollUpdateStatus, 1500);
+  }
 }
 
 function setSiteCarrierInhibited(inhibited) {
@@ -3216,6 +3299,13 @@ function initNav() {
 
 loadRadioIdCache();
 initNav();
+if (readUpdateReloadPending()) {
+  state.updateBusy = true;
+  state.updateStatus = "running";
+  state.updateLog = "Update was in progress before this page load; waiting for dashboard restart...";
+  setUpdateReloadPending(true);
+  pollUpdateStatus();
+}
 refreshDashboardData();
 loadConfigText("config.toml");
 connectWs();

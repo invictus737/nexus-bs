@@ -31,16 +31,20 @@ pub struct CfgDashboard {
     /// appliance images can boot while assets are deployed later; the dashboard
     /// server falls back to the embedded UI until the directory is usable.
     pub static_dir: Option<String>,
-    /// Optional dashboard login credentials.
-    /// When both username and password are set, all dashboard requests require a
-    /// cookie session obtained from the form login at `/login`.
-    /// When omitted, the dashboard is accessible without a password (default, home-network use).
+    /// Enable dashboard form login.
+    ///
+    /// Default is false so existing local dashboards remain open unless the
+    /// operator explicitly opts in. When enabled, all dashboard requests require
+    /// a cookie session obtained from the form login at `/login`.
+    pub auth_enabled: bool,
+    /// Dashboard login credentials. These have safe parse-time defaults so an
+    /// operator can enable auth by setting only `auth_enabled = true`.
     ///
     /// SECURITY NOTE: without TLS the login POST still crosses the LAN in clear
     /// text. For internet-facing deployments, put a reverse proxy with HTTPS in
     /// front of the dashboard.
-    pub username: Option<String>,
-    pub password: Option<String>,
+    pub username: String,
+    pub password: String,
 }
 
 impl Default for CfgDashboard {
@@ -50,8 +54,9 @@ impl Default for CfgDashboard {
             bind: "0.0.0.0".to_string(),
             source_dir: None,
             static_dir: None,
-            username: None,
-            password: None,
+            auth_enabled: false,
+            username: default_username(),
+            password: default_password(),
         }
     }
 }
@@ -67,9 +72,11 @@ pub struct CfgDashboardDto {
     #[serde(default)]
     pub static_dir: Option<String>,
     #[serde(default)]
-    pub username: Option<String>,
-    #[serde(default)]
-    pub password: Option<String>,
+    pub auth_enabled: bool,
+    #[serde(default = "default_username")]
+    pub username: String,
+    #[serde(default = "default_password")]
+    pub password: String,
 
     #[serde(flatten)]
     pub extra: HashMap<String, Value>,
@@ -80,6 +87,12 @@ fn default_port() -> u16 {
 }
 fn default_bind() -> String {
     "0.0.0.0".to_string()
+}
+fn default_username() -> String {
+    "admin".to_string()
+}
+fn default_password() -> String {
+    "nexus".to_string()
 }
 
 pub fn apply_dashboard_patch(src: CfgDashboardDto) -> Result<CfgDashboard, String> {
@@ -96,24 +109,18 @@ pub fn apply_dashboard_patch(src: CfgDashboardDto) -> Result<CfgDashboard, Strin
     if let Some(ref sd) = src.static_dir {
         validate_dashboard_static_dir(sd)?;
     }
-    // Auth: either both username+password are set, or neither.
-    match (&src.username, &src.password) {
-        (Some(u), Some(p)) => {
-            if u.trim().is_empty() {
-                return Err("dashboard: username cannot be empty".to_string());
-            }
-            if p.trim().is_empty() {
-                return Err("dashboard: password cannot be empty".to_string());
-            }
-        }
-        (None, None) => {}
-        _ => return Err("dashboard: set both 'username' and 'password', or neither".to_string()),
+    if src.username.trim().is_empty() {
+        return Err("dashboard: username cannot be empty".to_string());
+    }
+    if src.password.trim().is_empty() {
+        return Err("dashboard: password cannot be empty".to_string());
     }
     Ok(CfgDashboard {
         port: src.port,
         bind: src.bind,
         source_dir: src.source_dir,
         static_dir: src.static_dir,
+        auth_enabled: src.auth_enabled,
         username: src.username,
         password: src.password,
     })
@@ -154,8 +161,9 @@ mod tests {
             bind: default_bind(),
             source_dir: None,
             static_dir,
-            username: None,
-            password: None,
+            auth_enabled: false,
+            username: default_username(),
+            password: default_password(),
             extra: HashMap::new(),
         }
     }
@@ -213,41 +221,53 @@ mod tests {
     }
 
     #[test]
-    fn dashboard_auth_accepts_username_and_password_together() {
-        let mut dto = dashboard_dto_with_static_dir(None);
-        dto.username = Some("admin".to_string());
-        dto.password = Some("change-this".to_string());
+    fn dashboard_auth_defaults_to_disabled_admin_nexus() {
+        let cfg = apply_dashboard_patch(dashboard_dto_with_static_dir(None)).expect("dashboard defaults should parse");
 
-        let cfg = apply_dashboard_patch(dto).expect("paired credentials should parse");
-
-        assert_eq!(cfg.username.as_deref(), Some("admin"));
-        assert_eq!(cfg.password.as_deref(), Some("change-this"));
+        assert!(!cfg.auth_enabled);
+        assert_eq!(cfg.username, "admin");
+        assert_eq!(cfg.password, "nexus");
     }
 
     #[test]
-    fn dashboard_auth_rejects_partial_credentials() {
-        let mut user_only = dashboard_dto_with_static_dir(None);
-        user_only.username = Some("admin".to_string());
-        let err = apply_dashboard_patch(user_only).expect_err("username without password must fail");
-        assert!(err.contains("set both"));
+    fn dashboard_auth_accepts_explicit_username_and_password() {
+        let mut dto = dashboard_dto_with_static_dir(None);
+        dto.auth_enabled = true;
+        dto.username = "admin".to_string();
+        dto.password = "change-this".to_string();
 
-        let mut password_only = dashboard_dto_with_static_dir(None);
-        password_only.password = Some("change-this".to_string());
-        let err = apply_dashboard_patch(password_only).expect_err("password without username must fail");
-        assert!(err.contains("set both"));
+        let cfg = apply_dashboard_patch(dto).expect("paired credentials should parse");
+
+        assert!(cfg.auth_enabled);
+        assert_eq!(cfg.username, "admin");
+        assert_eq!(cfg.password, "change-this");
+    }
+
+    #[test]
+    fn dashboard_auth_enabled_uses_default_credentials() {
+        let mut dto = dashboard_dto_with_static_dir(None);
+        dto.auth_enabled = true;
+
+        let cfg = apply_dashboard_patch(dto).expect("auth_enabled should parse with default credentials");
+
+        assert!(cfg.auth_enabled);
+        assert_eq!(cfg.username, "admin");
+        assert_eq!(cfg.password, "nexus");
     }
 
     #[test]
     fn dashboard_auth_rejects_blank_credentials() {
         let mut blank_user = dashboard_dto_with_static_dir(None);
-        blank_user.username = Some("  ".to_string());
-        blank_user.password = Some("change-this".to_string());
+        blank_user.auth_enabled = true;
+        blank_user.username = "  ".to_string();
+        blank_user.password = "change-this".to_string();
         let err = apply_dashboard_patch(blank_user).expect_err("blank username must fail");
         assert!(err.contains("username"));
 
         let mut blank_password = dashboard_dto_with_static_dir(None);
-        blank_password.username = Some("admin".to_string());
-        blank_password.password = Some("  ".to_string());
+        blank_password.auth_enabled = true;
+        blank_password.username = "admin".to_string();
+        blank_password.password = "  ".to_string();
         let err = apply_dashboard_patch(blank_password).expect_err("blank password must fail");
         assert!(err.contains("password"));
     }

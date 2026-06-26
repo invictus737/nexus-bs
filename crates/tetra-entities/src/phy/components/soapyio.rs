@@ -69,6 +69,8 @@ const TX_CAL_CLIP_LEVEL: f32 = 0.98;
 const TX_CAL_MAX_CLIPPED_FRACTION: f64 = 0.001;
 const TX_CAL_FREQ_MATCH_TOLERANCE_HZ: f64 = 50.0;
 const TX_CAL_SAMPLE_RATE_MATCH_TOLERANCE_HZ: f64 = 1.0;
+const TX_CAL_MODE_ENV: &str = "NEXUS_BS_RF_CALIBRATION_MODE";
+const TX_CAL_MODE_MEASURE_ONLY: &str = "measure_only";
 const SOAPY_SX_LOOPBACK_ANTENNA: &str = "LB";
 const SOAPY_SX_PA_SETTING: &str = "PA";
 
@@ -531,6 +533,17 @@ impl SoapyIo {
                 }
             }
 
+            if tx_calibration_measure_only_requested() {
+                let file = self.build_tx_measurement_only_report(session, limits, reference_meas, neutral, &timing);
+                let written_path = write_tx_calibration_result_file_atomic(calibration_path, &file)?;
+                tracing::warn!(
+                    "SoapySDR: TX RF measure-only report saved to {}: {}",
+                    written_path.display(),
+                    file.report.summary
+                );
+                return Ok(file);
+            }
+
             let dc_actuator = self.probe_tx_dc_actuator_response(
                 &mut rx_stream,
                 &mut tx_stream,
@@ -831,28 +844,7 @@ impl SoapyIo {
                 },
                 created_unix_secs: now,
                 updated_unix_secs: now,
-                device: TxCalibrationDevice {
-                    name: self.sdr_name.clone(),
-                    tx_gain_profile: self.tx_gain_profile.clone(),
-                    tx_frequency_hz: session.live_tx_carrier_hz,
-                    rx_frequency_hz: session.live_rx_carrier_hz,
-                    tx_center_frequency_hz: session.live_tx_center_hz,
-                    rx_center_frequency_hz: session.live_rx_center_hz,
-                    calibration_frequency_hz: session.calibration_center_hz,
-                    duplex_shift_hz: session.live_tx_carrier_hz - session.live_rx_carrier_hz,
-                    sample_rate_hz: self.tx_fs,
-                    tx_channel: self.tx_ch,
-                    rx_channel: self.rx_ch,
-                    tx_antenna: self.tx_ant.clone().unwrap_or_else(|| "auto".to_string()),
-                    rx_antenna: self
-                        .rx_ant
-                        .clone()
-                        .unwrap_or_else(|| session.original_rx_antenna.clone().unwrap_or_else(|| "auto".to_string())),
-                    loopback_source: session.loopback_source.clone(),
-                    pa_setting: session.original_pa_setting.clone().unwrap_or_else(|| "unknown".to_string()),
-                    tx_gains_fingerprint: device_gains_fingerprint(&self.dev, soapysdr::Direction::Tx, self.tx_ch, &self.tx_gain),
-                    rx_gains_fingerprint: device_gains_fingerprint(&self.dev, soapysdr::Direction::Rx, self.rx_ch, &self.rx_gain),
-                },
+                device: self.tx_calibration_device_snapshot(session),
                 limits,
                 reference: reference_meas.into_point("neutral_no_calibration", neutral),
                 calibrated: final_meas.into_point(
@@ -1016,6 +1008,99 @@ impl SoapyIo {
         rx.activate(None).map_err(|e| format!("activate RX calibration stream: {}", e))?;
         tx.activate(None).map_err(|e| format!("activate TX calibration stream: {}", e))?;
         Ok((rx, tx))
+    }
+
+    fn tx_calibration_device_snapshot(&self, session: &TxCalibrationSession) -> TxCalibrationDevice {
+        TxCalibrationDevice {
+            name: self.sdr_name.clone(),
+            tx_gain_profile: self.tx_gain_profile.clone(),
+            tx_frequency_hz: session.live_tx_carrier_hz,
+            rx_frequency_hz: session.live_rx_carrier_hz,
+            tx_center_frequency_hz: session.live_tx_center_hz,
+            rx_center_frequency_hz: session.live_rx_center_hz,
+            calibration_frequency_hz: session.calibration_center_hz,
+            duplex_shift_hz: session.live_tx_carrier_hz - session.live_rx_carrier_hz,
+            sample_rate_hz: self.tx_fs,
+            tx_channel: self.tx_ch,
+            rx_channel: self.rx_ch,
+            tx_antenna: self.tx_ant.clone().unwrap_or_else(|| "auto".to_string()),
+            rx_antenna: self
+                .rx_ant
+                .clone()
+                .unwrap_or_else(|| session.original_rx_antenna.clone().unwrap_or_else(|| "auto".to_string())),
+            loopback_source: session.loopback_source.clone(),
+            pa_setting: session.original_pa_setting.clone().unwrap_or_else(|| "unknown".to_string()),
+            tx_gains_fingerprint: device_gains_fingerprint(&self.dev, soapysdr::Direction::Tx, self.tx_ch, &self.tx_gain),
+            rx_gains_fingerprint: device_gains_fingerprint(&self.dev, soapysdr::Direction::Rx, self.rx_ch, &self.rx_gain),
+        }
+    }
+
+    fn build_tx_measurement_only_report(
+        &self,
+        session: &TxCalibrationSession,
+        limits: TxCalibrationLimits,
+        measurement: CalibrationMeasurement,
+        neutral: TxCalibrationCoefficients,
+        timing: &CalibrationTiming,
+    ) -> TxCalibrationFile {
+        let now = unix_secs_now();
+        let tetra_known_quality_ok = tetra_known_evm_quality_ok(measurement.tetra_known);
+        let rf_limiting = rf_limiting_factor(&measurement, tetra_known_quality_ok);
+        let timing_suffix = if timing.warning() {
+            format!(", timing warning events={} last={}", timing.status_events, timing.last_status)
+        } else {
+            String::new()
+        };
+        let known_suffix = match measurement.tetra_known {
+            Some(known) => format!(
+                ", known-symbol EVM rms {:.2}% peak {:.2}% diff {:.2}deg symbols={} timing={:.2}",
+                known.rms_evm_pct, known.peak_evm_pct, known.differential_rms_deg, known.symbols_used, known.timing_sample
+            ),
+            None => ", known-symbol EVM unavailable".to_string(),
+        };
+
+        TxCalibrationFile {
+            schema_version: 1,
+            status: "measured".to_string(),
+            created_unix_secs: now,
+            updated_unix_secs: now,
+            device: self.tx_calibration_device_snapshot(session),
+            limits,
+            reference: measurement.into_point("neutral_no_calibration", neutral),
+            calibrated: measurement.into_point("measured_rf_only", neutral),
+            applied: TxCalibrationCoefficients::default(),
+            report: TxCalibrationReport {
+                tetra_known_evm_quality_ok: tetra_known_quality_ok,
+                rf_limiting_factor: rf_limiting.to_string(),
+                accepted: false,
+                accepted_dc: false,
+                accepted_iq: false,
+                accepted_mode: "measure_only".to_string(),
+                image_quality_ok: calibration_image_quality_ok(&measurement),
+                final_quality_ok: calibration_preconfirmation_quality_ok(&measurement),
+                timing_warning: timing.warning(),
+                timing_status_events: timing.status_events,
+                timing_confirmation_status_events: timing.confirmation_status_events,
+                timing_underflows: timing.underflows,
+                timing_overflows: timing.overflows,
+                timing_time_errors: timing.time_errors,
+                timing_other_errors: timing.other_errors,
+                timing_last_status: timing.last_status.clone(),
+                summary: format!(
+                    "measured RF only: carrier {:.1} dBc, image {:.1} dB, EVM proxy {:.2}%, SNR {:.1} dB, signal {:.1} dBFS, floor drift {:.1} dB, limiting={}{}{}",
+                    measurement.carrier_leakage_dbc,
+                    measurement.image_rejection_db,
+                    measurement.evm_proxy_pct,
+                    measurement.snr_db,
+                    measurement.signal_dbfs,
+                    measurement.floor_drift_db,
+                    rf_limiting,
+                    known_suffix,
+                    timing_suffix
+                ),
+                ..TxCalibrationReport::default()
+            },
+        }
     }
 
     fn calibration_block_len(&self) -> usize {
@@ -1441,7 +1526,7 @@ impl SoapyIo {
             .ok_or_else(|| "TETRA known-EVM calibration sequence length overflow".to_string())?;
         let tx_sequence = synthesize_tetra_calibration_tx_sequence(self.tx_fs, calibration_center_hz, tx_sequence_len)?;
         let reference_symbols = tetra_calibration_reference_symbols(TX_CAL_TETRA_REFERENCE_SYMBOLS)?;
-        let attempts = TX_CAL_TETRA_EVM_ATTEMPTS.max(1);
+        let attempts = tx_calibration_tetra_evm_attempts();
         let mut best: Option<(usize, TetraKnownEvmMeasurement)> = None;
         let mut last_modem_samples = 0usize;
 
@@ -3164,6 +3249,20 @@ fn unix_secs_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+fn tx_calibration_measure_only_requested() -> bool {
+    std::env::var(TX_CAL_MODE_ENV)
+        .ok()
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case(TX_CAL_MODE_MEASURE_ONLY))
+}
+
+fn tx_calibration_tetra_evm_attempts() -> usize {
+    if tx_calibration_measure_only_requested() {
+        1
+    } else {
+        TX_CAL_TETRA_EVM_ATTEMPTS.max(1)
+    }
 }
 
 fn temperature_sensor_reads_supported(settings_name: &str) -> bool {

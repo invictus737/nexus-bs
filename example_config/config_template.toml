@@ -239,6 +239,9 @@ reconnect_delay_secs = 15
 [dashboard]
 port = 8080
 bind = "0.0.0.0"
+auth_enabled = false
+username = "admin"
+password = "nexus"
 allow_config_api = false
 allow_control_commands = false
 # auth_token = "change-me-to-a-long-random-token"

@@ -106,10 +106,9 @@ fn main() {
             .or_else(|| dash_cfg.as_ref().and_then(|cfg| cfg.static_dir.clone()))
             .or_else(|| Some("dashboard".to_string())),
         source_dir: dash_cfg.as_ref().and_then(|cfg| cfg.source_dir.clone()),
-        auth: dash_cfg.as_ref().and_then(|cfg| match (&cfg.username, &cfg.password) {
-            (Some(user), Some(pass)) => Some((user.clone(), pass.clone())),
-            _ => None,
-        }),
+        auth: dash_cfg
+            .as_ref()
+            .and_then(|cfg| cfg.auth_enabled.then(|| (cfg.username.clone(), cfg.password.clone()))),
         telemetry_listen: args
             .telemetry_listen
             .or_else(|| non_empty_env("NEXUS_BS_DASHBOARD_TELEMETRY_LISTEN"))

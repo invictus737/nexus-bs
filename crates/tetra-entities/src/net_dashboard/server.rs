@@ -61,6 +61,14 @@ const EASY_START_TEMPLATE_TOML: &str = include_str!("../../../../example_config/
 const EASY_START_DONE_MARKER: &str = ".easy-start-done";
 const SMART_RF_TUNE_CORE_STOP_TIMEOUT_SECS: u64 = 20;
 const SMART_RF_TUNE_MEASUREMENT_TIMEOUT_SECS: u64 = 180;
+const RF_CALIBRATION_MODE_ENV: &str = "NEXUS_BS_RF_CALIBRATION_MODE";
+const RF_CALIBRATION_MODE_MEASURE_ONLY: &str = "measure_only";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SmartRfTuneMeasurementMode {
+    MeasureOnly,
+    FullCalibration,
+}
 
 #[derive(Clone, Debug, serde::Serialize)]
 struct SmartRfTuneState {
@@ -2792,14 +2800,15 @@ fn run_smart_rf_tune_orchestrator(
         }
 
         let candidate_calibration_path = smart_rf_tune_candidate_calibration_path(idx + 1);
-        let result = match run_smart_rf_tune_measurement(&config_path, &candidate_calibration_path) {
+        let result = match run_smart_rf_tune_measurement(&config_path, &candidate_calibration_path, SmartRfTuneMeasurementMode::MeasureOnly)
+        {
             Ok(report) => smart_rf_tune_result_from_report(candidate, &report),
             Err(err) => smart_rf_tune_error_result(candidate, err),
         };
         cleanup_smart_rf_tune_candidate_calibration_files(&candidate_calibration_path);
         smart_rf_tune_push_result(result.clone());
         results.push(result);
-        std::thread::sleep(std::time::Duration::from_secs(8));
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     let Some(best) = results
@@ -2826,7 +2835,7 @@ fn run_smart_rf_tune_orchestrator(
         Ok(()) => {
             clear_dashboard_config_cache(&config_path);
             smart_rf_tune_log("best measured config written; running final persistent RF calibration at selected gains");
-            match run_smart_rf_tune_measurement(&config_path, &calibration_path) {
+            match run_smart_rf_tune_measurement(&config_path, &calibration_path, SmartRfTuneMeasurementMode::FullCalibration) {
                 Ok(report) => smart_rf_tune_log(format!(
                     "final persistent calibration report accepted={} rms={:?} peak={:?} snr={:.1} summary={}",
                     report.report.accepted,
@@ -3182,7 +3191,7 @@ fn run_rf_evm_measure_orchestrator(config_path: String, calibration_path: PathBu
 
     crate::rf_calibration::mark_calibrating(&calibration_path.display().to_string());
     let temp_path = rf_evm_measure_temp_calibration_path();
-    let result = run_smart_rf_tune_measurement(&config_path, &temp_path);
+    let result = run_smart_rf_tune_measurement(&config_path, &temp_path, SmartRfTuneMeasurementMode::MeasureOnly);
     let cleanup_path = temp_path.clone();
     match result {
         Ok(report) => {
@@ -3212,6 +3221,13 @@ fn rf_evm_measure_temp_calibration_path() -> PathBuf {
     std::env::temp_dir().join(format!("nexus-bs-rf-evm-measure-{}.toml", std::process::id()))
 }
 
+fn rf_calibration_measurement_env(mode: SmartRfTuneMeasurementMode) -> Vec<(&'static str, &'static str)> {
+    match mode {
+        SmartRfTuneMeasurementMode::MeasureOnly => vec![(RF_CALIBRATION_MODE_ENV, RF_CALIBRATION_MODE_MEASURE_ONLY)],
+        SmartRfTuneMeasurementMode::FullCalibration => Vec::new(),
+    }
+}
+
 fn stop_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) -> String {
     let unit = crate::service_control::resolve_service_unit();
     let queued = send_control_cmd(core_cmd_tx, ControlCommand::ShutdownService);
@@ -3232,6 +3248,7 @@ fn stop_core_for_smart_rf_tune(core_cmd_tx: &Arc<Mutex<Option<CmdSender>>>) -> S
 fn run_smart_rf_tune_measurement(
     config_path: &str,
     calibration_path: &Path,
+    mode: SmartRfTuneMeasurementMode,
 ) -> Result<tetra_config::bluestation::TxCalibrationFile, String> {
     let run_report_path = tetra_config::bluestation::tx_calibration_run_report_path(calibration_path);
     match std::fs::remove_file(&run_report_path) {
@@ -3240,12 +3257,14 @@ fn run_smart_rf_tune_measurement(
         Err(err) => return Err(format!("remove stale run report {}: {}", run_report_path.display(), err)),
     }
     smart_rf_tune_log(format!(
-        "starting exclusive calibration-only process; BS runtime is stopped; startup underruns are not part of measurement"
+        "starting exclusive calibration-only process mode={:?}; BS runtime is stopped; startup underruns are not part of measurement",
+        mode
     ));
     let mut child = Command::new(nexus_bs_core_binary_path())
         .arg(config_path)
         .arg("--rf-calibration-only")
         .arg(calibration_path)
+        .envs(rf_calibration_measurement_env(mode))
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -3538,7 +3557,7 @@ fn run_rf_calibration_orchestrator(config_path: String, calibration_path: PathBu
     }
 
     crate::rf_calibration::mark_calibrating(&calibration_path.display().to_string());
-    let report = match run_smart_rf_tune_measurement(&config_path, &calibration_path) {
+    let report = match run_smart_rf_tune_measurement(&config_path, &calibration_path, SmartRfTuneMeasurementMode::FullCalibration) {
         Ok(report) => report,
         Err(err) => {
             crate::rf_calibration::mark_failed(format!("exclusive RF calibration failed: {}", err));
@@ -3805,14 +3824,11 @@ fn handle_connection(
     // mobile usability issues (iOS Safari prompts 2-3 times, forgets credentials
     // between WebSocket reconnects, etc.). With cookies we control the UX fully.
     //
-    // Public routes (no auth required): GET /login and POST /api/login.
+    // Public routes (no auth required): GET /api/auth/status, GET /login,
+    // POST /api/login and logout cookie cleanup.
     // Dashboard assets are served after the same cookie-session gate as `/`.
     // Every other route is checked here against the session store.
     if let Some((ref expected_user, ref expected_pass)) = auth {
-        // Login page and login API must remain reachable without a session.
-        let is_login_page = request_matches(&req_line, "GET", "/login");
-        let is_login_api = request_matches(&req_line, "POST", "/api/login");
-
         // Validate session cookie when present. Note: validate() refreshes last-seen,
         // so active users effectively never time out.
         let session_ok = parse_session_cookie(&header_str)
@@ -3822,93 +3838,99 @@ fn handle_connection(
             })
             .unwrap_or(false);
 
-        if is_login_page {
-            let mut buf = BufReader::new(stream);
-            loop {
-                let mut line = String::new();
-                let _ = buf.read_line(&mut line);
-                if line == "\r\n" || line.is_empty() || line == "\n" {
-                    break;
+        match dashboard_auth_gate(&req_line, session_ok) {
+            DashboardAuthGate::Allow => {}
+            DashboardAuthGate::LoginPage => {
+                let mut buf = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line);
+                    if line == "\r\n" || line.is_empty() || line == "\n" {
+                        break;
+                    }
                 }
-            }
-            // If already logged in, send them straight to the dashboard.
-            if session_ok {
-                http_redirect(buf.into_inner(), "/");
-            } else {
-                serve_login_page(buf.into_inner());
-            }
-            return;
-        }
-
-        if is_login_api {
-            // Body has form-encoded or JSON-encoded credentials.
-            let mut buf = BufReader::new(stream);
-            let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
-                Ok(body) => body,
-                Err(e) => {
-                    respond_http_body_error(buf.into_inner(), e);
-                    return;
-                }
-            };
-            let body_str = String::from_utf8_lossy(&body);
-
-            let (user, pass) = parse_login_body(&body_str);
-            let ok = timing_safe_eq(user.as_bytes(), expected_user.as_bytes()) && timing_safe_eq(pass.as_bytes(), expected_pass.as_bytes());
-
-            if ok {
-                let token = if let Ok(mut store) = sessions.lock() {
-                    store.create()
+                // If already logged in, send them straight to the dashboard.
+                if session_ok {
+                    http_redirect(buf.into_inner(), "/");
                 } else {
-                    String::new()
+                    serve_login_page(buf.into_inner());
+                }
+                return;
+            }
+            DashboardAuthGate::LoginApi => {
+                // Body has form-encoded or JSON-encoded credentials.
+                let mut buf = BufReader::new(stream);
+                let body = match read_http_body_from_buf(&mut buf, DASHBOARD_SMALL_BODY_MAX) {
+                    Ok(body) => body,
+                    Err(e) => {
+                        respond_http_body_error(buf.into_inner(), e);
+                        return;
+                    }
                 };
-                tracing::info!("Dashboard: login OK (user: {})", user);
-                serve_login_success(buf.into_inner(), &token);
-            } else {
-                tracing::warn!("Dashboard: login FAILED (user attempt: {})", user);
-                // Small artificial delay to limit brute-force throughput.
-                std::thread::sleep(std::time::Duration::from_millis(500));
-                http_response(buf.into_inner(), 401, "Invalid credentials");
-            }
-            return;
-        }
+                let body_str = String::from_utf8_lossy(&body);
 
-        // Logout: invalidate the cookie, then redirect to /login.
-        if request_matches(&req_line, "POST", "/api/logout") || request_matches(&req_line, "GET", "/logout") {
-            if let Some(token) = parse_session_cookie(&header_str) {
-                if let Ok(mut store) = sessions.lock() {
-                    store.invalidate(&token);
-                }
-            }
-            let mut buf = BufReader::new(stream);
-            loop {
-                let mut line = String::new();
-                let _ = buf.read_line(&mut line);
-                if line == "\r\n" || line.is_empty() || line == "\n" {
-                    break;
-                }
-            }
-            serve_logout(buf.into_inner());
-            return;
-        }
+                let (user, pass) = parse_login_body(&body_str);
+                let ok =
+                    timing_safe_eq(user.as_bytes(), expected_user.as_bytes()) && timing_safe_eq(pass.as_bytes(), expected_pass.as_bytes());
 
-        // All other routes require a valid session.
-        if !session_ok {
-            let mut buf = BufReader::new(stream);
-            loop {
-                let mut line = String::new();
-                let _ = buf.read_line(&mut line);
-                if line == "\r\n" || line.is_empty() || line == "\n" {
-                    break;
+                if ok {
+                    let token = if let Ok(mut store) = sessions.lock() {
+                        store.create()
+                    } else {
+                        String::new()
+                    };
+                    tracing::info!("Dashboard: login OK (user: {})", user);
+                    serve_login_success(buf.into_inner(), &token);
+                } else {
+                    tracing::warn!("Dashboard: login FAILED (user attempt: {})", user);
+                    // Small artificial delay to limit brute-force throughput.
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    http_response(buf.into_inner(), 401, "Invalid credentials");
                 }
+                return;
             }
-            // For GET / (the dashboard SPA): redirect to /login so the browser navigates.
-            // For API requests: 401 so JS code can detect and refresh.
-            if request_matches(&req_line, "GET", "/") {
+            DashboardAuthGate::Logout => {
+                // Logout: invalidate the cookie, then redirect to /login.
+                if let Some(token) = parse_session_cookie(&header_str) {
+                    if let Ok(mut store) = sessions.lock() {
+                        store.invalidate(&token);
+                    }
+                }
+                let mut buf = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line);
+                    if line == "\r\n" || line.is_empty() || line == "\n" {
+                        break;
+                    }
+                }
+                serve_logout(buf.into_inner());
+                return;
+            }
+            DashboardAuthGate::RedirectToLogin => {
+                let mut buf = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line);
+                    if line == "\r\n" || line.is_empty() || line == "\n" {
+                        break;
+                    }
+                }
                 http_redirect(buf.into_inner(), "/login");
-            } else {
-                http_response(buf.into_inner(), 401, "Unauthorized — please log in");
+                return;
             }
-            return;
+            DashboardAuthGate::Unauthorized => {
+                let mut buf = BufReader::new(stream);
+                loop {
+                    let mut line = String::new();
+                    let _ = buf.read_line(&mut line);
+                    if line == "\r\n" || line.is_empty() || line == "\n" {
+                        break;
+                    }
+                }
+                http_response(buf.into_inner(), 401, "Unauthorized — please log in");
+                return;
+            }
         }
     }
 
@@ -5028,6 +5050,39 @@ fn serve_dashboard_auth_status(stream: TcpStream, auth: &Option<(String, String)
     http_json_response(stream, 200, &body);
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DashboardAuthGate {
+    Allow,
+    LoginPage,
+    LoginApi,
+    Logout,
+    RedirectToLogin,
+    Unauthorized,
+}
+
+fn dashboard_auth_gate(req_line: &str, session_ok: bool) -> DashboardAuthGate {
+    if request_matches(req_line, "GET", "/api/auth/status") {
+        return DashboardAuthGate::Allow;
+    }
+    if request_matches(req_line, "GET", "/login") {
+        return DashboardAuthGate::LoginPage;
+    }
+    if request_matches(req_line, "POST", "/api/login") {
+        return DashboardAuthGate::LoginApi;
+    }
+    if request_matches(req_line, "POST", "/api/logout") || request_matches(req_line, "GET", "/logout") {
+        return DashboardAuthGate::Logout;
+    }
+    if session_ok {
+        return DashboardAuthGate::Allow;
+    }
+    if request_matches(req_line, "GET", "/") {
+        DashboardAuthGate::RedirectToLogin
+    } else {
+        DashboardAuthGate::Unauthorized
+    }
+}
+
 fn handle_ws_command(text: &str, state: &DashboardState, cmd_tx: &Arc<Mutex<Option<CmdSender>>>, update_state: &SharedUpdateState) {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
         return;
@@ -5170,8 +5225,9 @@ fn serve_update_status(stream: TcpStream, update_state: &SharedUpdateState) {
         (phase_str, success, u.log.clone())
     };
     let body = format!(
-        "{{\"status\":\"{}\",\"success\":{},\"log\":{}}}",
+        "{{\"status\":\"{}\",\"success\":{},\"reload_required\":{},\"log\":{}}}",
         phase_str,
+        success,
         success,
         serde_json::to_string(&log).unwrap_or_else(|_| "\"\"".into())
     );
@@ -7132,6 +7188,31 @@ mod tests {
     }
 
     #[test]
+    fn dashboard_auth_gate_blocks_api_and_ws_without_session() {
+        for req_line in [
+            "GET /api/system HTTP/1.1",
+            "POST /api/config HTTP/1.1",
+            "POST /api/update/apply HTTP/1.1",
+            "GET /ws HTTP/1.1",
+        ] {
+            assert_eq!(dashboard_auth_gate(req_line, false), DashboardAuthGate::Unauthorized, "{req_line}");
+            assert_eq!(dashboard_auth_gate(req_line, true), DashboardAuthGate::Allow, "{req_line}");
+        }
+    }
+
+    #[test]
+    fn dashboard_auth_gate_only_allows_login_and_auth_status_publicly() {
+        assert_eq!(
+            dashboard_auth_gate("GET /api/auth/status HTTP/1.1", false),
+            DashboardAuthGate::Allow
+        );
+        assert_eq!(dashboard_auth_gate("GET /login HTTP/1.1", false), DashboardAuthGate::LoginPage);
+        assert_eq!(dashboard_auth_gate("POST /api/login HTTP/1.1", false), DashboardAuthGate::LoginApi);
+        assert_eq!(dashboard_auth_gate("POST /api/logout HTTP/1.1", false), DashboardAuthGate::Logout);
+        assert_eq!(dashboard_auth_gate("GET / HTTP/1.1", false), DashboardAuthGate::RedirectToLogin);
+    }
+
+    #[test]
     fn dashboard_session_cookie_parser_handles_cookie_lists() {
         let headers = "GET / HTTP/1.1\r\nCookie: theme=dark; fs_session=ABC123; fs_auth=1\r\n\r\n";
 
@@ -7619,6 +7700,15 @@ rx_gain_pga = 20.0
         assert!(updated.contains("tx_gain_profile = \"low_drive_calibration\""));
         assert!(updated.contains("tx_gain_pga = 39.0"));
         assert!(updated.contains("rx_gain_pga = 14.0"));
+    }
+
+    #[test]
+    fn smart_rf_tune_measure_only_mode_sets_fast_rf_measurement_env() {
+        assert_eq!(
+            rf_calibration_measurement_env(SmartRfTuneMeasurementMode::MeasureOnly),
+            vec![(RF_CALIBRATION_MODE_ENV, RF_CALIBRATION_MODE_MEASURE_ONLY)]
+        );
+        assert!(rf_calibration_measurement_env(SmartRfTuneMeasurementMode::FullCalibration).is_empty());
     }
 
     #[test]
