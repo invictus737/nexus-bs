@@ -242,8 +242,8 @@ bind = "0.0.0.0"
 # Dashboard/API auth are disabled by default. Uncomment and set auth_enabled = true
 # to require the same login for the dashboard page, /api/* and /ws.
 # auth_enabled = false
-# username = admin
-# password = nexus
+# username = "admin"
+# password = "nexus"
 allow_config_api = false
 allow_control_commands = false
 # auth_token = "change-me-to-a-long-random-token"

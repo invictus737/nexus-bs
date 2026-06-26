@@ -18,6 +18,27 @@ CONTROL_SERVICE_BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/nexus-bs-con
 DASHBOARD_BIN="$ROOT/target/aarch64-unknown-linux-gnu/release/nexus-bs-dashboard"
 SSH_OPTS="-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=2 -o ServerAliveCountMax=2"
 
+project_version() {
+    awk '
+        /^\[workspace\.package\][[:space:]]*$/ { in_workspace_package = 1; next }
+        /^\[/ { in_workspace_package = 0 }
+        in_workspace_package && /^[[:space:]]*version[[:space:]]*=/ {
+            sub(/^[^=]*=[[:space:]]*/, "", $0)
+            gsub(/"/, "", $0)
+            gsub(/[[:space:]]/, "", $0)
+            print
+            exit
+        }
+    ' Cargo.toml
+}
+
+render_systemd_unit() {
+    src="$1"
+    dst="$2"
+    version="$3"
+    sed -E "s/Nexus-BS v[0-9]+[.][0-9]+[.][0-9]+/Nexus-BS v${version}/g" "$src" > "$dst"
+}
+
 if [ "${RUN_TESTS:-1}" = "1" ]; then
     cargo test -p tetra-entities --test test_cmce_bs repeated_group_u_setup --locked
     cargo test -p tetra-entities --test test_cmce_bs --locked
@@ -40,6 +61,12 @@ local_sha="$(shasum -a 256 "$BIN" | awk '{print $1}')"
 control_service_sha="$(shasum -a 256 "$CONTROL_SERVICE_BIN" | awk '{print $1}')"
 dashboard_sha="$(shasum -a 256 "$DASHBOARD_BIN" | awk '{print $1}')"
 commit="$(git rev-parse --short=8 HEAD)"
+version="$(project_version)"
+unit_dir="$(mktemp -d "${TMPDIR:-/tmp}/nexus-bs-units.XXXXXX")"
+trap 'rm -rf "$unit_dir"' EXIT INT TERM
+render_systemd_unit contrib/systemd/nexus-bs.service "$unit_dir/nexus-bs.service" "$version"
+render_systemd_unit contrib/systemd/nexus-bs-control.service "$unit_dir/nexus-bs-control.service" "$version"
+render_systemd_unit contrib/systemd/nexus-bs-dashboard.service "$unit_dir/nexus-bs-dashboard.service" "$version"
 
 ssh $SSH_OPTS "$REMOTE" "timeout 12s sh -lc '
 sudo -n systemctl daemon-reload || true
@@ -59,9 +86,9 @@ scp $SSH_OPTS dashboard/assets/app.js "$REMOTE:$REMOTE_BASE/dashboard/assets/app
 scp $SSH_OPTS dashboard/assets/styles.css "$REMOTE:$REMOTE_BASE/dashboard/assets/styles.css"
 scp $SSH_OPTS dashboard/assets/nexus-bs-logo.svg "$REMOTE:$REMOTE_BASE/dashboard/assets/nexus-bs-logo.svg"
 scp $SSH_OPTS scripts/nexus-bs-factory-reset-clean "$REMOTE:$REMOTE_BASE/nexus-bs-factory-reset-clean"
-scp $SSH_OPTS contrib/systemd/nexus-bs.service "$REMOTE:/tmp/nexus-bs.service"
-scp $SSH_OPTS contrib/systemd/nexus-bs-control.service "$REMOTE:/tmp/nexus-bs-control.service"
-scp $SSH_OPTS contrib/systemd/nexus-bs-dashboard.service "$REMOTE:/tmp/nexus-bs-dashboard.service"
+scp $SSH_OPTS "$unit_dir/nexus-bs.service" "$REMOTE:/tmp/nexus-bs.service"
+scp $SSH_OPTS "$unit_dir/nexus-bs-control.service" "$REMOTE:/tmp/nexus-bs-control.service"
+scp $SSH_OPTS "$unit_dir/nexus-bs-dashboard.service" "$REMOTE:/tmp/nexus-bs-dashboard.service"
 
 remote_sha="$(ssh $SSH_OPTS "$REMOTE" "timeout 10s sha256sum '$REMOTE_BASE/nexus-bs' | awk '{print \$1}'")"
 remote_control_service_sha="$(ssh $SSH_OPTS "$REMOTE" "timeout 10s sha256sum '$REMOTE_BASE/nexus-bs-control-service' | awk '{print \$1}'")"

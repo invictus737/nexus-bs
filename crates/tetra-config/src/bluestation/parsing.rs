@@ -322,6 +322,44 @@ location_area = 1
     }
 
     #[test]
+    fn dashboard_auth_parses_from_real_toml_section() {
+        let toml = minimal_toml(
+            r#"
+
+[dashboard]
+port = 8080
+bind = "0.0.0.0"
+auth_enabled = true
+username = "operator"
+password = "change-this"
+"#,
+        );
+        let cfg = from_toml_str(&toml).expect("dashboard auth config should parse");
+        let dashboard = cfg.dashboard.expect("dashboard section should be present");
+
+        assert!(dashboard.auth_enabled);
+        assert_eq!(dashboard.username.as_deref(), Some("operator"));
+        assert_eq!(dashboard.password.as_deref(), Some("change-this"));
+    }
+
+    #[test]
+    fn dashboard_auth_rejects_unquoted_template_values() {
+        let toml = minimal_toml(
+            r#"
+
+[dashboard]
+port = 8080
+bind = "0.0.0.0"
+auth_enabled = true
+username = admin
+password = nexus
+"#,
+        );
+
+        assert!(from_toml_str(&toml).is_err(), "TOML dashboard credentials must be quoted strings");
+    }
+
+    #[test]
     fn test_no_neighbor_cells() {
         let toml = minimal_toml("");
         let cfg = from_toml_str(&toml).expect("parse failed");
@@ -819,8 +857,8 @@ allowed_gssi_ranges = [
         assert!(dashboard.password.is_none());
         let template = include_str!("../../../../example_config/config_template.toml");
         assert!(template.contains("# auth_enabled = false"));
-        assert!(template.contains("# username = admin"));
-        assert!(template.contains("# password = nexus"));
+        assert!(template.contains("# username = \""));
+        assert!(template.contains("# password = \""));
         assert!(!toml.contains("IqMaster"));
         assert!(!toml.contains("[identity]"));
         assert!(toml.contains("backend = \"SoapySdr\""));

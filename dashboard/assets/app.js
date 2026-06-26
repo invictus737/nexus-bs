@@ -65,7 +65,7 @@ const state = {
   easyStartPreview: null,
   easyStartDismissed: false,
   factoryResetBusy: false,
-  logAutoScroll: true,
+  logStreaming: true,
   logBusy: false,
   activePage: "system",
 };
@@ -2551,14 +2551,15 @@ function renderLogs(options = {}) {
   setHtml("logList", rows.length ? rows.join("") : '<div class="log-row"><span>--</span><span class="level">INFO</span><span class="msg">No log entries</span></div>');
   const scrollButton = $("logAutoScrollBtn");
   if (scrollButton) {
-    scrollButton.textContent = state.logAutoScroll ? "Pause" : "Play";
-    scrollButton.setAttribute("aria-pressed", state.logAutoScroll ? "true" : "false");
+    scrollButton.textContent = state.logStreaming ? "Pause" : "Play";
+    scrollButton.setAttribute("aria-pressed", state.logStreaming ? "true" : "false");
+    scrollButton.title = state.logStreaming ? "Pause live log rendering" : "Resume live log rendering";
   }
   for (const id of ["logClearBtn", "logExportBtn", "logAutoScrollBtn"]) {
     const button = $(id);
     if (button) button.disabled = !!state.logBusy;
   }
-  if (state.activePage === "logs" && list && (state.logAutoScroll || options.forceBottom)) {
+  if (state.activePage === "logs" && list && (state.logStreaming || options.forceBottom)) {
     list.scrollTop = list.scrollHeight;
   } else if (state.activePage === "logs" && list) {
     list.scrollTop = Math.min(previousScrollTop, Math.max(0, list.scrollHeight - list.clientHeight));
@@ -2867,7 +2868,7 @@ function renderAll() {
   renderRadios();
   renderCalls();
   renderHeard();
-  if (state.activePage === "logs") renderLogs();
+  if (state.activePage === "logs" && state.logStreaming) renderLogs();
   renderSystem();
   renderConfigProfiles();
   renderWifi();
@@ -3039,7 +3040,7 @@ function applyMessage(msg) {
     case "log":
       state.logs.push({ ts: msg.ts, level: msg.level, msg: msg.msg });
       state.logs = state.logs.slice(-500);
-      if (state.activePage === "logs") renderLogs();
+      if (state.activePage === "logs" && state.logStreaming) renderLogs();
       return;
     case "ts_voice":
       state.slotActivity.set(Number(msg.ts), Date.now());
@@ -3279,8 +3280,8 @@ function initNav() {
   $("wifiShowPassword")?.addEventListener("change", syncWifiPasswordVisibility);
   $("diagramPathToggle")?.addEventListener("click", requestRfCarrierToggle);
   $("logAutoScrollBtn")?.addEventListener("click", () => {
-    state.logAutoScroll = !state.logAutoScroll;
-    renderLogs({ forceBottom: state.logAutoScroll });
+    state.logStreaming = !state.logStreaming;
+    renderLogs({ forceBottom: state.logStreaming });
   });
   $("logExportBtn")?.addEventListener("click", exportLogs);
   $("logClearBtn")?.addEventListener("click", clearLogs);

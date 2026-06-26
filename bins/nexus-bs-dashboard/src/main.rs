@@ -85,7 +85,7 @@ fn main() {
         .config
         .or_else(|| non_empty_env("NEXUS_BS_PERSISTENT_CONFIG"))
         .unwrap_or_else(|| "/etc/nexus-bs/config.toml".to_string());
-    let stack_config = load_optional_stack_config(&config_path);
+    let stack_config = load_dashboard_stack_config(&config_path);
     let dash_cfg = stack_config.as_ref().and_then(|cfg| cfg.dashboard.clone());
 
     let runtime = DashboardRuntimeConfig {
@@ -146,13 +146,14 @@ fn main() {
     start_journal_log_bridge(Arc::clone(&dashboard));
 
     tracing::info!(
-        "Nexus-BS external dashboard listening on http://{}:{} (config={}, static_dir={}, telemetry={}, control={})",
+        "Nexus-BS external dashboard listening on http://{}:{} (config={}, static_dir={}, telemetry={}, control={}, auth={})",
         runtime.bind,
         runtime.port,
         runtime.config_path,
         runtime.static_dir.as_deref().unwrap_or("<embedded>"),
         runtime.telemetry_listen,
-        runtime.control_url
+        runtime.control_url,
+        if runtime.auth.is_some() { "enabled" } else { "disabled" }
     );
 
     loop {
@@ -227,12 +228,17 @@ fn journal_level_hint(line: &str) -> &'static str {
     }
 }
 
-fn load_optional_stack_config(path: &str) -> Option<StackConfig> {
+fn load_dashboard_stack_config(path: &str) -> Option<StackConfig> {
     match parsing::from_file(path) {
         Ok(config) => Some(config),
         Err(error) => {
-            tracing::warn!("Dashboard: config '{}' could not be loaded for dashboard settings: {}", path, error);
-            None
+            if std::path::Path::new(path).exists() {
+                tracing::error!("Dashboard: refusing to start with invalid config '{}': {}", path, error);
+                std::process::exit(78);
+            } else {
+                tracing::warn!("Dashboard: config '{}' is missing; starting with dashboard defaults", path);
+                None
+            }
         }
     }
 }

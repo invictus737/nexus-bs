@@ -323,9 +323,11 @@ fn external_dashboard_asset_manifest_is_coherent() {
             && !app.contains("pageScroll: new Map()")
             && !app.contains("function preserveActivePageScroll")
             && !app.contains("history.scrollRestoration")
-            && app.contains(r#"state.activePage === "logs" && list && (state.logAutoScroll || options.forceBottom)"#)
-            && app.contains("renderLogs({ forceBottom: state.logAutoScroll })"),
-        "dashboard live renders must not move page scroll; only the logs list may auto-scroll under Play/Pause control"
+            && app.contains("logStreaming: true")
+            && app.contains(r#"state.activePage === "logs" && list && (state.logStreaming || options.forceBottom)"#)
+            && app.contains(r#"if (state.activePage === "logs" && state.logStreaming) renderLogs()"#)
+            && app.contains("renderLogs({ forceBottom: state.logStreaming })"),
+        "dashboard live renders must not move page scroll; the Logs Play/Pause control must freeze live log rendering"
     );
     assert!(
         app.contains(r#"/ws`"#),
