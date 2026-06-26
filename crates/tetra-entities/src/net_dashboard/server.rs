@@ -7166,7 +7166,7 @@ mod tests {
     #[test]
     fn dashboard_auth_status_requires_session_when_credentials_are_set() {
         let sessions = Arc::new(Mutex::new(SessionStore::new()));
-        let auth = Some(("admin".to_string(), "change-this".to_string()));
+        let auth = Some(("operator".to_string(), "change-this".to_string()));
 
         let status = auth_status_value(auth, &sessions, "GET / HTTP/1.1\r\n\r\n");
 
@@ -7178,7 +7178,7 @@ mod tests {
     fn dashboard_auth_status_accepts_valid_session_cookie() {
         let sessions = Arc::new(Mutex::new(SessionStore::new()));
         let token = sessions.lock().unwrap().create();
-        let auth = Some(("admin".to_string(), "change-this".to_string()));
+        let auth = Some(("operator".to_string(), "change-this".to_string()));
         let headers = format!("GET / HTTP/1.1\r\nCookie: theme=dark; fs_session={token}; fs_auth=1\r\n\r\n");
 
         let status = auth_status_value(auth, &sessions, &headers);

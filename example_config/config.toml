@@ -244,12 +244,6 @@ assume_pdch_ready_after_data_transmit = false
 [dashboard]
 port = 8080
 bind = "0.0.0.0"
-# Dashboard login is available but disabled by default for local appliance use.
-# Set auth_enabled = true after changing the password when exposing the dashboard
-# beyond a trusted local network.
-auth_enabled = false
-username = "admin"
-password = "nexus"
 
 [telemetry]
 host = "127.0.0.1"
