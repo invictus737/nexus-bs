@@ -4257,16 +4257,17 @@ pub const LOGIN_HTML: &str = r##"<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<meta name="theme-color" content="#101214">
+<meta name="theme-color" content="#0a0c0f">
+<meta name="color-scheme" content="dark">
 <title>Nexus-BS {{PRODUCT_VERSION_TAG}} - Login</title>
 <style>
 :root{
-  --bg:#101214;--bg2:#15191c;--bg3:#1d2326;--bg4:#263034;
-  --border:#303a3e;--border2:#465359;
-  --text:#e8ece9;--text2:#a7b5b0;--text3:#6f7d78;
-  --accent:#00c2a8;--accent2:#6bb8d6;--danger:#e05252;
+  --bg:#0a0c0f;--rail:#0f1114;--panel:#181d22;--panel2:#1f252b;--panel3:#11161a;
+  --line:#303941;--line-soft:#242c33;
+  --text:#e8edf1;--muted:#9aa6ae;--dim:#68747d;
+  --cyan:#52b6c8;--green:#39b86f;--red:#df5c5c;
   --mono:'ui-monospace','Cascadia Code','Consolas','Liberation Mono','Menlo',monospace;
-  --sans: 'ui-sans-serif', system-ui, -apple-system, 'Segoe UI', 'Microsoft YaHei', 'Noto Sans SC', 'PingFang SC', 'Hiragino Sans GB', 'WenQuanYi Micro Hei', sans-serif;
+  --sans:Inter,'ui-sans-serif',system-ui,-apple-system,'Segoe UI','Microsoft YaHei','Noto Sans SC','PingFang SC','Hiragino Sans GB','WenQuanYi Micro Hei',sans-serif;
 }
 *{box-sizing:border-box;}
 html,body{margin:0;padding:0;height:100%;}
@@ -4275,78 +4276,63 @@ body{
   display:flex;align-items:center;justify-content:center;
   min-height:100vh;min-height:100dvh;
   padding:20px;
-  background:var(--bg);
   -webkit-tap-highlight-color:transparent;
 }
 
 .login-card{
   width:100%;max-width:380px;
-  background:var(--bg2);border:1px solid var(--border2);
+  background:var(--panel);border:1px solid var(--line);
   border-radius:8px;
-  box-shadow:0 1px 0 rgba(255,255,255,0.03), 0 18px 48px rgba(0,0,0,0.38);
-  padding:36px 32px 32px;
+  box-shadow:0 1px 0 rgba(255,255,255,0.03),0 20px 52px rgba(0,0,0,0.42);
+  padding:32px 30px 30px;
   position:relative;overflow:hidden;
 }
-/* Top accent bar */
 .login-card::before{
   content:"";position:absolute;top:0;left:0;right:0;height:3px;
-  background:linear-gradient(90deg, var(--accent) 0%, var(--accent2) 100%);
+  background:var(--cyan);
 }
 
-.logo-wrap{display:flex;flex-direction:column;align-items:center;gap:14px;margin-bottom:26px;}
-/* Tower / antenna mark — SVG inlined so there's no extra request */
-.logo-mark{
-  width:64px;height:64px;
-  border-radius:8px;
-  background:rgba(0,194,168,0.10);
-  border:1px solid rgba(0,194,168,0.32);
+.logo-wrap{display:flex;flex-direction:column;align-items:center;gap:12px;margin-bottom:26px;}
+.logo-plate{
+  width:100%;max-width:286px;min-height:78px;
   display:flex;align-items:center;justify-content:center;
-  box-shadow:0 0 24px rgba(0,212,168,0.15);
+  padding:0 4px;
 }
-.logo-mark svg{width:36px;height:36px;}
-
-.logo-title{
-  font-family:var(--mono);font-size:13px;font-weight:700;
-  letter-spacing:0.18em;text-transform:uppercase;
-  color:var(--text);
-  display:flex;align-items:center;gap:8px;
-}
-.logo-title .accent{color:var(--accent);}
+.logo-img{display:block;width:100%;height:auto;}
 .logo-sub{
   font-family:var(--mono);font-size:10px;font-weight:500;
   letter-spacing:0.1em;text-transform:uppercase;
-  color:var(--text3);
+  color:var(--dim);
 }
 
 form{display:flex;flex-direction:column;gap:14px;}
 .field-label{
   display:block;font-family:var(--mono);font-size:10px;font-weight:600;
-  letter-spacing:0.1em;text-transform:uppercase;color:var(--text3);
+  letter-spacing:0.1em;text-transform:uppercase;color:var(--dim);
   margin-bottom:6px;
 }
 input[type="text"],input[type="password"]{
   width:100%;
-  background:var(--bg3);border:1px solid var(--border2);
+  background:var(--panel3);border:1px solid var(--line);
   color:var(--text);
   padding:12px 14px;border-radius:8px;
   font-family:var(--mono);font-size:14px;
   outline:none;transition:border-color 0.15s, background 0.15s;
   -webkit-appearance:none;appearance:none;
 }
-input:focus{border-color:var(--accent2);background:var(--bg4);}
+input:focus{border-color:var(--cyan);background:var(--panel2);}
 /* iOS Safari respects the 16px rule to skip the auto-zoom; we set 14px on desktop
    and bump back up on mobile via the @media block below. */
 
 .btn-login{
   width:100%;
-  background:linear-gradient(180deg, var(--accent) 0%, #009d89 100%);
-  color:#06231d;font-weight:700;letter-spacing:0.04em;
-  border:none;border-radius:8px;
+  background:var(--cyan);
+  color:#081215;font-weight:700;letter-spacing:0.04em;
+  border:1px solid #6fc4d3;border-radius:8px;
   padding:13px 16px;font-family:var(--sans);font-size:14px;
   cursor:pointer;
   margin-top:6px;
-  transition:transform 0.05s, box-shadow 0.15s, filter 0.15s;
-  box-shadow:0 4px 14px rgba(0,212,168,0.3);
+  transition:transform 0.05s,filter 0.15s;
 }
 .btn-login:hover{filter:brightness(1.05);}
 .btn-login:active{transform:translateY(1px);}
@@ -4360,17 +4346,16 @@ input:focus{border-color:var(--accent2);background:var(--bg4);}
 
 .footer{
   margin-top:22px;text-align:center;
-  font-family:var(--mono);font-size:10px;color:var(--text3);
+  font-family:var(--mono);font-size:10px;color:var(--dim);
   letter-spacing:0.06em;
 }
-.footer a{color:var(--text3);text-decoration:none;}
-.footer a:hover{color:var(--accent2);}
+.footer a{color:var(--dim);text-decoration:none;}
+.footer a:hover{color:var(--cyan);}
 
 @media(max-width:500px){
   body{padding:14px;}
   .login-card{padding:28px 22px;border-radius:8px;}
-  .logo-mark{width:56px;height:56px;}
-  .logo-mark svg{width:30px;height:30px;}
+  .logo-plate{min-height:68px;}
   /* Bigger inputs on mobile: prevents iOS zoom-on-focus, easier tap target. */
   input[type="text"],input[type="password"]{font-size:16px;padding:14px 14px;}
   .btn-login{font-size:15px;padding:14px 16px;min-height:48px;}
@@ -4380,29 +4365,10 @@ input:focus{border-color:var(--accent2);background:var(--bg4);}
 <body>
 <div class="login-card">
   <div class="logo-wrap">
-    <div class="logo-mark">
-      <!-- Stylised antenna tower with radio waves -->
-      <svg viewBox="0 0 32 32" xmlns="http://www.w3.org/2000/svg" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent)">
-        <!-- Tower legs -->
-        <path d="M14 28 L16 8 L18 28" />
-        <!-- Cross braces -->
-        <line x1="14.6" y1="22" x2="17.4" y2="22"/>
-        <line x1="14.9" y1="17" x2="17.1" y2="17"/>
-        <line x1="15.2" y1="13" x2="16.8" y2="13"/>
-        <!-- Tip antenna -->
-        <line x1="16" y1="8" x2="16" y2="4"/>
-        <circle cx="16" cy="3" r="1" fill="currentColor"/>
-        <!-- Radio waves -->
-        <path d="M9 8 Q6 11 6 16" style="color:var(--accent2)" opacity="0.7"/>
-        <path d="M23 8 Q26 11 26 16" style="color:var(--accent2)" opacity="0.7"/>
-        <path d="M11 6 Q7 9 7 14" style="color:var(--accent2)" opacity="0.4"/>
-        <path d="M21 6 Q25 9 25 14" style="color:var(--accent2)" opacity="0.4"/>
-      </svg>
+    <div class="logo-plate">
+      <img class="logo-img" src="/assets/nexus-bs-logo.svg" alt="Nexus-BS">
     </div>
-    <div style="text-align:center">
-      <div class="logo-title"><span>Nexus</span><span class="accent">-BS</span></div>
-      <div class="logo-sub">TETRA Base Station</div>
-    </div>
+    <div class="logo-sub">TETRA eBTS operations console</div>
   </div>
 
   <form id="login-form" autocomplete="on">

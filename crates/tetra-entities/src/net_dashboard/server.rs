@@ -5067,6 +5067,9 @@ fn dashboard_auth_gate(req_line: &str, session_ok: bool) -> DashboardAuthGate {
     if request_matches(req_line, "GET", "/login") {
         return DashboardAuthGate::LoginPage;
     }
+    if request_matches(req_line, "GET", "/assets/nexus-bs-logo.svg") {
+        return DashboardAuthGate::Allow;
+    }
     if request_matches(req_line, "POST", "/api/login") {
         return DashboardAuthGate::LoginApi;
     }
@@ -7207,6 +7210,14 @@ mod tests {
             DashboardAuthGate::Allow
         );
         assert_eq!(dashboard_auth_gate("GET /login HTTP/1.1", false), DashboardAuthGate::LoginPage);
+        assert_eq!(
+            dashboard_auth_gate("GET /assets/nexus-bs-logo.svg HTTP/1.1", false),
+            DashboardAuthGate::Allow
+        );
+        assert_eq!(
+            dashboard_auth_gate("GET /assets/app.js HTTP/1.1", false),
+            DashboardAuthGate::Unauthorized
+        );
         assert_eq!(dashboard_auth_gate("POST /api/login HTTP/1.1", false), DashboardAuthGate::LoginApi);
         assert_eq!(dashboard_auth_gate("POST /api/logout HTTP/1.1", false), DashboardAuthGate::Logout);
         assert_eq!(dashboard_auth_gate("GET / HTTP/1.1", false), DashboardAuthGate::RedirectToLogin);
@@ -7256,6 +7267,10 @@ mod tests {
         assert!(dashboard.contains("Nexus-BS Project"));
         assert!(dashboard.contains(tetra_core::PRODUCT_USER_AGENT));
         assert!(login.contains("Nexus-BS Project"));
+        assert!(login.contains(r#"src="/assets/nexus-bs-logo.svg""#));
+        assert!(login.contains("TETRA eBTS operations console"));
+        assert!(!login.contains("logo-mark"));
+        assert!(!login.contains("#00c2a8"));
         assert!(!dashboard.contains(&stale_project_line));
         assert!(!login.contains(&stale_project_line));
     }

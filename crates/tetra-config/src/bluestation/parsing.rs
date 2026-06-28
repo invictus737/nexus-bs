@@ -856,6 +856,9 @@ allowed_gssi_ranges = [
         assert!(dashboard.username.is_none());
         assert!(dashboard.password.is_none());
         let template = include_str!("../../../../example_config/config_template.toml");
+        assert!(template.contains("# Optional Nexus-BS dashboard/API auth is disabled by default."));
+        assert!(template.contains("# username = \"admin\"  # optional; required only when auth_enabled = true"));
+        assert!(template.contains("# password = \"nexus\"  # optional; required only when auth_enabled = true"));
         assert!(template.contains("# auth_enabled = false"));
         assert!(template.contains("# username = \""));
         assert!(template.contains("# password = \""));
