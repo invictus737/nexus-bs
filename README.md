@@ -10,6 +10,11 @@ SPDX-FileComment: See CHANGES-NEXUS.md for the central Nexus-BS change notice.
 
 # Nexus-BS
 
+> **This is Nexus-BS 1.x, archived and read-only.**
+> Nexus-BS 2.0 (TETRA, DMR, P25 and FM on one SDR) continues at
+> [nexus-bs.pages.dev](https://nexus-bs.pages.dev) ·
+> [invictus737/nexus-bs2](https://github.com/invictus737/nexus-bs2).
+
 Nexus-BS is a source-available TETRA base-station project focused on practical
 HAM-radio, lab, and research operation with real SDR hardware and real TETRA
 terminals.
